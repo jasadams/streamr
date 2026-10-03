@@ -274,6 +274,14 @@ impl TreeNodeRewriter for ArroyoRewriter<'_> {
     fn f_up(&mut self, mut node: Self::Node) -> Result<Transformed<Self::Node>> {
         match node {
             LogicalPlan::Projection(ref mut projection) => {
+                if projection.input.exists(|plan| {
+                    Ok(matches!(plan, LogicalPlan::Extension(extension)
+                        if extension.node.as_any().is::<crate::extension::state_table::StateTableScan>()))
+                })? {
+                    return plan_err!(
+                        "state-table scans require an input-event keyed INNER or LEFT JOIN; standalone target scans are unsupported"
+                    );
+                }
                 if !has_timestamp_field(&projection.schema) {
                     let timestamp_field: DFField = projection
                         .input
@@ -340,6 +348,9 @@ impl TreeNodeRewriter for ArroyoRewriter<'_> {
                 .f_up(LogicalPlan::Aggregate(aggregate));
             }
             LogicalPlan::Join(join) => {
+                if let Some(lookup) = crate::extension::state_table::plan_lookup(&join)? {
+                    return Ok(Transformed::yes(lookup));
+                }
                 return JoinRewriter {
                     schema_provider: self.schema_provider,
                 }

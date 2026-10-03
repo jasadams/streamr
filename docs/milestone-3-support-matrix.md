@@ -12,6 +12,56 @@ capability tests and an external workload capture do not establish migration of
 all retained-state operators, delivery guarantees or unrestricted beyond-RAM
 execution. See [validation evidence](milestone-3-validation.md).
 
+## Revised delivery scope
+
+The current milestone plan uses native SQL operators before proposing new
+extensions. This is planned scope, not a claim that the paths below are already
+implemented or qualified:
+
+| Capability | Milestone 3 owner | Required evidence |
+| --- | --- | --- |
+| Typed state tables, current-row reads and continuous MERGE | [STR-38–42](https://trakkt.app/issues/STR-38) | Separate retained storage/output relations, one ordered state owner, source/old/new/no-action output and native recovery |
+| Persistent updating aggregates | [STR-17](https://trakkt.app/issues/STR-17) | Exact COUNT/SUM/extrema/ordered first-last/FILTER/NULL values, bounded retraction state and explicit retention |
+| Native TUMBLE and HOP panes and closure | [STR-19](https://trakkt.app/issues/STR-19) | Configured-backend migration, watermark/expiry/quiet-key behavior and bounded open-window recovery |
+| Native SESSION | [STR-20](https://trakkt.app/issues/STR-20) | Gap/late-input/deadline/max-duration semantics, bounded histories and closure recovery |
+| Typed aggregate/window composition, ranking and arrays | [STR-29](https://trakkt.app/issues/STR-29) | Runnable native plans, bounded values/collections and precise composition/emit behavior |
+| Legacy state_* SQL function removal | [STR-43](https://trakkt.app/issues/STR-43) | Native caller migration, explicit old-plan/checkpoint handling and removal from active catalogs/examples |
+
+[STR-28](https://trakkt.app/issues/STR-28) freezes the actual native plans and
+maps each required behavior to supported SQL, a demonstrated defect or a policy
+difference requiring discussion. A non-windowed GROUP BY already retains
+aggregate state; a whole-record JSON processor is not the default replacement.
+Native TUMBLE/HOP work is now in milestone 3. Broader analytic histories,
+unsupported aggregate variants, general historical joins and rescaling remain
+milestone 4 unless a selected plan demonstrates a required narrow gap.
+
+All selected paths must use backend-neutral state interfaces and the configured
+live SQL backend: memory and RocksDB currently. New providers belong behind the
+construction/lifecycle/capability boundary, not in SQL operator logic. Existing
+SQL construction still has distinct memory/RocksDB paths; STR-39 corrects that
+boundary, and STR-17/19/20 depend on its common adapter work.
+
+The five legacy functions are state_get, state_put, state_upsert, state_update
+and state_delete. They remain in the current code until STR-43's prerequisites
+pass; ordinary native table INSERT/MERGE and backend get/put APIs are retained.
+Historical milestone 2 evidence is preserved as evidence of the old path.
+
+No new SQL timer/callback API is preselected. Native windows already schedule
+their own closure. Application emission/deadline requirements must be tested
+against native composition before proposing an additional generic interface.
+Application SQL, schemas and oracles stay in the consuming repository. Proposed
+external SQL is not physical-plan/native-runtime evidence.
+
+## Native route evidence
+
+The [STR-28 native capability audit](milestone-3-native-capabilities.md) maps all
+external profile/session fields and lifecycle rules, records source-level
+composition restrictions, retained ownership and the STR-43 removal inventory.
+It is source evidence, not a frozen runnable graph or passing native values.
+Ordered FIRST_VALUE/LAST_VALUE remain a reported defect until value tests pass.
+Memory planning/execution and RocksDB admission are separate gates; SESSION
+semantics are not assumed equivalent to an external timer-driven function.
+
 ## Retained-state inventory
 
 | Path / node | Retained working state | Current support and limitation |
@@ -121,7 +171,7 @@ bound arbitrary UDF allocations, channel contents or legacy window/join state.
 The following are questions to resolve with interface consumers before choosing
 or implementing a design. They are not approved application integrations:
 
-- **External callbacks:** what supported extension interface lets external code
+- **External callbacks (broader design topic):** what supported extension interface lets external code
   execute bounded stateful callbacks, with cancellation and checkpoint ordering?
 - **Timer registration and dispatch:** how are generic timer IDs/payloads exposed
   to external consumers, and who owns event/processing-clock advancement,
@@ -131,7 +181,7 @@ or implementing a design. They are not approved application integrations:
 - **Operator registration:** how can independently owned logic be registered and
   planned through a generic interface, without adding application-specific
   protocol variants or built-in worker operators?
-- **Bounded multi-namespace transactions:** how are namespaces registered for
+- **Coordinated state and checkpoint assembly:** how are namespaces registered for
   export/restore, producer reservations retained, multiple prepared operations
   admitted and related state/output/checkpoint boundaries expressed? This also
   needs a supported integration for derived history namespaces.

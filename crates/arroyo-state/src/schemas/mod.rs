@@ -89,6 +89,7 @@ impl SchemaWithHashAndOperation {
         batch: RecordBatch,
         range: &RangeInclusive<u64>,
     ) -> Result<Option<RecordBatch>, ArrowError> {
+        let source_schema = batch.schema();
         let hash_array: &PrimitiveArray<UInt64Type> = batch
             .column(self.hash_index)
             .as_primitive_opt()
@@ -114,10 +115,7 @@ impl SchemaWithHashAndOperation {
             .map(|column| filter(column, &filtered_indices))
             .collect::<Result<Vec<_>, ArrowError>>()?;
 
-        Ok(Some(RecordBatch::try_new(
-            self.state_schema.schema.clone(),
-            columns,
-        )?))
+        Ok(Some(RecordBatch::try_new(source_schema, columns)?))
     }
 
     pub(crate) fn batch_stats_from_state_batch(

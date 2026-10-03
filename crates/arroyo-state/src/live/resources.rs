@@ -67,10 +67,9 @@ impl fmt::Display for ResourceError {
                 "{resource} request of {requested} exceeds budget {limit}"
             ),
             Self::Closed { resource } => write!(f, "{resource} admission closed"),
-            Self::ResourceExhausted { resource, limit } => write!(
-                f,
-                "{resource} budget exhausted (limit {limit}); worker startup cannot wait for a database slot"
-            ),
+            Self::ResourceExhausted { resource, limit } => {
+                write!(f, "{resource} budget exhausted (limit {limit})")
+            }
             Self::BlockingTask(e) => write!(f, "live-state blocking task failed: {e}"),
             Self::DiskIo(e) => write!(f, "cannot inspect live-state disk: {e}"),
             Self::CleanupThread(e) => write!(f, "cannot start live-state cleanup thread: {e}"),
@@ -146,11 +145,19 @@ impl Budget {
             amount,
         })
     }
-    fn try_acquire_one(&self) -> Result<ResourcePermit, ResourceError> {
+    fn try_acquire(&self, amount: usize) -> Result<ResourcePermit, ResourceError> {
+        let count = u32::try_from(amount)
+            .ok()
+            .filter(|_| amount <= self.limit)
+            .ok_or(ResourceError::RequestTooLarge {
+                resource: self.name,
+                requested: amount,
+                limit: self.limit.min(u32::MAX as usize),
+            })?;
         let permit = self
             .semaphore
             .clone()
-            .try_acquire_owned()
+            .try_acquire_many_owned(count)
             .map_err(|error| match error {
                 tokio::sync::TryAcquireError::Closed => ResourceError::Closed {
                     resource: self.name,
@@ -161,12 +168,15 @@ impl Budget {
                 },
             })?;
         let used = self.metrics.with_label_values(&[self.name, "used"]);
-        used.inc();
+        used.add(amount as i64);
         Ok(ResourcePermit {
             _permit: permit,
             used,
-            amount: 1,
+            amount,
         })
+    }
+    fn try_acquire_one(&self) -> Result<ResourcePermit, ResourceError> {
+        self.try_acquire(1)
     }
 }
 struct GaugeGuard(prometheus::IntGauge);
@@ -379,7 +389,7 @@ impl WorkerStateResources {
             operation_latency,
         })))
     }
-    pub(crate) fn same_pool(&self, other: &Self) -> bool {
+    pub fn same_pool(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
     }
 
@@ -391,6 +401,16 @@ impl WorkerStateResources {
     }
     pub fn write_buffer_manager(&self) -> &WriteBufferManager {
         &self.0.manager
+    }
+    /// Fail-fast acquisition for callers already holding other resource permits.
+    pub fn try_queued_write(&self, bytes: usize) -> Result<ResourcePermit, ResourceError> {
+        self.0.queued.try_acquire(bytes)
+    }
+    pub fn try_decoded_value(&self, bytes: usize) -> Result<ResourcePermit, ResourceError> {
+        self.0.decoded.try_acquire(bytes)
+    }
+    pub fn try_scan_page(&self, bytes: usize) -> Result<ResourcePermit, ResourceError> {
+        self.0.scans.try_acquire(bytes)
     }
     pub async fn queued_write(&self, bytes: usize) -> Result<ResourcePermit, ResourceError> {
         self.0.queued.acquire(bytes).await

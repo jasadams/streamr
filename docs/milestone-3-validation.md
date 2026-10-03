@@ -8,6 +8,144 @@ business behavior remain in the consuming application. See
 [the support matrix](milestone-3-support-matrix.md) for retained paths and
 interface gaps requiring discussion before further implementation.
 
+The revised milestone plan is recorded in the support matrix: native aggregates
+(STR-17), TUMBLE/HOP (STR-19), SESSION (STR-20), typed result composition
+(STR-29), state tables/MERGE (STR-38–42) and legacy state_* removal (STR-43).
+This revision does not qualify those paths or change the historical evidence
+below. Application query proposals and oracles remain in the application repo;
+they are not embedded engine implementations.
+
+## Current STR-28 evidence gate
+
+### Current foundation batch
+
+The uncommitted implementation batch on top of `d59124ea` has passed these
+Bookworm library runs through the shared machine build queue:
+
+```sh
+/home/jason/repos/streamr/scripts/rust-build podman exec \
+  -e CARGO_TARGET_DIR=/app/target/milestone2-runtime \
+  -e DATABASE_URL=postgres://arroyo:arroyo@localhost:5432/arroyo \
+  streamr-state-build cargo test --locked -j4 -p arroyo-state --lib
+
+/home/jason/repos/streamr/scripts/rust-build podman exec \
+  -e CARGO_TARGET_DIR=/app/target/milestone2-runtime \
+  -e DATABASE_URL=postgres://arroyo:arroyo@localhost:5432/arroyo \
+  streamr-state-build cargo test --locked -j4 -p arroyo-worker --lib
+```
+
+The state run passed 68 tests, including memory/RocksDB/third-adapter typed-table
+conformance, allocation guards, exact resource admission, and real Parquet
+metadata preservation and legacy rejection across both compaction partition
+paths. The worker run passed 73 tests, including ordered values, FILTER and NULL
+inputs, retractions, duplicate ordering keys, serialized-row reload into a fresh
+operator, and state-table preflight rejection before task construction.
+
+The planner run subsequently passed all 113 library tests using the same queue
+and container command with `-p arroyo-planner --lib`. This covers retained-table
+declarations, component-safe names, named MERGE effects and shared capture,
+complete-key INNER/LEFT lookups, deterministic key expressions, related owner
+compatibility and native aggregate/window plan probes.
+
+These passes establish the tested foundation, planning and aggregate correctness
+slices. Workspace all-target checking and strict Clippy passed for this batch
+(`cargo check --locked -j4 --workspace --all-targets` and `cargo clippy --locked
+-j4 --workspace --all-targets -- -D warnings`, exit 0). Logs are in the container
+at `/tmp/streamr-m3-workspace-{check,clippy}.log`. Formatting and staged whitespace
+checks also passed. The full workspace build remains pending.
+STR-40 planning deliberately rejects startup until STR-41
+supplies fused serial execution.
+
+### Native aggregate value and recovery capture
+
+The SQL-testing binary rebuilt from this batch with `cargo test --locked -j4
+-p arroyo-sql-testing --no-run` (exit 0; container log
+`/tmp/streamr-m3-sql-build.log`). The selected executable is
+`/app/target/milestone2-runtime/debug/deps/arroyo_sql_testing-b1c805b1e01cc8a7`.
+Two isolated `external_sql_checkpoint_capture` runs passed with configured
+`memory`, 16 MiB execution resources, checkpoint epoch 1 after two of three input
+rows, and controller and leader checkpoint publication respectively. All four
+complete initial/recovered JSONL comparisons passed.
+
+The generic query under `target/native-aggregate-values/{controller,leader}` uses
+these aggregate expressions grouped by `item_key`:
+
+```sql
+COUNT(*) AS total,
+COUNT(*) FILTER (WHERE selected) AS selected_total,
+FIRST_VALUE(item_value ORDER BY ordinal) AS first_value,
+LAST_VALUE(item_value ORDER BY ordinal) AS last_value,
+FIRST_VALUE(item_value ORDER BY ordinal DESC) AS descending_first,
+LAST_VALUE(item_value ORDER BY ordinal) FILTER (WHERE selected) AS selected_last
+```
+
+Input `(ordinal, item_value, selected)` is `(1, 'u', true)`, `(2, 'v', false)`,
+`(3, 'w', true)`, all under key `x`. The uninterrupted capture emits one create:
+`(total, selected_total, first_value, last_value, descending_first, selected_last)
+= (3, 2, 'u', 'w', 'w', 'w')`. Recovery preserves the checkpoint's create at
+`(2, 1, 'u', 'v', 'v', 'u')`, followed by an update with that exact before-image
+and the uninterrupted final after-image. The explicit null before-image is also
+compared. Logs: `/tmp/streamr-native-aggregate-{controller,leader}.log`.
+
+This exercises the native planner, operator, ordinary Arrow checkpoint tables,
+publication, source/sink progress and recreated worker. The aggregate caches
+remain in memory; STR-17's configured live-backend migration, bounded fallback
+history and resource qualification remain open. It does not qualify native MERGE.
+
+The rebuilt binary also passed the legacy capture guard and all nine earlier
+legacy stateful/stateless capture cases, with 18 complete initial/recovered
+payload comparisons. Command: the shared queue runs `python3
+/app/target/boundary-capture/run-current.py` with the executable above. This fresh
+regression replaces the warm-binary limitation for these legacy cases only.
+
+The [native capability audit](milestone-3-native-capabilities.md) records the
+2026-10-04 source review against the full STR-28 ticket and all four substantive compatibility comments.
+The revised application sketches, reference payload fields, planner guards,
+worker admission, operator retained state, connector records and legacy plan/
+checkpoint surfaces were inspected. No Cargo command or native physical-plan/
+value/recovery capture was run for this documentation slice. The coordinating
+agent owns the combined Bookworm validation queue; pending results are not passes.
+
+The coordinating agent recorded this legacy harness regression command, exit 0:
+
+```sh
+/home/jason/repos/streamr/scripts/rust-build podman exec streamr-state-build \
+  python3 /app/target/boundary-capture/run.py
+```
+
+It reused the warm Bookworm binary selected by
+`/tmp/streamr-boundary-sql-build.log`, with the same direct `prost` dependency fix
+recorded at `d59124ea`; it predates the new planner/state edits. This is not an
+exact-current-head build. The guard test passed once; nine capture tests passed
+(legacy stateful cutoffs 4/epoch 7 and 9/epoch 11, stateless cutoff 4/epoch 1,
+each in memory/controller/leader modes). All 18 initial/recovered complete payload
+comparisons passed. Container logs are
+`/tmp/streamr-boundary-{stateful,stateless}-{memory,controller,leader}-{4,9}.log`
+for the selected cases; generated payloads are under
+`target/boundary-capture/{kind}/{mode}`. These outputs are local build artifacts,
+not committed fixtures. This validates the legacy scalar-map/stateless capture
+harness only; it does not validate native state tables, aggregates or windows.
+
+Remaining acceptance requires pinned application query/oracle revisions, actual
+positive/negative native plan captures, exact ordered aggregate/FILTER/NULL and
+collection values, approved lifecycle/ownership differences, configured-backend
+migration with registered namespaces and admitted buffers, and restore/output
+checks in memory/controller, RocksDB/controller and RocksDB/leader modes.
+FIRST_VALUE/LAST_VALUE's reported input/order/filter defects are now covered by
+the unit and memory-configured native recovery captures above; their live-backend
+migration and broader acceptance remain open. Lifetime ranks, updating-input joins,
+unequal-window composition and session ranking/join restrictions have source
+evidence but still require actual plan probes and a discussed minimum contract
+for any required gap. No public callback API is approved by this audit.
+
+SESSION equality/next-instant deadlines, canceled/extended deadlines, old
+arrivals, pre-watermark gap splitting, reused IDs, >=24-hour continuous activity,
+quiet producers and restore around closure remain open. Idle output, calendar
+expiry-to-zero, processing-time coalescing and last-emitted changed-field deltas
+are not demonstrated by scalar sketches or timer storage tests. Old SQL callers
+and serialized plans/checkpoints need an explicit removal/migration policy before
+STR-43. Source audit is a partial STR-28 milestone, not STR-28 or M3 completion.
+
 ## Execution accounting
 
 ```toml
@@ -62,12 +200,15 @@ No hidden namespaces are used, so the milestone 2 full logical snapshot exporter
 captures each primary/index relationship together. Schema identities must version
 the operator's logical state. Restore always targets a fresh attempt.
 
-These APIs do not schedule callbacks by themselves. An application-owned
-processor needs a generic interface to register all state,
-drain event timers before forwarding watermarks, fire overdue processing timers
-after recovery, emit caller-defined Arrow schemas within admitted limits, and
-coordinate output/source/sink checkpoints. The current interface gap must be
-discussed before implementation. Storage tests do not establish those callbacks.
+These APIs do not schedule callbacks by themselves. Native window operators
+already own watermark-driven scheduling; their state and execution still need
+the selected migration/qualification work. Use native aggregate/window SQL
+composition first. If actual tests demonstrate a missing timed-output behavior,
+discuss the minimum generic interface before implementing it; no external
+application callback path is preselected for this milestone. Any such path
+would need state registration, clock/watermark/recovery ordering, admitted typed
+outputs and source/sink checkpoint integration. Storage tests establish none of
+those execution guarantees.
 
 ## Reproduction
 
@@ -89,6 +230,11 @@ query/output paths and explicit expectations; it has no business schema or oracl
 Set `STREAMR_CAPTURE_QUERY`, `STREAMR_CAPTURE_OUTPUT`,
 `STREAMR_CAPTURE_INPUT_ROWS_BEFORE_CHECKPOINT`, `STREAMR_CAPTURE_EXPECTED_ROWS`,
 `STREAMR_CAPTURE_EXPECTED_CHECKPOINT_ROWS`, and `STREAMR_CAPTURE_CHECKPOINT_EPOCH`.
+Optional `STREAMR_CAPTURE_EXPECTED_INITIAL_ROWS` declares the uninterrupted
+capture count separately; it defaults to `STREAMR_CAPTURE_EXPECTED_ROWS`.
+Updating aggregates can emit additional intermediate changelog rows when a
+checkpoint forces a flush. Compare their complete values and final materialized
+result as well as the explicitly declared counts.
 Use `STREAMR_TEST_BACKEND=memory|rocksdb`,
 `STREAMR_TEST_CHECKPOINT_MODE=controller|leader`, and optional
 `STREAMR_TEST_EXECUTION_BYTES` for the engine configuration. Run it alone:

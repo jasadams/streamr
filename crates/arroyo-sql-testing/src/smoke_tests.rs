@@ -1109,17 +1109,28 @@ async fn local_program(
 struct CaptureCounts {
     input_rows_before_checkpoint: i32,
     expected_rows: usize,
+    expected_initial_rows: usize,
     expected_checkpoint_rows: usize,
     checkpoint_epoch: u32,
 }
 
 impl CaptureCounts {
     fn from_env() -> std::result::Result<Self, String> {
-        Self::parse(|name| env::var(name).map_err(|error| format!("{name}: {error}")))
+        let initial_name = "STREAMR_CAPTURE_EXPECTED_INITIAL_ROWS";
+        let initial = match env::var(initial_name) {
+            Ok(value) => Some(value),
+            Err(env::VarError::NotPresent) => None,
+            Err(error) => return Err(format!("{initial_name}: {error}")),
+        };
+        Self::parse(
+            |name| env::var(name).map_err(|error| format!("{name}: {error}")),
+            initial.as_deref(),
+        )
     }
 
     fn parse(
         mut read: impl FnMut(&str) -> std::result::Result<String, String>,
+        initial_rows: Option<&str>,
     ) -> std::result::Result<Self, String> {
         fn number<T: std::str::FromStr>(name: &str, raw: String) -> std::result::Result<T, String> {
             if raw.is_empty() || !raw.bytes().all(|byte| byte.is_ascii_digit()) {
@@ -1142,9 +1153,15 @@ impl CaptureCounts {
         }
         let rows_name = "STREAMR_CAPTURE_EXPECTED_ROWS";
         let checkpoint_rows_name = "STREAMR_CAPTURE_EXPECTED_CHECKPOINT_ROWS";
+        let expected_rows = number(rows_name, read(rows_name)?)?;
+        let expected_initial_rows = match initial_rows {
+            Some(value) => number("STREAMR_CAPTURE_EXPECTED_INITIAL_ROWS", value.to_owned())?,
+            None => expected_rows,
+        };
         Ok(Self {
             input_rows_before_checkpoint,
-            expected_rows: number(rows_name, read(rows_name)?)?,
+            expected_rows,
+            expected_initial_rows,
             expected_checkpoint_rows: number(checkpoint_rows_name, read(checkpoint_rows_name)?)?,
             checkpoint_epoch,
         })
@@ -1154,22 +1171,26 @@ impl CaptureCounts {
 #[test]
 fn capture_counts_require_explicit_bounded_parameters() {
     let parse = |input: &str, rows: &str, checkpoint_rows: &str, epoch: &str| {
-        CaptureCounts::parse(|name| {
-            Ok(match name {
-                "STREAMR_CAPTURE_INPUT_ROWS_BEFORE_CHECKPOINT" => input,
-                "STREAMR_CAPTURE_EXPECTED_ROWS" => rows,
-                "STREAMR_CAPTURE_EXPECTED_CHECKPOINT_ROWS" => checkpoint_rows,
-                "STREAMR_CAPTURE_CHECKPOINT_EPOCH" => epoch,
-                _ => unreachable!(),
-            }
-            .to_owned())
-        })
+        CaptureCounts::parse(
+            |name| {
+                Ok(match name {
+                    "STREAMR_CAPTURE_INPUT_ROWS_BEFORE_CHECKPOINT" => input,
+                    "STREAMR_CAPTURE_EXPECTED_ROWS" => rows,
+                    "STREAMR_CAPTURE_EXPECTED_CHECKPOINT_ROWS" => checkpoint_rows,
+                    "STREAMR_CAPTURE_CHECKPOINT_EPOCH" => epoch,
+                    _ => unreachable!(),
+                }
+                .to_owned())
+            },
+            None,
+        )
     };
     assert_eq!(
         parse("7", "3", "2", "9").unwrap(),
         CaptureCounts {
             input_rows_before_checkpoint: 7,
             expected_rows: 3,
+            expected_initial_rows: 3,
             expected_checkpoint_rows: 2,
             checkpoint_epoch: 9
         }
@@ -1185,7 +1206,27 @@ fn capture_counts_require_explicit_bounded_parameters() {
     assert!(parse("2147483648", "3", "2", "9").is_err());
     assert!(parse("7", "3", "2", "0").is_err());
     assert!(parse("7", "3", "2", "4294967296").is_err());
-    assert!(CaptureCounts::parse(|name| Err(format!("missing {name}"))).is_err());
+    assert!(CaptureCounts::parse(|name| Err(format!("missing {name}")), None).is_err());
+    let with_initial = |initial| {
+        CaptureCounts::parse(
+            |name| {
+                Ok(match name {
+                    "STREAMR_CAPTURE_INPUT_ROWS_BEFORE_CHECKPOINT" => "2",
+                    "STREAMR_CAPTURE_EXPECTED_ROWS" => "3",
+                    "STREAMR_CAPTURE_EXPECTED_CHECKPOINT_ROWS" => "1",
+                    "STREAMR_CAPTURE_CHECKPOINT_EPOCH" => "1",
+                    _ => unreachable!(),
+                }
+                .to_owned())
+            },
+            Some(initial),
+        )
+    };
+    assert_eq!(with_initial("1").unwrap().expected_initial_rows, 1);
+    assert_eq!(with_initial("0").unwrap().expected_initial_rows, 0);
+    for invalid in ["", "-1", "+1", " 1", "1.5", "18446744073709551616"] {
+        assert!(with_initial(invalid).is_err());
+    }
 }
 
 /// Capture externally supplied SQL as JSONL before and after checkpoint recovery.
@@ -1301,13 +1342,13 @@ async fn external_sql_checkpoint_capture_inner() {
         .start()
         .await;
     run_until_finished(&running, &mut control_rx).await;
-    capture_rows(&output_path, capture.expected_rows).await;
+    capture_rows(&output_path, capture.expected_initial_rows).await;
     tokio::fs::rename(&output_path, &initial_path)
         .await
         .unwrap();
     println!(
         "CAPTURE_RESULT phase=initial rows={} path={}",
-        capture.expected_rows,
+        capture.expected_initial_rows,
         initial_path.display()
     );
 

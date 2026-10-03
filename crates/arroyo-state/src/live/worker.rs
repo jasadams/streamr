@@ -32,3 +32,27 @@ pub fn configured_worker_resources() -> Result<Option<WorkerStateResources>> {
     }
     Ok(Some(resources))
 }
+
+/// Backend selection occurs once at construction. SQL kernels receive only the
+/// returned generic handle. Future adapters register here and run conformance.
+pub enum BackendConstruction {
+    Memory { max_resident_bytes: usize },
+    Rocksdb(super::lifecycle::RocksStateConfig),
+}
+
+pub async fn construct_backend(
+    construction: BackendConstruction,
+    resources: WorkerStateResources,
+) -> Result<std::sync::Arc<dyn super::LiveStateBackend>> {
+    match construction {
+        BackendConstruction::Memory { max_resident_bytes } => Ok(std::sync::Arc::new(
+            super::memory::MemoryLiveState::bounded(resources, max_resident_bytes)?,
+        )),
+        BackendConstruction::Rocksdb(config) => {
+            let backend =
+                super::rocks::RocksLiveState::open_worker_with_resources(config, resources).await?;
+            backend.remove_on_drop();
+            Ok(std::sync::Arc::new(backend))
+        }
+    }
+}

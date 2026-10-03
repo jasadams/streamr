@@ -41,6 +41,7 @@ pub(crate) mod lookup;
 pub(crate) mod projection;
 pub(crate) mod remote_table;
 pub(crate) mod sink;
+pub(crate) mod state_table;
 pub(crate) mod stateful_processor;
 pub(crate) mod table_source;
 pub(crate) mod updating_aggregate;
@@ -80,6 +81,11 @@ impl<'a> TryFrom<&'a dyn UserDefinedLogicalNode> for &'a dyn ArroyoExtension {
     type Error = DataFusionError;
 
     fn try_from(node: &'a dyn UserDefinedLogicalNode) -> Result<Self, Self::Error> {
+        if node.as_any().is::<state_table::StateTableScan>() {
+            return datafusion::common::plan_err!(
+                "state-table scans require an input-event keyed INNER or LEFT JOIN; standalone target scans are unsupported"
+            );
+        }
         try_from_t::<TableSourceExtension>(node)
             .or_else(|_| try_from_t::<WatermarkNode>(node))
             .or_else(|_| try_from_t::<SinkExtension>(node))
@@ -93,6 +99,7 @@ impl<'a> TryFrom<&'a dyn UserDefinedLogicalNode> for &'a dyn ArroyoExtension {
             .or_else(|_| try_from_t::<DebeziumUnrollingExtension>(node))
             .or_else(|_| try_from_t::<UpdatingAggregateExtension>(node))
             .or_else(|_| try_from_t::<StatefulProcessorExtension>(node))
+            .or_else(|_| try_from_t::<state_table::StateTableAccess>(node))
             .or_else(|_| try_from_t::<LookupJoin>(node))
             .or_else(|_| try_from_t::<ProjectionExtension>(node))
             .map_err(|_| DataFusionError::Plan(format!("unexpected node: {}", node.name())))

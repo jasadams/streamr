@@ -221,6 +221,27 @@ impl Program {
         let mut map_owners = HashMap::new();
         for node in logical.node_weights() {
             for (operator, _) in node.operator_chain.iter() {
+                if operator.operator_name == OperatorName::StateTable {
+                    use prost::Message;
+                    let state =
+                        api::StateTableOperator::decode(operator.operator_config.as_slice())
+                            .map_err(|error| StateError::Other {
+                                table: operator.operator_id.clone(),
+                                error: format!("invalid state-table plan: {error}"),
+                            })?;
+                    let table = state
+                        .table
+                        .as_ref()
+                        .map(|definition| definition.name.clone())
+                        .unwrap_or_else(|| operator.operator_id.clone());
+                    return Err(StateError::Other {
+                        table,
+                        error: format!(
+                            "state-table event scope '{}' requires STR-41 fused serial execution; standalone state-table plans cannot start",
+                            state.event_scope_id
+                        ),
+                    });
+                }
                 if operator.operator_name == OperatorName::StatefulProcessor {
                     use prost::Message;
                     let state =
@@ -1033,6 +1054,11 @@ pub fn construct_operator(
         OperatorName::SessionWindowAggregate => Box::new(SessionAggregatingWindowConstructor),
         OperatorName::UpdatingAggregate => Box::new(IncrementalAggregatingConstructor),
         OperatorName::StatefulProcessor => Box::new(StatefulProcessorConstructor),
+        OperatorName::StateTable => {
+            panic!(
+                "state-table execution requires STR-41 fused serial event owner; standalone state-table operator is unavailable"
+            )
+        }
         OperatorName::ExpressionWatermark => Box::new(WatermarkGeneratorConstructor),
         OperatorName::Join => Box::new(JoinWithExpirationConstructor),
         OperatorName::InstantJoin => Box::new(InstantJoinConstructor),
@@ -1055,4 +1081,53 @@ pub fn construct_operator(
 
     ctor.with_config(config, registry)
         .unwrap_or_else(|e| panic!("Failed to construct operator {operator:?}, with error:\n{e:?}"))
+}
+
+#[cfg(test)]
+mod state_table_preflight_tests {
+    use super::*;
+    use arroyo_rpc::grpc::api::{StateTableDefinition, StateTableOperator};
+    use prost::Message;
+
+    #[tokio::test]
+    async fn state_table_plan_rejects_before_task_construction() {
+        let mut logical = DiGraph::new();
+        let config = StateTableOperator {
+            table: Some(StateTableDefinition {
+                name: "generic_inventory".into(),
+                ..Default::default()
+            }),
+            event_scope_id: "state-event-v1:events".into(),
+            requires_fused_serial_owner: true,
+            ..Default::default()
+        };
+        logical.add_node(LogicalNode::single(
+            0,
+            "state-table-operator".into(),
+            OperatorName::StateTable,
+            config.encode_to_vec(),
+            "generic state access".into(),
+            1,
+        ));
+        let (control_tx, _control_rx) = channel(1);
+        let result = Program::from_logical(
+            "test-job",
+            &logical,
+            &Vec::new(),
+            new_registry(),
+            None,
+            None,
+            CheckpointFilePathLayout::Legacy,
+            control_tx,
+        )
+        .await;
+        let error = result
+            .err()
+            .expect("state table must fail before tasks start");
+        assert!(error.to_string().contains("generic_inventory"), "{error}");
+        assert!(
+            error.to_string().contains("STR-41 fused serial execution"),
+            "{error}"
+        );
+    }
 }

@@ -230,6 +230,7 @@ pub(crate) enum NamedNode {
     Watermark(TableReference),
     RemoteTable(TableReference),
     Sink(TableReference),
+    StateTableMerge(TableReference),
 }
 
 struct ArroyoExtensionPlanner {}

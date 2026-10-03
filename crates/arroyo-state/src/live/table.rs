@@ -12,6 +12,8 @@ pub struct LiveTableManager {
     backend: Arc<dyn LiveStateBackend>,
     ownership: Ownership,
     tables: HashMap<String, LiveTable>,
+    typed_owner: Arc<tokio::sync::Mutex<()>>,
+    typed_descriptors: HashMap<String, super::typed_table::TableDescriptor>,
 }
 impl LiveTableManager {
     pub fn new(backend: Arc<dyn LiveStateBackend>, ownership: Ownership) -> Result<Self> {
@@ -24,6 +26,8 @@ impl LiveTableManager {
             backend,
             ownership,
             tables: HashMap::new(),
+            typed_owner: Arc::new(tokio::sync::Mutex::new(())),
+            typed_descriptors: HashMap::new(),
         })
     }
     pub fn register(&mut self, name: impl Into<String>) -> Result<LiveTable> {
@@ -43,12 +47,51 @@ impl LiveTableManager {
         self.tables.insert(name, table.clone());
         Ok(table)
     }
+    /// All registered typed tables share one serialized input-event owner and
+    /// backend snapshot boundary. Durable namespace metadata remains available
+    /// to checkpoint integration; registration never writes hidden namespaces.
+    pub fn register_typed(
+        &mut self,
+        descriptor: super::typed_table::TableDescriptor,
+        limits: super::typed_table::TableLimits,
+        resources: super::resources::WorkerStateResources,
+    ) -> Result<super::typed_table::TypedTable> {
+        let name = String::from_utf8(descriptor.table_identity.clone())
+            .map_err(|_| LiveStateError::InvalidEncoding("table identity must be UTF-8".into()))?;
+        if self.tables.contains_key(&name) {
+            return Err(LiveStateError::InvalidEncoding(
+                "duplicate live table name".into(),
+            ));
+        }
+        let namespace = StateNamespace {
+            ownership: self.ownership.clone(),
+            table: descriptor.table_identity.clone(),
+        };
+        let table = super::typed_table::TypedTable::new(
+            self.backend.clone(),
+            namespace,
+            descriptor.clone(),
+            limits,
+            resources,
+        )?
+        .with_owner(self.typed_owner.clone());
+        self.register(name.clone())?;
+        self.typed_descriptors.insert(name, descriptor);
+        Ok(table)
+    }
+    pub fn namespaces(&self) -> impl Iterator<Item = &StateNamespace> {
+        self.tables.values().map(|table| &table.namespace)
+    }
+    pub fn typed_descriptors(&self) -> impl Iterator<Item = &super::typed_table::TableDescriptor> {
+        self.typed_descriptors.values()
+    }
     pub fn table(&self, name: &str) -> Result<LiveTable> {
         self.tables.get(name).cloned().ok_or_else(|| {
             LiveStateError::InvalidEncoding(format!("unregistered live table {name}"))
         })
     }
     pub async fn snapshot(&self) -> Result<StateSnapshot> {
+        let _owner = self.typed_owner.lock().await;
         self.backend.snapshot().await
     }
 }

@@ -1,6 +1,7 @@
 #![allow(clippy::new_without_default)]
 
 pub mod builder;
+pub(crate) mod continuous_merge;
 pub(crate) mod extension;
 pub mod external;
 mod functions;
@@ -9,6 +10,7 @@ pub mod physical;
 mod plan;
 mod rewriters;
 pub mod schemas;
+pub mod state_tables;
 mod tables;
 pub mod types;
 pub mod udafs;
@@ -112,6 +114,9 @@ impl Default for PlanningOptions {
 pub struct ArroyoSchemaProvider {
     pub source_defs: HashMap<String, String>,
     tables: HashMap<UniCase<String>, Table>,
+    ordinary_table_keys: HashMap<Vec<String>, UniCase<String>>,
+    state_tables: HashMap<Vec<String>, state_tables::StateTable>,
+    ordinary_relation_names: HashSet<Vec<String>>,
     pub functions: HashMap<String, Arc<ScalarUDF>>,
     pub aggregate_functions: HashMap<String, Arc<AggregateUDF>>,
     pub window_functions: HashMap<String, Arc<WindowUDF>>,
@@ -277,6 +282,11 @@ impl ArroyoSchemaProvider {
     }
 
     pub fn add_connector_table(&mut self, connection: Connection) {
+        let components =
+            state_tables::reference_components(&TableReference::parse_str(&connection.name));
+        self.ordinary_relation_names.insert(components.clone());
+        self.ordinary_table_keys
+            .insert(components, UniCase::new(connection.name.clone()));
         self.tables.insert(
             UniCase::new(connection.name.clone()),
             Table::ConnectorTable(connection.into()),
@@ -287,17 +297,61 @@ impl ArroyoSchemaProvider {
         self.profiles.insert(profile.name.clone(), profile);
     }
 
-    fn insert_table(&mut self, table: Table) {
+    fn insert_table(&mut self, table: Table, components: Vec<String>) {
+        self.ordinary_relation_names.insert(components.clone());
+        self.ordinary_table_keys
+            .insert(components, UniCase::new(table.name().to_string()));
         self.tables
             .insert(UniCase::new(table.name().to_string()), table);
     }
 
+    /// Retained-state metadata; this is not a connector or intermediate result.
+    pub fn get_state_table(&self, name: impl Into<String>) -> Option<&state_tables::StateTable> {
+        self.get_state_table_reference(&TableReference::parse_str(&name.into()))
+    }
+
+    pub(crate) fn get_state_table_reference(
+        &self,
+        name: &TableReference,
+    ) -> Option<&state_tables::StateTable> {
+        self.state_tables
+            .get(&state_tables::reference_components(name))
+    }
+
+    pub fn register_state_table(
+        &mut self,
+        declaration: &sqlparser::ast::CreateTable,
+        parallelism: usize,
+    ) -> Result<()> {
+        let table = state_tables::StateTable::from_declaration(declaration, parallelism)?;
+        if self
+            .ordinary_relation_names
+            .contains(&table.name_components)
+            || self.state_tables.contains_key(&table.name_components)
+        {
+            return plan_err!("relation '{}' already exists", table.name);
+        }
+        self.state_tables
+            .insert(table.name_components.clone(), table);
+        Ok(())
+    }
+
     pub fn get_table(&self, table_name: impl Into<String>) -> Option<&Table> {
-        self.tables.get(&UniCase::new(table_name.into()))
+        self.get_table_reference(&TableReference::parse_str(&table_name.into()))
     }
 
     pub fn get_table_mut(&mut self, table_name: impl Into<String>) -> Option<&mut Table> {
-        self.tables.get_mut(&UniCase::new(table_name.into()))
+        let components =
+            state_tables::reference_components(&TableReference::parse_str(&table_name.into()));
+        let key = self.ordinary_table_keys.get(&components)?.clone();
+        self.tables.get_mut(&key)
+    }
+
+    pub(crate) fn get_table_reference(&self, name: &TableReference) -> Option<&Table> {
+        let key = self
+            .ordinary_table_keys
+            .get(&state_tables::reference_components(name))?;
+        self.tables.get(key)
     }
 
     pub fn add_rust_udf(&mut self, body: &str, url: &str) -> anyhow::Result<String> {
@@ -428,8 +482,11 @@ impl ContextProvider for ArroyoSchemaProvider {
         &self,
         name: TableReference,
     ) -> datafusion::common::Result<Arc<dyn TableSource>> {
+        if let Some(table) = self.get_state_table_reference(&name) {
+            return Ok(create_table(name.to_string(), table.schema.clone()));
+        }
         let table = self
-            .get_table(name.to_string())
+            .get_table_reference(&name)
             .ok_or_else(|| DataFusionError::Plan(format!("Table {name} not found")))?;
 
         let fields = table.get_fields();
@@ -790,7 +847,7 @@ pub async fn parse_and_get_arrow_program(
     query: String,
     mut schema_provider: ArroyoSchemaProvider,
     // TODO: use config
-    _config: SqlConfig,
+    sql_config: SqlConfig,
 ) -> Result<CompiledSql> {
     let mut config = SessionConfig::new();
     config
@@ -810,13 +867,57 @@ pub async fn parse_and_get_arrow_program(
         .build();
 
     let mut inserts = vec![];
-    for statement in parse_sql(&query)? {
+    let mut retained_mutations = vec![];
+    for statement in state_tables::parse_statements(&query)? {
+        let statement = match statement {
+            state_tables::SqlStatement::StateTable(declaration) => {
+                schema_provider
+                    .register_state_table(&declaration, sql_config.default_parallelism)?;
+                continue;
+            }
+            state_tables::SqlStatement::NamedMerge(merge) => {
+                let components = state_tables::object_name_components(&merge.name);
+                if schema_provider
+                    .ordinary_relation_names
+                    .contains(&components)
+                    || schema_provider.state_tables.contains_key(&components)
+                {
+                    return plan_err!("relation '{}' already exists", merge.name);
+                }
+                let (table, mutation) =
+                    continuous_merge::plan_named_merge(merge, &schema_provider)?;
+                schema_provider.insert_table(table, components);
+                retained_mutations.push(mutation);
+                continue;
+            }
+            state_tables::SqlStatement::Ordinary(statement) => statement,
+        };
         if try_handle_set_variable(&statement, &mut schema_provider)? {
             continue;
         }
 
+        let declared_name = match &statement {
+            Statement::CreateTable(table) => Some(&table.name),
+            Statement::CreateView { name, .. } => Some(name),
+            _ => None,
+        };
+        if let Some(name) = declared_name
+            && schema_provider
+                .state_tables
+                .contains_key(&state_tables::object_name_components(name))
+        {
+            return plan_err!("relation '{}' already exists", name);
+        }
         if let Some(table) = Table::try_from_statement(&statement, &schema_provider)? {
-            schema_provider.insert_table(table);
+            let components = declared_name
+                .map(state_tables::object_name_components)
+                .unwrap_or_else(|| {
+                    state_tables::reference_components(&TableReference::parse_str(table.name()))
+                });
+            if declared_name.is_none() && schema_provider.state_tables.contains_key(&components) {
+                return plan_err!("relation '{}' already exists", table.name());
+            }
+            schema_provider.insert_table(table, components);
         } else {
             inserts.push(Insert::try_from_statement(
                 &statement,
@@ -825,7 +926,7 @@ pub async fn parse_and_get_arrow_program(
         };
     }
 
-    if inserts.is_empty() {
+    if inserts.is_empty() && retained_mutations.is_empty() {
         return plan_err!("The provided SQL does not contain a query");
     }
 
@@ -914,12 +1015,23 @@ pub async fn parse_and_get_arrow_program(
         }));
     }
 
+    for mutation in &retained_mutations {
+        let mut metadata = SourceMetadataVisitor::new(&schema_provider);
+        mutation.visit_with_subqueries(&mut metadata)?;
+        used_connections.extend(metadata.connection_ids.iter());
+    }
+
     // rewrite sink's inputs, and remove duplicated sink
     let extensions = rewrite_sinks(extensions)?;
 
     let mut plan_to_graph_visitor = PlanToGraphVisitor::new(&schema_provider, &session_state);
     for extension in extensions {
         plan_to_graph_visitor.add_plan(extension)?;
+    }
+    // Register each effectful MERGE producer once even when no consumer uses
+    // the captured relation. Named-node memoization reuses it across sinks.
+    for mutation in retained_mutations {
+        plan_to_graph_visitor.add_plan(mutation)?;
     }
     let graph = plan_to_graph_visitor.into_graph();
 

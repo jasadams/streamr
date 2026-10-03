@@ -1,7 +1,7 @@
 use crate::arrow::decode_aggregate;
 use crate::arrow::updating_cache::{Key, UpdatingCache};
 use anyhow::{Result, anyhow, bail};
-use arrow::compute::max_array;
+use arrow::compute::{filter, max_array};
 use arrow::row::{RowConverter, SortField};
 use arrow_array::builder::{
     BinaryBuilder, TimestampNanosecondBuilder, UInt32Builder, UInt64Builder,
@@ -27,6 +27,7 @@ use arroyo_rpc::{TIMESTAMP_FIELD, UPDATING_META_FIELD, updating_meta_fields};
 use arroyo_state::timestamp_table_config;
 use arroyo_types::{CheckpointBarrier, SignalMessage, to_nanos};
 use datafusion::common::{Result as DFResult, ScalarValue};
+use datafusion::physical_plan::aggregates::{AggregateMode, aggregate_expressions};
 use datafusion::physical_plan::udaf::AggregateFunctionExpr;
 use datafusion::physical_plan::{Accumulator, PhysicalExpr};
 use datafusion_proto::physical_plan::DefaultPhysicalExtensionCodec;
@@ -83,6 +84,7 @@ enum IncrementalState {
         data: HashMap<Key, BatchData>,
         row_converter: Arc<RowConverter>,
         changed_values: HashSet<Key>,
+        ordered: bool,
     },
 }
 
@@ -96,14 +98,17 @@ impl IncrementalState {
                 data,
                 row_converter,
                 changed_values,
+                ordered,
                 ..
             } => {
                 for r in row_converter.convert_columns(batch)?.iter() {
-                    if data.contains_key(r.as_ref()) {
-                        data.get_mut(r.as_ref()).unwrap().inc();
-                        changed_values.insert(data.get_key_value(r.as_ref()).unwrap().0.clone());
+                    let encoded = encode_args_row(r.as_ref(), *ordered);
+                    let r = encoded.as_slice();
+                    if data.contains_key(r) {
+                        data.get_mut(r).unwrap().inc();
+                        changed_values.insert(data.get_key_value(r).unwrap().0.clone());
                     } else {
-                        let key = Key(Arc::new(r.as_ref().to_vec()));
+                        let key = Key(Arc::new(r.to_vec()));
                         data.insert(key.clone(), BatchData::new(new_geneeration));
                         changed_values.insert(key);
                     }
@@ -121,10 +126,13 @@ impl IncrementalState {
                 data,
                 row_converter,
                 changed_values,
+                ordered,
                 ..
             } => {
                 for r in row_converter.convert_columns(batch)?.iter() {
-                    match data.get(r.as_ref()).map(|d| d.count) {
+                    let encoded = encode_args_row(r.as_ref(), *ordered);
+                    let r = encoded.as_slice();
+                    match data.get(r).map(|d| d.count) {
                         Some(0) => {
                             debug!(
                                 "tried to retract value for key with count 0; this implies an \
@@ -132,9 +140,8 @@ impl IncrementalState {
                             );
                         }
                         Some(_) => {
-                            data.get_mut(r.as_ref()).unwrap().dec();
-                            changed_values
-                                .insert(data.get_key_value(r.as_ref()).unwrap().0.clone());
+                            data.get_mut(r).unwrap().dec();
+                            changed_values.insert(data.get_key_value(r).unwrap().0.clone());
                         }
                         None => {
                             debug!(
@@ -157,19 +164,99 @@ impl IncrementalState {
                 expr,
                 data,
                 row_converter,
+                ordered,
                 ..
             } => {
                 let parser = row_converter.parser();
-                let input = row_converter.convert_rows(
-                    data.iter()
-                        .filter(|(_, c)| c.count > 0)
-                        .map(|(v, _)| parser.parse(&v.0)),
-                )?;
+                let rows = data
+                    .iter()
+                    .filter(|(_, c)| c.count > 0)
+                    .map(|(v, _)| decode_args_row(&v.0, *ordered))
+                    .collect::<DFResult<Vec<_>>>()?;
+                let input =
+                    row_converter.convert_rows(rows.into_iter().map(|r| parser.parse(r)))?;
                 let mut acc = expr.create_accumulator()?;
                 acc.update_batch(&input)?;
                 acc.evaluate_mut()
             }
         }
+    }
+}
+
+// Ordered fallback checkpoints previously omitted every ORDER BY column. Those
+// rows cannot be upgraded: replay is required to recover the discarded values.
+const ORDERED_ARGS_V1: &[u8] = b"\xffstreamr.ordered-args.v1\0";
+
+const INPUT_SEMANTICS_KEY: &str = "streamr.aggregate-input-semantics";
+const INPUT_SEMANTICS_V1: &str = "order-and-filter.v1";
+
+fn versioned_state_timestamp(field: Field, versioned: bool) -> Field {
+    if versioned {
+        let mut metadata = field.metadata().clone();
+        metadata.insert(INPUT_SEMANTICS_KEY.into(), INPUT_SEMANTICS_V1.into());
+        field.with_metadata(metadata)
+    } else {
+        field
+    }
+}
+
+fn encode_args_row(row: &[u8], ordered: bool) -> Vec<u8> {
+    if ordered {
+        [ORDERED_ARGS_V1, row].concat()
+    } else {
+        row.to_vec()
+    }
+}
+
+fn decode_args_row(row: &[u8], ordered: bool) -> DFResult<&[u8]> {
+    if ordered {
+        row.strip_prefix(ORDERED_ARGS_V1).ok_or_else(|| {
+            datafusion::common::DataFusionError::Execution(
+                "legacy or unsupported ordered aggregate checkpoint: ORDER BY values were not \
+                 persisted; restart from source replay with a fresh checkpoint rather than \
+                 restoring this ordered fallback state"
+                    .into(),
+            )
+        })
+    } else {
+        Ok(row)
+    }
+}
+
+struct AggregateInput {
+    values: Vec<ArrayRef>,
+    filter: Option<BooleanArray>,
+}
+
+impl AggregateInput {
+    fn selected_values(&self, index: Option<usize>) -> DFResult<Option<Vec<ArrayRef>>> {
+        if let Some(index) = index {
+            if self
+                .filter
+                .as_ref()
+                .is_some_and(|mask| mask.is_null(index) || !mask.value(index))
+            {
+                return Ok(None);
+            }
+            return Ok(Some(
+                self.values.iter().map(|v| v.slice(index, 1)).collect(),
+            ));
+        }
+        if let Some(mask) = &self.filter {
+            // SQL FILTER includes only true; null is false, independently of
+            // each aggregate's input null handling.
+            let mask = BooleanArray::from_iter(mask.iter().map(|v| Some(v.unwrap_or(false))));
+            if mask.true_count() == 0 {
+                return Ok(None);
+            }
+            return self
+                .values
+                .iter()
+                .map(|v| Ok(filter(v, &mask)?))
+                .collect::<DFResult<Vec<_>>>()
+                .map(Some);
+        }
+        Ok(Some(self.values.clone()))
     }
 }
 
@@ -192,6 +279,8 @@ impl AccumulatorType {
 #[derive(Debug)]
 struct Aggregator {
     func: Arc<AggregateFunctionExpr>,
+    input_exprs: Vec<Arc<dyn PhysicalExpr>>,
+    filter: Option<Arc<dyn PhysicalExpr>>,
     accumulator_type: AccumulatorType,
     row_converter: Arc<RowConverter>,
     state_cols: Vec<usize>,
@@ -217,19 +306,15 @@ impl IncrementalAggregatingFunc {
     fn update_batch(
         &mut self,
         key: &[u8],
-        batch: &[Vec<ArrayRef>],
+        batch: &[AggregateInput],
         idx: Option<usize>,
     ) -> DFResult<()> {
         self.accumulators
             .modify_and_update(key, Instant::now(), |values| {
                 for (inputs, accs) in batch.iter().zip(values.iter_mut()) {
-                    let values = if let Some(idx) = idx {
-                        &inputs.iter().map(|c| c.slice(idx, 1)).collect()
-                    } else {
-                        inputs
-                    };
-
-                    accs.update_batch(self.new_generation, values)?;
+                    if let Some(values) = inputs.selected_values(idx)? {
+                        accs.update_batch(self.new_generation, &values)?;
+                    }
                 }
                 Ok(())
             })
@@ -239,19 +324,15 @@ impl IncrementalAggregatingFunc {
     fn retract_batch(
         &mut self,
         key: &[u8],
-        batch: &[Vec<ArrayRef>],
+        batch: &[AggregateInput],
         idx: Option<usize>,
     ) -> DFResult<()> {
         self.accumulators
             .modify(key, |values| {
                 for (inputs, accs) in batch.iter().zip(values.iter_mut()) {
-                    let values = if let Some(idx) = idx {
-                        &inputs.iter().map(|c| c.slice(idx, 1)).collect()
-                    } else {
-                        inputs
-                    };
-
-                    accs.retract_batch(values)?;
+                    if let Some(values) = inputs.selected_values(idx)? {
+                        accs.retract_batch(&values)?;
+                    }
                 }
                 Ok::<(), datafusion::common::DataFusionError>(())
             })
@@ -443,13 +524,159 @@ impl IncrementalAggregatingFunc {
         Ok(())
     }
 
+    fn validate_checkpoint_semantics(&self, batch: &RecordBatch) -> Result<()> {
+        if self
+            .aggregates
+            .iter()
+            .any(|agg| agg.filter.is_some() || agg.func.order_bys().is_some())
+        {
+            let schema = batch.schema();
+            let version = schema
+                .field_with_name(TIMESTAMP_FIELD)?
+                .metadata()
+                .get(INPUT_SEMANTICS_KEY)
+                .map(String::as_str);
+            if version != Some(INPUT_SEMANTICS_V1) {
+                bail!(
+                    "legacy or unsupported ordered/filtered aggregate checkpoint: historical \
+                       ORDER BY or FILTER inputs were not persisted correctly; restart from \
+                       source replay with a fresh checkpoint"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn restore_sliding_batch(&mut self, batch: &RecordBatch) -> Result<()> {
+        self.validate_checkpoint_semantics(batch)?;
+        let key_converter = RowConverter::new(self.sliding_state_schema.sort_fields(false))?;
+        let key_cols: Vec<_> = self
+            .sliding_state_schema
+            .sort_columns(batch, false)
+            .into_iter()
+            .map(|c| c.values)
+            .collect();
+
+        let aggregate_states = self
+            .aggregates
+            .iter()
+            .map(|agg| {
+                agg.state_cols
+                    .iter()
+                    .map(|idx| batch.column(*idx).clone())
+                    .collect_vec()
+            })
+            .collect_vec();
+
+        let generations = batch.columns().last().unwrap().as_primitive::<UInt64Type>();
+
+        let now = Instant::now();
+
+        if key_cols.is_empty() {
+            // global aggregate
+            self.restore_sliding(&GLOBAL_KEY, now, 0, &aggregate_states, generations.value(0))?;
+        } else {
+            let key_rows = key_converter.convert_columns(&key_cols)?;
+            for ((i, row), generation) in key_rows.iter().enumerate().zip(generations) {
+                self.restore_sliding(row.as_ref(), now, i, &aggregate_states, generation.unwrap())?;
+            }
+        }
+        Ok(())
+    }
+
+    fn restore_batch(&mut self, batch: &RecordBatch) -> Result<()> {
+        self.validate_checkpoint_semantics(batch)?;
+        let key_cols: Vec<_> = self
+            .sliding_state_schema
+            .sort_columns(batch, false)
+            .into_iter()
+            .map(|c| c.values)
+            .collect();
+
+        let count_column = batch
+            .column(self.batch_state_schema.schema.index_of("count").unwrap())
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        let accumulator_column = batch
+            .column(
+                self.batch_state_schema
+                    .schema
+                    .index_of("accumulator")
+                    .unwrap(),
+            )
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .unwrap();
+        let args_row_column = batch
+            .column(self.batch_state_schema.schema.index_of("args_row").unwrap())
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .unwrap();
+        let generations = batch.columns().last().unwrap().as_primitive::<UInt64Type>();
+
+        // Check every row before mutating the cache. A checkpoint can contain
+        // rows for several aggregates, including legacy ordered rows alongside
+        // current rows, and a late failure must not leave a partial restore.
+        for i in 0..batch.num_rows() {
+            let accumulator_idx = accumulator_column.value(i) as usize;
+            let agg = self
+                .aggregates
+                .get(accumulator_idx)
+                .ok_or_else(|| anyhow!("invalid checkpoint aggregate index {accumulator_idx}"))?;
+            decode_args_row(args_row_column.value(i), agg.func.order_bys().is_some())?;
+        }
+
+        let key_rows = if key_cols.is_empty() {
+            vec![GLOBAL_KEY; batch.num_rows()]
+        } else {
+            self.key_converter
+                .convert_columns(&key_cols)?
+                .iter()
+                .map(|k| k.as_ref().to_vec())
+                .collect()
+        };
+
+        for (i, row) in key_rows.iter().enumerate() {
+            let accumulator_idx = accumulator_column.value(i) as usize;
+            let args_row = args_row_column.value(i);
+            let Some(accumulators) = self.accumulators.get_mut(row.as_ref()) else {
+                debug!(
+                    "missing accumulator for key {:?} while restoring batch",
+                    row
+                );
+                continue;
+            };
+
+            let count = count_column.value(i);
+            let generation = generations.value(i);
+
+            let IncrementalState::Batch { data, .. } = &mut accumulators[accumulator_idx] else {
+                bail!(
+                    "expected aggregate {accumulator_idx} to be a batch accumulator, but was sliding"
+                );
+            };
+
+            if let Some(existing) = data.get_mut(args_row) {
+                if existing.generation < generation {
+                    existing.count = count;
+                    existing.generation = generation;
+                }
+            } else {
+                data.insert(
+                    Key(Arc::new(args_row.to_vec())),
+                    BatchData { count, generation },
+                );
+            }
+        }
+        Ok(())
+    }
+
     async fn initialize(&mut self, ctx: &mut OperatorContext) -> Result<()> {
         let table = ctx.table_manager.get_uncached_key_value_view("a").await?;
 
         // initialize the sliding accumulator cache
         let mut stream = Box::pin(table.get_all());
-        let key_converter = RowConverter::new(self.sliding_state_schema.sort_fields(false))?;
-
         while let Some(batch) = stream.next().await {
             let batch = batch?;
 
@@ -457,43 +684,7 @@ impl IncrementalAggregatingFunc {
                 continue;
             }
 
-            let key_cols: Vec<_> = self
-                .sliding_state_schema
-                .sort_columns(&batch, false)
-                .into_iter()
-                .map(|c| c.values)
-                .collect();
-
-            let aggregate_states = self
-                .aggregates
-                .iter()
-                .map(|agg| {
-                    agg.state_cols
-                        .iter()
-                        .map(|idx| batch.column(*idx).clone())
-                        .collect_vec()
-                })
-                .collect_vec();
-
-            let generations = batch.columns().last().unwrap().as_primitive::<UInt64Type>();
-
-            let now = Instant::now();
-
-            if key_cols.is_empty() {
-                // global aggregate
-                self.restore_sliding(&GLOBAL_KEY, now, 0, &aggregate_states, generations.value(0))?;
-            } else {
-                let key_rows = key_converter.convert_columns(&key_cols)?;
-                for ((i, row), generation) in key_rows.iter().enumerate().zip(generations) {
-                    self.restore_sliding(
-                        row.as_ref(),
-                        now,
-                        i,
-                        &aggregate_states,
-                        generation.unwrap(),
-                    )?;
-                }
-            }
+            self.restore_sliding_batch(&batch)?;
         }
 
         drop(stream);
@@ -513,78 +704,7 @@ impl IncrementalAggregatingFunc {
                     continue;
                 }
 
-                let key_cols: Vec<_> = self
-                    .sliding_state_schema
-                    .sort_columns(&batch, false)
-                    .into_iter()
-                    .map(|c| c.values)
-                    .collect();
-
-                let count_column = batch
-                    .column(self.batch_state_schema.schema.index_of("count").unwrap())
-                    .as_any()
-                    .downcast_ref::<UInt64Array>()
-                    .unwrap();
-                let accumulator_column = batch
-                    .column(
-                        self.batch_state_schema
-                            .schema
-                            .index_of("accumulator")
-                            .unwrap(),
-                    )
-                    .as_any()
-                    .downcast_ref::<UInt32Array>()
-                    .unwrap();
-                let args_row_column = batch
-                    .column(self.batch_state_schema.schema.index_of("args_row").unwrap())
-                    .as_any()
-                    .downcast_ref::<BinaryArray>()
-                    .unwrap();
-                let generations = batch.columns().last().unwrap().as_primitive::<UInt64Type>();
-
-                let key_rows = if key_cols.is_empty() {
-                    vec![GLOBAL_KEY]
-                } else {
-                    self.key_converter
-                        .convert_columns(&key_cols)?
-                        .iter()
-                        .map(|k| k.as_ref().to_vec())
-                        .collect()
-                };
-
-                for (i, row) in key_rows.iter().enumerate() {
-                    let Some(accumulators) = self.accumulators.get_mut(row.as_ref()) else {
-                        debug!(
-                            "missing accumulator for key {:?} while restoring batch",
-                            row
-                        );
-                        continue;
-                    };
-
-                    let count = count_column.value(i);
-                    let accumulator_idx = accumulator_column.value(i) as usize;
-                    let args_row = args_row_column.value(i);
-                    let generation = generations.value(i);
-
-                    let IncrementalState::Batch { data, .. } = &mut accumulators[accumulator_idx]
-                    else {
-                        bail!(
-                            "expected aggregate {accumulator_idx} to be a batch accumulator, but was sliding"
-                        );
-                    };
-
-                    if let Some(existing) = data.get_mut(args_row) {
-                        if existing.generation < generation {
-                            existing.count = count;
-                            existing.generation = generation;
-                        }
-                    } else {
-                        data.insert(
-                            Key(Arc::new(args_row.to_vec())),
-                            BatchData { count, generation },
-                        );
-                    }
-                }
+                self.restore_batch(&batch)?;
             }
         }
 
@@ -771,6 +891,7 @@ impl IncrementalAggregatingFunc {
                     data: Default::default(),
                     row_converter: agg.row_converter.clone(),
                     changed_values: Default::default(),
+                    ordered: agg.func.order_bys().is_some(),
                 },
             })
             .collect()
@@ -779,7 +900,7 @@ impl IncrementalAggregatingFunc {
     fn global_aggregate(&mut self, batch: &RecordBatch) -> Result<()> {
         let retracts = Self::get_retracts(batch);
 
-        let aggregate_input_cols = self.compute_inputs(&batch);
+        let aggregate_input_cols = self.compute_inputs(batch)?;
 
         let mut first = false;
 
@@ -855,7 +976,7 @@ impl IncrementalAggregatingFunc {
         }
 
         // then update the states with the new data
-        let aggregate_input_cols = self.compute_inputs(&batch);
+        let aggregate_input_cols = self.compute_inputs(batch)?;
 
         for (i, key) in keys.iter().enumerate() {
             if self.accumulators.contains_key(key.as_ref()) {
@@ -882,22 +1003,34 @@ impl IncrementalAggregatingFunc {
         Ok(())
     }
 
-    fn compute_inputs(&self, batch: &&RecordBatch) -> Vec<Vec<ArrayRef>> {
+    fn compute_inputs(&self, batch: &RecordBatch) -> DFResult<Vec<AggregateInput>> {
         self.aggregates
             .iter()
             .map(|agg| {
-                agg.func
-                    .expressions()
+                let values = agg
+                    .input_exprs
                     .iter()
+                    .map(|ex| ex.evaluate(batch)?.into_array(batch.num_rows()))
+                    .collect::<DFResult<Vec<_>>>()?;
+                let filter = agg
+                    .filter
+                    .as_ref()
                     .map(|ex| {
-                        ex.evaluate(batch)
-                            .unwrap()
-                            .into_array(batch.num_rows())
-                            .unwrap()
+                        let values = ex.evaluate(batch)?.into_array(batch.num_rows())?;
+                        values
+                            .as_any()
+                            .downcast_ref::<BooleanArray>()
+                            .cloned()
+                            .ok_or_else(|| {
+                                datafusion::common::DataFusionError::Execution(
+                                    "aggregate FILTER expression must return Boolean".into(),
+                                )
+                            })
                     })
-                    .collect::<Vec<_>>()
+                    .transpose()?;
+                Ok(AggregateInput { values, filter })
             })
-            .collect::<Vec<_>>()
+            .collect()
     }
 }
 
@@ -1040,6 +1173,17 @@ impl OperatorConstructor for IncrementalAggregatingConstructor {
         config: Self::ConfigT,
         registry: Arc<Registry>,
     ) -> anyhow::Result<ConstructedOperator> {
+        Ok(ConstructedOperator::from_operator(Box::new(Self::build(
+            config, registry,
+        )?)))
+    }
+}
+
+impl IncrementalAggregatingConstructor {
+    fn build(
+        config: UpdatingAggregateOperator,
+        registry: Arc<Registry>,
+    ) -> Result<IncrementalAggregatingFunc> {
         let ttl = Duration::from_micros(if config.ttl_micros == 0 {
             warn!("ttl was not set for updating aggregate");
             24 * 60 * 60 * 1000 * 1000
@@ -1081,19 +1225,42 @@ impl OperatorConstructor for IncrementalAggregatingConstructor {
 
         let key_fields = (0..sliding_state_fields.len()).collect_vec();
 
+        if !aggregate_exec.filter_expr.is_empty()
+            && aggregate_exec.filter_expr.len() != aggregate_exec.aggr_expr.len()
+        {
+            bail!("aggregate FILTER count does not match aggregate expressions");
+        }
+        let filters = aggregate_exec
+            .filter_expr
+            .iter()
+            .map(|filter| {
+                filter
+                    .expr
+                    .as_ref()
+                    .map(|expr| {
+                        parse_physical_expr(
+                            expr,
+                            registry.as_ref(),
+                            &input_schema.schema,
+                            &DefaultPhysicalExtensionCodec {},
+                        )
+                    })
+                    .transpose()
+            })
+            .collect::<DFResult<Vec<_>>>()?;
+
         let aggregates: Vec<_> = aggregate_exec
             .aggr_expr
             .iter()
             .zip(aggregate_exec.aggr_expr_name.iter())
-            .map(|(expr, name)| {
-                Ok(decode_aggregate(
-                    &input_schema.schema,
-                    name,
-                    expr,
-                    registry.as_ref(),
-                )?)
+            .enumerate()
+            .map(|(index, (expr, name))| {
+                Ok((
+                    decode_aggregate(&input_schema.schema, name, expr, registry.as_ref())?,
+                    filters.get(index).cloned().flatten(),
+                ))
             })
-            .map_ok(|agg| {
+            .map_ok(|(agg, filter)| {
                 let retract = match agg.create_sliding_accumulator() {
                     Ok(s) => s.supports_retract_batch(),
                     _ => false,
@@ -1106,11 +1273,16 @@ impl OperatorConstructor for IncrementalAggregatingConstructor {
                     } else {
                         AccumulatorType::Batch
                     },
+                    filter,
                 )
             })
-            .map_ok(|(agg, t)| {
+            .map_ok(|(agg, t, filter)| {
+                let input_exprs =
+                    aggregate_expressions(std::slice::from_ref(&agg), &AggregateMode::Single, 0)?
+                        .pop()
+                        .unwrap();
                 let row_converter = Arc::new(RowConverter::new(
-                    agg.expressions()
+                    input_exprs
                         .iter()
                         .map(|ex| Ok(SortField::new(ex.data_type(&input_schema.schema)?)))
                         .collect::<DFResult<_>>()?,
@@ -1121,32 +1293,40 @@ impl OperatorConstructor for IncrementalAggregatingConstructor {
                 let field_names = fields.iter().map(|f| f.name().to_string()).collect_vec();
                 sliding_state_fields.extend(fields.into_iter().map(|f| (*f).clone()));
 
-                Ok::<_, anyhow::Error>((agg, t, row_converter, field_names))
+                Ok::<_, anyhow::Error>((agg, t, row_converter, field_names, input_exprs, filter))
             })
             .flatten_ok()
             .collect::<Result<_>>()?;
 
         let state_schema = Schema::new(sliding_state_fields);
 
+        let versioned_inputs = aggregates
+            .iter()
+            .any(|(agg, _, _, _, _, filter)| filter.is_some() || agg.order_bys().is_some());
         let aggregates = aggregates
             .into_iter()
-            .map(|(agg, t, row_converter, field_names)| Aggregator {
-                func: agg,
-                accumulator_type: t,
-                row_converter,
-                state_cols: field_names
-                    .iter()
-                    .map(|f| state_schema.index_of(f).unwrap())
-                    .collect(),
-            })
+            .map(
+                |(agg, t, row_converter, field_names, input_exprs, filter)| Aggregator {
+                    func: agg,
+                    input_exprs,
+                    filter,
+                    accumulator_type: t,
+                    row_converter,
+                    state_cols: field_names
+                        .iter()
+                        .map(|f| state_schema.index_of(f).unwrap())
+                        .collect(),
+                },
+            )
             .collect();
 
         // ensure the last field (timestamp) has the expected name before creating the arroyo schema
         let mut state_fields = state_schema.fields().to_vec();
         let timestamp_field = state_fields.pop().unwrap();
-        state_fields.push(Arc::new(
+        state_fields.push(Arc::new(versioned_state_timestamp(
             (*timestamp_field).clone().with_name(TIMESTAMP_FIELD),
-        ));
+            versioned_inputs,
+        )));
 
         let sliding_state_schema = Arc::new(ArroyoSchema::from_schema_keys(
             Arc::new(Schema::new(state_fields)),
@@ -1156,10 +1336,13 @@ impl OperatorConstructor for IncrementalAggregatingConstructor {
         batch_state_fields.push(Field::new("accumulator", DataType::UInt32, false));
         batch_state_fields.push(Field::new("args_row", DataType::Binary, false));
         batch_state_fields.push(Field::new("count", DataType::UInt64, false));
-        batch_state_fields.push(Field::new(
-            TIMESTAMP_FIELD,
-            DataType::Timestamp(TimeUnit::Nanosecond, None),
-            false,
+        batch_state_fields.push(versioned_state_timestamp(
+            Field::new(
+                TIMESTAMP_FIELD,
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                false,
+            ),
+            versioned_inputs,
         ));
         let timestamp_index = batch_state_fields.len() - 1;
 
@@ -1176,20 +1359,542 @@ impl OperatorConstructor for IncrementalAggregatingConstructor {
             Some(key_fields),
         ));
 
-        Ok(ConstructedOperator::from_operator(Box::new(
-            IncrementalAggregatingFunc {
-                flush_interval: Duration::from_micros(config.flush_interval_micros),
-                metadata_expr,
-                ttl,
-                aggregates,
-                accumulators: UpdatingCache::with_time_to_idle(ttl),
-                schema_without_metadata: Arc::new(schema_without_metadata.finish()),
-                updated_keys: Default::default(),
-                key_converter: RowConverter::new(input_schema.sort_fields(false))?,
-                sliding_state_schema,
-                batch_state_schema,
-                new_generation: 0,
+        Ok(IncrementalAggregatingFunc {
+            flush_interval: Duration::from_micros(config.flush_interval_micros),
+            metadata_expr,
+            ttl,
+            aggregates,
+            accumulators: UpdatingCache::with_time_to_idle(ttl),
+            schema_without_metadata: Arc::new(schema_without_metadata.finish()),
+            updated_keys: Default::default(),
+            key_converter: RowConverter::new(input_schema.sort_fields(false))?,
+            sliding_state_schema,
+            batch_state_schema,
+            new_generation: 0,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::compute::SortOptions;
+    use arrow_array::{Int64Array, StringArray, TimestampNanosecondArray};
+    use datafusion::execution::FunctionRegistry;
+    use datafusion::functions_aggregate::{
+        count::count_udaf,
+        first_last::{first_value_udaf, last_value_udaf},
+        min_max::max_udaf,
+    };
+    use datafusion::physical_expr::aggregate::AggregateExprBuilder;
+    use datafusion::physical_expr::expressions::{Column, Literal};
+    use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
+    use datafusion_proto::physical_plan::to_proto::{
+        serialize_physical_aggr_expr, serialize_physical_expr,
+    };
+    use datafusion_proto::protobuf::{AggregateExecNode, MaybeFilter};
+
+    fn input_schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![
+            Field::new("value", DataType::Utf8, true),
+            Field::new("sequence", DataType::Int64, false),
+            Field::new("include", DataType::Boolean, true),
+            Field::new(
+                TIMESTAMP_FIELD,
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                false,
+            ),
+        ]))
+    }
+
+    // Exercise the production protobuf decoder and constructor, with generic
+    // physical expressions rather than application SQL or replacement logic.
+    fn native_config() -> (UpdatingAggregateOperator, Arc<Registry>) {
+        let schema = input_schema();
+        let value: Arc<dyn PhysicalExpr> = Arc::new(Column::new("value", 0));
+        let sequence: Arc<dyn PhysicalExpr> = Arc::new(Column::new("sequence", 1));
+        let include: Arc<dyn PhysicalExpr> = Arc::new(Column::new("include", 2));
+        let timestamp: Arc<dyn PhysicalExpr> = Arc::new(Column::new(TIMESTAMP_FIELD, 3));
+        let mut registry = Registry::default();
+        for function in [
+            first_value_udaf(),
+            last_value_udaf(),
+            count_udaf(),
+            max_udaf(),
+        ] {
+            registry.register_udaf(function).unwrap();
+        }
+        let mut expressions = vec![];
+        let mut filters = vec![];
+        for (name, function, descending, filtered) in [
+            ("first_asc", first_value_udaf(), false, false),
+            ("last_asc", last_value_udaf(), false, false),
+            ("first_desc", first_value_udaf(), true, false),
+            ("last_desc", last_value_udaf(), true, false),
+            ("selected_last", last_value_udaf(), false, true),
+        ] {
+            expressions.push(Arc::new(
+                AggregateExprBuilder::new(function, vec![value.clone()])
+                    .schema(schema.clone())
+                    .alias(name)
+                    .order_by(LexOrdering::new(vec![PhysicalSortExpr::new(
+                        sequence.clone(),
+                        SortOptions {
+                            descending,
+                            nulls_first: false,
+                        },
+                    )]))
+                    .build()
+                    .unwrap(),
+            ));
+            filters.push(filtered.then(|| include.clone()));
+        }
+        let one: Arc<dyn PhysicalExpr> = Arc::new(Literal::new(ScalarValue::Int64(Some(1))));
+        for (name, filtered) in [("all_count", false), ("selected_count", true)] {
+            expressions.push(Arc::new(
+                AggregateExprBuilder::new(count_udaf(), vec![one.clone()])
+                    .schema(schema.clone())
+                    .alias(name)
+                    .build()
+                    .unwrap(),
+            ));
+            filters.push(filtered.then(|| include.clone()));
+        }
+        expressions.push(Arc::new(
+            AggregateExprBuilder::new(max_udaf(), vec![timestamp])
+                .schema(schema.clone())
+                .alias(TIMESTAMP_FIELD)
+                .build()
+                .unwrap(),
+        ));
+        filters.push(None);
+        let codec = DefaultPhysicalExtensionCodec {};
+        let aggregate = AggregateExecNode {
+            aggr_expr: expressions
+                .iter()
+                .map(|expr| serialize_physical_aggr_expr(expr.clone(), &codec).unwrap())
+                .collect(),
+            aggr_expr_name: expressions
+                .iter()
+                .map(|expr| expr.name().to_string())
+                .collect(),
+            filter_expr: filters
+                .iter()
+                .map(|filter| MaybeFilter {
+                    expr: filter
+                        .as_ref()
+                        .map(|expr| serialize_physical_expr(expr, &codec).unwrap()),
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let mut final_fields: Vec<_> = expressions.iter().map(|expr| expr.field()).collect();
+        final_fields.push(Arc::new(Field::new(
+            UPDATING_META_FIELD,
+            DataType::Struct(updating_meta_fields()),
+            false,
+        )));
+        let metadata: Arc<dyn PhysicalExpr> = Arc::new(Literal::new(ScalarValue::Null));
+        (
+            UpdatingAggregateOperator {
+                name: "native-aggregate-correctness".into(),
+                input_schema: Some(ArroyoSchema::from_schema_unkeyed(schema).unwrap().into()),
+                final_schema: Some(
+                    ArroyoSchema::from_schema_unkeyed(Arc::new(Schema::new(final_fields)))
+                        .unwrap()
+                        .into(),
+                ),
+                aggregate_exec: PhysicalPlanNode {
+                    physical_plan_type: Some(PhysicalPlanType::Aggregate(Box::new(aggregate))),
+                }
+                .encode_to_vec(),
+                metadata_expr: serialize_physical_expr(&metadata, &codec)
+                    .unwrap()
+                    .encode_to_vec(),
+                flush_interval_micros: 1_000_000,
+                ttl_micros: 3_600_000_000,
             },
-        )))
+            Arc::new(registry),
+        )
+    }
+
+    fn operator() -> IncrementalAggregatingFunc {
+        let (config, registry) = native_config();
+        IncrementalAggregatingConstructor::build(config, registry).unwrap()
+    }
+
+    fn batch(values: &[Option<&str>], sequence: &[i64], include: &[Option<bool>]) -> RecordBatch {
+        RecordBatch::try_new(
+            input_schema(),
+            vec![
+                Arc::new(StringArray::from(values.to_vec())),
+                Arc::new(Int64Array::from(sequence.to_vec())),
+                Arc::new(BooleanArray::from(include.to_vec())),
+                Arc::new(TimestampNanosecondArray::from(sequence.to_vec())),
+            ],
+        )
+        .unwrap()
+    }
+
+    fn assert_values(
+        operator: &mut IncrementalAggregatingFunc,
+        expected: &[Option<&str>],
+        all: i64,
+        selected: i64,
+    ) {
+        let actual = operator.evaluate(&GLOBAL_KEY).unwrap();
+        for (value, expected) in actual.iter().zip(expected) {
+            assert_eq!(value, &ScalarValue::Utf8(expected.map(str::to_string)));
+        }
+        assert_eq!(actual[5], ScalarValue::Int64(Some(all)));
+        assert_eq!(actual[6], ScalarValue::Int64(Some(selected)));
+    }
+
+    fn retract(
+        operator: &mut IncrementalAggregatingFunc,
+        batch: &RecordBatch,
+        index: Option<usize>,
+    ) {
+        let inputs = operator.compute_inputs(batch).unwrap();
+        operator.retract_batch(&GLOBAL_KEY, &inputs, index).unwrap();
+    }
+
+    fn checkpoint_rows(schema: &ArroyoSchema, columns: Vec<ArrayRef>) -> RecordBatch {
+        let mut fields = schema.schema.fields().to_vec();
+        fields.push(Arc::new(Field::new("generation", DataType::UInt64, false)));
+        RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap()
+    }
+
+    #[test]
+    fn native_ordered_values_across_batches_and_retractions() {
+        let mut operator = operator();
+        operator
+            .global_aggregate(&batch(
+                &[Some("u"), Some("v")],
+                &[1, 2],
+                &[Some(true), Some(true)],
+            ))
+            .unwrap();
+        assert_values(
+            &mut operator,
+            &[Some("u"), Some("v"), Some("v"), Some("u"), Some("v")],
+            2,
+            2,
+        );
+        operator
+            .global_aggregate(&batch(
+                &[Some("early"), Some("late")],
+                &[0, 3],
+                &[Some(false), None],
+            ))
+            .unwrap();
+        assert_values(
+            &mut operator,
+            &[
+                Some("early"),
+                Some("late"),
+                Some("late"),
+                Some("early"),
+                Some("v"),
+            ],
+            4,
+            2,
+        );
+        // Removing an excluded row must leave the independently filtered values
+        // and count unchanged while retracting the unfiltered companion.
+        retract(
+            &mut operator,
+            &batch(&[Some("late")], &[3], &[None]),
+            Some(0),
+        );
+        assert_values(
+            &mut operator,
+            &[
+                Some("early"),
+                Some("v"),
+                Some("v"),
+                Some("early"),
+                Some("v"),
+            ],
+            3,
+            2,
+        );
+        retract(
+            &mut operator,
+            &batch(&[Some("v")], &[2], &[Some(true)]),
+            None,
+        );
+        assert_values(
+            &mut operator,
+            &[
+                Some("early"),
+                Some("u"),
+                Some("u"),
+                Some("early"),
+                Some("u"),
+            ],
+            2,
+            1,
+        );
+    }
+
+    #[test]
+    fn native_ordered_repeated_values_keep_distinct_sequences() {
+        let mut operator = operator();
+        operator
+            .global_aggregate(&batch(
+                &[Some("same"), Some("middle"), Some("same")],
+                &[1, 2, 3],
+                &[Some(true); 3],
+            ))
+            .unwrap();
+        retract(
+            &mut operator,
+            &batch(&[Some("same")], &[3], &[Some(true)]),
+            Some(0),
+        );
+        assert_values(
+            &mut operator,
+            &[
+                Some("same"),
+                Some("middle"),
+                Some("middle"),
+                Some("same"),
+                Some("middle"),
+            ],
+            2,
+            2,
+        );
+    }
+
+    #[test]
+    fn native_ordered_equal_keys_retain_remaining_duplicate() {
+        let mut operator = operator();
+        operator
+            .global_aggregate(&batch(
+                &[Some("tied"), Some("tied"), Some("later")],
+                &[1, 1, 2],
+                &[Some(true), Some(true), Some(false)],
+            ))
+            .unwrap();
+        retract(
+            &mut operator,
+            &batch(&[Some("tied")], &[1], &[Some(true)]),
+            Some(0),
+        );
+        assert_values(
+            &mut operator,
+            &[
+                Some("tied"),
+                Some("later"),
+                Some("later"),
+                Some("tied"),
+                Some("tied"),
+            ],
+            2,
+            1,
+        );
+    }
+
+    #[test]
+    fn native_filter_null_values_and_row_updates() {
+        let mut operator = operator();
+        operator
+            .global_aggregate(&batch(
+                &[Some("u"), None, Some("")],
+                &[1, 2, 3],
+                &[Some(true), Some(true), Some(false)],
+            ))
+            .unwrap();
+        assert_values(
+            &mut operator,
+            &[Some("u"), Some(""), Some(""), Some("u"), None],
+            3,
+            2,
+        );
+        let next = batch(
+            &[Some("null-filter"), Some("selected")],
+            &[4, 5],
+            &[None, Some(true)],
+        );
+        let inputs = operator.compute_inputs(&next).unwrap();
+        operator
+            .update_batch(&GLOBAL_KEY, &inputs, Some(0))
+            .unwrap();
+        operator
+            .update_batch(&GLOBAL_KEY, &inputs, Some(1))
+            .unwrap();
+        assert_values(
+            &mut operator,
+            &[
+                Some("u"),
+                Some("selected"),
+                Some("selected"),
+                Some("u"),
+                Some("selected"),
+            ],
+            5,
+            3,
+        );
+    }
+
+    #[test]
+    fn native_ordered_checkpoint_rows_reload_into_fresh_operator() {
+        let mut original = operator();
+        original
+            .global_aggregate(&batch(
+                &[Some("u"), Some("v"), Some("w")],
+                &[1, 2, 3],
+                &[Some(true), Some(false), Some(true)],
+            ))
+            .unwrap();
+        let sliding = checkpoint_rows(
+            &original.sliding_state_schema.clone(),
+            original.checkpoint_sliding().unwrap().unwrap(),
+        );
+        let fallback = checkpoint_rows(
+            &original.batch_state_schema.clone(),
+            original.checkpoint_batch().unwrap().unwrap(),
+        );
+        drop(original);
+        let mut fresh = operator();
+        // Production checkpoint serializers and restore methods; this is a
+        // fresh operator row-codec reload, not a remote TableManager checkpoint.
+        fresh.restore_sliding_batch(&sliding).unwrap();
+        fresh.restore_batch(&fallback).unwrap();
+        assert_values(
+            &mut fresh,
+            &[Some("u"), Some("w"), Some("w"), Some("u"), Some("w")],
+            3,
+            2,
+        );
+        retract(
+            &mut fresh,
+            &batch(&[Some("w")], &[3], &[Some(true)]),
+            Some(0),
+        );
+        fresh
+            .global_aggregate(&batch(&[Some("later")], &[4], &[Some(true)]))
+            .unwrap();
+        assert_values(
+            &mut fresh,
+            &[
+                Some("u"),
+                Some("later"),
+                Some("later"),
+                Some("u"),
+                Some("later"),
+            ],
+            3,
+            2,
+        );
+    }
+
+    #[test]
+    fn native_ordered_legacy_checkpoint_rows_reject_before_input() {
+        let mut original = operator();
+        original
+            .global_aggregate(&batch(&[Some("u")], &[1], &[Some(true)]))
+            .unwrap();
+        let mut columns = original.checkpoint_batch().unwrap().unwrap();
+        let index = original
+            .batch_state_schema
+            .schema
+            .index_of("args_row")
+            .unwrap();
+        let rows = columns[index]
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .unwrap();
+        let mut legacy = BinaryBuilder::new();
+        // Keep earlier rows current so a late legacy row tests atomic validation.
+        for (index, row) in rows.iter().enumerate() {
+            let row = row.unwrap();
+            legacy.append_value(if index + 1 == rows.len() {
+                row.strip_prefix(ORDERED_ARGS_V1).unwrap()
+            } else {
+                row
+            });
+        }
+        columns[index] = Arc::new(legacy.finish());
+        let checkpoint = checkpoint_rows(&original.batch_state_schema, columns);
+        let mut fresh = operator();
+        let error = fresh.restore_batch(&checkpoint).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("legacy or unsupported ordered aggregate checkpoint")
+        );
+        assert!(error.to_string().contains("source replay"));
+        assert!(fresh.accumulators.iter_mut().next().is_none());
+    }
+    #[test]
+    fn native_filtered_legacy_checkpoint_rejects_before_input() {
+        let mut original = operator();
+        original
+            .global_aggregate(&batch(&[Some("u")], &[1], &[Some(true)]))
+            .unwrap();
+        let columns = original.checkpoint_sliding().unwrap().unwrap();
+        let mut checkpoint = checkpoint_rows(&original.sliding_state_schema, columns);
+        let fields: Vec<_> = checkpoint
+            .schema()
+            .fields()
+            .iter()
+            .map(|field| {
+                let mut metadata = field.metadata().clone();
+                metadata.remove(INPUT_SEMANTICS_KEY);
+                Arc::new((**field).clone().with_metadata(metadata))
+            })
+            .collect();
+        checkpoint =
+            RecordBatch::try_new(Arc::new(Schema::new(fields)), checkpoint.columns().to_vec())
+                .unwrap();
+        let mut fresh = operator();
+        let error = fresh.restore_sliding_batch(&checkpoint).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("ordered/filtered aggregate checkpoint")
+        );
+        assert!(error.to_string().contains("source replay"));
+        assert!(fresh.accumulators.iter_mut().next().is_none());
+    }
+
+    #[test]
+    fn native_unordered_unfiltered_legacy_checkpoint_remains_compatible() {
+        let (mut config, registry) = native_config();
+        let mut plan = PhysicalPlanNode::decode(config.aggregate_exec.as_slice()).unwrap();
+        let Some(PhysicalPlanType::Aggregate(ref mut aggregate)) = plan.physical_plan_type else {
+            panic!("expected aggregate");
+        };
+        // Keep only the two ordinary COUNTs and timestamp MAX; remove FILTER.
+        aggregate.aggr_expr.drain(..5);
+        aggregate.aggr_expr_name.drain(..5);
+        aggregate.filter_expr = vec![MaybeFilter::default(); 3];
+        config.aggregate_exec = plan.encode_to_vec();
+        let mut original =
+            IncrementalAggregatingConstructor::build(config.clone(), registry.clone()).unwrap();
+        original
+            .global_aggregate(&batch(
+                &[Some("u"), Some("v")],
+                &[1, 2],
+                &[None, Some(false)],
+            ))
+            .unwrap();
+        let columns = original.checkpoint_sliding().unwrap().unwrap();
+        let checkpoint = checkpoint_rows(&original.sliding_state_schema, columns);
+        assert!(
+            !checkpoint
+                .schema()
+                .field_with_name(TIMESTAMP_FIELD)
+                .unwrap()
+                .metadata()
+                .contains_key(INPUT_SEMANTICS_KEY)
+        );
+        let mut fresh = IncrementalAggregatingConstructor::build(config, registry).unwrap();
+        fresh.restore_sliding_batch(&checkpoint).unwrap();
+        let actual = fresh.evaluate(&GLOBAL_KEY).unwrap();
+        assert_eq!(actual[0], ScalarValue::Int64(Some(2)));
+        assert_eq!(actual[1], ScalarValue::Int64(Some(2)));
     }
 }

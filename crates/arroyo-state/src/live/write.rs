@@ -18,26 +18,55 @@ pub struct AdmittedWriteBatch {
     encoded_bytes: usize,
 }
 impl AdmittedWriteBatch {
-    pub(crate) async fn reserve(
-        resources: WorkerStateResources,
-        max_encoded_bytes: usize,
-        max_operations: usize,
-    ) -> Result<Self> {
+    pub fn reservation_bytes(max_encoded_bytes: usize, max_operations: usize) -> Result<usize> {
         if max_encoded_bytes == 0 || max_operations == 0 {
             return Err(LiveStateError::InvalidLimit);
         }
-        // Account for owned payloads, temporary encoding, native buffer growth during copies,
-        // the preallocated operation vector and native per-operation metadata.
-        let bytes = max_encoded_bytes
+        max_encoded_bytes
             .checked_mul(5)
             .and_then(|bytes| {
                 max_operations
                     .checked_mul(std::mem::size_of::<WriteOperation>() + 32)
                     .and_then(|operations| bytes.checked_add(operations))
             })
-            .ok_or(LiveStateError::InvalidLimit)?;
+            .ok_or(LiveStateError::InvalidLimit)
+    }
+    pub async fn reserve(
+        resources: WorkerStateResources,
+        max_encoded_bytes: usize,
+        max_operations: usize,
+    ) -> Result<Self> {
+        let bytes = Self::reservation_bytes(max_encoded_bytes, max_operations)?;
         let permit = resources.queued_write(bytes).await?;
-        Ok(Self {
+        Ok(Self::with_permit(
+            resources,
+            permit,
+            max_encoded_bytes,
+            max_operations,
+        ))
+    }
+    /// Fail fast when a producer already holds another pool's admission.
+    pub fn try_reserve(
+        resources: WorkerStateResources,
+        max_encoded_bytes: usize,
+        max_operations: usize,
+    ) -> Result<Self> {
+        let bytes = Self::reservation_bytes(max_encoded_bytes, max_operations)?;
+        let permit = resources.try_queued_write(bytes)?;
+        Ok(Self::with_permit(
+            resources,
+            permit,
+            max_encoded_bytes,
+            max_operations,
+        ))
+    }
+    fn with_permit(
+        resources: WorkerStateResources,
+        permit: ResourcePermit,
+        max_encoded_bytes: usize,
+        max_operations: usize,
+    ) -> Self {
+        Self {
             batch: WriteBatch {
                 operations: Vec::with_capacity(max_operations),
                 max_bytes: max_encoded_bytes,
@@ -46,7 +75,7 @@ impl AdmittedWriteBatch {
             resources,
             max_operations,
             encoded_bytes: 0,
-        })
+        }
     }
 
     pub fn put(&mut self, key: &StateKey, value: &[u8]) -> Result<()> {
@@ -91,7 +120,7 @@ impl AdmittedWriteBatch {
 
     /// The backend must verify resource-pool identity and retain this permit in
     /// its native write closure; reacquiring queued admission would deadlock.
-    pub(crate) fn into_parts(self) -> (WriteBatch, ResourcePermit, WorkerStateResources) {
+    pub fn into_parts(self) -> (WriteBatch, ResourcePermit, WorkerStateResources) {
         (self.batch, self.permit, self.resources)
     }
 }
