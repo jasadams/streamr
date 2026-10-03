@@ -228,14 +228,19 @@ impl KafkaSinkFunc {
         ctx: &mut OperatorContext,
     ) -> Result<()> {
         if self.is_committing() {
+            let next_bytes = recovery::check_record_budget(
+                self.journal_bytes,
+                v.len(),
+                k.as_ref().map_or(0, Vec::len),
+                self.recovery_max_bytes,
+            )?;
             let record = ReplayRecord {
                 timestamp: ts,
                 key: k.clone(),
                 payload: v.clone(),
                 partition: -1,
             };
-            self.journal_bytes =
-                recovery::check_budget(self.journal_bytes, &record, self.recovery_max_bytes)?;
+            self.journal_bytes = next_bytes;
             self.journal.push(record);
         }
         let mut rec = {

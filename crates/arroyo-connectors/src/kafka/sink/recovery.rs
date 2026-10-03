@@ -84,8 +84,25 @@ pub fn validate_marker_epoch(marker_epoch: u32, checkpoint_epoch: u32) -> Result
 }
 
 pub fn check_budget(used: usize, record: &ReplayRecord, max: usize) -> Result<usize> {
+    check_record_budget(
+        used,
+        record.payload.len(),
+        record.key.as_ref().map_or(0, Vec::len),
+        max,
+    )
+}
+pub fn check_record_budget(
+    used: usize,
+    payload_bytes: usize,
+    key_bytes: usize,
+    max: usize,
+) -> Result<usize> {
+    let bytes = payload_bytes
+        .checked_add(key_bytes)
+        .and_then(|n| n.checked_add(64))
+        .ok_or_else(|| anyhow!("Kafka replay journal size overflow"))?;
     let next = used
-        .checked_add(record.bytes()?)
+        .checked_add(bytes)
         .ok_or_else(|| anyhow!("Kafka replay journal size overflow"))?;
     ensure!(
         next <= max,
@@ -316,6 +333,7 @@ mod tests {
         assert_eq!(check_budget(0, &record(), 69).unwrap(), 69);
         assert!(check_budget(1, &record(), 69).is_err());
         assert!(check_budget(usize::MAX, &record(), usize::MAX).is_err());
+        assert!(check_record_budget(0, usize::MAX, 0, usize::MAX).is_err());
     }
     #[test]
     fn replay_preserves_wire_record() {
