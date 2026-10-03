@@ -6,6 +6,8 @@ license = "MIT OR Apache-2.0"
 
 [features]
 default = []
+# Package the console into development binaries without changing normal debug asset reloads.
+embedded-console = ["rust-embed/debug-embed"]
 
 [dependencies]
 arroyo-types = { path = "../arroyo-types" }
