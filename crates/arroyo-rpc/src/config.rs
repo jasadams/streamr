@@ -425,8 +425,14 @@ pub struct CompilerConfig {
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub struct WorkerConfig {
-    /// Explicit worker-wide budgets for the live-state prototype. Operators must
-    /// opt into the live-state API; this does not enable disk-backed SQL recovery.
+    /// SQL map storage. RocksDB requires explicit disk and worker resource budgets.
+    #[serde(default)]
+    pub sql_state_backend: SqlStateBackend,
+
+    #[serde(default)]
+    pub disk_sql_state: Option<DiskSqlStateConfig>,
+
+    /// Explicit worker-wide budgets shared by disk-backed operators.
     #[serde(default)]
     pub live_state_resources: Option<LiveStateResourceConfig>,
 
@@ -462,6 +468,73 @@ pub struct WorkerConfig {
 
     /// Maximum number of checkpoints to keep in history for serving the checkpoint details APIs
     pub checkpoint_details_to_keep: u32,
+}
+
+/// Disk-backed SQL is opt-in and supports singleton maps at fixed parallelism.
+#[derive(Debug, Default, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum SqlStateBackend {
+    #[default]
+    Memory,
+    Rocksdb,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct DiskSqlStateConfig {
+    pub directory: PathBuf,
+    /// Per-row execution and overlay limit. Oversized rows fail before emission.
+    pub max_row_bytes: usize,
+}
+
+impl WorkerConfig {
+    pub fn validate_sql_state(&self) -> anyhow::Result<()> {
+        if self.sql_state_backend == SqlStateBackend::Memory {
+            return Ok(());
+        }
+        let disk = self
+            .disk_sql_state
+            .as_ref()
+            .ok_or_else(|| anyhow!("RocksDB SQL requires worker.disk-sql-state"))?;
+        let resources = self
+            .live_state_resources
+            .as_ref()
+            .ok_or_else(|| anyhow!("RocksDB SQL requires explicit worker.live-state-resources"))?;
+        if disk.directory.as_os_str().is_empty()
+            || disk.max_row_bytes == 0
+            || disk.max_row_bytes > 256 * 1024
+            || resources.decoded_value_bytes
+                < disk
+                    .max_row_bytes
+                    .saturating_mul(
+                        resources
+                            .max_open_databases
+                            .saturating_mul(8)
+                            .saturating_add(5),
+                    )
+                    .saturating_add(8192usize.saturating_mul(resources.max_open_databases))
+            || resources.queued_write_bytes
+                < disk.max_row_bytes.saturating_mul(12).saturating_add(8192)
+            || disk.max_row_bytes > resources.scan_page_bytes / 4
+        {
+            bail!(
+                "RocksDB SQL max-row-bytes must be 1..=262144 and fit decoded, write and snapshot budgets (decoded must cover all admitted operators plus read headroom, write >= 12x + 8192 and scan >= 4x row limit)"
+            );
+        }
+        let page_bytes = resources
+            .scan_page_bytes
+            .saturating_div(8usize.saturating_mul(resources.max_open_databases.saturating_add(1)))
+            .min(resources.queued_write_bytes / 8)
+            .min(resources.decoded_value_bytes / 4)
+            .min(1024 * 1024)
+            .saturating_sub(32 * 1024);
+        if disk.max_row_bytes.saturating_mul(2).saturating_add(1024) > page_bytes {
+            bail!(
+                "RocksDB SQL max-row-bytes must fit resource-derived checkpoint pages with 1024 bytes for encoding"
+            );
+        }
+        Ok(())
+    }
 }
 
 /// No production defaults: values must be supplied from deployment measurements.

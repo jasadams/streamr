@@ -1,3 +1,4 @@
+use crate::tables::disk_keyed_map::DiskKeyedTable;
 use crate::tables::expiring_time_key_map::ExpiringTimeKeyTable;
 use crate::tables::global_keyed_map::GlobalKeyedTable;
 use crate::tables::{CompactionConfig, ErasedTable};
@@ -204,6 +205,7 @@ impl ParquetBackend {
                         error: "should have table type".to_string(),
                     });
                 }
+                rpc::TableEnum::DiskKeyedMap => None,
                 rpc::TableEnum::GlobalKeyValue => {
                     GlobalKeyedTable::compact_data(
                         table_config,
@@ -241,27 +243,35 @@ impl ParquetBackend {
             Self::load_operator_metadata(role, &job_id, &operator_id, new_min_epoch)
                 .await?
                 .expect("expect new_min_epoch metadata to still be present");
-        let paths_to_keep: HashSet<String> = operator_metadata
-            .table_checkpoint_metadata
-            .iter()
-            .flat_map(|(table_name, metadata)| {
-                let table_config = operator_metadata
-                    .table_configs
-                    .get(table_name)
-                    .unwrap()
-                    .clone();
-
-                match table_config.table_type() {
-                    rpc::TableEnum::MissingTableType => todo!("should handle error"),
-                    rpc::TableEnum::GlobalKeyValue => {
-                        GlobalKeyedTable::files_to_keep(table_config, metadata.clone()).unwrap()
-                    }
-                    rpc::TableEnum::ExpiringKeyedTimeTable => {
-                        ExpiringTimeKeyTable::files_to_keep(table_config, metadata.clone()).unwrap()
-                    }
+        let mut paths_to_keep = HashSet::new();
+        for (table_name, metadata) in &operator_metadata.table_checkpoint_metadata {
+            let table_config = operator_metadata
+                .table_configs
+                .get(table_name)
+                .ok_or_else(|| StateError::Other {
+                    table: table_name.clone(),
+                    error: "missing retained checkpoint table configuration".into(),
+                })?
+                .clone();
+            let files = match table_config.table_type() {
+                rpc::TableEnum::MissingTableType => {
+                    return Err(StateError::Other {
+                        table: table_name.clone(),
+                        error: "missing retained checkpoint table type".into(),
+                    });
                 }
-            })
-            .collect();
+                rpc::TableEnum::DiskKeyedMap => {
+                    DiskKeyedTable::files_to_keep(table_config, metadata.clone())?
+                }
+                rpc::TableEnum::GlobalKeyValue => {
+                    GlobalKeyedTable::files_to_keep(table_config, metadata.clone())?
+                }
+                rpc::TableEnum::ExpiringKeyedTimeTable => {
+                    ExpiringTimeKeyTable::files_to_keep(table_config, metadata.clone())?
+                }
+            };
+            paths_to_keep.extend(files);
+        }
 
         let mut deleted_paths = HashSet::new();
         let storage_client = get_storage_provider(role).await?;
@@ -290,6 +300,9 @@ impl ParquetBackend {
                         warn!("found table without table type: {:?}", table_name);
                         HashSet::new()
                     }
+                    rpc::TableEnum::DiskKeyedMap => {
+                        DiskKeyedTable::files_to_keep(table_config, metadata.clone())?
+                    }
                     rpc::TableEnum::GlobalKeyValue => {
                         GlobalKeyedTable::files_to_keep(table_config, metadata.clone())?
                     }
@@ -307,6 +320,14 @@ impl ParquetBackend {
             }
         }
 
+        cleanup_abandoned_controller_disk_files(
+            storage_client.as_ref(),
+            &job_id,
+            &operator_id,
+            new_min_epoch,
+            &paths_to_keep,
+        )
+        .await?;
         Ok(operator_id)
     }
 }
@@ -333,5 +354,86 @@ impl ParquetStats {
         self.max_timestamp = self.max_timestamp.max(other.max_timestamp);
         self.min_routing_key = self.min_routing_key.min(other.min_routing_key);
         self.max_routing_key = self.max_routing_key.max(other.max_routing_key);
+    }
+}
+
+/// Full logical disk pages have exclusive epoch ownership. Once the controller
+/// advances its retained minimum, pages in older epochs cannot be referenced by
+/// a retained checkpoint or an active publication, including pages uploaded by
+/// workers that crashed before reporting completion.
+pub async fn cleanup_abandoned_controller_disk_files(
+    storage: &arroyo_storage::StorageProvider,
+    job_id: &str,
+    operator_id: &str,
+    retained_min_epoch: u32,
+    retained_files: &HashSet<String>,
+) -> Result<(), StateError> {
+    use futures::TryStreamExt;
+    let namespace = format!("{job_id}/checkpoints/");
+    let qualified = storage.qualify_path(&namespace.as_str().into()).to_string();
+    let prefix = format!("{}/", qualified.trim_end_matches('/'));
+    let listing = storage.list(true).await?;
+    futures::pin_mut!(listing);
+    while let Some(object) = listing
+        .try_next()
+        .await
+        .map_err(arroyo_rpc::errors::StorageError::from)?
+    {
+        let object = object.to_string();
+        let Some(suffix) = object.strip_prefix(&prefix) else {
+            continue;
+        };
+        let parts: Vec<_> = suffix.split('/').collect();
+        if parts.len() != 4
+            || parts[1] != format!("operator-{operator_id}")
+            || !parts[2].starts_with("table-")
+            || !parts[3].starts_with("disk-")
+        {
+            continue;
+        }
+        let Some(epoch) = parts[0].strip_prefix("checkpoint-") else {
+            continue;
+        };
+        let Ok(epoch) = epoch.parse::<u32>() else {
+            continue;
+        };
+        if epoch < retained_min_epoch && !retained_files.contains(&format!("{namespace}{suffix}")) {
+            storage
+                .delete_if_present(format!("{namespace}{suffix}"))
+                .await?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod disk_cleanup_tests {
+    use super::*;
+    #[tokio::test]
+    async fn cleans_abandoned_pages_only_below_retained_minimum_and_for_owned_operator() {
+        let root = tempfile::tempdir().unwrap();
+        let storage =
+            arroyo_storage::StorageProvider::for_url(&format!("file://{}", root.path().display()))
+                .await
+                .unwrap();
+        let abandoned = "J/checkpoints/checkpoint-0000001/operator-o/table-m-000/disk-orphan.bin";
+        let retained = "J/checkpoints/checkpoint-0000002/operator-o/table-m-000/disk-keep.bin";
+        let active = "J/checkpoints/checkpoint-0000003/operator-o/table-m-000/disk-upload.bin";
+        let foreign =
+            "J/checkpoints/checkpoint-0000001/operator-other/table-m-000/disk-foreign.bin";
+        let legacy = "J/checkpoints/checkpoint-0000001/operator-o/table-legacy-000";
+        for path in [abandoned, retained, active, foreign, legacy] {
+            storage.put(path, vec![1]).await.unwrap();
+        }
+        cleanup_abandoned_controller_disk_files(&storage, "J", "o", 2, &HashSet::new())
+            .await
+            .unwrap();
+        assert!(!storage.exists(abandoned).await.unwrap());
+        for path in [retained, active, foreign, legacy] {
+            assert!(storage.exists(path).await.unwrap());
+        }
+        cleanup_abandoned_controller_disk_files(&storage, "J", "o", 2, &HashSet::new())
+            .await
+            .unwrap();
     }
 }

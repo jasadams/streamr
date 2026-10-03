@@ -21,6 +21,7 @@ pub struct RocksLiveState {
     completion: oneshot::Receiver<Result<()>>,
     path: PathBuf,
     resources: WorkerStateResources,
+    sync_writes: bool,
 }
 
 fn backend(error: impl std::fmt::Display) -> LiveStateError {
@@ -51,29 +52,43 @@ fn options(resources: &WorkerStateResources, create: bool) -> Options {
 impl RocksLiveState {
     /// Worker entry point: every operator uses the configured process-wide pool.
     /// This opens fresh live storage; checkpoint restore remains caller-managed.
+    /// Exhausted database slots fail immediately to avoid readiness deadlocks.
+    /// Writes complete atomically with WAL enabled, without per-row fsync;
+    /// recovery must restore a committed checkpoint into this fresh attempt.
     pub async fn open_worker(config: RocksStateConfig) -> Result<Self> {
         let resources = super::worker::configured_worker_resources()?.ok_or_else(|| {
             LiveStateError::Backend("worker live-state resource budgets are not configured".into())
         })?;
-        Self::open(config, resources).await
+        Self::open_worker_with_resources(config, resources).await
+    }
+
+    async fn open_worker_with_resources(
+        config: RocksStateConfig,
+        resources: WorkerStateResources,
+    ) -> Result<Self> {
+        let permit = resources.try_database()?;
+        Self::open_mode(config, resources, false, permit, false).await
     }
 
     pub async fn open(config: RocksStateConfig, resources: WorkerStateResources) -> Result<Self> {
-        Self::open_mode(config, resources, false).await
+        let permit = resources.database().await?;
+        Self::open_mode(config, resources, false, permit, true).await
     }
 
     /// Explicit reuse of precisely the supplied attempt. Missing or corrupt
     /// databases fail instead of being replaced with empty state.
     pub async fn reopen(config: RocksStateConfig, resources: WorkerStateResources) -> Result<Self> {
-        Self::open_mode(config, resources, true).await
+        let permit = resources.database().await?;
+        Self::open_mode(config, resources, true, permit, true).await
     }
 
     async fn open_mode(
         config: RocksStateConfig,
         resources: WorkerStateResources,
         reopen: bool,
+        database_permit: ResourcePermit,
+        sync_writes: bool,
     ) -> Result<Self> {
-        let database_permit = resources.database().await.map_err(LiveStateError::from)?;
         let cleanup = resources.cleanup().await.map_err(LiveStateError::from)?;
         let task_resources = resources.clone();
         resources
@@ -109,6 +124,7 @@ impl RocksLiveState {
                     completion,
                     path,
                     resources: task_resources,
+                    sync_writes,
                 })
             })
             .await
@@ -140,6 +156,7 @@ impl RocksLiveState {
         let db = self.db.clone();
         let path = self.path.clone();
         let resources = self.resources.clone();
+        let sync_writes = self.sync_writes;
         self.resources
             .run_blocking(move || {
                 let _latency = resources.operation_timer("write");
@@ -158,7 +175,7 @@ impl RocksLiveState {
                 }
                 let mut options = WriteOptions::default();
                 options.disable_wal(false);
-                options.set_sync(true);
+                options.set_sync(sync_writes);
                 db.write_opt(native, &options).map_err(backend)
             })
             .await
@@ -167,6 +184,13 @@ impl RocksLiveState {
 
     pub fn path(&self) -> &std::path::Path {
         &self.path
+    }
+
+    /// Attempt-local SQL databases are disposable caches of committed remote
+    /// checkpoints. Mark before restore so all failure paths remove this attempt
+    /// after its final native reader releases it.
+    pub fn remove_on_drop(&self) {
+        self.db.remove.store(true, Ordering::Relaxed);
     }
 
     /// Wait until all native users have released the database and cleanup finishes.
@@ -631,12 +655,82 @@ mod tests {
         }
     }
     #[tokio::test]
+    async fn worker_database_open_rejects_saturation_before_native_preparation() {
+        let mut limits = resources().config().clone();
+        limits.max_open_databases = 1;
+        let resources = WorkerStateResources::new(limits).unwrap();
+        let first_config = config();
+        let first =
+            RocksLiveState::open_worker_with_resources(first_config.clone(), resources.clone())
+                .await
+                .unwrap();
+        let second_config = config();
+        let rejected =
+            RocksLiveState::open_worker_with_resources(second_config.clone(), resources.clone());
+        tokio::pin!(rejected);
+        assert!(matches!(
+            futures::poll!(&mut rejected),
+            std::task::Poll::Ready(Err(LiveStateError::Resource(
+                super::super::resources::ResourceError::ResourceExhausted {
+                    resource: "databases",
+                    limit: 1,
+                }
+            )))
+        ));
+        assert!(!second_config.root.exists());
+
+        let diagnostic = RocksLiveState::open(second_config.clone(), resources.clone());
+        tokio::pin!(diagnostic);
+        assert!(futures::poll!(&mut diagnostic).is_pending());
+        first.close_and_remove().await.unwrap();
+        let second = diagnostic.await.unwrap();
+        second.close_and_remove().await.unwrap();
+        std::fs::remove_dir_all(first_config.root).unwrap();
+        std::fs::remove_dir_all(second_config.root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn worker_writes_are_visible_and_snapshots_survive_without_per_write_sync() {
+        let config = config();
+        let resources = resources();
+        let state = RocksLiveState::open_worker_with_resources(config.clone(), resources.clone())
+            .await
+            .unwrap();
+        assert!(!state.sync_writes);
+        // Covers atomic batch rejection, operation ordering, immediate reads,
+        // namespace isolation, and snapshot pagination on the worker write mode.
+        super::super::tests::backend_contract(&state).await;
+        state.put(key(), b"committed".to_vec(), 1024).await.unwrap();
+        let snapshot = state.snapshot().await.unwrap();
+        state.put(key(), b"newer".to_vec(), 1024).await.unwrap();
+        assert_eq!(
+            state
+                .get(&key(), ReadOptions { max_bytes: 9 })
+                .await
+                .unwrap(),
+            Some(b"newer".to_vec())
+        );
+        state.close_and_remove().await.unwrap();
+        assert_eq!(
+            snapshot
+                .get(&key(), ReadOptions { max_bytes: 9 })
+                .await
+                .unwrap(),
+            Some(b"committed".to_vec())
+        );
+        drop(snapshot);
+        drain_cleanup(&resources).await;
+        std::fs::remove_dir_all(config.root).unwrap();
+    }
+
+    #[tokio::test]
     async fn rocks_conforms_and_reopens_explicitly() {
         let config = config();
         let resources = resources();
         let state = RocksLiveState::open(config.clone(), resources.clone())
             .await
             .unwrap();
+        assert!(state.sync_writes);
         super::super::tests::backend_contract(&state).await;
         state.put(key(), b"persisted".to_vec(), 1024).await.unwrap();
         assert!(
@@ -649,6 +743,7 @@ mod tests {
         let reopened = RocksLiveState::reopen(config.clone(), resources.clone())
             .await
             .unwrap();
+        assert!(reopened.sync_writes);
         assert_eq!(
             reopened
                 .get(&key(), ReadOptions { max_bytes: 9 })

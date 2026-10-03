@@ -23,14 +23,14 @@ These crates have no vendored C dependencies and can be checked locally:
 - `cargo check -p arroyo-rpc` (proto generation)
 - `cargo check -p arroyo-datastream`
 - `cargo check -p arroyo-operator`
-- `cargo check -p arroyo-state`
 
 ## Crates that require the dev container
 
-These pull in rdkafka → sasl2-sys (vendored K&R C code):
+These build native dependencies, including Kafka/SASL or RocksDB:
 - `arroyo-worker`
 - `arroyo-planner`
 - `arroyo-connectors`
+- `arroyo-state` (RocksDB, LZ4 and runtime libclang bindings)
 - `arroyo` (top-level binary)
 
 ## Quick check (per modified crate)

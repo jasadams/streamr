@@ -42,6 +42,10 @@ pub enum ResourceError {
     Closed {
         resource: &'static str,
     },
+    ResourceExhausted {
+        resource: &'static str,
+        limit: usize,
+    },
     BlockingTask(tokio::task::JoinError),
     DiskIo(std::io::Error),
     CleanupThread(std::io::Error),
@@ -63,6 +67,10 @@ impl fmt::Display for ResourceError {
                 "{resource} request of {requested} exceeds budget {limit}"
             ),
             Self::Closed { resource } => write!(f, "{resource} admission closed"),
+            Self::ResourceExhausted { resource, limit } => write!(
+                f,
+                "{resource} budget exhausted (limit {limit}); worker startup cannot wait for a database slot"
+            ),
             Self::BlockingTask(e) => write!(f, "live-state blocking task failed: {e}"),
             Self::DiskIo(e) => write!(f, "cannot inspect live-state disk: {e}"),
             Self::CleanupThread(e) => write!(f, "cannot start live-state cleanup thread: {e}"),
@@ -136,6 +144,28 @@ impl Budget {
             _permit: permit,
             used,
             amount,
+        })
+    }
+    fn try_acquire_one(&self) -> Result<ResourcePermit, ResourceError> {
+        let permit = self
+            .semaphore
+            .clone()
+            .try_acquire_owned()
+            .map_err(|error| match error {
+                tokio::sync::TryAcquireError::Closed => ResourceError::Closed {
+                    resource: self.name,
+                },
+                tokio::sync::TryAcquireError::NoPermits => ResourceError::ResourceExhausted {
+                    resource: self.name,
+                    limit: self.limit,
+                },
+            })?;
+        let used = self.metrics.with_label_values(&[self.name, "used"]);
+        used.inc();
+        Ok(ResourcePermit {
+            _permit: permit,
+            used,
+            amount: 1,
         })
     }
 }
@@ -378,6 +408,12 @@ impl WorkerStateResources {
     pub async fn database(&self) -> Result<ResourcePermit, ResourceError> {
         self.0.databases.acquire(1).await
     }
+
+    /// Worker startup must fail instead of waiting for other operators that
+    /// may themselves be waiting for the worker readiness barrier.
+    pub fn try_database(&self) -> Result<ResourcePermit, ResourceError> {
+        self.0.databases.try_acquire_one()
+    }
     pub async fn cleanup(&self) -> Result<CleanupPermit, ResourceError> {
         self.0.cleanup.reserve().await
     }
@@ -531,6 +567,26 @@ mod tests {
             disk_reserve_bytes: 1,
         }
     }
+    #[tokio::test]
+    async fn worker_database_admission_fails_fast_but_diagnostic_admission_waits() {
+        let resources = WorkerStateResources::new(config()).unwrap();
+        let permit = resources.try_database().unwrap();
+        assert!(matches!(
+            resources.try_database(),
+            Err(ResourceError::ResourceExhausted {
+                resource: "databases",
+                limit: 1,
+            })
+        ));
+        let diagnostic = resources.database();
+        tokio::pin!(diagnostic);
+        assert!(futures::poll!(&mut diagnostic).is_pending());
+        drop(permit);
+        drop(diagnostic.await.unwrap());
+        assert!(resources.try_database().is_ok());
+        assert_eq!(resources.0.databases.semaphore.available_permits(), 1);
+    }
+
     #[tokio::test]
     async fn shared_admission_blocks_until_owner_releases() {
         let resources = WorkerStateResources::new(config()).unwrap();

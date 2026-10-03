@@ -21,7 +21,9 @@ use std::time::SystemTime;
 /// Callers normally use this through [`publish_checkpoint`] or
 /// [`resolve_generation_manifest`]. Use it directly only when the checkpoint
 /// manifest has already been published and parent safety has already been
-/// checked.
+/// checked. Version-1 publication generations additionally require a successful
+/// immutable `Published` log slot; writing the physical manifest alone is not
+/// publication authorization.
 #[derive(Debug, Clone)]
 pub struct ClaimEpochRecordRequest<'a> {
     pub epoch_record_path: &'a CheckpointRef,
@@ -259,6 +261,51 @@ where
         });
     }
 
+    // Repeated initialization must recover the current generation's immutable
+    // frontier, never overwrite it with an empty or older recovery pointer.
+    // Existing legacy generations remain legacy; upgrade only at a new generation.
+    if let Some(existing) =
+        read_json::<_, GenerationManifest>(store, &paths.generation_manifest(request.generation))
+            .await?
+    {
+        if existing.publication_log_version != 0
+            && crate::publication::inspect(store, &existing, None)
+                .await?
+                .closed
+        {
+            return Err(StoreError::InvalidProtobuf {
+                path: paths.generation_manifest(request.generation),
+                msg: "generation publication log is closed; initialize a newer generation".into(),
+            });
+        }
+        let resolution = resolve_generation_manifest(store, &existing, request.generation).await?;
+        let recovery = match resolution {
+            GenerationResolution::Ready { checkpoint_ref } => {
+                GenerationRecovery::Ready { checkpoint_ref }
+            }
+            GenerationResolution::ReplayCommit {
+                checkpoint_ref,
+                commit_permit,
+            } => GenerationRecovery::ReplayCommit {
+                checkpoint_ref,
+                commit_permit,
+            },
+            GenerationResolution::Failed(ResolveFailure::NoCandidate) => {
+                GenerationRecovery::NoCheckpoint
+            }
+            GenerationResolution::Failed(failure) => {
+                return Ok(GenerationInitialization::Failed(failure));
+            }
+            GenerationResolution::StopOrphaned { canonical_ref } => {
+                return Ok(GenerationInitialization::StopOrphaned { canonical_ref });
+            }
+        };
+        return Ok(GenerationInitialization::Initialized {
+            generation_manifest: existing,
+            recovery,
+        });
+    }
+
     let recovery = find_recovery_checkpoint(store, &paths, request.generation).await?;
     let base_checkpoint_ref = match &recovery {
         RecoverySearch::Found(recovery) => match recovery {
@@ -278,13 +325,15 @@ where
         }
     };
 
-    let generation_manifest = GenerationManifest::new(
+    let mut generation_manifest = GenerationManifest::new(
         request.pipeline_id,
         request.job_id,
         request.generation,
         base_checkpoint_ref,
         to_micros(request.updated_at),
     );
+    generation_manifest.publication_log_version = crate::publication::PUBLICATION_LOG_VERSION;
+    crate::publication::open(store, &generation_manifest).await?;
 
     put_json(
         store,
@@ -532,11 +581,31 @@ where
     S: ProtocolStore + ?Sized,
 {
     validate_checkpoint_for_generation(request.generation_manifest, request.checkpoint)?;
+    crate::disk::validate_manifest(request.checkpoint).map_err(|msg| {
+        StoreError::InvalidProtobuf {
+            path: request.checkpoint_ref.clone(),
+            msg,
+        }
+    })?;
 
     let paths = ProtocolPaths::new(
         request.generation_manifest.pipeline_id.clone(),
         request.generation_manifest.job_id.clone(),
     );
+
+    if let Some(stored) = read_json::<_, GenerationManifest>(
+        store,
+        &paths.generation_manifest(request.generation_manifest.generation),
+    )
+    .await?
+        && stored.publication_log_version != request.generation_manifest.publication_log_version
+    {
+        return Err(StoreError::InvalidProtobuf {
+            path: paths.generation_manifest(stored.generation),
+            msg: "publication protocol version differs from authoritative generation manifest"
+                .into(),
+        });
+    }
 
     let is_current_generation =
         read_json::<_, CurrentGeneration>(store, &paths.current_generation())
@@ -565,6 +634,42 @@ where
         return Ok(CheckpointPublication::Failed(
             ResolveFailure::ParentNotReadyCanonical,
         ));
+    }
+
+    if request.generation_manifest.publication_log_version != 0 {
+        if *request.checkpoint_ref
+            != paths.checkpoint_manifest(
+                Generation(request.checkpoint.generation),
+                Epoch(request.checkpoint.epoch),
+            )
+        {
+            return Err(StoreError::Protocol(
+                ProtocolError::CheckpointManifestMismatch,
+            ));
+        }
+        if let Some(parent_ref) = checkpoint_parent_checkpoint_ref(request.checkpoint)? {
+            let parent: CheckpointManifest =
+                read_protobuf(store, &parent_ref).await?.ok_or_else(|| {
+                    StoreError::ExistingObjectMissing {
+                        path: parent_ref.clone(),
+                    }
+                })?;
+            if request.checkpoint.epoch <= parent.epoch {
+                return Err(StoreError::Protocol(
+                    ProtocolError::CheckpointManifestMismatch,
+                ));
+            }
+        }
+        if !crate::publication::publish(
+            store,
+            request.generation_manifest,
+            request.checkpoint_ref,
+            checkpoint_parent_checkpoint_ref(request.checkpoint)?.as_ref(),
+        )
+        .await?
+        {
+            return Ok(CheckpointPublication::StaleGeneration);
+        }
     }
 
     let mut updated_generation_manifest = request.generation_manifest.clone();
@@ -621,15 +726,29 @@ pub async fn resolve_generation_manifest<S>(
 where
     S: ProtocolStore + ?Sized,
 {
-    let Some(candidate_ref) = manifest.candidate_checkpoint_ref().cloned() else {
-        return Ok(GenerationResolution::Failed(ResolveFailure::NoCandidate));
-    };
-
     let paths = ProtocolPaths::new(manifest.pipeline_id.clone(), manifest.job_id.clone());
     let is_current_generation =
         read_json::<_, CurrentGeneration>(store, &paths.current_generation())
             .await?
-            .is_some_and(|current_generation| current_generation.generation == runner_generation);
+            .is_some_and(|current| current.generation == runner_generation);
+    let mut effective_manifest = manifest.clone();
+    let mut closed_latest = None;
+    if manifest.publication_log_version != 0 {
+        let frontier = if is_current_generation && manifest.generation < runner_generation {
+            crate::publication::close(store, manifest, None).await?
+        } else {
+            crate::publication::inspect(store, manifest, None).await?
+        };
+        effective_manifest.base_checkpoint_ref = frontier.base_checkpoint_ref;
+        effective_manifest.latest_checkpoint_ref = frontier.latest_checkpoint_ref.clone();
+        if frontier.closed {
+            closed_latest = frontier.latest_checkpoint_ref;
+        }
+    }
+    let manifest = &effective_manifest;
+    let Some(candidate_ref) = manifest.candidate_checkpoint_ref().cloned() else {
+        return Ok(GenerationResolution::Failed(ResolveFailure::NoCandidate));
+    };
 
     let mut candidate_ref = candidate_ref;
 
@@ -639,7 +758,10 @@ where
             &paths,
             manifest,
             &candidate_ref,
-            is_current_generation,
+            is_current_generation
+                && (manifest.publication_log_version == 0
+                    || manifest.generation == runner_generation
+                    || closed_latest.as_ref() == Some(&candidate_ref)),
         )
         .await?
         {
@@ -672,6 +794,12 @@ where
     S: ProtocolStore + ?Sized,
 {
     let checkpoint: Option<CheckpointManifest> = read_protobuf(store, candidate_ref).await?;
+    if let Some(checkpoint) = &checkpoint {
+        crate::disk::validate_manifest(checkpoint).map_err(|msg| StoreError::InvalidProtobuf {
+            path: candidate_ref.clone(),
+            msg,
+        })?;
+    }
     let parent_status = parent_status(store, paths, checkpoint.as_ref()).await?;
     let epoch_record = match &checkpoint {
         Some(checkpoint) => read_json(store, &paths.epoch_record(Epoch(checkpoint.epoch))).await?,
@@ -794,7 +922,13 @@ where
     let Some(parent_checkpoint): Option<CheckpointManifest> =
         read_protobuf(store, &parent_checkpoint_ref).await?
     else {
-        return Ok(ParentCheckpointStatus::NotReadyCanonical);
+        return Ok(
+            if crate::ready::exists(store, paths, &parent_checkpoint_ref).await? {
+                ParentCheckpointStatus::ReadyCanonical
+            } else {
+                ParentCheckpointStatus::NotReadyCanonical
+            },
+        );
     };
     let parent_epoch_record: Option<EpochRecord> =
         read_json(store, &paths.epoch_record(Epoch(parent_checkpoint.epoch))).await?;

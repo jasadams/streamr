@@ -53,6 +53,9 @@ include their content.
 ## Admission and lifecycle
 
 Requests exceeding byte budgets fail; capacity saturation awaits admission.
+Worker database startup fails immediately when database slots are exhausted,
+because waiting could deadlock operators at the worker readiness barrier.
+Diagnostic `open` and `reopen` retain asynchronous database admission.
 Use `RocksLiveState::admitted_batch(max_bytes, max_operations)` before assembling
 pending writes, then add borrowed keys/values and submit with `write_admitted`.
 The builder reserves worker bytes before allocating or copying and retains them
@@ -60,7 +63,13 @@ through native completion. Existing owned `write_batch` inputs remain caller
 allocations while waiting; they must be separately bounded by their producer.
 Native request copies and output container overhead are accounted before their
 allocation. Reads pin native values and check size before copying. Writes remain
-WAL enabled and synchronous. Errors propagate and never trigger a RAM fallback.
+WAL enabled. Diagnostic `open` and `reopen` synchronize each write to disk.
+Disposable worker attempts complete atomic native writes before emitting rows,
+but omit per-row WAL fsync. Stable snapshots still capture completed writes;
+pipeline durability comes from publishing the full committed checkpoint.
+Worker recovery always restores that selected checkpoint into fresh storage,
+so a newer local WAL is never accepted as committed pipeline state.
+Errors propagate and never trigger a RAM fallback.
 Native operations run through bounded blocking admission. Cancellation leaves
 permits with executing work until it finishes.
 

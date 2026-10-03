@@ -217,6 +217,9 @@ pub struct GenerationManifest {
     pub generation: Generation,
     pub base_checkpoint_ref: Option<CheckpointRef>,
     pub latest_checkpoint_ref: Option<CheckpointRef>,
+    /// Zero denotes legacy advisory publication; new generations use an immutable closure log.
+    #[serde(default)]
+    pub publication_log_version: u32,
     pub updated_at_micros: u64,
 }
 
@@ -239,6 +242,7 @@ impl GenerationManifest {
             generation,
             base_checkpoint_ref,
             latest_checkpoint_ref: None,
+            publication_log_version: 0,
             updated_at_micros,
         }
     }

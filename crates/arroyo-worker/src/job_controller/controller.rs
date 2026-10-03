@@ -22,7 +22,7 @@ use arroyo_state::tables::expiring_time_key_map::ExpiringTimeKeyTable;
 use arroyo_state::tables::global_keyed_map::GlobalKeyedTable;
 use arroyo_state::{StorageProviderFor, get_storage_provider};
 use arroyo_state_protocol::ProtocolPaths;
-use arroyo_state_protocol::gc::cleanup_leader_checkpoints;
+use arroyo_state_protocol::gc::{cleanup_leader_checkpoints, reconcile_abandoned_disk_uploads};
 use arroyo_state_protocol::types::{CheckpointRef, Epoch, Generation};
 use arroyo_state_protocol::workflow::{
     CommitPermit, CommittedMarkerOutcome, GenerationInitialization, GenerationRecovery,
@@ -839,6 +839,7 @@ impl WorkerJobController {
         let start = Instant::now();
         Some(tokio::spawn(async move {
             let storage = get_storage_provider(&StorageProviderFor::Worker).await?;
+            reconcile_abandoned_disk_uploads(storage.as_ref(), &paths).await?;
             cleanup_leader_checkpoints(storage.as_ref(), &paths, last_checkpoint, new_min).await?;
 
             info!(
@@ -870,6 +871,7 @@ fn manifest_into_commit_req(manifest: CheckpointManifest) -> anyhow::Result<Comm
 
             let commit_data = match config.table_type() {
                 TableEnum::MissingTableType => bail!("missing table type"),
+                TableEnum::DiskKeyedMap => None,
                 TableEnum::GlobalKeyValue => {
                     GlobalKeyedTable::committing_data(config, &table_metadata)
                 }

@@ -218,6 +218,104 @@ impl Program {
         file_path_layout: CheckpointFilePathLayout,
         control_tx: Sender<ControlResp>,
     ) -> Result<Program, StateError> {
+        let mut map_owners = HashMap::new();
+        for node in logical.node_weights() {
+            for (operator, _) in node.operator_chain.iter() {
+                if operator.operator_name == OperatorName::StatefulProcessor {
+                    use prost::Message;
+                    let state =
+                        api::StatefulProcessorOperator::decode(operator.operator_config.as_slice())
+                            .map_err(|error| StateError::Other {
+                                table: operator.operator_id.clone(),
+                                error: error.to_string(),
+                            })?;
+                    for map in state.map_names {
+                        if let Some(owner) =
+                            map_owners.insert(map.clone(), operator.operator_id.clone())
+                        {
+                            if owner != operator.operator_id {
+                                return Err(StateError::Other { table: map, error: "named SQL maps require one ordered execution owner; branching stateful stages are unsupported".into() });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let worker_config = config().worker.clone();
+        worker_config
+            .validate_sql_state()
+            .map_err(|error| StateError::Other {
+                table: "SQL state backend".into(),
+                error: error.to_string(),
+            })?;
+        if worker_config.sql_state_backend == arroyo_rpc::config::SqlStateBackend::Rocksdb {
+            let owners_per_node: HashMap<_, _> = logical
+                .node_weights()
+                .map(|node| {
+                    (
+                        node.node_id,
+                        node.operator_chain
+                            .iter()
+                            .filter(|(operator, _)| {
+                                operator.operator_name == OperatorName::StatefulProcessor
+                            })
+                            .count(),
+                    )
+                })
+                .collect();
+            let mut owners_per_worker = HashMap::<u64, usize>::new();
+            for assignment in assignments {
+                *owners_per_worker.entry(assignment.worker_id).or_default() += owners_per_node
+                    .get(&assignment.task_id)
+                    .copied()
+                    .unwrap_or(0);
+            }
+            let database_limit = worker_config
+                .live_state_resources
+                .as_ref()
+                .expect("validated disk SQL resource configuration")
+                .max_open_databases;
+            if owners_per_worker
+                .values()
+                .any(|owners| *owners > database_limit)
+            {
+                return Err(StateError::Other {
+                    table: "SQL state backend".into(),
+                    error: format!(
+                        "RocksDB SQL execution owners exceed max-open-databases ({database_limit}) on a worker"
+                    ),
+                });
+            }
+            for node in logical.node_weights() {
+                if node.parallelism != 1 {
+                    return Err(StateError::Other {
+                        table: "SQL state backend".into(),
+                        error: "RocksDB SQL requires singleton execution and unchanged parallelism"
+                            .into(),
+                    });
+                }
+                for (operator, _) in node.operator_chain.iter() {
+                    if !matches!(
+                        operator.operator_name,
+                        OperatorName::ExpressionWatermark
+                            | OperatorName::ArrowValue
+                            | OperatorName::ArrowKey
+                            | OperatorName::Projection
+                            | OperatorName::StatefulProcessor
+                            | OperatorName::ConnectorSource
+                            | OperatorName::ConnectorSink
+                    ) {
+                        return Err(StateError::Other {
+                            table: operator.operator_id.clone(),
+                            error: format!(
+                                "RocksDB SQL does not bound retained state for {}",
+                                operator.operator_name
+                            ),
+                        });
+                    }
+                }
+            }
+        }
         let mut physical = DiGraph::new();
 
         let checkpoint_metadata = if let Some(manifest) = checkpoint_manifest_ref {
@@ -372,6 +470,7 @@ pub struct Engine {
     program: Program,
     worker_context: WorkerContext,
     network_manager: NetworkManager,
+    task_aborts: std::sync::Mutex<Vec<tokio::task::AbortHandle>>,
     assignments: HashMap<(u32, usize), TaskAssignment>,
 }
 
@@ -383,9 +482,18 @@ pub struct RunningEngine {
     program: Program,
     assignments: HashMap<(u32, usize), TaskAssignment>,
     worker_id: WorkerId,
+    task_aborts: Vec<tokio::task::AbortHandle>,
 }
 
 impl RunningEngine {
+    /// Abruptly cancel local operator tasks, without a final checkpoint or drain.
+    /// Recovery must reconstruct a fresh engine from a committed checkpoint.
+    pub fn abort_workers(&self) {
+        for task in &self.task_aborts {
+            task.abort();
+        }
+    }
+
     pub fn source_controls(&self) -> Vec<Sender<ControlMessage>> {
         let graph = self.program.graph.read().unwrap();
         graph
@@ -473,6 +581,7 @@ impl Engine {
             program,
             worker_context,
             network_manager,
+            task_aborts: std::sync::Mutex::new(Vec::new()),
             assignments,
         }
     }
@@ -519,6 +628,7 @@ impl Engine {
                 generation: 0,
             },
             network_manager: NetworkManager::new(0).await?,
+            task_aborts: std::sync::Mutex::new(Vec::new()),
             assignments,
         })
     }
@@ -564,6 +674,7 @@ impl Engine {
             program: self.program,
             assignments: self.assignments,
             worker_id,
+            task_aborts: self.task_aborts.into_inner().unwrap(),
         }
     }
 
@@ -781,6 +892,10 @@ impl Engine {
             })
         };
 
+        self.task_aborts
+            .lock()
+            .unwrap()
+            .push(join_task.abort_handle());
         let send_copy = control_tx.clone();
         tokio::spawn(async move {
             if let Err(error) = join_task.await {
