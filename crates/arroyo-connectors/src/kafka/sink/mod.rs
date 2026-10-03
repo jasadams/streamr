@@ -466,6 +466,7 @@ impl ArrowOperator for KafkaSinkFunc {
                 records: std::mem::take(&mut self.journal),
             };
             self.journal_bytes = 0;
+            let pending_bytes = recovery::encode_pending(&pending)?;
             let topic = self.recovery_topic.as_ref().unwrap();
             recovery::send_marker(
                 self.producer.as_ref().unwrap(),
@@ -476,10 +477,7 @@ impl ArrowOperator for KafkaSinkFunc {
             )
             .await?;
             ctx.table_manager
-                .insert_committing_data(
-                    "i",
-                    serde_json::to_vec(&pending).map_err(anyhow::Error::from)?,
-                )
+                .insert_committing_data("i", pending_bytes)
                 .await;
             ctx.table_manager
                 .get_global_keyed_state::<u32, Vec<u8>>("i")

@@ -17,6 +17,9 @@ pub fn require(condition: bool, message: &str) -> Result<()> {
 
 pub const PROTOCOL_VERSION: u32 = 2;
 pub const DEFAULT_MAX_BYTES: usize = 8 * 1024 * 1024;
+// CommitRequest uses tonic's bounded message transport. Keep a single-subtask
+// journal comfortably below its 4 MiB frame; aggregate sizing is a separate gate.
+pub const MAX_COMMIT_METADATA_BYTES: usize = 1024 * 1024;
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct ReplayRecord {
     pub timestamp: Option<i64>,
@@ -104,7 +107,8 @@ pub fn check_record_budget(
 pub fn decode_pending(bytes: &[u8], epoch: u32, max: usize) -> Result<PendingCommit> {
     // JSON byte arrays can expand by up to four times; bound before deserialization.
     ensure!(
-        bytes.len() <= max.saturating_mul(5).saturating_add(4096),
+        bytes.len() <= MAX_COMMIT_METADATA_BYTES
+            && bytes.len() <= max.saturating_mul(5).saturating_add(4096),
         "Kafka replay metadata exceeds configured budget"
     );
     let pending: PendingCommit = serde_json::from_slice(bytes)
@@ -121,6 +125,14 @@ pub fn decode_pending(bytes: &[u8], epoch: u32, max: usize) -> Result<PendingCom
         used = check_budget(used, r, max)?;
     }
     Ok(pending)
+}
+pub fn encode_pending(pending: &PendingCommit) -> Result<Vec<u8>> {
+    let bytes = serde_json::to_vec(pending)?;
+    ensure!(
+        bytes.len() <= MAX_COMMIT_METADATA_BYTES,
+        "Kafka encoded checkpoint replay journal exceeds 1 MiB commit metadata limit; reduce checkpoint interval/output volume"
+    );
+    Ok(bytes)
 }
 pub fn retry_transaction(
     mut op: impl FnMut() -> std::result::Result<(), KafkaError>,
@@ -386,5 +398,27 @@ mod tests {
     #[test]
     fn legacy_checkpoint_fails_closed() {
         assert!(decode_pending(&[1, 2, 3], 1, 100).is_err());
+    }
+    #[test]
+    fn oversized_commit_metadata_is_rejected_before_checkpoint_publication() {
+        let pending = PendingCommit {
+            version: PROTOCOL_VERSION,
+            generation: "g".into(),
+            epoch: 1,
+            transaction_index: 1,
+            records: vec![ReplayRecord {
+                payload: vec![255; MAX_COMMIT_METADATA_BYTES / 4],
+                ..record()
+            }],
+        };
+        assert!(encode_pending(&pending).is_err());
+        assert!(
+            decode_pending(
+                &vec![0; MAX_COMMIT_METADATA_BYTES + 1],
+                1,
+                DEFAULT_MAX_BYTES
+            )
+            .is_err()
+        );
     }
 }
