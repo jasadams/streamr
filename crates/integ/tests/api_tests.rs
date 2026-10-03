@@ -56,28 +56,44 @@ async fn wait_for_state(
 fn get_client() -> Arc<Client> {
     static CLIENT: OnceLock<Arc<Client>> = OnceLock::new();
     CLIENT
-        .get_or_init(|| {
-            let client = reqwest::ClientBuilder::new()
-                .timeout(Duration::from_secs(60))
-                .build()
-                .unwrap();
-            Arc::new(Client::new_with_client(
-                &format!(
-                    "{}/api",
-                    env::var("API_ENDPOINT")
-                        .unwrap_or_else(|_| "http://localhost:5115".to_string())
-                ),
-                client,
-            ))
-        })
+        .get_or_init(|| client_with_timeout(Duration::from_secs(60)))
         .clone()
+}
+
+fn get_udf_compile_client() -> Arc<Client> {
+    static CLIENT: OnceLock<Arc<Client>> = OnceLock::new();
+    // Cold UDF validation and compilation build a separate Cargo project.
+    // Keep a bounded ten-minute allowance for these requests on CI runners;
+    // ordinary API requests retain their one-minute deadline.
+    CLIENT
+        .get_or_init(|| client_with_timeout(Duration::from_secs(600)))
+        .clone()
+}
+
+fn client_with_timeout(timeout: Duration) -> Arc<Client> {
+    let client = reqwest::ClientBuilder::new()
+        .timeout(timeout)
+        .build()
+        .unwrap();
+    Arc::new(Client::new_with_client(
+        &format!(
+            "{}/api",
+            env::var("API_ENDPOINT").unwrap_or_else(|_| "http://localhost:5115".to_string())
+        ),
+        client,
+    ))
 }
 
 async fn start_pipeline(test_id: u32, query: &str, udfs: &[&str]) -> anyhow::Result<String> {
     let pipeline_name = format!("pipeline_{test_id}");
     info!("Creating pipeline {}", pipeline_name);
 
-    let pipeline_id = get_client()
+    let client = if udfs.is_empty() {
+        get_client()
+    } else {
+        get_udf_compile_client()
+    };
+    let pipeline_id = client
         .create_pipeline()
         .body(
             PipelinePost::builder()
@@ -384,7 +400,7 @@ fn my_double(x: i64) -> i64 {
 }"#;
 
     // validate UDF
-    let valid = get_client()
+    let valid = get_udf_compile_client()
         .validate_udf()
         .body(ValidateUdfPost::builder().definition(udf))
         .send()
