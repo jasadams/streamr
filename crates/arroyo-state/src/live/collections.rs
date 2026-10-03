@@ -132,6 +132,7 @@ impl RankedCounts {
         // Validate worst-case admission arithmetic before any caller allocation.
         page_reservation(limits, super::encoding::encoded_namespace_size(&namespace)?)?;
         prepare_reservation(limits)?;
+        clear_reservation(limits, super::encoding::encoded_namespace_size(&namespace)?)?;
         top_reservation(limits, limits.max_top_k)?;
         Ok(Self {
             backend,
@@ -152,7 +153,13 @@ impl RankedCounts {
         let read = native_read_reservation(self.limits, namespace_bytes)?;
         let simultaneous = page
             .checked_add(top)
-            .and_then(|n| n.checked_add(prepare_reservation(self.limits).ok()?))
+            .and_then(|n| {
+                n.checked_add(
+                    prepare_reservation(self.limits)
+                        .ok()?
+                        .max(clear_reservation(self.limits, namespace_bytes).ok()?),
+                )
+            })
             .and_then(|n| n.checked_add(read))
             .ok_or(LiveStateError::InvalidLimit)?;
         if simultaneous > resources.config().decoded_value_bytes {
@@ -307,9 +314,10 @@ impl RankedCounts {
         })
     }
 
-    /// Delete one bounded page of a retired entity/incarnation. Fresh snapshot
-    /// each call; repeat until zero. Both count and ranking keys disappear in
-    /// one atomic batch. Never apply this to an incarnation still accepting input.
+    /// Delete a bounded prefix of one scan page of a retired entity/incarnation.
+    /// A smaller write budget still makes progress. Fresh snapshot each call;
+    /// repeat until zero. Both indexes disappear in one atomic batch. Never apply
+    /// this to an incarnation still accepting input.
     pub async fn clear_page(&self, entity: &[u8]) -> Result<usize> {
         let _guard = self.mutation.lock().await;
         let snapshot = CollectionSnapshot {
@@ -319,8 +327,36 @@ impl RankedCounts {
             resources: self.resources.clone(),
         };
         let page = snapshot.members(entity, None).await?;
-        let mut operations = Vec::with_capacity(page.entries.len() * 2);
+        let namespace_bytes = super::encoding::encoded_namespace_size(&self.namespace)?;
+        let _assembly = if let Some(resources) = &self.resources {
+            Some(
+                resources
+                    .decoded_value(clear_reservation(self.limits, namespace_bytes)?)
+                    .await?,
+            )
+        } else {
+            None
+        };
+        // Bound container capacity by admitted encoded delete cost rather than
+        // the potentially much larger scan page. No Vec growth is needed.
+        let pair_capacity = clear_pair_capacity(self.limits, namespace_bytes)?;
+        let mut operations = Vec::with_capacity(page.entries.len().min(pair_capacity) * 2);
+        let mut bytes = 0usize;
+        let mut removed = 0usize;
         for entry in &page.entries {
+            let required = delete_pair_size(namespace_bytes, entity, &entry.member, entry.count)?;
+            let next = bytes
+                .checked_add(required)
+                .ok_or(LiveStateError::InvalidLimit)?;
+            if next > self.limits.batch_bytes {
+                if removed == 0 {
+                    return Err(LiveStateError::BatchLimitExceeded {
+                        required,
+                        limit: self.limits.batch_bytes,
+                    });
+                }
+                break;
+            }
             operations.push(WriteOperation::Delete {
                 key: state_key(&self.namespace, member_key(entity, &entry.member)),
             });
@@ -330,6 +366,8 @@ impl RankedCounts {
                     rank_key(entity, &entry.member, entry.count),
                 ),
             });
+            bytes = next;
+            removed += 1;
         }
         operation_size(&operations, self.limits.batch_bytes)?;
         self.backend
@@ -338,7 +376,7 @@ impl RankedCounts {
                 max_bytes: self.limits.batch_bytes,
             })
             .await?;
-        Ok(page.entries.len())
+        Ok(removed)
     }
 }
 
@@ -591,6 +629,65 @@ fn prepare_reservation(limits: CollectionLimits) -> Result<usize> {
         .batch_bytes
         .checked_mul(2)
         .and_then(|n| n.checked_add(1024))
+        .ok_or(LiveStateError::InvalidLimit)
+}
+fn clear_pair_capacity(limits: CollectionLimits, namespace_bytes: usize) -> Result<usize> {
+    // Two namespace headers, two nine-byte logical prefixes, an eight-byte rank
+    // and two key terminators are a lower bound even before entity/member bytes.
+    let minimum = namespace_bytes
+        .checked_mul(2)
+        .and_then(|n| n.checked_add(30))
+        .ok_or(LiveStateError::InvalidLimit)?;
+    Ok(limits.page_entries.min(limits.batch_bytes / minimum))
+}
+fn clear_reservation(limits: CollectionLimits, namespace_bytes: usize) -> Result<usize> {
+    let containers = clear_pair_capacity(limits, namespace_bytes)?
+        .checked_mul(2)
+        .and_then(|n| n.checked_mul(std::mem::size_of::<WriteOperation>()))
+        .ok_or(LiveStateError::InvalidLimit)?;
+    prepare_reservation(limits)?
+        .checked_add(containers)
+        .ok_or(LiveStateError::InvalidLimit)
+}
+fn delete_pair_size(
+    namespace_bytes: usize,
+    entity: &[u8],
+    member: &[u8],
+    count: u64,
+) -> Result<usize> {
+    let length_zeros = (entity.len() as u32)
+        .to_be_bytes()
+        .iter()
+        .filter(|b| **b == 0)
+        .count();
+    let zeros = length_zeros
+        .checked_add(entity.iter().filter(|b| **b == 0).count())
+        .and_then(|n| n.checked_add(member.iter().filter(|b| **b == 0).count()))
+        .ok_or(LiveStateError::InvalidLimit)?;
+    let common = namespace_bytes
+        .checked_add(9)
+        .and_then(|n| n.checked_add(entity.len()))
+        .and_then(|n| n.checked_add(member.len()))
+        .and_then(|n| n.checked_add(zeros))
+        .and_then(|n| n.checked_add(2))
+        .ok_or(LiveStateError::InvalidLimit)?;
+    // Primary kind zero escapes once; rank kind one does not. Rank timestamp
+    // bytes can independently escape. Values are absent in delete operations.
+    let primary = common.checked_add(1).ok_or(LiveStateError::InvalidLimit)?;
+    let rank = common
+        .checked_add(8)
+        .and_then(|n| {
+            n.checked_add(
+                (u64::MAX - count)
+                    .to_be_bytes()
+                    .iter()
+                    .filter(|b| **b == 0)
+                    .count(),
+            )
+        })
+        .ok_or(LiveStateError::InvalidLimit)?;
+    primary
+        .checked_add(rank)
         .ok_or(LiveStateError::InvalidLimit)
 }
 fn page_reservation(limits: CollectionLimits, namespace_bytes: usize) -> Result<usize> {
@@ -987,7 +1084,9 @@ mod tests {
         let mut resources_config = resources().config().clone();
         resources_config.decoded_value_bytes = page_reservation(limits(), namespace_bytes).unwrap()
             + top_reservation(limits(), limits().max_top_k).unwrap()
-            + prepare_reservation(limits()).unwrap()
+            + prepare_reservation(limits())
+                .unwrap()
+                .max(clear_reservation(limits(), namespace_bytes).unwrap())
             + native_read_reservation(limits(), namespace_bytes).unwrap()
             - 1;
         assert!(
@@ -1039,6 +1138,122 @@ mod tests {
             .unwrap()
             .unwrap();
         drop(occupied);
+    }
+
+    #[tokio::test]
+    async fn clear_progresses_when_full_scan_exceeds_write_budget_and_preserves_snapshot() {
+        let backend: Arc<dyn LiveStateBackend> = Arc::new(MemoryLiveState::new());
+        let mut configured = limits();
+        configured.page_entries = 100;
+        configured.page_bytes = 8192;
+        configured.batch_bytes = 512;
+        let counts = RankedCounts::new(backend.clone(), namespace(), configured)
+            .unwrap()
+            .with_resources(resources())
+            .unwrap();
+        for i in 0u32..50 {
+            counts
+                .set(b"h", &i.to_be_bytes(), u64::from(i) + 1)
+                .await
+                .unwrap();
+        }
+        counts.set(b"h\0next", b"keep", 1).await.unwrap();
+        let stable = counts.snapshot().await.unwrap();
+        let page = stable.members(b"h", None).await.unwrap();
+        assert_eq!(page.entries().len(), 50);
+        let namespace_bytes = super::super::encoding::encoded_namespace_size(&namespace()).unwrap();
+        let full_cost: usize = page
+            .entries()
+            .iter()
+            .map(|entry| {
+                delete_pair_size(namespace_bytes, b"h", &entry.member, entry.count).unwrap()
+            })
+            .sum();
+        assert!(full_cost > configured.batch_bytes);
+        drop(page);
+        let mut removed = 0;
+        loop {
+            let n = counts.clear_page(b"h").await.unwrap();
+            if n == 0 {
+                break;
+            }
+            assert!(n < 50);
+            removed += n;
+        }
+        assert_eq!(removed, 50);
+        assert!(
+            counts
+                .snapshot()
+                .await
+                .unwrap()
+                .members(b"h", None)
+                .await
+                .unwrap()
+                .entries()
+                .is_empty()
+        );
+        assert!(
+            counts
+                .snapshot()
+                .await
+                .unwrap()
+                .ranked(b"h", None)
+                .await
+                .unwrap()
+                .entries()
+                .is_empty()
+        );
+        assert_eq!(counts.count(b"h\0next", b"keep").await.unwrap(), 1);
+        assert_eq!(stable.count(b"h", &0u32.to_be_bytes()).await.unwrap(), 1);
+        assert_eq!(stable.top_k(b"h", 1).await.unwrap().entries()[0].count, 50);
+        // Check exact preflight matches the authoritative encoding for NULs and
+        // both extreme rank scores, rather than depending on optimistic sizing.
+        for count in [1, 256, u64::MAX] {
+            let entity = b"e\0";
+            let member = b"m\0";
+            let pair = [
+                WriteOperation::Delete {
+                    key: state_key(&namespace(), member_key(entity, member)),
+                },
+                WriteOperation::Delete {
+                    key: state_key(&namespace(), rank_key(entity, member, count)),
+                },
+            ];
+            assert_eq!(
+                delete_pair_size(namespace_bytes, entity, member, count).unwrap(),
+                operation_size(&pair, usize::MAX).unwrap()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn clear_assembly_is_admitted_before_mutation_and_cancellation_releases_page() {
+        let resources = resources();
+        let counts = view(Arc::new(MemoryLiveState::new()))
+            .with_resources(resources.clone())
+            .unwrap();
+        counts.set(b"retired", b"member", 1).await.unwrap();
+        let namespace_bytes = super::super::encoding::encoded_namespace_size(&namespace()).unwrap();
+        let page = page_reservation(limits(), namespace_bytes).unwrap();
+        assert!(clear_reservation(limits(), namespace_bytes).unwrap() > 1024);
+        let occupied = resources
+            .decoded_value(resources.config().decoded_value_bytes - page - 1024)
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), counts.clear_page(b"retired"))
+                .await
+                .is_err()
+        );
+        assert_eq!(counts.count(b"retired", b"member").await.unwrap(), 1);
+        // The cancelled clear releases its held page reservation too.
+        tokio::time::timeout(Duration::from_secs(1), resources.decoded_value(page + 1024))
+            .await
+            .unwrap()
+            .unwrap();
+        drop(occupied);
+        assert_eq!(counts.clear_page(b"retired").await.unwrap(), 1);
+        assert_eq!(counts.clear_page(b"retired").await.unwrap(), 0);
     }
 
     #[tokio::test]
