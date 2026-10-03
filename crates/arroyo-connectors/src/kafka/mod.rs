@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::num::NonZeroU32;
+use std::num::{NonZeroU32, NonZeroU64};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
@@ -154,7 +154,7 @@ impl KafkaConnector {
                         Some(other) => bail!("invalid value for commit_mode '{}'", other),
                     },
                     recovery_topic,
-                    recovery_max_bytes,
+                    recovery_max_bytes: recovery_max_bytes.and_then(NonZeroU64::new),
                     timestamp_field: options.pull_opt_str("sink.timestamp_field")?,
                     key_field: options.pull_opt_str("sink.key_field")?,
                 }
@@ -456,7 +456,7 @@ impl Connector for KafkaConnector {
                     producer: None,
                     recovery_topic: recovery_topic.clone(),
                     recovery_max_bytes: recovery_max_bytes
-                        .map(|v| v as usize)
+                        .map(|v| v.get() as usize)
                         .unwrap_or(sink::recovery::DEFAULT_MAX_BYTES),
                     recovery_state: None,
                     journal: vec![],
