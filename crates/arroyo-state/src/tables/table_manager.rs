@@ -1,3 +1,6 @@
+// Owned live handles are separate from the legacy Parquet checkpoint manager.
+pub use crate::live::table::{LiveTable, LiveTableManager};
+
 use std::any::Any;
 
 use std::{collections::HashMap, sync::Arc, time::SystemTime};
