@@ -30,6 +30,7 @@ arroyo-state-protocol = { path = "../arroyo-state-protocol" }
 arrow = {workspace = true }
 tracing = { workspace = true }
 prometheus = { workspace = true }
+prost = { workspace = true }
 datafusion = { workspace = true }
 
 [dev-dependencies]

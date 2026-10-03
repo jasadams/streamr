@@ -26,6 +26,20 @@ Arcstream is an external consumer, not part of this engine.
   invariants, or required application checkouts. Application-specific preparation
   and oracle comparison belong in the application repository.
 
+## Native SQL and backend design
+
+- Start with existing native relational operators, updating aggregates and
+  TUMBLE/HOP/SESSION windows. Do not manually recreate supported SQL behavior in
+  opaque state blobs or application UDFs. Demonstrate a specific missing
+  capability with planned SQL and value assertions before proposing a primitive.
+- SQL/operator semantics depend on generic state interfaces. Select the live
+  backend through configuration and construction/lifecycle adapters; do not
+  duplicate SQL execution for memory versus RocksDB. Future adapters must satisfy
+  the same ownership, visibility, limits and checkpoint contract.
+- Distinguish a runnable native query from a proposal and distinguish operator
+  recovery from a standalone SQL/state simulation. Preserve application output
+  and time semantics or discuss explicit differences before changing them.
+
 ## Work and verification
 
 Preserve unrelated user changes. Follow [.claude/build-test.md](.claude/build-test.md)

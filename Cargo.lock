@@ -945,6 +945,7 @@ dependencies = [
  "datafusion",
  "petgraph 0.8.2",
  "prometheus",
+ "prost",
  "rstest",
  "serde",
  "serde_json",
