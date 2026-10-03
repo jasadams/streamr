@@ -1087,21 +1087,107 @@ async fn local_program(
     .unwrap()
 }
 
-/// External Arcstream fixtures supply absolute connector paths and compare the
-/// captured JSONL against their independent oracle, preserving row multiplicity.
-/// Run alone because worker configuration and checkpoint storage are process-wide.
-#[test_log(tokio::test)]
-#[ignore = "opt-in Arcstream identity output and checkpoint/recovery capture"]
-async fn arcstream_identity_capture() {
-    tokio::time::timeout(
-        test_runtime_timeout() * 4,
-        arcstream_identity_capture_inner(),
-    )
-    .await
-    .expect("identity capture planning, startup, or recovery timed out");
+#[derive(Debug, PartialEq, Eq)]
+struct CaptureCounts {
+    input_rows_before_checkpoint: i32,
+    expected_rows: usize,
+    expected_checkpoint_rows: usize,
+    checkpoint_epoch: u32,
 }
 
-async fn arcstream_identity_capture_inner() {
+impl CaptureCounts {
+    fn from_env() -> std::result::Result<Self, String> {
+        Self::parse(|name| env::var(name).map_err(|error| format!("{name}: {error}")))
+    }
+
+    fn parse(
+        mut read: impl FnMut(&str) -> std::result::Result<String, String>,
+    ) -> std::result::Result<Self, String> {
+        fn number<T: std::str::FromStr>(name: &str, raw: String) -> std::result::Result<T, String> {
+            if raw.is_empty() || !raw.bytes().all(|byte| byte.is_ascii_digit()) {
+                return Err(format!("{name} must be an unsigned decimal integer"));
+            }
+            raw.parse()
+                .map_err(|_| format!("{name} is outside the supported integer range"))
+        }
+        let input_name = "STREAMR_CAPTURE_INPUT_ROWS_BEFORE_CHECKPOINT";
+        let epoch_name = "STREAMR_CAPTURE_CHECKPOINT_EPOCH";
+        let input_rows_before_checkpoint = number(input_name, read(input_name)?)?;
+        let checkpoint_epoch = number(epoch_name, read(epoch_name)?)?;
+        if input_rows_before_checkpoint == 0 {
+            return Err(format!(
+                "{input_name} must be positive: the source reads its first row immediately"
+            ));
+        }
+        if checkpoint_epoch == 0 {
+            return Err(format!("{epoch_name} must be positive"));
+        }
+        let rows_name = "STREAMR_CAPTURE_EXPECTED_ROWS";
+        let checkpoint_rows_name = "STREAMR_CAPTURE_EXPECTED_CHECKPOINT_ROWS";
+        Ok(Self {
+            input_rows_before_checkpoint,
+            expected_rows: number(rows_name, read(rows_name)?)?,
+            expected_checkpoint_rows: number(checkpoint_rows_name, read(checkpoint_rows_name)?)?,
+            checkpoint_epoch,
+        })
+    }
+}
+
+#[test]
+fn capture_counts_require_explicit_bounded_parameters() {
+    let parse = |input: &str, rows: &str, checkpoint_rows: &str, epoch: &str| {
+        CaptureCounts::parse(|name| {
+            Ok(match name {
+                "STREAMR_CAPTURE_INPUT_ROWS_BEFORE_CHECKPOINT" => input,
+                "STREAMR_CAPTURE_EXPECTED_ROWS" => rows,
+                "STREAMR_CAPTURE_EXPECTED_CHECKPOINT_ROWS" => checkpoint_rows,
+                "STREAMR_CAPTURE_CHECKPOINT_EPOCH" => epoch,
+                _ => unreachable!(),
+            }
+            .to_owned())
+        })
+    };
+    assert_eq!(
+        parse("7", "3", "2", "9").unwrap(),
+        CaptureCounts {
+            input_rows_before_checkpoint: 7,
+            expected_rows: 3,
+            expected_checkpoint_rows: 2,
+            checkpoint_epoch: 9
+        }
+    );
+    assert!(parse("1", "0", "0", "1").is_ok());
+    for invalid in ["", "-1", "+1", " 1", "1.5", "18446744073709551616"] {
+        assert!(parse(invalid, "3", "2", "9").is_err());
+        assert!(parse("7", invalid, "2", "9").is_err());
+        assert!(parse("7", "3", invalid, "9").is_err());
+        assert!(parse("7", "3", "2", invalid).is_err());
+    }
+    assert!(parse("0", "3", "2", "9").is_err());
+    assert!(parse("2147483648", "3", "2", "9").is_err());
+    assert!(parse("7", "3", "2", "0").is_err());
+    assert!(parse("7", "3", "2", "4294967296").is_err());
+    assert!(CaptureCounts::parse(|name| Err(format!("missing {name}"))).is_err());
+}
+
+/// Capture externally supplied SQL as JSONL before and after checkpoint recovery.
+/// Requires a singleton graph and one control-waiting single-file source.
+/// Input advancement and expected output counts are configured independently;
+/// fixture preparation and business-output comparison belong to the caller.
+/// Run alone because worker configuration and checkpoint storage are process-wide.
+#[test_log(tokio::test)]
+#[ignore = "opt-in external SQL output and checkpoint/recovery capture"]
+async fn external_sql_checkpoint_capture() {
+    tokio::time::timeout(
+        test_runtime_timeout() * 4,
+        external_sql_checkpoint_capture_inner(),
+    )
+    .await
+    .expect("external SQL capture planning, startup, or recovery timed out");
+}
+
+async fn external_sql_checkpoint_capture_inner() {
+    let capture = CaptureCounts::from_env().expect("invalid external SQL capture configuration");
     configure_test_worker();
     let selected_backend = env::var("STREAMR_TEST_BACKEND").unwrap_or_else(|_| "memory".into());
     let selected_checkpoint =
@@ -1119,14 +1205,14 @@ async fn arcstream_identity_capture_inner() {
         selected_backend == "rocksdb"
     );
     println!(
-        "IDENTITY_CONFIG backend={selected_backend} checkpoint_mode={selected_checkpoint} execution_resources={:?}",
+        "CAPTURE_CONFIG backend={selected_backend} checkpoint_mode={selected_checkpoint} execution_resources={:?}",
         config::config().worker.execution_resources
     );
     let query_path = PathBuf::from(
-        env::var("STREAMR_IDENTITY_QUERY").expect("STREAMR_IDENTITY_QUERY is required"),
+        env::var("STREAMR_CAPTURE_QUERY").expect("STREAMR_CAPTURE_QUERY is required"),
     );
     let output_path = PathBuf::from(
-        env::var("STREAMR_IDENTITY_OUTPUT").expect("STREAMR_IDENTITY_OUTPUT is required"),
+        env::var("STREAMR_CAPTURE_OUTPUT").expect("STREAMR_CAPTURE_OUTPUT is required"),
     );
     assert!(query_path.is_absolute(), "query path must be absolute");
     assert!(output_path.is_absolute(), "output path must be absolute");
@@ -1135,33 +1221,46 @@ async fn arcstream_identity_capture_inner() {
     let logical = Arc::new(
         tokio::time::timeout(test_runtime_timeout(), get_graph(query, &udfs))
             .await
-            .expect("identity planning timed out")
-            .expect("identity SQL failed to plan"),
+            .expect("external SQL planning timed out")
+            .expect("external SQL failed to plan"),
     );
     for node in logical.graph.node_weights() {
         assert_eq!(
             node.parallelism, 1,
-            "identity capture requires singleton graph"
+            "external SQL capture requires singleton graph"
         );
         for (operator, _) in node.operator_chain.iter() {
             println!(
-                "IDENTITY_OPERATOR node={} operator={} kind={:?} parallelism={}",
+                "CAPTURE_OPERATOR node={} operator={} kind={:?} parallelism={}",
                 node.node_id, operator.operator_id, operator.operator_name, node.parallelism
             );
         }
     }
+    let sources: Vec<_> = logical
+        .graph
+        .node_weights()
+        .flat_map(|node| node.operator_chain.iter())
+        .filter(|(operator, _)| operator.operator_name == OperatorName::ConnectorSource)
+        .collect();
+    assert_eq!(sources.len(), 1, "capture requires one connector source");
+    let source: arroyo_rpc::grpc::api::ConnectorOp =
+        prost::Message::decode(sources[0].0.operator_config.as_slice())
+            .expect("capture source config must decode");
     assert_eq!(
-        logical
-            .graph
-            .node_weights()
-            .flat_map(|node| node.operator_chain.iter())
-            .filter(|(operator, _)| operator.operator_name == OperatorName::StatefulProcessor)
-            .count(),
-        1,
-        "identity CTE maps must share one ordered execution owner"
+        source.connector, "single_file",
+        "capture requires a single-file source"
+    );
+    let source_config: arroyo_rpc::OperatorConfig =
+        serde_json::from_str(&source.config).expect("capture source connector config must decode");
+    assert!(
+        source_config
+            .table
+            .get("wait_for_control")
+            .is_none_or(|value| value.is_null() || value.as_bool() == Some(true)),
+        "capture source must wait for control after each input row"
     );
     let job_id = format!(
-        "arcstream-identity-{}-{}",
+        "external-sql-capture-{}-{}",
         std::process::id(),
         SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -1184,19 +1283,19 @@ async fn arcstream_identity_capture_inner() {
         .start()
         .await;
     run_until_finished(&running, &mut control_rx).await;
-    identity_capture_rows(&output_path, 13).await;
+    capture_rows(&output_path, capture.expected_rows).await;
     tokio::fs::rename(&output_path, &initial_path)
         .await
         .unwrap();
     println!(
-        "IDENTITY_CAPTURE phase=initial rows=13 path={}",
+        "CAPTURE_RESULT phase=initial rows={} path={}",
+        capture.expected_rows,
         initial_path.display()
     );
 
-    // Epoch 41 is deliberately the first checkpoint for this second run. The
-    // shared smoke helper initializes leader generations at epoch 1, so create
-    // the generation explicitly here rather than changing ordinary smoke tests.
-    if leader_mode() {
+    // The shared helper initializes leader generations for epoch 1. Other
+    // configured first epochs require explicit generation initialization.
+    if leader_mode() && capture.checkpoint_epoch != 1 {
         use arroyo_state_protocol::workflow::{
             GenerationInitialization, InitializeGenerationRequest, initialize_generation,
         };
@@ -1228,13 +1327,14 @@ async fn arcstream_identity_capture_inner() {
         .start()
         .await;
     // A control-waiting single-file source reads its first row immediately;
-    // nine NoOps advance to row ten. The barrier flushes that partial batch.
+    // configured NoOps advance the remaining input rows. The barrier flushes
+    // a partial source batch; output cardinality need not match input cardinality.
     assert_eq!(
         running.source_controls().len(),
         1,
         "capture requires one source"
     );
-    advance(&running, 9).await;
+    advance(&running, capture.input_rows_before_checkpoint - 1).await;
     let checkpoint_bytes = checkpoint(
         &mut SmokeTestContext {
             job_id: Arc::new(job_id.clone()),
@@ -1242,18 +1342,20 @@ async fn arcstream_identity_capture_inner() {
             control_rx: &mut control_rx,
             program: logical.clone(),
         },
-        41,
+        capture.checkpoint_epoch,
     )
     .await;
-    identity_capture_rows(&output_path, 10).await;
+    capture_rows(&output_path, capture.expected_checkpoint_rows).await;
     if leader_mode() {
         use arroyo_state_protocol::store::read_protobuf;
         let paths = arroyo_state_protocol::ProtocolPaths::new(
             arroyo_types::PipelineId::new("pipe-test"),
             arroyo_types::JobId::new(job_id.clone()),
         );
-        let checkpoint_ref =
-            paths.checkpoint_manifest(arroyo_state_protocol::types::Generation(0), Epoch(41));
+        let checkpoint_ref = paths.checkpoint_manifest(
+            arroyo_state_protocol::types::Generation(0),
+            Epoch(u64::from(capture.checkpoint_epoch)),
+        );
         let storage = arroyo_state::get_storage_provider(&StorageProviderFor::Worker)
             .await
             .unwrap();
@@ -1262,20 +1364,24 @@ async fn arcstream_identity_capture_inner() {
                 .await
                 .unwrap()
                 .unwrap();
-        assert_eq!(metadata.epoch, 41);
+        assert_eq!(metadata.epoch, u64::from(capture.checkpoint_epoch));
         assert_eq!(metadata.job_id, job_id);
         assert!(!metadata.operators.is_empty());
-        println!("IDENTITY_CHECKPOINT path={checkpoint_ref} metadata={metadata:?}");
+        println!("CAPTURE_CHECKPOINT path={checkpoint_ref} metadata={metadata:?}");
     } else {
-        let metadata =
-            StateBackend::load_checkpoint_metadata(&StorageProviderFor::Worker, &job_id, 41)
-                .await
-                .unwrap();
-        assert_eq!(metadata.epoch, 41);
+        let metadata = StateBackend::load_checkpoint_metadata(
+            &StorageProviderFor::Worker,
+            &job_id,
+            capture.checkpoint_epoch,
+        )
+        .await
+        .unwrap();
+        assert_eq!(metadata.epoch, capture.checkpoint_epoch);
         assert_eq!(metadata.job_id, job_id);
         assert!(!metadata.operator_ids.is_empty());
         println!(
-            "IDENTITY_CHECKPOINT path={job_id}/checkpoints/checkpoint-0000041/metadata metadata={metadata:?}"
+            "CAPTURE_CHECKPOINT path={job_id}/checkpoints/checkpoint-{:07}/metadata metadata={metadata:?}",
+            capture.checkpoint_epoch
         );
     }
     let task_count: usize = running.operator_controls().values().map(Vec::len).sum();
@@ -1307,27 +1413,38 @@ async fn arcstream_identity_capture_inner() {
         );
     })
     .await
-    .expect("identity worker cancellation timed out");
+    .expect("external SQL worker cancellation timed out");
     drop(running);
     let (control_tx, mut control_rx) = channel(128);
-    let program = local_program(&job_id, &logical.graph, &udfs, Some(41), control_tx).await;
+    let program = local_program(
+        &job_id,
+        &logical.graph,
+        &udfs,
+        Some(u64::from(capture.checkpoint_epoch)),
+        control_tx,
+    )
+    .await;
     let restored = Engine::for_local(program, "pipe-test".into(), job_id.clone())
         .await
         .unwrap()
         .start()
         .await;
     run_until_finished(&restored, &mut control_rx).await;
-    identity_capture_rows(&output_path, 13).await;
+    capture_rows(&output_path, capture.expected_rows).await;
     println!(
-        "IDENTITY_CAPTURE phase=recovered checkpoint=41 committed_rows=10 rows=13 bytes={checkpoint_bytes} path={} job={job_id}",
+        "CAPTURE_RESULT phase=recovered checkpoint={} input_rows_before_checkpoint={} committed_rows={} rows={} bytes={checkpoint_bytes} path={} job={job_id}",
+        capture.checkpoint_epoch,
+        capture.input_rows_before_checkpoint,
+        capture.expected_checkpoint_rows,
+        capture.expected_rows,
         output_path.display()
     );
 }
 
-async fn identity_capture_rows(path: &Path, expected: usize) {
+async fn capture_rows(path: &Path, expected: usize) {
     let captured = read_to_string(path)
         .await
-        .expect("identity capture file missing");
+        .expect("external SQL capture file missing");
     let rows: Vec<_> = captured.lines().collect();
     assert_eq!(
         rows.len(),
@@ -1337,10 +1454,10 @@ async fn identity_capture_rows(path: &Path, expected: usize) {
     );
     for row in rows {
         let value: Value =
-            serde_json::from_str(row).expect("identity capture contains invalid JSON");
+            serde_json::from_str(row).expect("external SQL capture contains invalid JSON");
         assert!(
             value.is_object(),
-            "identity capture must contain JSON objects"
+            "external SQL capture must contain JSON objects"
         );
     }
 }

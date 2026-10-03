@@ -1,11 +1,12 @@
 # Milestone 3 implementation and verification
 
 This branch builds on milestone 2 PR #4 at `fbd5179a`. It carries the existing
-identity capture from PR #5 and adds the first STR-16/29 implementation slice:
+capture harness originating in PR #5 and adds the first STR-16/29 implementation slice:
 shared execution accounting, durable dual-clock timers and paginated ranked
-collections. It does not establish full Arcstream profile/session readiness.
-See [the exact support matrix](milestone-3-support-matrix.md) for the business
-contracts, retained paths and remaining implementation owners.
+collections. These are generic engine capabilities. Application schemas and
+business behavior remain in the consuming application. See
+[the support matrix](milestone-3-support-matrix.md) for retained paths and
+interface gaps requiring discussion before further implementation.
 
 ## Execution accounting
 
@@ -47,10 +48,9 @@ deadline/payload against a scanned entry. A stale page cannot cancel a replaceme
 
 `LiveTable::ranked_counts` constructs separately addressed counters and ranking
 entries within one registered namespace. Entity keys use length framing; callers
-include tenant and incarnation. Updating a counter and its previous/new rank is
-atomic. Ranking is descending count, then ascending member bytes. This is an
-explicit primitive policy; parity with Flink's unspecified equal-count ordering
-is not asserted. Counter overflow/underflow and oversized values fail. Top-K reads,
+choose and encode logical identity and incarnation where needed. Updating a counter and its previous/new rank is
+atomic. Ranking is descending count, then ascending member bytes. This is the generic primitive's
+explicit deterministic ordering contract. Counter overflow/underflow and oversized values fail. Top-K reads,
 membership scans and retired-incarnation cleanup are bounded by bytes and entries.
 
 Both views require one serial execution owner. Prepared mutations hold that
@@ -62,11 +62,12 @@ No hidden namespaces are used, so the milestone 2 full logical snapshot exporter
 captures each primary/index relationship together. Schema identities must version
 the operator's logical state. Restore always targets a fresh attempt.
 
-These APIs do not schedule callbacks by themselves. Typed profile/session
-operators still need to register all state, drain event timers before forwarding
-watermarks, fire overdue processing timers on ticks after recovery, construct
-native output fields within admitted limits, and coordinate output/source/sink
-checkpoints. Storage tests do not establish that operator behavior.
+These APIs do not schedule callbacks by themselves. An application-owned
+processor needs a generic interface to register all state,
+drain event timers before forwarding watermarks, fire overdue processing timers
+after recovery, emit caller-defined Arrow schemas within admitted limits, and
+coordinate output/source/sink checkpoints. The current interface gap must be
+discussed before implementation. Storage tests do not establish those callbacks.
 
 ## Reproduction
 
@@ -75,30 +76,52 @@ Use the prescribed Bookworm image and migrated build database from
 Cargo target. The first-slice verification command is:
 
 ```sh
-ARCSTREAM_REFERENCE_ROOT=/arc bash scripts/verify-milestone3.sh
+bash scripts/verify-milestone3.sh
 ```
 
-Mount the pinned ARC-16 reference checkout read-only at `/arc`. The inspected
-revision is `10f779469748d0c0dde6d5af3aa7375f8dbc36d3`, with identity input/oracle
-and preparation/comparison scripts in `test/streamr-reference/`. This command
-runs state/RPC/worker units, real identity SQL in memory/controller,
-RocksDB/controller and RocksDB/leader modes with 16 MiB execution accounting,
-then compares both initial and recovered outputs against the independent Flink
-oracle. It also runs all-targets checks, strict Clippy, formatting and diff checks.
-Generated captures stay in `target/milestone3-identity/`.
+The script needs no application checkout. It runs state/RPC/worker units,
+SQL-testing compilation, all-target checks, strict Clippy, formatting and diff
+checks in the prescribed development container.
 
-The identity fixture covers 13 events, two directed merges, all 17 forwarded event
-fields and checkpoint 41 after event 10. Recovery recreates the program and uses
-the selected published checkpoint plus source/sink metadata. It is a small file
-connector worker cancellation test, not a process-kill/Kafka/remote-storage or
-beyond-RAM qualification. The timer and collection tests separately exercise the
-production logical exporter and restoration into fresh RocksDB databases.
+External applications may use the opt-in `external_sql_checkpoint_capture` test
+with an externally prepared single-file SQL query. The harness accepts absolute
+query/output paths and explicit expectations; it has no business schema or oracle.
+Set `STREAMR_CAPTURE_QUERY`, `STREAMR_CAPTURE_OUTPUT`,
+`STREAMR_CAPTURE_INPUT_ROWS_BEFORE_CHECKPOINT`, `STREAMR_CAPTURE_EXPECTED_ROWS`,
+`STREAMR_CAPTURE_EXPECTED_CHECKPOINT_ROWS`, and `STREAMR_CAPTURE_CHECKPOINT_EPOCH`.
+Use `STREAMR_TEST_BACKEND=memory|rocksdb`,
+`STREAMR_TEST_CHECKPOINT_MODE=controller|leader`, and optional
+`STREAMR_TEST_EXECUTION_BYTES` for the engine configuration. Run it alone:
+
+```sh
+cargo test --locked -j4 -p arroyo-sql-testing external_sql_checkpoint_capture \
+  -- --ignored --test-threads=1 --nocapture
+```
+
+The source must be a single control-waiting file source; the graph must have
+parallelism one. Expected output counts are independent of input counts, so
+filters and multiple state owners are not assumed to preserve rows one-for-one.
+The initial capture uses `.initial.jsonl`; the recovered capture uses the supplied
+output path. The harness recreates the program from the selected published
+checkpoint and source/sink metadata. Worker cancellation is not a process-kill,
+Kafka, remote-storage or beyond-RAM proof. Fixture preparation, application output
+schemas, reference normalization and business comparisons belong externally.
+
+Earlier compatibility evaluation used a pinned external Arcstream fixture at
+`10f779469748d0c0dde6d5af3aa7375f8dbc36d3`. Its six initial/recovered identity
+comparisons passed at Streamr `a2d2aba7` with 16 MiB execution accounting. That is
+historical external evaluation evidence, not an engine dependency or profile/session
+readiness claim. The timer and collection tests separately exercise the generic
+production logical exporter and fresh RocksDB restoration.
 
 ## Validation status
 
-The initial coordinated Bookworm run passed 129 tests: 32 RPC, 44 state and 53
-worker. Further lifecycle, resource-headroom and collection changes require the
-final coordinated rerun. No pending check is treated as passing.
+Qualification of `a2d2aba7` passed 153 Bookworm units (33 RPC, 56 state, 64
+worker), 25 isolated native fixture runs, all-target checks and strict Clippy.
+CI passed 468 library tests and 12 integration tests. Validation for the current
+application-boundary correction is recorded against the exact PR head in
+[PR #6](https://github.com/jasadams/streamr/pull/6); no pending check counts as
+acceptance.
 
 STR-16, STR-29 and the STR-28 inventory remain in progress. STR-17, STR-20, STR-26
 and STR-32 retain their full acceptance gates. Milestone 3 requires reviewed
