@@ -112,8 +112,9 @@ podman run --rm localhost/streamr:str-1-candidate --help
 
 The packaging helper rejects intervening source changes and records the source,
 original/stripped binary hashes, Git revision, and immutable builder image ID.
-It packages the binary, built public console assets, and provenance into a
-temporary build context. Debug binaries read console files at their compile-time
+It packages the binary, built public console and Swagger assets, and provenance
+into a temporary build context. Swagger assets retain their generated build
+paths; their file hashes are recorded in the provenance. Debug binaries read console files at their compile-time
 `/app/webui/dist` path, so the image includes these assets without source files.
 This is a local development candidate retaining the Rust/clang/protoc toolchain
 for runtime UDF compilation; the helper does not push or deploy it.

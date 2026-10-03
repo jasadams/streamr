@@ -18,6 +18,7 @@ LABEL org.opencontainers.image.title="Streamr local candidate" \
 RUN mkdir -p /app/crates/arroyo-api
 COPY arroyo /app/arroyo
 COPY webui-dist /app/webui/dist
+COPY swagger-ui /app/
 COPY provenance.json /app/streamr-provenance.json
 ENV ARROYO__API__RUN_HTTP_PORT=5115
 EXPOSE 5115

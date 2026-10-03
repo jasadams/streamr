@@ -73,16 +73,65 @@ cp docker/Dockerfile.streamr-candidate "$task_context/Dockerfile"
 python3 - "$task_context/provenance.json" "$task_revision" "$task_source" \
     "$task_input_sha" "$task_binary_sha" "$task_base_id" <<'PY'
 import json
+import hashlib
 import pathlib
+import re
+import shutil
 import sys
 
 destination, revision, source, original, packaged, base = sys.argv[1:]
+context = pathlib.Path(destination).parent
+swagger_stage = context / 'swagger-ui'
+swagger_stage.mkdir()
+swagger_directories = []
+for embed in sorted(pathlib.Path('target/debug/build').glob('utoipa-swagger-ui-*/out/embed.rs')):
+    match = re.search(r'#\[folder\s*=\s*r"([^"]+)"\s*\]', embed.read_text())
+    if match is None:
+        raise SystemExit(f'Cannot read Swagger asset folder from {embed}')
+    folder = match.group(1)
+    if (not re.fullmatch(r'/app/target/debug/build/utoipa-swagger-ui-[0-9a-f]+/out/[^/]+/dist/?', folder)
+            or any(part in ('.', '..') for part in folder.split('/'))):
+        raise SystemExit(f'Unexpected Swagger asset folder in {embed}: {folder}')
+    relative = pathlib.PurePosixPath(folder).relative_to('/app')
+    source_dir = pathlib.Path(relative)
+    if (not source_dir.is_dir()
+            or any(parent.is_symlink() for parent in (source_dir, *source_dir.parents))):
+        raise SystemExit(f'Generated Swagger asset directory missing or symlinked: {source_dir}')
+    # Copy only public asset files, never embed.rs or the rest of target/.
+    destination_dir = swagger_stage / relative
+    destination_dir.mkdir(parents=True, exist_ok=True)
+    for asset in sorted(source_dir.rglob('*')):
+        if asset.is_symlink():
+            raise SystemExit(f'Symlink not allowed in Swagger public assets: {asset}')
+        if asset.is_file():
+            asset_relative = asset.relative_to(source_dir)
+            staged_asset = destination_dir / asset_relative
+            staged_asset.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(asset, staged_asset)
+    swagger_directories.append('/app/' + relative.as_posix())
+if not swagger_directories:
+    raise SystemExit('No generated Swagger UI public assets found under target/debug/build')
+
+swagger_files = []
+swagger_digest = hashlib.sha256()
+for asset in sorted(swagger_stage.rglob('*')):
+    if asset.is_file():
+        runtime_path = '/app/' + asset.relative_to(swagger_stage).as_posix()
+        file_hash = hashlib.sha256(asset.read_bytes()).hexdigest()
+        swagger_files.append({'path': runtime_path, 'sha256': file_hash})
+        swagger_digest.update(runtime_path.encode() + b'\0')
+        swagger_digest.update(bytes.fromhex(file_hash))
 pathlib.Path(destination).write_text(json.dumps({
     'git_revision': revision,
     'source_sha256': source,
     'original_binary_sha256': original,
     'packaged_binary_sha256': packaged,
     'base_image_id': base,
+    'swagger_public_assets': {
+        'directories': sorted(set(swagger_directories)),
+        'sha256': swagger_digest.hexdigest(),
+        'files': swagger_files,
+    },
     'scope': 'local development candidate; source digest captured before build',
 }, indent=2) + '\n')
 PY
