@@ -1087,6 +1087,261 @@ async fn local_program(
     .unwrap()
 }
 
+/// External Arcstream fixtures supply absolute connector paths and compare the
+/// captured JSONL against their independent oracle, preserving row multiplicity.
+/// Run alone because worker configuration and checkpoint storage are process-wide.
+#[test_log(tokio::test)]
+#[ignore = "opt-in Arcstream identity output and checkpoint/recovery capture"]
+async fn arcstream_identity_capture() {
+    tokio::time::timeout(
+        test_runtime_timeout() * 4,
+        arcstream_identity_capture_inner(),
+    )
+    .await
+    .expect("identity capture planning, startup, or recovery timed out");
+}
+
+async fn arcstream_identity_capture_inner() {
+    configure_test_worker();
+    let selected_backend = env::var("STREAMR_TEST_BACKEND").unwrap_or_else(|_| "memory".into());
+    let selected_checkpoint =
+        env::var("STREAMR_TEST_CHECKPOINT_MODE").unwrap_or_else(|_| "controller".into());
+    assert!(matches!(selected_backend.as_str(), "memory" | "rocksdb"));
+    assert!(matches!(
+        selected_checkpoint.as_str(),
+        "controller" | "leader"
+    ));
+    assert_eq!(
+        matches!(
+            config::config().worker.sql_state_backend,
+            arroyo_rpc::config::SqlStateBackend::Rocksdb
+        ),
+        selected_backend == "rocksdb"
+    );
+    println!("IDENTITY_CONFIG backend={selected_backend} checkpoint_mode={selected_checkpoint}");
+    let query_path = PathBuf::from(
+        env::var("STREAMR_IDENTITY_QUERY").expect("STREAMR_IDENTITY_QUERY is required"),
+    );
+    let output_path = PathBuf::from(
+        env::var("STREAMR_IDENTITY_OUTPUT").expect("STREAMR_IDENTITY_OUTPUT is required"),
+    );
+    assert!(query_path.is_absolute(), "query path must be absolute");
+    assert!(output_path.is_absolute(), "output path must be absolute");
+    let query = read_to_string(&query_path).await.unwrap();
+    let udfs = get_udfs();
+    let logical = Arc::new(
+        tokio::time::timeout(test_runtime_timeout(), get_graph(query, &udfs))
+            .await
+            .expect("identity planning timed out")
+            .expect("identity SQL failed to plan"),
+    );
+    for node in logical.graph.node_weights() {
+        assert_eq!(
+            node.parallelism, 1,
+            "identity capture requires singleton graph"
+        );
+        for (operator, _) in node.operator_chain.iter() {
+            println!(
+                "IDENTITY_OPERATOR node={} operator={} kind={:?} parallelism={}",
+                node.node_id, operator.operator_id, operator.operator_name, node.parallelism
+            );
+        }
+    }
+    assert_eq!(
+        logical
+            .graph
+            .node_weights()
+            .flat_map(|node| node.operator_chain.iter())
+            .filter(|(operator, _)| operator.operator_name == OperatorName::StatefulProcessor)
+            .count(),
+        1,
+        "identity CTE maps must share one ordered execution owner"
+    );
+    let job_id = format!(
+        "arcstream-identity-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let initial_path = output_path.with_extension("initial.jsonl");
+    for path in [&output_path, &initial_path] {
+        match tokio::fs::remove_file(path).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => panic!("cannot clear capture {}: {error}", path.display()),
+        }
+    }
+    let (control_tx, mut control_rx) = channel(128);
+    let program = local_program(&job_id, &logical.graph, &udfs, None, control_tx).await;
+    let running = Engine::for_local(program, "pipe-test".into(), job_id.clone())
+        .await
+        .unwrap()
+        .start()
+        .await;
+    run_until_finished(&running, &mut control_rx).await;
+    identity_capture_rows(&output_path, 13).await;
+    tokio::fs::rename(&output_path, &initial_path)
+        .await
+        .unwrap();
+    println!(
+        "IDENTITY_CAPTURE phase=initial rows=13 path={}",
+        initial_path.display()
+    );
+
+    // Epoch 41 is deliberately the first checkpoint for this second run. The
+    // shared smoke helper initializes leader generations at epoch 1, so create
+    // the generation explicitly here rather than changing ordinary smoke tests.
+    if leader_mode() {
+        use arroyo_state_protocol::workflow::{
+            GenerationInitialization, InitializeGenerationRequest, initialize_generation,
+        };
+        let storage = arroyo_state::get_storage_provider(&StorageProviderFor::Worker)
+            .await
+            .unwrap();
+        let initialized = initialize_generation(
+            storage.as_ref(),
+            InitializeGenerationRequest {
+                pipeline_id: arroyo_types::PipelineId::new("pipe-test"),
+                job_id: arroyo_types::JobId::new(job_id.clone()),
+                generation: arroyo_state_protocol::types::Generation(0),
+                updated_at: SystemTime::now(),
+            },
+            true,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            initialized,
+            GenerationInitialization::Initialized { .. }
+        ));
+    }
+    let (control_tx, mut control_rx) = channel(128);
+    let program = local_program(&job_id, &logical.graph, &udfs, None, control_tx).await;
+    let running = Engine::for_local(program, "pipe-test".into(), job_id.clone())
+        .await
+        .unwrap()
+        .start()
+        .await;
+    // A control-waiting single-file source reads its first row immediately;
+    // nine NoOps advance to row ten. The barrier flushes that partial batch.
+    assert_eq!(
+        running.source_controls().len(),
+        1,
+        "capture requires one source"
+    );
+    advance(&running, 9).await;
+    let checkpoint_bytes = checkpoint(
+        &mut SmokeTestContext {
+            job_id: Arc::new(job_id.clone()),
+            engine: &running,
+            control_rx: &mut control_rx,
+            program: logical.clone(),
+        },
+        41,
+    )
+    .await;
+    identity_capture_rows(&output_path, 10).await;
+    if leader_mode() {
+        use arroyo_state_protocol::store::read_protobuf;
+        let paths = arroyo_state_protocol::ProtocolPaths::new(
+            arroyo_types::PipelineId::new("pipe-test"),
+            arroyo_types::JobId::new(job_id.clone()),
+        );
+        let checkpoint_ref =
+            paths.checkpoint_manifest(arroyo_state_protocol::types::Generation(0), Epoch(41));
+        let storage = arroyo_state::get_storage_provider(&StorageProviderFor::Worker)
+            .await
+            .unwrap();
+        let metadata: arroyo_rpc::grpc::rpc::CheckpointManifest =
+            read_protobuf(storage.as_ref(), &checkpoint_ref)
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(metadata.epoch, 41);
+        assert_eq!(metadata.job_id, job_id);
+        assert!(!metadata.operators.is_empty());
+        println!("IDENTITY_CHECKPOINT path={checkpoint_ref} metadata={metadata:?}");
+    } else {
+        let metadata =
+            StateBackend::load_checkpoint_metadata(&StorageProviderFor::Worker, &job_id, 41)
+                .await
+                .unwrap();
+        assert_eq!(metadata.epoch, 41);
+        assert_eq!(metadata.job_id, job_id);
+        assert!(!metadata.operator_ids.is_empty());
+        println!(
+            "IDENTITY_CHECKPOINT path={job_id}/checkpoints/checkpoint-0000041/metadata metadata={metadata:?}"
+        );
+    }
+    let task_count: usize = running.operator_controls().values().map(Vec::len).sum();
+    running.abort_workers();
+    tokio::time::timeout(test_runtime_timeout(), async {
+        let mut stopped = HashSet::new();
+        while stopped.len() < task_count {
+            match control_rx.recv().await {
+                Some(ControlResp::TaskFailed {
+                    task_id,
+                    subtask_idx,
+                    ..
+                })
+                | Some(ControlResp::TaskFinished {
+                    task_id,
+                    subtask_idx,
+                    ..
+                }) => {
+                    stopped.insert((task_id, subtask_idx));
+                }
+                Some(_) => {}
+                None => break,
+            }
+        }
+        assert_eq!(
+            stopped.len(),
+            task_count,
+            "cancelled workers did not all terminate"
+        );
+    })
+    .await
+    .expect("identity worker cancellation timed out");
+    drop(running);
+    let (control_tx, mut control_rx) = channel(128);
+    let program = local_program(&job_id, &logical.graph, &udfs, Some(41), control_tx).await;
+    let restored = Engine::for_local(program, "pipe-test".into(), job_id.clone())
+        .await
+        .unwrap()
+        .start()
+        .await;
+    run_until_finished(&restored, &mut control_rx).await;
+    identity_capture_rows(&output_path, 13).await;
+    println!(
+        "IDENTITY_CAPTURE phase=recovered checkpoint=41 committed_rows=10 rows=13 bytes={checkpoint_bytes} path={} job={job_id}",
+        output_path.display()
+    );
+}
+
+async fn identity_capture_rows(path: &Path, expected: usize) {
+    let captured = read_to_string(path)
+        .await
+        .expect("identity capture file missing");
+    let rows: Vec<_> = captured.lines().collect();
+    assert_eq!(
+        rows.len(),
+        expected,
+        "unexpected capture row count in {}",
+        path.display()
+    );
+    for row in rows {
+        let value: Value =
+            serde_json::from_str(row).expect("identity capture contains invalid JSON");
+        assert!(
+            value.is_object(),
+            "identity capture must contain JSON objects"
+        );
+    }
+}
+
 /// Run separately: resources and RSS measurements belong to one worker process.
 #[cfg(target_os = "linux")]
 #[test_log(tokio::test)]
