@@ -146,6 +146,68 @@ cancellation.
 
 ## Evidence
 
-Validation is in progress. Do not treat implementation, successful compilation or
-queued CI as milestone acceptance. Record the final revision, image ID, host,
-commands, test counts, qualification output and limitations here after execution.
+Local validation on 2026-10-03 used candidate source
+`49f0c0ec783d23a32ef735d40da1a13c12c06503` and Bookworm image
+`sha256:d9a759860b0921f5fb5b2cab28620b5e3c6e2439c8dbaf8688436dc4ed913785`,
+with Rust 1.96 and GCC 12.2. The host was an Intel i5-8259U (4 cores, 8 threads),
+31 GiB RAM, 8 GiB swap and NVMe storage with btrfs. The commands above and
+`scripts/verify-milestone2.sh` describe the build database, package checks and
+isolated runtime modes. [CI on this revision](https://github.com/jasadams/streamr/actions/runs/37107133887)
+passed the full Rust 1.95 build, workspace Clippy and console checks, then failed an
+existing Kafka source test that rejected a valid idle watermark before partition
+assignment. The follow-up changes only that test helper, CI cache handling, the
+verification script and this evidence; the qualified runtime is unchanged. A full
+CI rerun is required before merge; these local results do not establish CI acceptance.
+
+All 258 unit tests passed against the pinned revision: state 40, protocol 57,
+planner 82, worker 47 and RPC 32. Logs are
+`/tmp/streamr-m2-arroyo_*-pinned-units.log`.
+The seven packages in the verification script passed `cargo check --all-targets`
+and `cargo clippy --all-targets --no-deps -- -D warnings`; formatting checks passed.
+The pinned memory/controller/leader SQL runs each passed five tests. Controller
+and leader each passed the separate crash test, checkpoint-stop test and two fault tests.
+Their host logs are `/tmp/streamr-m2-{memory,controller,leader}-sql-final.log` and
+`/tmp/streamr-m2-{controller,leader}-{crash,stop,faults}-final.log`.
+
+Both 128 MiB qualification runs passed, producing exactly 65,536 output records
+and recovering the selected checkpoint after newer writes and worker cancellation.
+Both used a fresh binary built from exact revision
+`49f0c0ec783d23a32ef735d40da1a13c12c06503`. Run each mode in a separate process:
+
+```sh
+for checkpoint_mode in controller leader; do
+  STREAMR_TEST_BACKEND=rocksdb STREAMR_TEST_CHECKPOINT_MODE="$checkpoint_mode" \
+    STREAMR_TEST_CRASH=1 STREAMR_TEST_RUNTIME_TIMEOUT_SECONDS=600 \
+    cargo test --locked -j4 -p arroyo-sql-testing milestone2_larger_than_ram \
+      -- --ignored --test-threads=1 --nocapture
+done
+```
+
+| Measurement | Controller | Leader |
+| --- | ---: | ---: |
+| Checkpoint 3 bytes | 135,637,781 | 135,637,781 |
+| Checkpoint 3 alignment + upload | 21.556 s | 20.686 s |
+| Cleanup, two retries retaining epoch 3 | 7.109 s | 0.449 s |
+| Initial execution | 144.569 s | 164.511 s |
+| Checkpoint execution phase | 77.862 s | 80.045 s |
+| Restore + replay | 89.412 s | 44.811 s |
+| Qualification total | 313.773 s | 290.797 s |
+| Initial throughput, 65,536 / phase seconds | 453.3 rows/s | 398.4 rows/s |
+| Peak sampled process RSS | 312.77 MiB | 305.22 MiB |
+| SQL row latency mean / p50 / p99 | 1.830 / 2.500 / 10.000 ms | 1.859 / 2.500 / 10.000 ms |
+| Input-to-emission lag mean / p50 / p99 | 11.514 / 10 / 60 s | 12.447 / 10 / 60 s |
+| Initial RSS near 8k / 16k / 24k cardinality | 205.34 / 209.18 / 211.99 MiB | 204.32 / 207.46 / 211.88 MiB |
+| Maximum observed aggregate local cache disk | 240.56 MiB | 257.55 MiB |
+
+Qualification logs are
+`/tmp/streamr-m2-controller-qualification-pinned.log` and
+`/tmp/streamr-m2-leader-qualification-pinned.log`. Latency percentiles are
+histogram bucket upper bounds over 131,074 samples. RSS remained below the
+declared 768 MiB envelope; cardinality samples and subsequent fixed-cardinality
+updates provide bounded-growth evidence for this workload, not a universal RSS
+limit. Local disk samples aggregate the test cache and include roughly
+89 million bytes from earlier failed attempts, so they are not per-attempt disk
+requirements. The leader recorded 89,380,446 bytes after cleanup and before replay
+grew the cache again. Throughput includes planning/startup in the initial phase;
+the two modes ran at different times on the shared host and are not a controlled
+performance comparison.

@@ -1,9 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 # Execute inside the Bookworm development container from the repository root.
-cargo test --locked -j4 -p arroyo-state -p arroyo-state-protocol -p arroyo-rpc
-cargo test --locked -j4 -p arroyo-planner stateful
-cargo test --locked -j4 -p arroyo-worker stateful_processor
+cargo test --locked -j4 -p arroyo-state -p arroyo-state-protocol -p arroyo-rpc -p arroyo-planner -p arroyo-worker --lib
 cargo test --locked -j4 -p arroyo-sql-testing stateful_processor -- --test-threads=1
 for checkpoint_mode in controller leader; do
   STREAMR_TEST_BACKEND=rocksdb STREAMR_TEST_CHECKPOINT_MODE="$checkpoint_mode" \

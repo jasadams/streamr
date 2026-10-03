@@ -43,7 +43,8 @@ jobs:
         with:
           components: clippy, rustfmt
           toolchain: 1.95
-      - uses: actions/cache@v4
+      - uses: actions/cache/restore@v4
+        id: cargo-cache
         with:
           path: |
             ~/.cargo/bin/
@@ -103,6 +104,7 @@ jobs:
           cd webui
           pnpm build
       - name: Build
+        id: rust-build
         run: cargo build --all-features
       - name: Run Clippy
         run: cargo clippy --no-deps --all-features --all-targets --workspace -- -D warnings
@@ -164,6 +166,18 @@ jobs:
           run_integ controller-sqlite ARROYO__DATABASE__TYPE=sqlite
           run_integ leader-postgres ARROYO__DATABASE__TYPE=postgres ARROYO__JOB_CONTROLLER=worker
           run_integ leader-sqlite ARROYO__DATABASE__TYPE=sqlite ARROYO__JOB_CONTROLLER=worker
+      # Preserve the expensive native build when a later test fails.
+      - name: Save Rust build cache
+        if: ${{ always() && !cancelled() && steps.rust-build.outcome == 'success' && steps.cargo-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-no-debug-v2-${{ hashFiles('**/Cargo.lock') }}
           
   build-console:
     runs-on: ubuntu-latest
