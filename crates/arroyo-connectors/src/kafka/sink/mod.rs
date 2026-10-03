@@ -206,10 +206,10 @@ impl KafkaSinkFunc {
         let transactional = self.is_committing();
         for (index, future) in self.write_futures.drain(..).enumerate() {
             let delivery = future.await.unwrap();
-            if let Ok((partition, _)) = &delivery {
-                if transactional {
-                    self.journal[index].partition = *partition;
-                }
+            if let Ok((partition, _)) = &delivery
+                && transactional
+            {
+                self.journal[index].partition = *partition;
             }
             if let Err((e, _)) = delivery {
                 ctx.error_reporter
