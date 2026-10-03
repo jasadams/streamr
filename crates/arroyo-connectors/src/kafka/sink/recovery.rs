@@ -5,7 +5,6 @@ use rdkafka::admin::{AdminClient, AdminOptions, ResourceSpecifier};
 use rdkafka::consumer::{BaseConsumer, Consumer};
 use rdkafka::error::KafkaError;
 use rdkafka::producer::{FutureRecord, Producer};
-use rdkafka::util::Timeout;
 use rdkafka::{ClientConfig, Message, Offset, TopicPartitionList};
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant};
