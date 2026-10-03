@@ -145,8 +145,12 @@ impl KafkaSinkFunc {
         config.set("enable.idempotence", "true").set(
             "transactional.id",
             format!(
-                "arroyo-id-{}-{}-{}-{}-{}",
-                task.job_id, task.operator_id, self.topic, task.task_index, index
+                "streamr-v2-id-{}-{}-{}-{}-{}",
+                task.job_id,
+                task.operator_id,
+                self.topic,
+                task.task_index,
+                index % 2
             ),
         );
         let producer: FutureProducer = config.create_with_context(self.context.clone())?;
@@ -157,7 +161,7 @@ impl KafkaSinkFunc {
     }
     fn marker_key(&self, task: &TaskInfo) -> String {
         format!(
-            "streamr-v1/{}/{}/{}/{}",
+            "streamr-v2/{}/{}/{}/{}",
             task.job_id, task.operator_id, self.topic, task.task_index
         )
     }
@@ -359,7 +363,7 @@ impl ArrowOperator for KafkaSinkFunc {
                 state
             } else {
                 let state = RecoveryState {
-                    version: 1,
+                    version: recovery::PROTOCOL_VERSION,
                     generation: uuid::Uuid::now_v7().to_string(),
                     next_transaction_index: 1,
                     checkpoint_epoch: 0,
@@ -450,7 +454,7 @@ impl ArrowOperator for KafkaSinkFunc {
                     .ok_or_else(|| anyhow!("Kafka recovery state missing"))?
             };
             let pending = PendingCommit {
-                version: 1,
+                version: recovery::PROTOCOL_VERSION,
                 generation: state.generation.clone(),
                 epoch: barrier.epoch,
                 transaction_index: index - 1,

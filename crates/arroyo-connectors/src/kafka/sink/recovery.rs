@@ -15,6 +15,7 @@ pub fn require(condition: bool, message: &str) -> Result<()> {
     Ok(())
 }
 
+pub const PROTOCOL_VERSION: u32 = 2;
 pub const DEFAULT_MAX_BYTES: usize = 8 * 1024 * 1024;
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct ReplayRecord {
@@ -65,7 +66,7 @@ pub fn decode_state(bytes: &[u8]) -> Result<RecoveryState> {
     let state: RecoveryState = serde_json::from_slice(bytes)
         .map_err(|e| anyhow!("Unsupported legacy/corrupt Kafka checkpoint: {e}"))?;
     ensure!(
-        state.version == 1
+        state.version == PROTOCOL_VERSION
             && !state.generation.is_empty()
             && state.next_transaction_index > 0
             && state.next_transaction_index < usize::MAX,
@@ -101,7 +102,9 @@ pub fn decode_pending(bytes: &[u8], epoch: u32, max: usize) -> Result<PendingCom
     let pending: PendingCommit = serde_json::from_slice(bytes)
         .map_err(|e| anyhow!("Unsupported legacy/corrupt Kafka committing checkpoint: {e}"))?;
     ensure!(
-        pending.version == 1 && pending.epoch == epoch && !pending.generation.is_empty(),
+        pending.version == PROTOCOL_VERSION
+            && pending.epoch == epoch
+            && !pending.generation.is_empty(),
         "Kafka replay checkpoint identity/version mismatch"
     );
     let mut used = 0;
@@ -169,7 +172,7 @@ pub async fn send_marker(
     epoch: u32,
 ) -> Result<()> {
     let payload = serde_json::to_vec(&Marker {
-        version: 1,
+        version: PROTOCOL_VERSION,
         generation: generation.into(),
         epoch,
     })?;
@@ -258,7 +261,7 @@ pub async fn scan_marker(
         )
     })?;
     ensure!(
-        marker.version == 1 && marker.generation == generation,
+        marker.version == PROTOCOL_VERSION && marker.generation == generation,
         "Kafka recovery marker generation mismatch; topic may have been replaced"
     );
     Ok(marker.epoch)
@@ -317,7 +320,7 @@ mod tests {
     #[test]
     fn replay_preserves_wire_record() {
         let p = PendingCommit {
-            version: 1,
+            version: PROTOCOL_VERSION,
             generation: "g".into(),
             epoch: 9,
             transaction_index: 4,
@@ -332,7 +335,7 @@ mod tests {
     #[test]
     fn state_requires_generation_and_epoch() {
         let state = RecoveryState {
-            version: 1,
+            version: PROTOCOL_VERSION,
             generation: "g".into(),
             next_transaction_index: 2,
             checkpoint_epoch: 4,
