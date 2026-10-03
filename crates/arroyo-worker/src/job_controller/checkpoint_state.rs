@@ -322,8 +322,8 @@ impl CheckpointState {
                 context.pipeline_id, self.job_id, disk.generation, c.epoch, c.operator_id, name
             );
             for file in &disk.files {
-                if !(disk.generation == 0 && file.path.starts_with(&legacy_prefix))
-                    && !(disk.generation == context.generation
+                if !(disk.generation == 0 && file.path.starts_with(&legacy_prefix)
+                    || disk.generation == context.generation
                         && file.path.starts_with(&protocol_prefix))
                 {
                     bail!("disk-map checkpoint file is outside its exclusive worker table owner");

@@ -21,16 +21,16 @@ type LiveCaptures = Arc<Mutex<HashMap<u32, CapturedLiveTables>>>;
 use std::{collections::HashMap, sync::Arc, time::SystemTime};
 
 use crate::StorageProviderFor;
-use anyhow::{anyhow, bail, Result};
+use anyhow::{Result, anyhow, bail};
 use arroyo_rpc::CompactionResult;
 use arroyo_rpc::{
+    CheckpointCompleted, ControlResp,
     grpc::rpc::{
         SubtaskCheckpointMetadata, TableConfig, TableEnum, TableSubtaskCheckpointMetadata,
     },
-    CheckpointCompleted, ControlResp,
 };
 use arroyo_storage::StorageProviderRef;
-use arroyo_types::{from_micros, to_micros, CheckpointBarrier, Data, Key, TaskInfo};
+use arroyo_types::{CheckpointBarrier, Data, Key, TaskInfo, from_micros, to_micros};
 use tokio::sync::{
     mpsc::{self, Receiver, Sender},
     oneshot,
@@ -42,13 +42,13 @@ use super::expiring_time_key_map::{
 use super::global_keyed_map::GlobalKeyedView;
 use super::{ErasedCheckpointer, ErasedTable, MigratableState};
 use crate::{
-    get_storage_provider, tables::global_keyed_map::GlobalKeyedTable, BackingStore, StateBackend,
-    StateMessage,
+    BackingStore, StateBackend, StateMessage, get_storage_provider,
+    tables::global_keyed_map::GlobalKeyedTable,
 };
 use crate::{CheckpointMessage, TableData};
+use arroyo_rpc::MetadataOrManifest;
 use arroyo_rpc::errors::{DataflowResult, StateError};
 use arroyo_rpc::grpc::rpc::OperatorCheckpointMetadata;
-use arroyo_rpc::MetadataOrManifest;
 use tracing::{debug, error, info, warn};
 
 #[allow(unused)]
@@ -1281,14 +1281,16 @@ mod tests {
         };
         // Current attempt generation nine can recover selected generation seven.
         validate_selected_disk_checkpoint(&config, &metadata, &task, &selected, 2).unwrap();
-        assert!(validate_selected_disk_checkpoint(
-            &config,
-            &metadata,
-            &task,
-            &task.checkpoint_file_path_layout,
-            2
-        )
-        .is_err());
+        assert!(
+            validate_selected_disk_checkpoint(
+                &config,
+                &metadata,
+                &task,
+                &task.checkpoint_file_path_layout,
+                2
+            )
+            .is_err()
+        );
         metadata.subtasks.get_mut(&0).unwrap().files[0].path = format!(
             "{}/disk-page.bin",
             selected.table_checkpoint_path("foreign-job", "operator", "map", 0, 2, false)
@@ -1310,14 +1312,16 @@ mod tests {
         assert!(
             validate_selected_disk_checkpoint(&config, &metadata, &task, &selected, 2).is_err()
         );
-        assert!(validate_selected_disk_checkpoint(
-            &config,
-            &metadata,
-            &task,
-            &arroyo_types::CheckpointFilePathLayout::Legacy,
-            2
-        )
-        .is_err());
+        assert!(
+            validate_selected_disk_checkpoint(
+                &config,
+                &metadata,
+                &task,
+                &arroyo_types::CheckpointFilePathLayout::Legacy,
+                2
+            )
+            .is_err()
+        );
     }
     #[test]
     fn metadata_wire_cap_includes_all_tables_configs_and_protobuf_overhead() {
@@ -1414,11 +1418,10 @@ mod tests {
             .data
             .push(0);
         assert_eq!(metadata.encoded_len(), cap + 1);
-        assert!(validate_disk_tables_wire_budget(
-            &metadata.table_configs,
-            &metadata.table_metadata
-        )
-        .is_err());
+        assert!(
+            validate_disk_tables_wire_budget(&metadata.table_configs, &metadata.table_metadata)
+                .is_err()
+        );
         let error = validate_disk_subtask_metadata_size(&metadata).unwrap_err();
         assert!(error.to_string().contains("3 MiB RPC limit"));
     }
@@ -1462,11 +1465,10 @@ mod tests {
                 config: vec![],
             },
         );
-        assert!(validate_disk_tables_wire_budget(
-            &metadata.table_configs,
-            &metadata.table_metadata
-        )
-        .is_err());
+        assert!(
+            validate_disk_tables_wire_budget(&metadata.table_configs, &metadata.table_metadata)
+                .is_err()
+        );
         assert!(validate_disk_subtask_metadata_size(&metadata).is_err());
     }
 }

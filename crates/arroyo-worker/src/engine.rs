@@ -232,10 +232,9 @@ impl Program {
                     for map in state.map_names {
                         if let Some(owner) =
                             map_owners.insert(map.clone(), operator.operator_id.clone())
+                            && owner != operator.operator_id
                         {
-                            if owner != operator.operator_id {
-                                return Err(StateError::Other { table: map, error: "named SQL maps require one ordered execution owner; branching stateful stages are unsupported".into() });
-                            }
+                            return Err(StateError::Other { table: map, error: "named SQL maps require one ordered execution owner; branching stateful stages are unsupported".into() });
                         }
                     }
                 }

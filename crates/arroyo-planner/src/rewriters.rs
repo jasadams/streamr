@@ -819,14 +819,12 @@ fn contains_volatile_scalar(expr: &Expr) -> bool {
     .unwrap_or(false)
 }
 
-/// Walks an expression tree, replacing state function calls with column references
-/// to the operator's result columns, and accumulating `StatefulOpDesc` entries.
+type FusedStateInput = (LogicalPlan, Vec<StatefulOpDesc>, Vec<Expr>);
+
 /// Inline linear SQL stages into one ordered map owner. Columns from a CTE are
 /// substituted with their defining expressions; state-result columns remain
 /// references to earlier operations in the same owner.
-fn flatten_state_input(
-    plan: &LogicalPlan,
-) -> DFResult<Option<(LogicalPlan, Vec<StatefulOpDesc>, Vec<Expr>)>> {
+fn flatten_state_input(plan: &LogicalPlan) -> DFResult<Option<FusedStateInput>> {
     let (input, projection) = match plan {
         LogicalPlan::Projection(p) => (p.input.as_ref(), Some(p.expr.clone())),
         LogicalPlan::SubqueryAlias(a) => (a.input.as_ref(), None),
@@ -948,10 +946,9 @@ fn rewrite_guarded_state_calls(
             }
             return Ok(Transformed::no(Expr::BinaryExpr(binary)));
         }
-        if let Expr::ScalarFunction(f) = &e {
-            if matches!(f.func.name().to_ascii_lowercase().as_str(), "coalesce" | "nvl" | "ifnull" | "if" | "iif" | "nvl2") && f.args.iter().any(contains_state_function) {
-                return plan_err!("state functions inside {} are unsupported; use CASE with a state-free condition", f.func.name().to_ascii_uppercase());
-            }
+        if let Expr::ScalarFunction(f) = &e
+            && matches!(f.func.name().to_ascii_lowercase().as_str(), "coalesce" | "nvl" | "ifnull" | "if" | "iif" | "nvl2") && f.args.iter().any(contains_state_function) {
+            return plan_err!("state functions inside {} are unsupported; use CASE with a state-free condition", f.func.name().to_ascii_uppercase());
         }
         Ok(Transformed::no(e))
     })?.data;
