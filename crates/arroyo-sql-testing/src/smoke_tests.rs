@@ -1118,7 +1118,10 @@ async fn arcstream_identity_capture_inner() {
         ),
         selected_backend == "rocksdb"
     );
-    println!("IDENTITY_CONFIG backend={selected_backend} checkpoint_mode={selected_checkpoint}");
+    println!(
+        "IDENTITY_CONFIG backend={selected_backend} checkpoint_mode={selected_checkpoint} execution_resources={:?}",
+        config::config().worker.execution_resources
+    );
     let query_path = PathBuf::from(
         env::var("STREAMR_IDENTITY_QUERY").expect("STREAMR_IDENTITY_QUERY is required"),
     );
@@ -1626,6 +1629,12 @@ fn configure_test_worker() {
     config::update(|c| {
         // reduce the batch size to increase consistency
         c.pipeline.source_batch_size = 32;
+        if let Ok(bytes) = std::env::var("STREAMR_TEST_EXECUTION_BYTES") {
+            c.worker.execution_resources = Some(arroyo_rpc::config::ExecutionResourceConfig {
+                memory_bytes: bytes.parse().expect("invalid execution memory limit"),
+                max_batch_bytes: 1024 * 1024,
+            });
+        }
         if std::env::var("STREAMR_TEST_BACKEND").as_deref() == Ok("rocksdb") {
             use arroyo_rpc::config::{
                 DiskSqlStateConfig, LiveStateResourceConfig, SqlStateBackend,

@@ -241,6 +241,12 @@ impl Program {
             }
         }
         let worker_config = config().worker.clone();
+        if let Some(resources) = &worker_config.execution_resources {
+            resources.validate().map_err(|error| StateError::Other {
+                table: "execution resources".into(),
+                error: error.to_string(),
+            })?;
+        }
         worker_config
             .validate_sql_state()
             .map_err(|error| StateError::Other {

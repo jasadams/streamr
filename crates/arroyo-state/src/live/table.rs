@@ -58,6 +58,22 @@ pub struct LiveTable {
     namespace: StateNamespace,
 }
 impl LiveTable {
+    pub fn ranked_counts(
+        &self,
+        limits: super::collections::CollectionLimits,
+    ) -> Result<super::collections::RankedCounts> {
+        super::collections::RankedCounts::new(self.backend.clone(), self.namespace.clone(), limits)
+    }
+
+    /// Construct the single serial timer owner for this registered table. Both
+    /// timer indexes remain inside its checkpointed namespace.
+    pub fn timers(
+        &self,
+        limits: super::timers::TimerLimits,
+    ) -> Result<super::timers::DurableTimers> {
+        super::timers::DurableTimers::new(self.backend.clone(), self.namespace.clone(), limits)
+    }
+
     pub fn history(
         &self,
         schema: arrow_schema::SchemaRef,

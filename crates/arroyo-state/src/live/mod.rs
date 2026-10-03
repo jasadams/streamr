@@ -7,6 +7,7 @@ use std::fmt;
 use std::sync::Arc;
 
 pub mod checkpoint;
+pub mod collections;
 pub mod encoding;
 pub mod lifecycle;
 pub mod memory;
@@ -14,6 +15,7 @@ pub mod resources;
 pub mod rocks;
 pub mod table;
 pub mod time;
+pub mod timers;
 pub mod worker;
 pub mod write;
 
