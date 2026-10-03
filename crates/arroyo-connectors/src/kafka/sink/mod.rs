@@ -515,7 +515,7 @@ impl ArrowOperator for KafkaSinkFunc {
             .ok_or_else(|| anyhow!("Kafka recovery state missing"))?;
         recovery::require(
             state.generation == pending.generation
-                && state.next_transaction_index == pending.transaction_index + 1,
+                && pending.transaction_index.checked_add(1) == Some(state.next_transaction_index),
             "Kafka pending transaction/state mismatch",
         )?;
         let topic = self.recovery_topic.as_ref().unwrap();
