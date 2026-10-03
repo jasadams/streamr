@@ -152,8 +152,8 @@ pub fn retry_transaction(
     }
     unreachable!()
 }
-pub async fn validate_topic(config: &ClientConfig, topic: &str) -> Result<()> {
-    let admin: AdminClient<_> = config.create()?;
+pub async fn validate_topic(config: &ClientConfig, context: Context, topic: &str) -> Result<()> {
+    let admin: AdminClient<Context> = config.create_with_context(context)?;
     let metadata = admin
         .inner()
         .fetch_metadata(Some(topic), Duration::from_secs(10))?;

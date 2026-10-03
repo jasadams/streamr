@@ -343,7 +343,7 @@ impl ArrowOperator for KafkaSinkFunc {
                 topic != self.topic && self.recovery_max_bytes > 0,
                 "Invalid Kafka recovery topic/budget",
             )?;
-            recovery::validate_topic(&self.producer_config(), &topic).await?;
+            recovery::validate_topic(&self.producer_config(), self.context.clone(), &topic).await?;
             let saved = ctx
                 .table_manager
                 .get_global_keyed_state::<u32, Vec<u8>>("i")
