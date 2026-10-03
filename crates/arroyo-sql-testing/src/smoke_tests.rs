@@ -122,6 +122,19 @@ struct SmokeTestContext<'a> {
 }
 
 async fn checkpoint(ctx: &mut SmokeTestContext<'_>, epoch: u32) -> u64 {
+    let then_stop =
+        epoch == 3 && std::env::var("STREAMR_TEST_CHECKPOINT_STOP").as_deref() == Ok("1");
+    checkpoint_with_stop(ctx, epoch, then_stop, &mut HashSet::new()).await
+}
+
+/// Retain terminal events consumed while publishing a stopping checkpoint so
+/// callers can subsequently wait for the remaining tasks without losing IDs.
+async fn checkpoint_with_stop(
+    ctx: &mut SmokeTestContext<'_>,
+    epoch: u32,
+    then_stop: bool,
+    finished_tasks: &mut HashSet<(u32, u32)>,
+) -> u64 {
     let checkpoint_started = std::time::Instant::now();
     let checkpoint_id = epoch as i64;
     let leader = leader_mode();
@@ -170,8 +183,7 @@ async fn checkpoint(ctx: &mut SmokeTestContext<'_>, epoch: u32) -> u64 {
         epoch,
         min_epoch: 0,
         timestamp: SystemTime::now(),
-        then_stop: epoch == 3
-            && std::env::var("STREAMR_TEST_CHECKPOINT_STOP").as_deref() == Ok("1"),
+        then_stop,
     };
 
     for source in ctx.engine.source_controls() {
@@ -236,6 +248,12 @@ async fn checkpoint(ctx: &mut SmokeTestContext<'_>, epoch: u32) -> u64 {
                 }
             }
             ControlResp::TaskFailed { error, .. } => panic!("checkpoint worker failed: {error:?}"),
+            ControlResp::TaskFinished {
+                task_id,
+                subtask_idx,
+            } => {
+                finished_tasks.insert((task_id, subtask_idx));
+            }
             _ => {}
         }
     }
@@ -1335,7 +1353,10 @@ async fn external_sql_checkpoint_capture_inner() {
         "capture requires one source"
     );
     advance(&running, capture.input_rows_before_checkpoint - 1).await;
-    let checkpoint_bytes = checkpoint(
+    // Stop at the barrier: a normal checkpoint resumes the source and reads
+    // another line, which could flush beyond the captured checkpoint prefix.
+    let mut finished_tasks = HashSet::new();
+    let checkpoint_bytes = checkpoint_with_stop(
         &mut SmokeTestContext {
             job_id: Arc::new(job_id.clone()),
             engine: &running,
@@ -1343,6 +1364,8 @@ async fn external_sql_checkpoint_capture_inner() {
             program: logical.clone(),
         },
         capture.checkpoint_epoch,
+        true,
+        &mut finished_tasks,
     )
     .await;
     capture_rows(&output_path, capture.expected_checkpoint_rows).await;
@@ -1387,7 +1410,7 @@ async fn external_sql_checkpoint_capture_inner() {
     let task_count: usize = running.operator_controls().values().map(Vec::len).sum();
     running.abort_workers();
     tokio::time::timeout(test_runtime_timeout(), async {
-        let mut stopped = HashSet::new();
+        let mut stopped = finished_tasks;
         while stopped.len() < task_count {
             match control_rx.recv().await {
                 Some(ControlResp::TaskFailed {
