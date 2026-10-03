@@ -63,6 +63,11 @@ cp "$task_binary" "$task_context/arroyo"
 task_input_sha=$(sha256sum "$task_context/arroyo" | cut -d ' ' -f 1)
 strip --strip-debug "$task_context/arroyo"
 task_binary_sha=$(sha256sum "$task_context/arroyo" | cut -d ' ' -f 1)
+if [[ ! -f webui/dist/index.html ]]; then
+    echo 'Built console missing: webui/dist/index.html' >&2
+    exit 1
+fi
+cp -a webui/dist "$task_context/webui-dist"
 cp docker/Dockerfile.streamr-candidate "$task_context/Dockerfile"
 
 python3 - "$task_context/provenance.json" "$task_revision" "$task_source" \

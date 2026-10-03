@@ -104,7 +104,7 @@ same pinned Bookworm image for compilation and packaging:
 ```bash
 task_source_sha=$(docker/build-streamr-candidate.sh --source-digest)
 # In the pinned Bookworm container with DATABASE_URL configured:
-# cargo build --locked -p arroyo --bin arroyo --features arroyo-api/embedded-console
+# cargo build --locked -p arroyo --bin arroyo
 STREAMR_SOURCE_SHA256="$task_source_sha" \
   docker/build-streamr-candidate.sh target/debug/arroyo localhost/streamr:str-1-candidate
 podman run --rm localhost/streamr:str-1-candidate --help
@@ -112,9 +112,9 @@ podman run --rm localhost/streamr:str-1-candidate --help
 
 The packaging helper rejects intervening source changes and records the source,
 original/stripped binary hashes, Git revision, and immutable builder image ID.
-It packages only the binary and provenance into a temporary build context.
-The opt-in `arroyo-api/embedded-console` feature embeds console assets in the
-debug binary; normal debug builds otherwise read them from the source tree.
+It packages the binary, built public console assets, and provenance into a
+temporary build context. Debug binaries read console files at their compile-time
+`/app/webui/dist` path, so the image includes these assets without source files.
 This is a local development candidate retaining the Rust/clang/protoc toolchain
 for runtime UDF compilation; the helper does not push or deploy it.
 
