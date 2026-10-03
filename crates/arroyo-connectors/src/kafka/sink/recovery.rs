@@ -24,15 +24,6 @@ pub struct ReplayRecord {
     pub payload: Vec<u8>,
     pub partition: i32,
 }
-impl ReplayRecord {
-    pub fn bytes(&self) -> Result<usize> {
-        self.payload
-            .len()
-            .checked_add(self.key.as_ref().map_or(0, Vec::len))
-            .and_then(|n| n.checked_add(64))
-            .ok_or_else(|| anyhow!("Kafka replay journal size overflow"))
-    }
-}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RecoveryState {
