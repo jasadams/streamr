@@ -135,12 +135,26 @@ impl KafkaConnector {
             }
             "sink" => {
                 let commit_mode = options.pull_opt_str("sink.commit_mode")?;
+                let recovery_topic = options.pull_opt_str("sink.recovery_topic")?;
+                let recovery_max_bytes = options.pull_opt_u64("sink.recovery_max_bytes")?;
+                if commit_mode.as_deref() == Some("exactly_once")
+                    && recovery_topic.as_deref().is_none_or(str::is_empty)
+                {
+                    bail!(
+                        "exactly_once requires explicit sink.recovery_topic (preexisting compact-only one-partition topic)"
+                    );
+                }
+                if recovery_max_bytes == Some(0) {
+                    bail!("sink.recovery_max_bytes must be positive");
+                }
                 TableType::Sink {
                     commit_mode: match commit_mode.as_deref() {
                         Some("at_least_once") | None => SinkCommitMode::AtLeastOnce,
                         Some("exactly_once") => SinkCommitMode::ExactlyOnce,
                         Some(other) => bail!("invalid value for commit_mode '{}'", other),
                     },
+                    recovery_topic,
+                    recovery_max_bytes,
                     timestamp_field: options.pull_opt_str("sink.timestamp_field")?,
                     key_field: options.pull_opt_str("sink.key_field")?,
                 }
@@ -434,10 +448,19 @@ impl Connector for KafkaConnector {
                 commit_mode,
                 key_field,
                 timestamp_field,
+                recovery_topic,
+                recovery_max_bytes,
             } => Ok(ConstructedOperator::from_operator(Box::new(
                 KafkaSinkFunc {
                     bootstrap_servers: profile.bootstrap_servers.to_string(),
                     producer: None,
+                    recovery_topic: recovery_topic.clone(),
+                    recovery_max_bytes: recovery_max_bytes
+                        .map(|v| v as usize)
+                        .unwrap_or(sink::recovery::DEFAULT_MAX_BYTES),
+                    recovery_state: None,
+                    journal: vec![],
+                    journal_bytes: 0,
                     consistency_mode: (*commit_mode).into(),
                     timestamp_field: timestamp_field.clone(),
                     timestamp_col: None,

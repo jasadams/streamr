@@ -70,6 +70,15 @@
                             "type": "string",
                             "title": "timestamp field",
                             "description": "Field to use to set the timestamp of the message written to Kafka; defaults to the event time"
+                        },
+                        "recovery_topic": {
+                            "type": "string",
+                            "description": "Preexisting one-partition compact-only marker topic required for exactly_once; preserve for checkpoint lifetime."
+                        },
+                        "recovery_max_bytes": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "description": "Maximum replay journal bytes per subtask per checkpoint (default 8388608)."
                         }
                     },
                     "additionalProperties": false,
