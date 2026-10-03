@@ -649,7 +649,7 @@ pub fn rewrite_plan(
     schema_provider: &ArroyoSchemaProvider,
 ) -> Result<LogicalPlan> {
     let rewritten_plan = plan
-        .rewrite_with_subqueries(&mut ArroyoRewriter { schema_provider })?
+        .rewrite_with_subqueries(&mut ArroyoRewriter::new(schema_provider))?
         .data
         .rewrite_with_subqueries(&mut UnnestRewriter {})?;
 

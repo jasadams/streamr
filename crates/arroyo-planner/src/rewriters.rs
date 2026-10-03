@@ -769,11 +769,14 @@ impl TreeNodeRewriter for SinkInputRewriter<'_> {
 /// plan nodes. Each state function call is extracted as a `StatefulOpDesc` and the
 /// function call in the projection is replaced by a column reference to the
 /// operator's result column.
-pub struct StatefulProcessorRewriter;
+#[derive(Default)]
+pub struct StatefulProcessorRewriter {
+    counter: usize,
+}
 
 impl StatefulProcessorRewriter {
     pub fn new() -> Self {
-        Self
+        Self::default()
     }
 
     fn is_state_function(name: &str) -> bool {
@@ -891,28 +894,36 @@ impl TreeNodeRewriter for StatefulProcessorRewriter {
         };
 
         let mut ops: Vec<StatefulOpDesc> = vec![];
-        let mut counter = 0usize;
 
-        // Rewrite each projection expression, extracting state function calls
+        // Rewrite each projection expression, extracting state function calls.
+        // Uses self.counter (shared across all projections in the plan) so that
+        // __state_result_N names are unique when multiple CTEs each contain state calls.
         let mut new_exprs = Vec::with_capacity(projection.expr.len());
         for expr in projection.expr.into_iter() {
-            new_exprs.push(rewrite_state_calls(expr, &mut ops, &mut counter)?);
+            new_exprs.push(rewrite_state_calls(expr, &mut ops, &mut self.counter)?);
         }
 
         if ops.is_empty() {
             // No state functions found -- reconstruct unchanged projection
             return Ok(Transformed::no(LogicalPlan::Projection(
-                Projection::try_new_with_schema(
-                    new_exprs,
-                    projection.input,
-                    projection.schema,
-                )?,
+                Projection::try_new_with_schema(new_exprs, projection.input, projection.schema)?,
             )));
         }
 
         Ok(Transformed::yes(LogicalPlan::Extension(Extension {
             node: Arc::new(StatefulProcessorExtension {
-                input: (*projection.input).clone(),
+                // Materialize the ordinary input plan before evaluating state calls.
+                // Graph traversal only creates operators for extensions; without this
+                // boundary filters and computed CTE columns would be skipped and the
+                // worker would receive the upstream extension's different schema.
+                input: LogicalPlan::Extension(Extension {
+                    node: Arc::new(RemoteTableExtension {
+                        input: (*projection.input).clone(),
+                        name: TableReference::bare(format!("__state_input_{}", self.counter)),
+                        schema: projection.input.schema().clone(),
+                        materialize: false,
+                    }),
+                }),
                 ops,
                 final_exprs: new_exprs,
                 final_schema: projection.schema,

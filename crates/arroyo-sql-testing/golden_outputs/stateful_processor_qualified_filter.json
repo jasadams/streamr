@@ -1,0 +1,5 @@
+{"id":1,"payload":"one","stored":"one","retrieved":"one"}
+{"id":3,"payload":"three","stored":"one","retrieved":"one"}
+{"id":4,"payload":"","stored":"","retrieved":""}
+{"id":5,"payload":null,"stored":null,"retrieved":null}
+{"id":6,"payload":"after","stored":"one","retrieved":"one"}
