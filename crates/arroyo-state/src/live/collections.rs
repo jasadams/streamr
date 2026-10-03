@@ -677,8 +677,12 @@ mod tests {
         })
         .unwrap()
     }
-    async fn rocks(root: &std::path::Path, generation: u64) -> Arc<dyn LiveStateBackend> {
-        Arc::new(
+    async fn rocks(
+        root: &std::path::Path,
+        generation: u64,
+    ) -> (Arc<RocksLiveState>, WorkerStateResources) {
+        let pool = resources();
+        let backend = Arc::new(
             RocksLiveState::open(
                 RocksStateConfig {
                     root: root.to_path_buf(),
@@ -688,11 +692,28 @@ mod tests {
                     generation,
                     attempt: 1,
                 },
-                resources(),
+                pool.clone(),
             )
             .await
             .unwrap(),
-        )
+        );
+        (backend, pool)
+    }
+    async fn close_native(backend: Arc<RocksLiveState>, resources: &WorkerStateResources) {
+        // Drop schedules native destruction on the resource pool's dedicated
+        // cleanup thread. Nextest exits this process immediately after one test;
+        // await live completion after all snapshots/views have been released.
+        // Their earlier FIFO cleanup jobs finish before this completion signal.
+        Arc::try_unwrap(backend)
+            .unwrap_or_else(|_| panic!("collection fixture retained a native backend alias"))
+            .close_and_remove()
+            .await
+            .unwrap();
+        let (finished, completion) = tokio::sync::oneshot::channel();
+        resources.cleanup().await.unwrap().submit(move || {
+            let _ = finished.send(());
+        });
+        completion.await.unwrap();
     }
     fn view(backend: Arc<dyn LiveStateBackend>) -> RankedCounts {
         RankedCounts::new(backend, namespace(), limits()).unwrap()
@@ -745,12 +766,17 @@ mod tests {
         assert!(counts.add(b"missing", b"m", -1).await.is_err());
         assert!(counts.set(b"a", &[0; 129], 1).await.is_err());
         assert!(counts.set(&[0; 65], b"m", 1).await.is_err());
+        drop(current);
+        drop(stable);
+        drop(counts);
     }
     #[tokio::test]
     async fn exact_counts_ranks_prefixes_overflow_and_stable_snapshots_on_both_backends() {
         contract(Arc::new(MemoryLiveState::new())).await;
         let root = tempfile::tempdir().unwrap();
-        contract(rocks(root.path(), 0).await).await;
+        let (backend, native_resources) = rocks(root.path(), 0).await;
+        contract(backend.clone()).await;
+        close_native(backend, &native_resources).await;
     }
 
     async fn hot_collection(backend: Arc<dyn LiveStateBackend>) {
@@ -829,12 +855,17 @@ mod tests {
             9
         );
         assert_eq!(stable.top_k(b"hot", 20).await.unwrap().entries.len(), 20);
+        drop(best);
+        drop(stable);
+        drop(counts);
     }
     #[tokio::test]
     async fn hot_collection_pages_and_retired_incarnation_clear_on_both_backends() {
         hot_collection(Arc::new(MemoryLiveState::new())).await;
         let root = tempfile::tempdir().unwrap();
-        hot_collection(rocks(root.path(), 0).await).await;
+        let (backend, native_resources) = rocks(root.path(), 0).await;
+        hot_collection(backend.clone()).await;
+        close_native(backend, &native_resources).await;
     }
 
     #[tokio::test]
@@ -1013,7 +1044,7 @@ mod tests {
     #[tokio::test]
     async fn complete_registered_namespace_export_restores_counts_and_ranks() {
         let root = tempfile::tempdir().unwrap();
-        let backend = rocks(root.path(), 0).await;
+        let (backend, native_resources) = rocks(root.path(), 0).await;
         let counts = view(backend.clone());
         for i in 0u32..140 {
             counts
@@ -1048,7 +1079,7 @@ mod tests {
         .await
         .unwrap();
         assert!(metadata.files.len() > 1);
-        let restored = rocks(root.path(), 1).await;
+        let (restored, restored_resources) = rocks(root.path(), 1).await;
         checkpoint::restore(
             restored.as_ref(),
             &namespace(),
@@ -1058,7 +1089,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let recovered = view(restored);
+        let recovered = view(restored.clone());
         assert_eq!(recovered.count(b"hot", b"uncommitted").await.unwrap(), 0);
         assert_eq!(
             recovered
@@ -1101,5 +1132,10 @@ mod tests {
                 .entries
                 .is_empty()
         );
+        drop(recovered);
+        drop(barrier);
+        drop(counts);
+        close_native(restored, &restored_resources).await;
+        close_native(backend, &native_resources).await;
     }
 }

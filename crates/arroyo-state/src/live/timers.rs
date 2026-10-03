@@ -504,8 +504,12 @@ mod tests {
         })
         .unwrap()
     }
-    async fn rocks(root: &std::path::Path, generation: u64) -> Arc<dyn LiveStateBackend> {
-        Arc::new(
+    async fn rocks(
+        root: &std::path::Path,
+        generation: u64,
+    ) -> (Arc<RocksLiveState>, WorkerStateResources) {
+        let resources = resources();
+        let backend = Arc::new(
             RocksLiveState::open(
                 RocksStateConfig {
                     root: root.to_path_buf(),
@@ -515,11 +519,58 @@ mod tests {
                     generation,
                     attempt: 0,
                 },
-                resources(),
+                resources.clone(),
             )
             .await
             .unwrap(),
-        )
+        );
+        (backend, resources)
+    }
+
+    async fn close_native_fixture(backend: Arc<RocksLiveState>, resources: &WorkerStateResources) {
+        let backend = match Arc::try_unwrap(backend) {
+            Ok(backend) => backend,
+            Err(backend) => panic!(
+                "timer fixture retains {} backend references",
+                Arc::strong_count(&backend)
+            ),
+        };
+        let path = backend.path().to_path_buf();
+        backend.close_and_remove().await.unwrap();
+        // Snapshot DB destruction has its own jobs. Drop every snapshot before
+        // this FIFO fence, and retain the pool until all those jobs have run.
+        let (finished, completion) = tokio::sync::oneshot::channel();
+        resources.cleanup().await.unwrap().submit(move || {
+            let _ = finished.send(());
+        });
+        completion.await.unwrap();
+        assert!(!path.exists());
+        for entry in std::fs::read_dir(path.parent().unwrap()).unwrap() {
+            assert!(
+                !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .contains("-snapshot-")
+            );
+        }
+        // The retained pool must remain operational with every DB/snapshot slot
+        // returned, rather than relying on an unawaited cleanup at process exit.
+        let mut databases = Vec::new();
+        for _ in 0..resources.config().max_open_databases {
+            databases.push(resources.try_database().unwrap());
+        }
+        let mut snapshots = Vec::new();
+        for _ in 0..resources.config().max_snapshots {
+            snapshots.push(
+                tokio::time::timeout(std::time::Duration::from_secs(1), resources.snapshot())
+                    .await
+                    .unwrap()
+                    .unwrap(),
+            );
+        }
+        drop(snapshots);
+        drop(databases);
     }
 
     async fn replacement_and_cancel(backend: Arc<dyn LiveStateBackend>) {
@@ -575,7 +626,9 @@ mod tests {
     async fn replacement_cancel_and_clock_isolation_on_memory_and_rocks() {
         replacement_and_cancel(Arc::new(MemoryLiveState::new())).await;
         let root = tempfile::tempdir().unwrap();
-        replacement_and_cancel(rocks(root.path(), 0).await).await;
+        let (backend, resources) = rocks(root.path(), 0).await;
+        replacement_and_cancel(backend.clone()).await;
+        close_native_fixture(backend, &resources).await;
     }
 
     #[tokio::test]
@@ -811,7 +864,7 @@ mod tests {
         );
         let view = DurableTimers::new(backend.clone(), namespace(), limits)
             .unwrap()
-            .with_resources(resources)
+            .with_resources(resources.clone())
             .unwrap();
         // All-zero IDs exercise maximum key escaping and native read admission.
         view.replace(TimerClock::Event, &[0; 16], 1, &[1; 32])
@@ -838,12 +891,16 @@ mod tests {
         let next = snapshot.due(TimerClock::Event, 2, cursor).await.unwrap();
         assert_eq!(next.entries.len(), 1);
         assert_eq!(next.entries[0].deadline, 2);
+        drop(next);
+        drop(snapshot);
+        drop(view);
+        close_native_fixture(backend, &resources).await;
     }
 
     #[tokio::test]
     async fn full_logical_checkpoint_restores_timer_indexes_into_fresh_generation() {
         let root = tempfile::tempdir().unwrap();
-        let backend = rocks(root.path(), 0).await;
+        let (backend, resources) = rocks(root.path(), 0).await;
         let view = timers(backend.clone());
         for i in 0u32..300 {
             view.replace(TimerClock::Event, &i.to_be_bytes(), 100, &i.to_be_bytes())
@@ -884,7 +941,7 @@ mod tests {
         .await
         .unwrap();
         assert!(metadata.files.len() > 1);
-        let restored = rocks(root.path(), 1).await;
+        let (restored, restored_resources) = rocks(root.path(), 1).await;
         checkpoint::restore(
             restored.as_ref(),
             &namespace(),
@@ -894,7 +951,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let restored_view = timers(restored);
+        let restored_view = timers(restored.clone());
         let due = all_due(
             &restored_view.snapshot().await.unwrap(),
             TimerClock::Event,
@@ -924,5 +981,10 @@ mod tests {
             .len(),
             299
         );
+        drop(restored_view);
+        drop(barrier);
+        drop(view);
+        close_native_fixture(restored, &restored_resources).await;
+        close_native_fixture(backend, &resources).await;
     }
 }
