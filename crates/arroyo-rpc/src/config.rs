@@ -436,6 +436,10 @@ pub struct WorkerConfig {
     #[serde(default)]
     pub disk_sql_state: Option<DiskSqlStateConfig>,
 
+    /// Native typed state-table limits, independent of the selected live backend.
+    #[serde(default)]
+    pub typed_sql_state: Option<TypedSqlStateConfig>,
+
     /// Explicit worker-wide budgets shared by disk-backed operators.
     #[serde(default)]
     pub live_state_resources: Option<LiveStateResourceConfig>,
@@ -489,6 +493,58 @@ pub struct DiskSqlStateConfig {
     pub directory: PathBuf,
     /// Per-row execution and overlay limit. Oversized rows fail before emission.
     pub max_row_bytes: usize,
+}
+
+/// Explicit bounds for one typed state-table owner. The same SQL kernel uses
+/// these limits with memory, RocksDB, or a future live-state backend adapter.
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct TypedSqlStateConfig {
+    pub key_bytes: usize,
+    pub row_bytes: usize,
+    pub decoded_bytes: usize,
+    pub scope_bytes: usize,
+    pub scope_operations: usize,
+    pub page_bytes: usize,
+    pub page_entries: usize,
+    pub max_working_event_bytes: usize,
+    pub max_captured_event_bytes: usize,
+    pub max_pending_output_rows: usize,
+    pub max_pending_output_bytes: usize,
+    /// Memory-backend resident-state cap. Ignored by disk adapters.
+    pub max_resident_bytes: usize,
+}
+
+impl TypedSqlStateConfig {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if [
+            self.key_bytes,
+            self.row_bytes,
+            self.decoded_bytes,
+            self.scope_bytes,
+            self.scope_operations,
+            self.page_bytes,
+            self.page_entries,
+            self.max_working_event_bytes,
+            self.max_captured_event_bytes,
+            self.max_pending_output_rows,
+            self.max_pending_output_bytes,
+            self.max_resident_bytes,
+        ]
+        .contains(&0)
+            || self.row_bytes > self.decoded_bytes
+            || self
+                .max_captured_event_bytes
+                .checked_add(64)
+                .is_none_or(|minimum| minimum > self.max_pending_output_bytes)
+            || self.max_captured_event_bytes > self.max_working_event_bytes
+        {
+            bail!(
+                "worker.typed-sql-state requires positive compatible state, event, and pending-output budgets"
+            );
+        }
+        Ok(())
+    }
 }
 
 /// Cooperative DataFusion execution accounting, distinct from live-state budgets.

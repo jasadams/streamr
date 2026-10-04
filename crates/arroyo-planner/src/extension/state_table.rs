@@ -91,6 +91,9 @@ pub(crate) struct StateTableAccess {
     pub result_name: Option<String>,
     pub clauses: Vec<StateTableClause>,
     pub lookup_join: Option<JoinType>,
+    /// Qualified event timestamp position in the output. A target may have
+    /// its own `_timestamp` field, so a name-only search is ambiguous.
+    pub event_timestamp_index: Option<usize>,
     pub event_scope_id: String,
     pub ownership_bindings: Vec<String>,
 }
@@ -102,7 +105,8 @@ multifield_partial_ord!(
     result_name,
     clauses,
     event_scope_id,
-    ownership_bindings
+    ownership_bindings,
+    event_timestamp_index
 );
 
 impl StateTableAccess {
@@ -158,6 +162,17 @@ impl StateTableAccess {
                 );
             }
         }
+        let event_timestamp_index = if lookup_join.is_none() {
+            let index = schema.fields().len().checked_sub(1).ok_or_else(|| {
+                datafusion::common::plan_datafusion_err!("MERGE result has no event timestamp")
+            })?;
+            if schema.field(index).name() != arroyo_rpc::TIMESTAMP_FIELD {
+                return plan_err!("MERGE result must end with the event timestamp");
+            }
+            Some(index)
+        } else {
+            None
+        };
         Ok(Self {
             input,
             table,
@@ -167,6 +182,7 @@ impl StateTableAccess {
             result_name,
             clauses,
             lookup_join,
+            event_timestamp_index,
             event_scope_id,
             ownership_bindings,
         })
@@ -388,7 +404,11 @@ impl ArroyoExtension for StateTableAccess {
         })
     }
     fn output_schema(&self) -> ArroyoSchema {
-        ArroyoSchema::from_schema_unkeyed(Arc::new(self.schema.as_ref().into())).unwrap()
+        let arrow = Arc::new(self.schema.as_ref().into());
+        match self.event_timestamp_index {
+            Some(index) => ArroyoSchema::new_unkeyed(arrow, index),
+            None => ArroyoSchema::from_schema_unkeyed(arrow).unwrap(),
+        }
     }
 }
 
@@ -540,13 +560,67 @@ pub(crate) fn plan_lookup(join: &Join) -> Result<Option<LogicalPlan>> {
             .map(|(q, f)| (q.cloned(), Arc::new(f.as_ref().clone().with_nullable(true)))),
     );
     let expression_schema = Arc::new(DFSchema::new_with_metadata(fields, HashMap::new())?);
-    let (timestamp_qualifier, _) = join
+    let (timestamp_qualifier, timestamp_field) = join
         .left
         .schema()
         .qualified_field_with_unqualified_name(arroyo_rpc::TIMESTAMP_FIELD)?;
-    let output_schema =
-        crate::schemas::add_timestamp_field(join.schema.clone(), timestamp_qualifier.cloned())?;
-    let access = StateTableAccess::new(
+    let timestamp_qualifier = timestamp_qualifier.cloned();
+    let mut output_schema = join.schema.clone();
+    let left_timestamp_index = join
+        .left
+        .schema()
+        .iter()
+        .position(|(qualifier, field)| {
+            qualifier.cloned() == timestamp_qualifier && field.as_ref() == timestamp_field
+        })
+        .ok_or_else(|| {
+            datafusion::common::plan_datafusion_err!(
+                "event timestamp is absent from the lookup left input"
+            )
+        })?;
+    let left_complete = output_schema
+        .iter()
+        .take(join.left.schema().fields().len())
+        .eq(join.left.schema().iter());
+    let event_timestamp_index = if left_complete {
+        left_timestamp_index
+    } else {
+        let left_without_timestamp = join
+            .left
+            .schema()
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| *index != left_timestamp_index)
+            .map(|(_, field)| field)
+            .collect::<Vec<_>>();
+        if !output_schema
+            .iter()
+            .take(left_without_timestamp.len())
+            .eq(left_without_timestamp.iter().copied())
+        {
+            return plan_err!("lookup JOIN changed the event-field order before its target fields");
+        }
+        let event_index = left_without_timestamp.len() + join.right.schema().fields().len();
+        if output_schema.fields().len() == event_index + 1 {
+            let (qualifier, field) = output_schema.qualified_field(event_index);
+            if qualifier.cloned() != timestamp_qualifier || field != timestamp_field {
+                return plan_err!("lookup JOIN has an unexpected field after target columns");
+            }
+            event_index
+        } else if output_schema.fields().len() == event_index {
+            // The logical JOIN may omit the source's internal event timestamp.
+            // Append that exact qualified field even if the target itself has
+            // an unrelated column named `_timestamp`.
+            output_schema = Arc::new(output_schema.join(&DFSchema::new_with_metadata(
+                vec![(timestamp_qualifier.clone(), timestamp_field.clone().into())],
+                HashMap::new(),
+            )?)?);
+            output_schema.fields().len() - 1
+        } else {
+            return plan_err!("lookup JOIN field count differs from event and target schemas");
+        }
+    };
+    let mut access = StateTableAccess::new(
         join.left.as_ref().clone(),
         scan.table.clone(),
         keys,
@@ -556,6 +630,7 @@ pub(crate) fn plan_lookup(join: &Join) -> Result<Option<LogicalPlan>> {
         vec![],
         Some(join.join_type),
     )?;
+    access.event_timestamp_index = Some(event_timestamp_index);
     Ok(Some(LogicalPlan::Extension(Extension {
         node: Arc::new(access),
     })))

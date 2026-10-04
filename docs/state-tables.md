@@ -1,11 +1,11 @@
 # Native state-table contract
 
 STR-38 implements declarations and validated catalog metadata. STR-40 plans
-direct keyed INNER/LEFT lookups and named continuous MERGE results as generic
-state-table operators. The worker rejects those plans before task construction
-until STR-41 supplies fused serial event execution. Storage, checkpoint and
-recovery qualification remain separate work in STR-39 through STR-43. A
-declaration or successfully compiled plan is not yet a runnable query.
+direct keyed INNER/LEFT lookups and named continuous MERGE results. STR-41
+fuses related accesses into one serial event owner using the configured generic
+memory or RocksDB adapter. Native value and fresh-worker recovery captures pass
+on both backends and checkpoint modes; see [validation evidence](milestone-3-validation.md).
+Broader fault, resource and migration gates remain in STR-42 and STR-43.
 
 ## Implemented declarations
 
@@ -54,10 +54,10 @@ must additionally map to that ownership key in the STR-40 plan.
 
 INSERT into retained state is unsupported; it does not mean append, upsert or
 initial population. Standalone MERGE, UPDATE and DELETE are explicitly rejected.
-The named CREATE VIEW ... AS MERGE form below is accepted for planning only. No
+The named CREATE VIEW ... AS MERGE form below executes through the fused owner. No
 state mutation falls through to the intermediate memory-table INSERT implementation.
 
-## Required execution behavior (not yet implemented)
+## Native execution contract
 
 A streaming join to a state table is a **current-row keyed lookup driven by an
 input event**. Lookup requires equality against the complete primary key and
@@ -90,7 +90,7 @@ to updating aggregates, not these tables. Any future state-table expiry policy
 changes application-visible rows and must be declared explicitly with its clock,
 replay and checkpoint semantics. No aggregate TTL is inherited.
 
-## Named MERGE output (planned, runtime unavailable)
+## Named MERGE output
 
 The syntax below is accepted by STR-40 and produces a generic state-table
 operator. It is **not executable** until STR-41 supplies fused serial ownership:
@@ -129,6 +129,15 @@ cannot shadow a state table. Multiple downstream consumers reuse the captured
 result; consuming the relation never reruns its mutation. Output is bounded and
 captured inside the same input-event scope as the mutation. Maintaining a history
 of this relation is an application sink decision.
+
+`_timestamp` identifies engine event time in query outputs. A retained table may
+store a value with that name; select it with a distinct alias, such as
+`target._timestamp AS stored_time`. The current state-table subset rejects a
+retained or computed value projected as `_timestamp`, with alias guidance,
+instead of treating that value as event time. Direct projection of the actual
+event timestamp remains supported. General support for overlapping unaliased
+names needs explicit event-time identity throughout projection and materialized
+relation planning.
 
 ## Backend construction and lifecycle
 

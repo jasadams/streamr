@@ -1810,6 +1810,15 @@ fn configure_test_worker() {
     config::update(|c| {
         // reduce the batch size to increase consistency
         c.pipeline.source_batch_size = 32;
+        if let Some(rows) = std::env::var_os("STREAMR_TEST_SOURCE_BATCH_ROWS") {
+            let rows: usize = rows
+                .to_str()
+                .expect("source batch rows must be Unicode")
+                .parse()
+                .expect("invalid source batch rows");
+            assert!(rows > 0, "source batch rows must be positive");
+            c.pipeline.source_batch_size = rows;
+        }
         if let Ok(bytes) = std::env::var("STREAMR_TEST_EXECUTION_BYTES") {
             c.worker.execution_resources = Some(arroyo_rpc::config::ExecutionResourceConfig {
                 memory_bytes: bytes.parse().expect("invalid execution memory limit"),
@@ -1836,6 +1845,46 @@ fn configure_test_worker() {
                 max_open_databases: 2,
                 disk_reserve_bytes: 64 * 1024 * 1024,
             });
+        }
+        if std::env::var("STREAMR_TEST_TYPED_SQL").as_deref() == Ok("1") {
+            c.worker.execution_resources.get_or_insert(
+                arroyo_rpc::config::ExecutionResourceConfig {
+                    memory_bytes: 16 * 1024 * 1024,
+                    max_batch_bytes: 1024 * 1024,
+                },
+            );
+            c.worker.typed_sql_state = Some(arroyo_rpc::config::TypedSqlStateConfig {
+                key_bytes: 4096,
+                row_bytes: 24 * 1024,
+                decoded_bytes: 64 * 1024,
+                scope_bytes: 256 * 1024,
+                scope_operations: 128,
+                page_bytes: 128 * 1024,
+                page_entries: 64,
+                max_working_event_bytes: 256 * 1024,
+                max_captured_event_bytes: 128 * 1024,
+                max_pending_output_rows: 64,
+                max_pending_output_bytes: 512 * 1024,
+                max_resident_bytes: 8 * 1024 * 1024,
+            });
+            let resources = c.worker.live_state_resources.get_or_insert(
+                arroyo_rpc::config::LiveStateResourceConfig {
+                    block_cache_bytes: 8 * 1024 * 1024,
+                    memtable_bytes: 4 * 1024 * 1024,
+                    queued_write_bytes: 1024 * 1024,
+                    decoded_value_bytes: 1024 * 1024,
+                    scan_page_bytes: 2 * 1024 * 1024,
+                    max_blocking_operations: 2,
+                    max_snapshots: 2,
+                    max_open_databases: 2,
+                    disk_reserve_bytes: 64 * 1024 * 1024,
+                },
+            );
+            // Typed paging reserves up to three decoded copies of each page,
+            // in addition to the live event scope and captured output buffers.
+            resources.decoded_value_bytes = 16 * 1024 * 1024;
+            // The typed scope also admits backend copies and operation metadata.
+            resources.queued_write_bytes = 2 * 1024 * 1024;
         }
     });
 }

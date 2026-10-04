@@ -398,6 +398,7 @@ async fn get_checkpoint_info_legacy<'a>(
                             GlobalKeyedTable::committing_data(config.clone(), table_metadata)
                         }
                         arroyo_rpc::grpc::rpc::TableEnum::DiskKeyedMap => None,
+                        arroyo_rpc::grpc::rpc::TableEnum::TypedStateTable => None,
                         arroyo_rpc::grpc::rpc::TableEnum::ExpiringKeyedTimeTable => None,
                     } {
                         committing_data

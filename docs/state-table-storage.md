@@ -32,7 +32,10 @@ identity and an Arrow IPC stream. Reads compare both identity and the complete
 schema and reject incompatible bytes. Encoding version is independent of schema
 identity. Checkpoint restore must compare the full descriptor, including PK
 indices, before admitting an attempt; the schema fingerprint is not a migration
-policy. Durable checkpoint export/restore integration is a separate runtime step.
+policy. The fused owner registers every typed namespace with TableManager's
+checkpoint integration. Full logical snapshots and descriptor/ownership metadata
+use the existing controller or leader publication path; a fresh attempt restores
+the selected checkpoint into the configured adapter before consuming input.
 
 A working scope holds the shared table-manager owner across awaits. `put`,
 `delete` and `get` operate on its table; `put_into`, `delete_from` and `get_from`

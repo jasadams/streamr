@@ -19,7 +19,7 @@ they are not embedded engine implementations.
 
 ### Current foundation batch
 
-The uncommitted implementation batch on top of `d59124ea` has passed these
+The foundation batch committed at `ad90cee9` on top of `d59124ea` passed these
 Bookworm library runs through the shared machine build queue:
 
 ```sh
@@ -52,9 +52,72 @@ slices. Workspace all-target checking and strict Clippy passed for this batch
 (`cargo check --locked -j4 --workspace --all-targets` and `cargo clippy --locked
 -j4 --workspace --all-targets -- -D warnings`, exit 0). Logs are in the container
 at `/tmp/streamr-m3-workspace-{check,clippy}.log`. Formatting and staged whitespace
-checks also passed. The full workspace build remains pending.
-STR-40 planning deliberately rejects startup until STR-41
-supplies fused serial execution.
+checks also passed. The full workspace build subsequently passed at `ad90cee9`
+(`cargo build --locked -j4 --workspace`, exit 0, 23m 23s; container log
+`/tmp/streamr-m3-workspace-build.log`). STR-41 integration starts after this
+source-frozen build; its subsequent edits need separate verification.
+All seven reported PR checks passed on full head
+`ad90cee99a99bdb78fcd4352eefe6c9e47d13645`; the head was rechecked after the CI
+watch exited 0. The [CI run](https://github.com/jasadams/streamr/actions/runs/37159026844)
+passed its build and strict Clippy steps, 521 tests with four skipped, and all
+12 integration tests across four runs. Its local log is
+`/tmp/streamr-m3-ci-ad90.log`. This is foundation evidence, not acceptance of
+the subsequent STR-41 integration edits.
+At that foundation head, STR-40 planning deliberately rejected startup pending
+STR-41's fused serial execution, exercised in the subsequent batch below.
+
+### Native state-table execution and recovery
+
+The subsequent STR-41 integration batch builds on foundation `ad90cee9`.
+Its latest combined Bookworm library run passed 332 tests: planner 124,
+state 69, protocol 59 and worker 80 (container log
+`/tmp/streamr-m3-native-runtime-units.log`). Worker regressions invoke the actual
+fused owner's `process_batch`: a single row emits without further input/control,
+a three-row hot-key/null-key batch splits under a one-row pending budget,
+an event budget error releases its scope, and a blocked collector keeps the
+decoded pool charged until cancellation releases its transient permits.
+
+The SQL-testing executable rebuilt successfully with `CARGO_INCREMENTAL=0`:
+`/app/target/milestone2-runtime/debug/deps/arroyo_sql_testing-7c49ff5580181832`.
+The reproducible generic driver is [scripts/test-native-state-tables.py](../scripts/test-native-state-tables.py).
+Run it inside the Bookworm container through the shared machine queue:
+
+```sh
+python3 /app/scripts/test-native-state-tables.py \
+  /app/target/milestone2-runtime/debug/deps/arroyo_sql_testing-7c49ff5580181832
+python3 /app/scripts/test-native-state-tables.py \
+  /app/target/milestone2-runtime/debug/deps/arroyo_sql_testing-7c49ff5580181832 \
+  --directory /app/target/native-state-table-timestamp-fixtures --target-timestamp
+```
+
+Both suites passed on memory/RocksDB, source batch targets 1/8 and controller/
+leader checkpoint publication: 16 runs and 64 complete JSON output comparisons.
+Each uses 15 generic events, two dependent named MERGEs, a current-row LEFT
+lookup, an intermediate sink and two final consumers. Assertions cover repeated
+and interleaved composite keys, Unicode/empty key components, NULL keys,
+matched/absent no-actions, delete/reinsert and a deliberately invalid arithmetic
+expression in an unselected clause. A checkpoint after four events at epoch 1
+is published, workers are recreated, and initial/recovered/mirror/intermediate
+outputs match independent value oracles. The second suite additionally stores a
+BIGINT value named `_timestamp` and selects it as `stored_marker`; event time
+retains its separate identity. Unaliased retained/computed `_timestamp` output
+is explicitly rejected in the current subset, as documented in
+[the SQL contract](state-tables.md).
+
+Artifacts are under `target/native-state-table{,-timestamp}-fixtures`; logs are
+in the container at `/tmp/streamr-native-state-table{,-timestamp}-fixtures-*.log`.
+Batch sizes 1/8 are source configuration targets; the direct callback regression
+independently exercises an actual three-row RecordBatch. These small captures
+do not establish beyond-RAM behavior, all fault points, backend switching, or
+STR-32's backfill/live gates. The new batch's full workspace build and
+current-head CI remain pending; the foundation's green CI does not cover it.
+The workspace all-target check and strict Clippy passed for this integration
+batch. The workspace library run initially failed six Kafka/MQTT connector
+tests because local brokers were absent. With dedicated Kafka 3.9.2 and
+Mosquitto test brokers running in the build container's network, its unchanged
+workspace connector executable passed all 60 tests (container log
+`/tmp/streamr-m3-final-connectors.log`). The final timestamp
+projection regression also passes the planner's 125-test library suite.
 
 ### Native aggregate value and recovery capture
 

@@ -2,7 +2,10 @@
 pub use crate::live::table::{LiveTable, LiveTableManager};
 
 use crate::live::{LiveStateBackend, Ownership, StateNamespace, StateSnapshot};
-use arroyo_rpc::grpc::rpc::{DiskKeyedTableConfig, DiskKeyedTableTaskCheckpointMetadata};
+use arroyo_rpc::grpc::rpc::{
+    DiskKeyedTableConfig, DiskKeyedTableTaskCheckpointMetadata, TypedStateTableConfig,
+    TypedStateTableTaskCheckpointMetadata,
+};
 use prost::Message;
 use std::any::Any;
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
@@ -10,11 +13,16 @@ use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 struct RegisteredLiveTable {
     backend: Arc<dyn LiveStateBackend>,
     namespace: StateNamespace,
-    config: DiskKeyedTableConfig,
+    config: LiveCheckpointConfig,
 }
 struct CapturedLiveTables {
-    tables: Vec<(String, StateSnapshot, StateNamespace, DiskKeyedTableConfig)>,
+    tables: Vec<(String, StateSnapshot, StateNamespace, LiveCheckpointConfig)>,
     _permit: OwnedSemaphorePermit,
+}
+#[derive(Clone)]
+enum LiveCheckpointConfig {
+    Disk(DiskKeyedTableConfig),
+    Typed(TypedStateTableConfig),
 }
 type LiveCaptures = Arc<Mutex<HashMap<u32, CapturedLiveTables>>>;
 
@@ -165,10 +173,12 @@ impl BackendFlusher {
         };
 
         let mut metadatas = HashMap::new();
-        let has_disk = self
-            .table_configs
-            .values()
-            .any(|config| config.table_type() == TableEnum::DiskKeyedMap);
+        let has_disk = self.table_configs.values().any(|config| {
+            matches!(
+                config.table_type(),
+                TableEnum::DiskKeyedMap | TableEnum::TypedStateTable
+            )
+        });
         if has_disk {
             validate_disk_tables_wire_budget(&self.table_configs, &metadatas)?;
         }
@@ -199,39 +209,83 @@ impl BackendFlusher {
                         *generation
                     }
                 };
-                let metadata = crate::live::checkpoint::export_with_file_limit(
-                    &snapshot,
-                    &namespace,
-                    &config,
-                    &self.storage,
-                    &path,
-                    cp.epoch,
-                    generation,
-                    self.task_info.task_index,
-                    crate::live::checkpoint::MAX_FILES
-                        / self
-                            .table_configs
-                            .values()
-                            .filter(|config| config.table_type() == TableEnum::DiskKeyedMap)
-                            .count()
-                            .max(1),
-                )
-                .await
-                .map_err(|error| StateError::Other {
-                    table: name.clone(),
-                    error: error.to_string(),
-                })?;
-                bytes += metadata
-                    .files
-                    .iter()
-                    .map(|f| f.size_bytes as usize)
-                    .sum::<usize>();
+                let max_files = crate::live::checkpoint::MAX_FILES
+                    / self
+                        .table_configs
+                        .values()
+                        .filter(|config| {
+                            matches!(
+                                config.table_type(),
+                                TableEnum::DiskKeyedMap | TableEnum::TypedStateTable
+                            )
+                        })
+                        .count()
+                        .max(1);
+                let (table_type, data, file_bytes) = match config {
+                    LiveCheckpointConfig::Disk(config) => {
+                        let metadata = crate::live::checkpoint::export_with_file_limit(
+                            &snapshot,
+                            &namespace,
+                            &config,
+                            &self.storage,
+                            &path,
+                            cp.epoch,
+                            generation,
+                            self.task_info.task_index,
+                            max_files,
+                        )
+                        .await
+                        .map_err(|error| StateError::Other {
+                            table: name.clone(),
+                            error: error.to_string(),
+                        })?;
+                        let file_bytes = metadata
+                            .files
+                            .iter()
+                            .map(|f| f.size_bytes as usize)
+                            .sum::<usize>();
+                        (
+                            TableEnum::DiskKeyedMap,
+                            metadata.encode_to_vec(),
+                            file_bytes,
+                        )
+                    }
+                    LiveCheckpointConfig::Typed(config) => {
+                        let metadata = crate::live::checkpoint::export_typed(
+                            &snapshot,
+                            &namespace,
+                            &config,
+                            &self.storage,
+                            &path,
+                            cp.epoch,
+                            generation,
+                            self.task_info.task_index,
+                            max_files,
+                        )
+                        .await
+                        .map_err(|error| StateError::Other {
+                            table: name.clone(),
+                            error: error.to_string(),
+                        })?;
+                        let file_bytes = metadata
+                            .files
+                            .iter()
+                            .map(|f| f.size_bytes as usize)
+                            .sum::<usize>();
+                        (
+                            TableEnum::TypedStateTable,
+                            metadata.encode_to_vec(),
+                            file_bytes,
+                        )
+                    }
+                };
+                bytes += file_bytes;
                 metadatas.insert(
                     name,
                     TableSubtaskCheckpointMetadata {
                         subtask_index: self.task_info.task_index,
-                        table_type: TableEnum::DiskKeyedMap as i32,
-                        data: metadata.encode_to_vec(),
+                        table_type: table_type as i32,
+                        data,
                     },
                 );
                 if has_disk {
@@ -276,11 +330,12 @@ impl BackendFlusher {
             table_configs: self.table_configs.clone(),
             bytes: bytes as u64,
         };
-        if self
-            .table_configs
-            .values()
-            .any(|config| config.table_type() == TableEnum::DiskKeyedMap)
-        {
+        if self.table_configs.values().any(|config| {
+            matches!(
+                config.table_type(),
+                TableEnum::DiskKeyedMap | TableEnum::TypedStateTable
+            )
+        }) {
             validate_disk_subtask_metadata_size(&subtask_metadata)?;
         }
         self.control_tx
@@ -375,10 +430,12 @@ fn validate_disk_tables_wire_budget(
     configs: &HashMap<String, TableConfig>,
     tables: &HashMap<String, TableSubtaskCheckpointMetadata>,
 ) -> Result<(), StateError> {
-    if !configs
-        .values()
-        .any(|config| config.table_type() == TableEnum::DiskKeyedMap)
-    {
+    if !configs.values().any(|config| {
+        matches!(
+            config.table_type(),
+            TableEnum::DiskKeyedMap | TableEnum::TypedStateTable
+        )
+    }) {
         return Ok(());
     }
     // Use worst-case timestamp/count varints before final metadata construction;
@@ -408,11 +465,12 @@ fn validate_disk_tables_wire_budget(
 fn validate_disk_subtask_metadata_size(
     metadata: &SubtaskCheckpointMetadata,
 ) -> Result<(), StateError> {
-    if !metadata
-        .table_configs
-        .values()
-        .any(|config| config.table_type() == TableEnum::DiskKeyedMap)
-    {
+    if !metadata.table_configs.values().any(|config| {
+        matches!(
+            config.table_type(),
+            TableEnum::DiskKeyedMap | TableEnum::TypedStateTable
+        )
+    }) {
         return Ok(());
     }
     let bytes = metadata.encoded_len();
@@ -562,11 +620,37 @@ impl TableManager {
 
         let live_configs: HashMap<_, _> = table_configs
             .iter()
-            .filter(|(_, c)| c.table_type() == TableEnum::DiskKeyedMap)
+            .filter(|(_, c)| {
+                matches!(
+                    c.table_type(),
+                    TableEnum::DiskKeyedMap | TableEnum::TypedStateTable
+                )
+            })
             .map(|(n, c)| (n.clone(), c.clone()))
             .collect();
         if live_configs.len() > 32 {
-            bail!("disk SQL supports at most 32 named maps per operator");
+            bail!("live SQL supports at most 32 named tables per operator");
+        }
+        if let Some(restored) = checkpoint_metadata.as_ref() {
+            for (name, config) in &live_configs {
+                if config.table_type() == TableEnum::TypedStateTable {
+                    let previous = restored.table_configs.get(name).ok_or_else(|| {
+                        anyhow!("selected checkpoint missing typed state-table descriptor {name}")
+                    })?;
+                    if previous.table_type() != TableEnum::TypedStateTable
+                        || previous.state_version != config.state_version
+                    {
+                        bail!("selected checkpoint has incompatible typed state-table type {name}");
+                    }
+                    let current = TypedStateTableConfig::decode(config.config.as_slice())?;
+                    let previous = TypedStateTableConfig::decode(previous.config.as_slice())?;
+                    if current != previous {
+                        bail!(
+                            "selected checkpoint has incompatible typed state-table descriptor {name}"
+                        );
+                    }
+                }
+            }
         }
         let live_restore: HashMap<String, arroyo_rpc::grpc::rpc::TableCheckpointMetadata> =
             checkpoint_metadata
@@ -581,15 +665,26 @@ impl TableManager {
                 .unwrap_or_default();
         let mut restore_files = 0usize;
         for metadata in live_restore.values() {
-            if metadata.table_type() != TableEnum::DiskKeyedMap {
-                bail!("legacy state cannot be restored as disk SQL state");
-            }
-            let metadata = DiskKeyedTableTaskCheckpointMetadata::decode(metadata.data.as_slice())?;
-            for subtask in metadata.subtasks.values() {
-                restore_files = restore_files
-                    .checked_add(subtask.files.len())
-                    .ok_or_else(|| anyhow!("disk checkpoint file count overflow"))?;
-            }
+            let files = match metadata.table_type() {
+                TableEnum::DiskKeyedMap => {
+                    DiskKeyedTableTaskCheckpointMetadata::decode(metadata.data.as_slice())?
+                        .subtasks
+                        .into_values()
+                        .map(|s| s.files.len())
+                        .sum::<usize>()
+                }
+                TableEnum::TypedStateTable => {
+                    TypedStateTableTaskCheckpointMetadata::decode(metadata.data.as_slice())?
+                        .subtasks
+                        .into_values()
+                        .map(|s| s.files.len())
+                        .sum::<usize>()
+                }
+                _ => bail!("legacy state cannot be restored as live SQL state"),
+            };
+            restore_files = restore_files
+                .checked_add(files)
+                .ok_or_else(|| anyhow!("live checkpoint file count overflow"))?;
             if restore_files > crate::live::checkpoint::MAX_FILES {
                 bail!("disk checkpoint exceeds 65536 page files per operator");
             }
@@ -597,13 +692,19 @@ impl TableManager {
         let live_captures = Arc::new(Mutex::new(HashMap::new()));
         let tables = table_configs
             .iter()
-            .filter(|(_, config)| config.table_type() != TableEnum::DiskKeyedMap)
+            .filter(|(_, config)| {
+                !matches!(
+                    config.table_type(),
+                    TableEnum::DiskKeyedMap | TableEnum::TypedStateTable
+                )
+            })
             .map(|(table_name, table_config)| {
                 let table_restore_from = checkpoint_metadata.as_ref().and_then(|metadata| {
                     metadata.table_checkpoint_metadata.get(table_name).cloned()
                 });
                 let erased_table = match table_config.table_type() {
                     TableEnum::DiskKeyedMap => unreachable!("filtered disk tables"),
+                    TableEnum::TypedStateTable => unreachable!("filtered typed tables"),
                     TableEnum::MissingTableType => bail!("should have table type"),
                     TableEnum::GlobalKeyValue => {
                         Arc::new(<GlobalKeyedTable as ErasedTable>::from_config(
@@ -783,10 +884,160 @@ impl TableManager {
             RegisteredLiveTable {
                 backend,
                 namespace,
-                config,
+                config: LiveCheckpointConfig::Disk(config),
             },
         );
         Ok(handle)
+    }
+
+    /// Register every native state table against one attempt backend and one
+    /// serialized owner. A failed restore poisons the supplied backend; callers
+    /// discard that attempt and construct a fresh backend before retrying.
+    pub async fn register_typed_tables(
+        &mut self,
+        definitions: HashMap<
+            String,
+            (
+                crate::live::typed_table::TableDescriptor,
+                crate::live::typed_table::TableLimits,
+            ),
+        >,
+        backend: Arc<dyn LiveStateBackend>,
+        resources: crate::live::resources::WorkerStateResources,
+    ) -> Result<HashMap<String, crate::live::typed_table::TypedTable>> {
+        use crate::live::typed_table::TypedTable;
+        if self.task_info.parallelism != 1 || self.task_info.task_index != 0 {
+            bail!("typed state tables require singleton execution without rescaling");
+        }
+        if definitions.is_empty()
+            || definitions.len() != self.live_configs.len()
+            || !self.live_tables.is_empty()
+        {
+            bail!("typed state-table registration must include all configured live tables once");
+        }
+        if self
+            .live_configs
+            .values()
+            .any(|config| config.table_type() != TableEnum::TypedStateTable)
+        {
+            bail!("typed state tables cannot share an owner with legacy live maps");
+        }
+        let owner = Arc::new(Mutex::new(()));
+        let mut handles = HashMap::new();
+        let mut registered = HashMap::new();
+        let mut shared_limits = None;
+        for (name, (descriptor, limits)) in definitions {
+            if shared_limits.is_some_and(|expected| expected != limits) {
+                bail!("typed state tables in one owner require identical working-scope limits");
+            }
+            shared_limits = Some(limits);
+            let wrapped = self
+                .live_configs
+                .get(&name)
+                .ok_or_else(|| anyhow!("unconfigured typed state table {name}"))?;
+            let config = TypedStateTableConfig::decode(wrapped.config.as_slice())?;
+            arroyo_state_protocol::typed_checkpoint::validate_config(&config)
+                .map_err(|e| anyhow!(e))?;
+            let schema: arrow_schema::Schema = serde_json::from_slice(&config.schema_json)?;
+            let primary_key: Vec<usize> = config.primary_key.iter().map(|i| *i as usize).collect();
+            if config.transport_name != name
+                || descriptor.table_identity != config.table_identity
+                || descriptor.schema_identity != config.schema_identity
+                || *descriptor.schema != schema
+                || descriptor.primary_key != primary_key
+            {
+                bail!(
+                    "typed state-table checkpoint descriptor differs from registered table {name}"
+                );
+            }
+            let namespace = StateNamespace {
+                ownership: Ownership::PartitionLocal {
+                    subtask: 0,
+                    parallelism: 1,
+                },
+                table: config.table_identity.clone(),
+            };
+            let handle = TypedTable::new(
+                backend.clone(),
+                namespace.clone(),
+                descriptor,
+                limits,
+                resources.clone(),
+            )?
+            .with_owner(owner.clone());
+            crate::live::checkpoint::ensure_empty(backend.as_ref(), &namespace).await?;
+            if self.restoring && !self.live_restore.contains_key(&name) {
+                bail!("selected checkpoint missing typed state table {name}");
+            }
+            if let Some(metadata) = self.live_restore.get(&name) {
+                if metadata.table_type() != TableEnum::TypedStateTable {
+                    bail!("legacy state cannot be restored as typed state table");
+                }
+                let metadata =
+                    TypedStateTableTaskCheckpointMetadata::decode(metadata.data.as_slice())?;
+                arroyo_state_protocol::typed_checkpoint::validate_table(&config, &metadata)
+                    .map_err(|e| anyhow!(e))?;
+                let subtask = metadata
+                    .subtasks
+                    .get(&0)
+                    .ok_or_else(|| anyhow!("missing typed state-table singleton subtask"))?;
+                let layout = self
+                    .restore_layout
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("missing selected checkpoint layout"))?;
+                let generation = match layout {
+                    arroyo_types::CheckpointFilePathLayout::Legacy => 0,
+                    arroyo_types::CheckpointFilePathLayout::Protocol { generation, .. } => {
+                        *generation
+                    }
+                };
+                if subtask.generation != generation || subtask.epoch != self.min_epoch {
+                    bail!("typed state-table checkpoint differs from selected epoch or generation");
+                }
+                let prefix = format!(
+                    "{}/disk-",
+                    layout.table_checkpoint_path(
+                        &self.task_info.job_id,
+                        &self.task_info.operator_id,
+                        &name,
+                        0,
+                        self.min_epoch,
+                        false
+                    )
+                );
+                for file in &subtask.files {
+                    let suffix = file
+                        .path
+                        .strip_prefix(&prefix)
+                        .ok_or_else(|| anyhow!("typed checkpoint file belongs to another owner"))?;
+                    if suffix.is_empty()
+                        || suffix.contains(['/', '\\'])
+                        || !suffix.ends_with(".bin")
+                    {
+                        bail!("typed checkpoint file is not an exclusive logical page");
+                    }
+                }
+                crate::live::checkpoint::restore_typed(
+                    backend.as_ref(),
+                    &namespace,
+                    &config,
+                    subtask,
+                    &self.storage,
+                )
+                .await?;
+            }
+            registered.insert(
+                name.clone(),
+                RegisteredLiveTable {
+                    backend: backend.clone(),
+                    namespace,
+                    config: LiveCheckpointConfig::Typed(config),
+                },
+            );
+            handles.insert(name, handle);
+        }
+        self.live_tables.extend(registered);
+        Ok(handles)
     }
 
     pub async fn checkpoint(&mut self, barrier: CheckpointBarrier, watermark: Option<SystemTime>) {
@@ -1176,11 +1427,11 @@ mod tests {
                         },
                         table: b"map".to_vec(),
                     },
-                    DiskKeyedTableConfig {
+                    LiveCheckpointConfig::Disk(DiskKeyedTableConfig {
                         table_name: "map".into(),
                         encoding_version: 1,
                         schema_identity: vec![1],
-                    },
+                    }),
                 )],
                 _permit: Arc::new(Semaphore::new(1)).acquire_owned().await.unwrap(),
             },

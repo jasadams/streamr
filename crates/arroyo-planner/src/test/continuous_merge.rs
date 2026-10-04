@@ -1,6 +1,6 @@
 use crate::{ArroyoSchemaProvider, SqlConfig, parse_and_get_program};
 use arroyo_datastream::logical::OperatorName;
-use arroyo_rpc::grpc::api::StateTableOperator;
+use arroyo_rpc::grpc::api::{FusedStateTableOperator, StateTableOperator};
 use prost::Message;
 use test_log::test;
 
@@ -41,9 +41,15 @@ fn state_operators(compiled: &crate::CompiledSql) -> Vec<StateTableOperator> {
         .graph
         .node_weights()
         .flat_map(|node| node.operator_chain.iter())
-        .filter(|(operator, _)| operator.operator_name == OperatorName::StateTable)
-        .map(|(operator, _)| {
-            StateTableOperator::decode(operator.operator_config.as_slice()).unwrap()
+        .filter(|(operator, _)| operator.operator_name == OperatorName::FusedStateTable)
+        .flat_map(|(operator, _)| {
+            FusedStateTableOperator::decode(operator.operator_config.as_slice())
+                .unwrap()
+                .steps
+                .into_iter()
+                .filter(|step| step.kind == "state_access")
+                .map(|step| StateTableOperator::decode(step.operator_config.as_slice()).unwrap())
+                .collect::<Vec<_>>()
         })
         .collect()
 }
@@ -68,6 +74,25 @@ async fn named_merge_has_one_captured_effectful_producer() {
          WHEN NOT MATCHED THEN INSERT (counter, quantity) VALUES (source.counter, 1)",
     );
     let compiled = plan(&query).await;
+    let graph_operators = compiled
+        .program
+        .graph
+        .node_weights()
+        .flat_map(|node| {
+            node.operator_chain
+                .iter()
+                .map(|(operator, _)| operator.operator_name)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        graph_operators
+            .iter()
+            .filter(|name| **name == OperatorName::FusedStateTable)
+            .count(),
+        1
+    );
+    assert!(graph_operators.contains(&OperatorName::StateTableCapture));
+    assert!(!graph_operators.contains(&OperatorName::StateTable));
     let operators = state_operators(&compiled);
     assert_eq!(operators.len(), 1);
     let config = &operators[0];
@@ -152,7 +177,97 @@ async fn inner_and_left_join_are_current_row_keyed_lookups() {
         );
         assert_eq!(configs[0].key_expressions.len(), 1);
         assert!(configs[0].clauses.is_empty());
+        let input: arrow_schema::Schema =
+            serde_json::from_str(&configs[0].input_schema.as_ref().unwrap().arrow_schema).unwrap();
+        let output: arrow_schema::Schema =
+            serde_json::from_str(&configs[0].output_schema.as_ref().unwrap().arrow_schema).unwrap();
+        let event_input_index = configs[0].input_schema.as_ref().unwrap().timestamp_index as usize;
+        let event_output_index =
+            configs[0].output_schema.as_ref().unwrap().timestamp_index as usize;
+        assert_eq!(
+            output.field(event_output_index),
+            input.field(event_input_index)
+        );
+        let actual_non_timestamp = output
+            .fields()
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| *index != event_output_index)
+            .map(|(_, field)| field.name().as_str())
+            .collect::<Vec<_>>();
+        let mut expected_non_timestamp = input
+            .fields()
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| *index != event_input_index)
+            .map(|(_, field)| field.name().as_str())
+            .collect::<Vec<_>>();
+        expected_non_timestamp.extend(["counter", "quantity"]);
+        assert_eq!(actual_non_timestamp, expected_non_timestamp);
     }
+}
+
+#[test(tokio::test)]
+async fn target_timestamp_does_not_replace_the_event_timestamp() {
+    let query = "CREATE TABLE events WITH (connector = 'impulse', event_rate = '1');
+        CREATE STATE TABLE retained (counter BIGINT PRIMARY KEY, _timestamp TIMESTAMP) PARTITION BY counter;
+        SELECT events.counter, target._timestamp AS retained_time FROM events LEFT JOIN retained AS target
+        ON events.counter = target.counter";
+    let configs = state_operators(&plan(query).await);
+    assert_eq!(configs.len(), 1);
+    let output = configs[0].output_schema.as_ref().unwrap();
+    let schema: arrow_schema::Schema = serde_json::from_str(&output.arrow_schema).unwrap();
+    let timestamps = schema
+        .fields()
+        .iter()
+        .enumerate()
+        .filter_map(|(index, field)| (field.name() == "_timestamp").then_some(index))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        timestamps.len(),
+        2,
+        "lookup retains target and event timestamps"
+    );
+    assert_eq!(
+        output.timestamp_index as usize,
+        *timestamps.last().unwrap(),
+        "event timestamp must be the appended field for the impulse source"
+    );
+}
+
+#[test(tokio::test)]
+async fn unaliased_retained_timestamp_cannot_shadow_event_time() {
+    let query = "CREATE TABLE events WITH (connector = 'impulse', event_rate = '1');
+        CREATE STATE TABLE retained (counter BIGINT PRIMARY KEY, _timestamp TIMESTAMP) PARTITION BY counter;
+        SELECT target._timestamp FROM events LEFT JOIN retained AS target
+        ON events.counter = target.counter";
+    reject(query, "alias the retained value").await;
+    let computed = "CREATE TABLE events WITH (connector = 'impulse', event_rate = '1');
+        CREATE STATE TABLE retained (counter BIGINT PRIMARY KEY, _timestamp TIMESTAMP) PARTITION BY counter;
+        SELECT COALESCE(target._timestamp, target._timestamp) AS _timestamp
+        FROM events LEFT JOIN retained AS target ON events.counter = target.counter";
+    reject(computed, "alias the retained value").await;
+}
+
+#[test(tokio::test)]
+async fn merge_new_timestamp_cannot_shadow_event_time() {
+    let declarations = "CREATE TABLE events WITH (connector = 'impulse', event_rate = '1');
+        CREATE STATE TABLE retained (counter BIGINT PRIMARY KEY, _timestamp TIMESTAMP) PARTITION BY counter;
+        CREATE VIEW applied AS MERGE INTO retained AS target USING events AS source
+        ON target.counter = source.counter
+        WHEN NOT MATCHED THEN INSERT (counter, _timestamp)
+        VALUES (source.counter, CAST('2020-01-01' AS TIMESTAMP))
+        RETURNING source AS source, old AS old, new AS new, action AS action;";
+    reject(
+        &format!("{declarations} SELECT new._timestamp AS _timestamp FROM applied"),
+        "alias the retained value",
+    )
+    .await;
+    let accepted = plan(&format!(
+        "{declarations} SELECT new._timestamp AS stored_time FROM applied"
+    ))
+    .await;
+    assert_eq!(state_operators(&accepted).len(), 1);
 }
 
 #[test(tokio::test)]

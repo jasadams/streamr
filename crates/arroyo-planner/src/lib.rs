@@ -10,6 +10,7 @@ pub mod physical;
 mod plan;
 mod rewriters;
 pub mod schemas;
+mod state_table_fusion;
 pub mod state_tables;
 mod tables;
 pub mod types;
@@ -1034,6 +1035,24 @@ pub async fn parse_and_get_arrow_program(
         plan_to_graph_visitor.add_plan(mutation)?;
     }
     let graph = plan_to_graph_visitor.into_graph();
+    let admission = state_table_fusion::PureScalarAdmission {
+        registry: &schema_provider,
+    };
+    let regions = state_table_fusion::analyze(&graph, &admission)?;
+    let graph = if regions.is_empty() {
+        graph
+    } else {
+        let mut next_node_id = graph
+            .node_weights()
+            .map(|node| node.node_id)
+            .max()
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or_else(|| DataFusionError::Plan("state-table graph node ID overflow".into()))?;
+        state_table_fusion::rebuild(&graph, &regions, |region, edge| {
+            state_table_fusion::lower_region(region, edge, &mut next_node_id)
+        })?
+    };
 
     let mut program = LogicalProgram::new(
         graph,

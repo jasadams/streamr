@@ -5,6 +5,8 @@ use crate::arrow::join_with_expiration::JoinWithExpirationConstructor;
 use crate::arrow::lookup_join::LookupJoinConstructor;
 use crate::arrow::session_aggregating_window::SessionAggregatingWindowConstructor;
 use crate::arrow::sliding_aggregating_window::SlidingAggregatingWindowConstructor;
+use crate::arrow::state_table::StateTableCaptureConstructor;
+use crate::arrow::state_table_runtime::FusedStateTableConstructor;
 use crate::arrow::stateful_processor::StatefulProcessorConstructor;
 use crate::arrow::tumbling_aggregating_window::TumblingAggregateWindowConstructor;
 use crate::arrow::watermark_generator::WatermarkGeneratorConstructor;
@@ -283,7 +285,10 @@ impl Program {
                         node.operator_chain
                             .iter()
                             .filter(|(operator, _)| {
-                                operator.operator_name == OperatorName::StatefulProcessor
+                                matches!(
+                                    operator.operator_name,
+                                    OperatorName::StatefulProcessor | OperatorName::FusedStateTable
+                                )
                             })
                             .count(),
                     )
@@ -328,6 +333,8 @@ impl Program {
                             | OperatorName::ArrowKey
                             | OperatorName::Projection
                             | OperatorName::StatefulProcessor
+                            | OperatorName::FusedStateTable
+                            | OperatorName::StateTableCapture
                             | OperatorName::ConnectorSource
                             | OperatorName::ConnectorSink
                     ) {
@@ -1059,6 +1066,8 @@ pub fn construct_operator(
                 "state-table execution requires STR-41 fused serial event owner; standalone state-table operator is unavailable"
             )
         }
+        OperatorName::FusedStateTable => Box::new(FusedStateTableConstructor),
+        OperatorName::StateTableCapture => Box::new(StateTableCaptureConstructor),
         OperatorName::ExpressionWatermark => Box::new(WatermarkGeneratorConstructor),
         OperatorName::Join => Box::new(JoinWithExpirationConstructor),
         OperatorName::InstantJoin => Box::new(InstantJoinConstructor),

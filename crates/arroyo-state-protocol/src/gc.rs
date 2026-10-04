@@ -210,6 +210,20 @@ fn table_checkpoint_data_files(
                 }
             }
         }
+        TableEnum::TypedStateTable => {
+            let metadata = arroyo_rpc::grpc::rpc::TypedStateTableTaskCheckpointMetadata::decode(
+                metadata.data.as_slice(),
+            )
+            .map_err(|source| StoreError::DecodeProtobuf {
+                path: metadata_path.clone(),
+                source,
+            })?;
+            for subtask in metadata.subtasks.into_values() {
+                for file in subtask.files {
+                    files.push(CheckpointRef::new(file.path)?);
+                }
+            }
+        }
         TableEnum::GlobalKeyValue => {
             let metadata = GlobalKeyedTableTaskCheckpointMetadata::decode(metadata.data.as_slice())
                 .map_err(|e| StoreError::DecodeProtobuf {

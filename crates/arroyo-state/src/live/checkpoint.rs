@@ -6,6 +6,7 @@ use super::{
 use anyhow::{Result, bail, ensure};
 use arroyo_rpc::grpc::rpc::{
     DiskCheckpointFile, DiskKeyedTableConfig, DiskKeyedTableSubtaskCheckpointMetadata,
+    TypedStateTableConfig, TypedStateTableSubtaskCheckpointMetadata,
 };
 use arroyo_storage::StorageProviderRef;
 use prost::Message;
@@ -50,22 +51,54 @@ pub(crate) async fn export_with_file_limit(
     subtask: u32,
     max_files: usize,
 ) -> Result<DiskKeyedTableSubtaskCheckpointMetadata> {
+    export_snapshot(
+        snapshot,
+        namespace,
+        &config.table_name,
+        config.table_name.as_bytes(),
+        &config.schema_identity,
+        config.encoding_version,
+        storage,
+        path,
+        epoch,
+        generation,
+        subtask,
+        max_files,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn export_snapshot(
+    snapshot: &StateSnapshot,
+    namespace: &StateNamespace,
+    transport_name: &str,
+    table_identity: &[u8],
+    schema_identity: &[u8],
+    encoding_version: u32,
+    storage: &StorageProviderRef,
+    path: &str,
+    epoch: u32,
+    generation: u64,
+    subtask: u32,
+    max_files: usize,
+) -> Result<DiskKeyedTableSubtaskCheckpointMetadata> {
     ensure!(
-        !config.table_name.is_empty()
-            && !config.table_name.contains(['/', '\\'])
-            && !matches!(config.table_name.as_str(), "." | ".."),
+        !transport_name.is_empty()
+            && !transport_name.contains(['/', '\\'])
+            && !matches!(transport_name, "." | ".."),
         "disk table name must be a safe path component"
     );
     ensure!(
-        namespace.table == config.table_name.as_bytes(),
+        namespace.table == table_identity,
         "disk snapshot namespace/config mismatch"
     );
-    ensure!(config.encoding_version == 1, "unsupported disk encoding");
+    ensure!(encoding_version == 1, "unsupported disk encoding");
     let mut metadata = DiskKeyedTableSubtaskCheckpointMetadata {
         subtask_index: subtask,
         format_version: 1,
         encoding_version: 1,
-        schema_identity: config.schema_identity.clone(),
+        schema_identity: schema_identity.to_vec(),
         namespace: encoding::encode_namespace(namespace)?,
         generation,
         epoch,
@@ -170,6 +203,48 @@ pub(crate) async fn export_with_file_limit(
     Ok(metadata)
 }
 
+#[allow(clippy::too_many_arguments)]
+pub async fn export_typed(
+    snapshot: &StateSnapshot,
+    namespace: &StateNamespace,
+    config: &TypedStateTableConfig,
+    storage: &StorageProviderRef,
+    path: &str,
+    epoch: u32,
+    generation: u64,
+    subtask: u32,
+    max_files: usize,
+) -> Result<TypedStateTableSubtaskCheckpointMetadata> {
+    arroyo_state_protocol::typed_checkpoint::validate_config(config)
+        .map_err(|error| anyhow::anyhow!(error))?;
+    let metadata = export_snapshot(
+        snapshot,
+        namespace,
+        &config.transport_name,
+        &config.table_identity,
+        &config.schema_identity,
+        config.encoding_version,
+        storage,
+        path,
+        epoch,
+        generation,
+        subtask,
+        max_files,
+    )
+    .await?;
+    Ok(TypedStateTableSubtaskCheckpointMetadata {
+        subtask_index: metadata.subtask_index,
+        format_version: metadata.format_version,
+        encoding_version: metadata.encoding_version,
+        schema_identity: metadata.schema_identity,
+        namespace: metadata.namespace,
+        generation: metadata.generation,
+        epoch: metadata.epoch,
+        empty: metadata.empty,
+        files: metadata.files,
+    })
+}
+
 /// Restore into a fresh namespace only. A failed restore poisons that attempt:
 /// callers must discard its database and retry in another fresh attempt directory.
 pub async fn restore(
@@ -179,14 +254,62 @@ pub async fn restore(
     metadata: &DiskKeyedTableSubtaskCheckpointMetadata,
     storage: &StorageProviderRef,
 ) -> Result<()> {
+    restore_snapshot(
+        backend,
+        namespace,
+        config.encoding_version,
+        &config.schema_identity,
+        metadata,
+        storage,
+    )
+    .await
+}
+
+pub async fn restore_typed(
+    backend: &dyn LiveStateBackend,
+    namespace: &StateNamespace,
+    config: &TypedStateTableConfig,
+    metadata: &TypedStateTableSubtaskCheckpointMetadata,
+    storage: &StorageProviderRef,
+) -> Result<()> {
+    arroyo_state_protocol::typed_checkpoint::validate_subtask(config, metadata)
+        .map_err(|error| anyhow::anyhow!(error))?;
+    let disk = DiskKeyedTableSubtaskCheckpointMetadata {
+        subtask_index: metadata.subtask_index,
+        format_version: metadata.format_version,
+        encoding_version: metadata.encoding_version,
+        schema_identity: metadata.schema_identity.clone(),
+        namespace: metadata.namespace.clone(),
+        generation: metadata.generation,
+        epoch: metadata.epoch,
+        empty: metadata.empty,
+        files: metadata.files.clone(),
+    };
+    restore_snapshot(
+        backend,
+        namespace,
+        config.encoding_version,
+        &config.schema_identity,
+        &disk,
+        storage,
+    )
+    .await
+}
+
+async fn restore_snapshot(
+    backend: &dyn LiveStateBackend,
+    namespace: &StateNamespace,
+    encoding_version: u32,
+    schema_identity: &[u8],
+    metadata: &DiskKeyedTableSubtaskCheckpointMetadata,
+    storage: &StorageProviderRef,
+) -> Result<()> {
     ensure!(
-        metadata.format_version == 1
-            && metadata.encoding_version == 1
-            && config.encoding_version == 1,
+        metadata.format_version == 1 && metadata.encoding_version == 1 && encoding_version == 1,
         "unsupported disk checkpoint encoding/version"
     );
     ensure!(
-        metadata.schema_identity == config.schema_identity,
+        metadata.schema_identity == schema_identity,
         "disk checkpoint schema mismatch"
     );
     ensure!(
@@ -356,6 +479,74 @@ mod tests {
                 .await
                 .unwrap(),
         )
+    }
+
+    #[tokio::test]
+    async fn typed_snapshot_restores_opaque_namespace_through_safe_transport_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = storage(&directory).await;
+        let identity = br#"state-table-v1:["public","items"]"#.to_vec();
+        let transport_name =
+            arroyo_state_protocol::typed_checkpoint::transport_table_name(&identity).unwrap();
+        let namespace = StateNamespace {
+            ownership: Ownership::PartitionLocal {
+                subtask: 0,
+                parallelism: 1,
+            },
+            table: identity.clone(),
+        };
+        let config = TypedStateTableConfig {
+            transport_name: transport_name.clone(),
+            table_identity: identity,
+            schema_identity: b"schema-v1".to_vec(),
+            schema_json: b"{}".to_vec(),
+            primary_key: vec![0],
+            partition_key: vec![0],
+            encoding_version: 1,
+        };
+        let key = StateKey {
+            namespace: namespace.clone(),
+            key: b"key".to_vec(),
+            routing_hash: None,
+        };
+        let source = MemoryLiveState::new();
+        source
+            .put(key.clone(), b"value".to_vec(), PAGE_BYTES)
+            .await
+            .unwrap();
+        let path = format!(
+            "P/J/generations/2/checkpoints/checkpoint-0000003/operator-o/table-{transport_name}-000"
+        );
+        let metadata = export_typed(
+            &source.snapshot().await.unwrap(),
+            &namespace,
+            &config,
+            &storage,
+            &path,
+            3,
+            2,
+            0,
+            MAX_FILES,
+        )
+        .await
+        .unwrap();
+        arroyo_state_protocol::typed_checkpoint::validate_subtask(&config, &metadata).unwrap();
+        let restored = MemoryLiveState::new();
+        restore_typed(&restored, &namespace, &config, &metadata, &storage)
+            .await
+            .unwrap();
+        assert_eq!(
+            restored
+                .get(
+                    &key,
+                    ReadOptions {
+                        max_bytes: PAGE_BYTES
+                    }
+                )
+                .await
+                .unwrap(),
+            Some(b"value".to_vec())
+        );
     }
 
     #[tokio::test]

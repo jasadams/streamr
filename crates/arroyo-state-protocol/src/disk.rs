@@ -104,10 +104,63 @@ pub fn validate_manifest(
 ) -> Result<(), String> {
     use arroyo_rpc::grpc::rpc::{
         DiskKeyedTableConfig, DiskKeyedTableTaskCheckpointMetadata, TableEnum,
+        TypedStateTableConfig, TypedStateTableTaskCheckpointMetadata,
     };
     use prost::Message;
     for operator in &manifest.operators {
         for (table_name, metadata) in &operator.table_checkpoint_metadata {
+            if metadata.table_type() == TableEnum::TypedStateTable {
+                let op = operator
+                    .operator_metadata
+                    .as_ref()
+                    .ok_or("missing typed table operator ownership")?;
+                if op.parallelism != 1
+                    || u64::from(op.epoch) != manifest.epoch
+                    || op.job_id != manifest.job_id
+                {
+                    return Err("typed state-table operator checkpoint ownership mismatch".into());
+                }
+                let config = operator
+                    .table_configs
+                    .get(table_name)
+                    .ok_or("missing typed state-table configuration")?;
+                if config.table_type() != TableEnum::TypedStateTable {
+                    return Err("typed state-table configuration type mismatch".into());
+                }
+                let config = TypedStateTableConfig::decode(config.config.as_slice())
+                    .map_err(|e| e.to_string())?;
+                if config.transport_name != *table_name {
+                    return Err("typed state-table transport name mismatch".into());
+                }
+                let metadata =
+                    TypedStateTableTaskCheckpointMetadata::decode(metadata.data.as_slice())
+                        .map_err(|e| e.to_string())?;
+                crate::typed_checkpoint::validate_table(&config, &metadata)?;
+                let prefix = format!(
+                    "{}/{}/generations/{}/checkpoints/checkpoint-{:07}/operator-{}/table-{}-000/",
+                    manifest.pipeline_id,
+                    manifest.job_id,
+                    manifest.generation,
+                    manifest.epoch,
+                    op.operator_id,
+                    table_name
+                );
+                for subtask in metadata.subtasks.values() {
+                    if subtask.generation != manifest.generation
+                        || u64::from(subtask.epoch) != manifest.epoch
+                    {
+                        return Err(
+                            "typed state-table checkpoint generation or epoch mismatch".into()
+                        );
+                    }
+                    for file in &subtask.files {
+                        if !file.path.starts_with(&prefix) {
+                            return Err("typed state-table file is outside exclusive checkpoint table directory".into());
+                        }
+                    }
+                }
+                continue;
+            }
             if metadata.table_type() != TableEnum::DiskKeyedMap {
                 continue;
             }

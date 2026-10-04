@@ -282,13 +282,70 @@ impl TreeNodeRewriter for ArroyoRewriter<'_> {
                         "state-table scans require an input-event keyed INNER or LEFT JOIN; standalone target scans are unsupported"
                     );
                 }
-                if !has_timestamp_field(&projection.schema) {
-                    let timestamp_field: DFField = projection
+                let direct_event_index =
+                    if let LogicalPlan::Extension(extension) = projection.input.as_ref() {
+                        extension
+                            .node
+                            .as_any()
+                            .downcast_ref::<crate::extension::state_table::StateTableAccess>()
+                            .and_then(|access| access.event_timestamp_index)
+                    } else {
+                        None
+                    };
+                let event_index = direct_event_index.or_else(|| {
+                    let timestamps = projection
                         .input
                         .schema()
-                        .qualified_field_with_unqualified_name(TIMESTAMP_FIELD).map_err(|_| {
+                        .fields()
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(index, field)| {
+                            (field.name() == TIMESTAMP_FIELD).then_some(index)
+                        })
+                        .collect::<Vec<_>>();
+                    (timestamps.len() == 1).then(|| timestamps[0])
+                });
+                let retained_timestamp_in_lineage = projection.input.exists(|plan| {
+                    Ok(matches!(plan, LogicalPlan::Extension(extension)
+                        if extension.node.as_any().downcast_ref::<crate::extension::state_table::StateTableAccess>()
+                            .is_some_and(|access| access.table.schema.fields().iter().any(|field| field.name() == TIMESTAMP_FIELD))))
+                })?;
+                if retained_timestamp_in_lineage {
+                    for (position, expression) in projection.expr.iter().enumerate() {
+                        if projection.schema.field(position).name() != TIMESTAMP_FIELD {
+                            continue;
+                        }
+                        let column = match expression {
+                            Expr::Column(column) => Some(column),
+                            Expr::Alias(alias) => match alias.expr.as_ref() {
+                                Expr::Column(column) => Some(column),
+                                _ => None,
+                            },
+                            _ => None,
+                        };
+                        if event_index.is_none_or(|event_index| {
+                            column.is_none_or(|column| {
+                                projection.input.schema().index_of_column(column).ok()
+                                    != Some(event_index)
+                            })
+                        }) {
+                            return plan_err!(
+                                "projected state-table _timestamp conflicts with event time; alias the retained value to a different output name"
+                            );
+                        }
+                    }
+                }
+                if !has_timestamp_field(&projection.schema) {
+                    let timestamp_field: DFField = if let Some(index) = event_index {
+                        // A lookup target may also declare `_timestamp`. Use the
+                        // access's qualified event-time ordinal, not an
+                        // unqualified name lookup that can select the target.
+                        projection.input.schema().qualified_field(index).into()
+                    } else {
+                        projection.input.schema().qualified_field_with_unqualified_name(TIMESTAMP_FIELD).map_err(|_| {
                             DataFusionError::Plan(format!("No timestamp field found in projection input ({}). Query should've been rewritten", projection.input.display()))
-                        })?.into();
+                        })?.into()
+                    };
                     projection.schema = add_timestamp_field(
                         projection.schema.clone(),
                         timestamp_field.qualifier().cloned(),
