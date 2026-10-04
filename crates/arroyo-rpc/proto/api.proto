@@ -123,7 +123,10 @@ message UpdatingAggregateOperator {
   bytes aggregate_exec = 5;
   bytes metadata_expr = 6;
   uint64 flush_interval_micros = 7;
+  // Zero retains the legacy default of 24 hours unless retain_indefinitely is true.
   uint64 ttl_micros = 8;
+  // Only explicit true disables state expiry; absent/false preserves finite TTL behavior.
+  optional bool retain_indefinitely = 9;
 }
 
 enum StateOpType {

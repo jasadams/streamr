@@ -1810,6 +1810,11 @@ fn configure_test_worker() {
     config::update(|c| {
         // reduce the batch size to increase consistency
         c.pipeline.source_batch_size = 32;
+        if let Ok(seconds) = std::env::var("STREAMR_TEST_AGGREGATE_FLUSH_SECONDS") {
+            let seconds: u64 = seconds.parse().expect("invalid aggregate flush interval");
+            assert!(seconds > 0, "aggregate flush interval must be positive");
+            c.pipeline.update_aggregate_flush_interval = Duration::from_secs(seconds).into();
+        }
         if let Some(rows) = std::env::var_os("STREAMR_TEST_SOURCE_BATCH_ROWS") {
             let rows: usize = rows
                 .to_str()
@@ -1885,6 +1890,40 @@ fn configure_test_worker() {
             resources.decoded_value_bytes = 16 * 1024 * 1024;
             // The typed scope also admits backend copies and operation metadata.
             resources.queued_write_bytes = 2 * 1024 * 1024;
+        }
+        if std::env::var("STREAMR_TEST_NATIVE_AGGREGATES").as_deref() == Ok("1") {
+            c.worker.execution_resources = Some(arroyo_rpc::config::ExecutionResourceConfig {
+                memory_bytes: 16 * 1024 * 1024,
+                max_batch_bytes: 8 * 1024 * 1024,
+            });
+            c.worker.aggregate_state = Some(arroyo_rpc::config::AggregateStateConfig {
+                key_bytes: 512,
+                value_bytes: 32 * 1024,
+                page_bytes: 128 * 1024,
+                page_entries: 64,
+                write_bytes: 2 * 1024 * 1024,
+                write_operations: 128,
+                overlay_bytes: 2 * 1024 * 1024,
+                max_pending_output_rows: 64,
+                max_pending_output_bytes: 512 * 1024,
+                max_resident_bytes: 128 * 1024 * 1024,
+            });
+            let resources = c.worker.live_state_resources.get_or_insert(
+                arroyo_rpc::config::LiveStateResourceConfig {
+                    block_cache_bytes: 8 * 1024 * 1024,
+                    memtable_bytes: 4 * 1024 * 1024,
+                    queued_write_bytes: 32 * 1024 * 1024,
+                    decoded_value_bytes: 16 * 1024 * 1024,
+                    scan_page_bytes: 2 * 1024 * 1024,
+                    max_blocking_operations: 2,
+                    max_snapshots: 2,
+                    max_open_databases: 2,
+                    disk_reserve_bytes: 64 * 1024 * 1024,
+                },
+            );
+            // Two native owners can each admit a complete 2 MiB write scope.
+            resources.queued_write_bytes = 32 * 1024 * 1024;
+            resources.decoded_value_bytes = 16 * 1024 * 1024;
         }
     });
 }

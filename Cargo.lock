@@ -1139,6 +1139,7 @@ dependencies = [
  "rand 0.9.1",
  "serde",
  "serde_json",
+ "sha2",
  "tokio",
  "tokio-rustls 0.26.2",
  "tokio-stream",

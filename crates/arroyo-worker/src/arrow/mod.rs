@@ -33,6 +33,8 @@ use std::sync::Arc;
 use std::sync::RwLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+mod aggregate_codec;
+mod aggregate_store;
 pub mod async_udf;
 mod execution;
 pub mod incremental_aggregator;

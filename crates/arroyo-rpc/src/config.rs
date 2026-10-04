@@ -440,6 +440,10 @@ pub struct WorkerConfig {
     #[serde(default)]
     pub typed_sql_state: Option<TypedSqlStateConfig>,
 
+    /// Bounded native updating-aggregate state on the configured live backend.
+    #[serde(default)]
+    pub aggregate_state: Option<AggregateStateConfig>,
+
     /// Explicit worker-wide budgets shared by disk-backed operators.
     #[serde(default)]
     pub live_state_resources: Option<LiveStateResourceConfig>,
@@ -513,6 +517,53 @@ pub struct TypedSqlStateConfig {
     pub max_pending_output_bytes: usize,
     /// Memory-backend resident-state cap. Ignored by disk adapters.
     pub max_resident_bytes: usize,
+}
+
+/// One updating-aggregate owner's backend-neutral limits. A memory adapter
+/// additionally uses max_resident_bytes; all other limits apply to every
+/// backend and cannot be inferred from unbounded input cardinality.
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct AggregateStateConfig {
+    pub key_bytes: usize,
+    pub value_bytes: usize,
+    pub page_bytes: usize,
+    pub page_entries: usize,
+    pub write_bytes: usize,
+    pub write_operations: usize,
+    pub overlay_bytes: usize,
+    pub max_pending_output_rows: usize,
+    pub max_pending_output_bytes: usize,
+    pub max_resident_bytes: usize,
+}
+
+impl AggregateStateConfig {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        let positive = [
+            self.key_bytes,
+            self.value_bytes,
+            self.page_bytes,
+            self.page_entries,
+            self.write_bytes,
+            self.write_operations,
+            self.overlay_bytes,
+            self.max_pending_output_rows,
+            self.max_pending_output_bytes,
+            self.max_resident_bytes,
+        ];
+        if positive.contains(&0)
+            || self.max_pending_output_rows < 2
+            || self.write_operations < 2
+            || self.page_bytes < self.key_bytes.saturating_add(self.value_bytes)
+            || self.write_bytes < self.key_bytes.saturating_add(self.value_bytes)
+            || self.overlay_bytes < self.key_bytes.saturating_add(self.value_bytes)
+        {
+            bail!(
+                "worker.aggregate-state requires positive limits, two output rows/write operations, and room for one maximum key/value in page, write, and overlay budgets"
+            );
+        }
+        Ok(())
+    }
 }
 
 impl TypedSqlStateConfig {

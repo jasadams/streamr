@@ -100,13 +100,15 @@ pub struct CompiledSql {
 
 #[derive(Clone)]
 pub struct PlanningOptions {
-    ttl: Duration,
+    ttl: Option<Duration>,
+    join_ttl: Duration,
 }
 
 impl Default for PlanningOptions {
     fn default() -> Self {
         Self {
-            ttl: Duration::from_secs(24 * 60 * 60),
+            ttl: Some(Duration::from_secs(24 * 60 * 60)),
+            join_ttl: Duration::from_secs(24 * 60 * 60),
         }
     }
 }
@@ -832,7 +834,17 @@ fn try_handle_set_variable(
             return plan_err!("invalid `SET updating_ttl` call; expected exactly one expression");
         }
 
-        schema_provider.planning_options.ttl = duration_from_sql(value[0].clone())?;
+        schema_provider.planning_options.ttl = match &value[0] {
+            sqlparser::ast::Expr::Value(value)
+                if matches!(&value.value, sqlparser::ast::Value::Null) =>
+            {
+                None
+            }
+            expression => Some(duration_from_sql(expression.clone())?),
+        };
+        if let Some(ttl) = schema_provider.planning_options.ttl {
+            schema_provider.planning_options.join_ttl = ttl;
+        }
 
         return Ok(true);
     }

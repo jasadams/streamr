@@ -113,8 +113,13 @@ STR-32's backfill/live gates. The integration source is committed at `67d9c96a`.
 Its full workspace build passed (3m 10s, container log
 `/tmp/streamr-m3-final-build.log`), and strict workspace all-target Clippy
 passed (1m 02s, `/tmp/streamr-m3-final-clippy.log`). Both 16-case capture suites
-above were rerun successfully after the final timestamp fix. Current-head CI
-remains pending; the foundation's green CI does not cover this source.
+above were rerun successfully after the final timestamp fix. All seven reported
+PR checks passed on full head `94f6228e87ea98f213c17973cbbb9433eb3033b8`;
+the head was rechecked after CI completed. The
+[CI run](https://github.com/jasadams/streamr/actions/runs/37167544579)
+covers this committed integration source: 543 tests passed with four skipped,
+and all 12 integration tests passed across four runs. Subsequent native aggregate and
+capacity/recovery additions are separate work and require their own gates.
 The workspace all-target check and strict Clippy passed for this integration
 batch. The workspace library run initially failed six Kafka/MQTT connector
 tests because local brokers were absent. With dedicated Kafka 3.9.2 and
@@ -122,6 +127,84 @@ Mosquitto test brokers running in the build container's network, its unchanged
 workspace connector executable passed all 60 tests (container log
 `/tmp/streamr-m3-final-connectors.log`). The final timestamp
 projection regression also passes the planner's 125-test library suite.
+
+### State-table retained-capacity and selected-checkpoint recovery
+
+The generic driver [scripts/test-state-table-capacity.py](../scripts/test-state-table-capacity.py)
+passed with the SQL executable built from `67d9c96a`, using RocksDB and both
+controller and leader checkpoint publication. Each run inserts 65,000 keys with
+8,192 bytes of deterministic, varied payload per key, then probes 64 keys spread
+across the retained set. Retained payload totals 532,480,000 bytes, more than ten
+times the conservative 48 MiB sum of the fixture's executor/live resource limits.
+The process RSS envelope is separately declared as 512 MiB.
+
+Controller peak RSS was 296,431,616 bytes; leader peak RSS was 292,675,584 bytes,
+measured with Linux `wait4` for the complete worker process. Both runs compare
+all 65,064 output rows before and after fresh-worker restore, including old/new
+values, actions and current lookup payload equality. The selected checkpoint is
+epoch 1 after 32,500 input rows. Four complete comparisons passed in total.
+Artifacts and measurements are under `target/state-table-capacity-varied`.
+A 100-key smoke run also passed both modes and explicitly did not meet the
+ten-times-pool threshold.
+
+This measures logical retained payload and actual process RSS. It does not claim
+that physical compressed storage exceeds host RAM, or qualify native aggregates,
+windows, backend switching, every failure point, or the full backfill/live gates.
+The separate backend-switch checkpoint unit test subsequently passed as part
+of the 70-test state library suite. It exercises all four source/destination
+backend pairs across full, updated/deleted and empty epochs, incomplete restore
+rejection and fresh-attempt retry. Integration build/test gates passed as recorded
+below; current-head CI remains pending for these additions.
+
+### Configured native updating-aggregate state
+
+The subsequent STR-17 batch adds `worker.aggregate-state` limits and uses the
+configured generic live backend for group accumulators, counted extrema,
+ordered members, dirty output state and finite-retention expiry. Memory and
+RocksDB use the same SQL/operator code. `SET updating_ttl = NULL` explicitly
+requests indefinite aggregate retention; default and finite retention remain
+compatible, and join retention remains finite. Ordinary admitted backend batches
+and checkpoint barriers provide visibility and recovery; no per-event durable
+transaction or synchronous flush is added.
+
+The complete Bookworm workspace library run passed 561 tests, including planner
+132, state 70, protocol 59 and worker 90. Formatting, strict workspace all-target
+Clippy (36.54s), and the full workspace build (2m 31s) passed. Logs are
+`/tmp/streamr-m3-native-aggregate-{fmt,clippy,build,final-units}.log`.
+The previous all-target compile check also passed (1m 42s); its log is
+`/tmp/streamr-m3-native-aggregate-check.log`.
+
+The generic [native aggregate driver](../scripts/test-native-aggregates.py)
+passed eight configured memory/RocksDB × source batch target 1/8 × controller/
+leader cases. Its actual SQL composes a per-item MAX aggregation with a second
+COUNT/FILTER/SUM/MIN/MAX/ordered FIRST IGNORE NULLS/LAST aggregation, so the second
+stage consumes genuine updating-input retractions. It compares full initial,
+checkpoint-prefix and recovered values and checks each Debezium before/after
+transition. A four-input-row epoch-1 checkpoint precedes fresh-worker restore.
+The recovered sink contains two creates and two updates; each update encodes its
+before and after rows in one Debezium record.
+
+The optional `--baseline` comparison reproduces an existing legacy moving-MAX
+defect after restore/retractions: one group reports 7 instead of the correct 9.
+The native counted index returns 9. That negative comparison is retained as
+evidence, rather than used as the native value oracle. SQL with equal ORDER BY
+tuples also permits ambiguous LAST results; the existing operator demonstrated
+different initial and recovered tie choices. Exact native value assertions use
+an explicit total-order tie-breaker.
+
+The final-source rerun passed all eight native cases, followed by both generic
+state-table suites (16 cases and 64 full comparisons). The reproducible
+[ordering diagnostic](../scripts/test-native-aggregate-ordering.py) also passed
+four native/legacy memory cases with `--total-order` at source batch targets
+1/8, comparing exact initial, checkpoint and recovered values. Its default
+equal-order mode records permitted tie differences explicitly rather than
+requiring the existing operator's inconsistent choices. Logs are
+`/tmp/streamr-m3-native-aggregate-{final-matrix,total-order,equal-order}.log`
+and `/tmp/streamr-m3-native-tables-aggregate-{batch,timestamp}.log`.
+
+These small operator captures and units do not qualify aggregate hot-key/high-
+cardinality capacity, every failure point, rescaling, native windows or the full
+backfill/live gates. Current-head CI remains pending for this batch.
 
 ### Native aggregate value and recovery capture
 

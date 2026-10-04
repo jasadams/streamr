@@ -550,6 +550,216 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn typed_checkpoints_switch_backends_with_full_and_empty_epochs() {
+        use crate::live::{
+            lifecycle::RocksStateConfig,
+            resources::{ResourceConfig, WorkerStateResources},
+            worker::{BackendConstruction, construct_backend},
+        };
+
+        async fn backend(rocks: bool, root: &std::path::Path) -> Arc<dyn LiveStateBackend> {
+            let resources = WorkerStateResources::new(ResourceConfig {
+                block_cache_bytes: 8 * 1024 * 1024,
+                memtable_bytes: 2 * 1024 * 1024,
+                // Restore admits a complete bounded page as a backend batch.
+                queued_write_bytes: 8 * 1024 * 1024,
+                decoded_value_bytes: 4 * 1024 * 1024,
+                // Restore checks namespace emptiness with a PAGE_BYTES scan;
+                // admit its backend buffers and request/container overhead.
+                scan_page_bytes: 8 * 1024 * 1024,
+                max_blocking_operations: 2,
+                max_snapshots: 4,
+                max_open_databases: 2,
+                disk_reserve_bytes: 0,
+            })
+            .unwrap();
+            let construction = if rocks {
+                BackendConstruction::Rocksdb(RocksStateConfig {
+                    root: root.to_path_buf(),
+                    job_id: "typed-checkpoint-test".into(),
+                    operator_id: "state-owner".into(),
+                    subtask: 0,
+                    generation: 7,
+                    attempt: 1,
+                })
+            } else {
+                BackendConstruction::Memory {
+                    max_resident_bytes: 32 * 1024 * 1024,
+                }
+            };
+            construct_backend(construction, resources).await.unwrap()
+        }
+
+        for source_rocks in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let storage = storage(&directory).await;
+            let identity = br#"state-table-v1:["public","inventory"]"#.to_vec();
+            let transport_name =
+                arroyo_state_protocol::typed_checkpoint::transport_table_name(&identity).unwrap();
+            let namespace = StateNamespace {
+                ownership: Ownership::PartitionLocal {
+                    subtask: 0,
+                    parallelism: 1,
+                },
+                table: identity.clone(),
+            };
+            let config = TypedStateTableConfig {
+                transport_name: transport_name.clone(),
+                table_identity: identity,
+                schema_identity: b"typed-switch-schema-v1".to_vec(),
+                schema_json: b"{}".to_vec(),
+                primary_key: vec![0],
+                partition_key: vec![0],
+                encoding_version: 1,
+            };
+            let key = |number: u32| StateKey {
+                namespace: namespace.clone(),
+                key: number.to_be_bytes().to_vec(),
+                routing_hash: None,
+            };
+            let source = backend(source_rocks, &directory.path().join("source")).await;
+            for number in 0..64 {
+                source
+                    .put(key(number), vec![number as u8; 32 * 1024], PAGE_BYTES)
+                    .await
+                    .unwrap();
+            }
+            let first = source.snapshot().await.unwrap();
+            source.delete(key(1), PAGE_BYTES).await.unwrap();
+            source
+                .put(key(0), b"updated".to_vec(), PAGE_BYTES)
+                .await
+                .unwrap();
+            let second = source.snapshot().await.unwrap();
+            for number in 0..64 {
+                source.delete(key(number), PAGE_BYTES).await.unwrap();
+            }
+            let empty = source.snapshot().await.unwrap();
+            // Newer local mutations must not leak into any selected snapshot.
+            source
+                .put(key(0), b"after-barrier".to_vec(), PAGE_BYTES)
+                .await
+                .unwrap();
+
+            for (epoch, snapshot) in [(1, first), (2, second), (3, empty)] {
+                let path = format!(
+                    "P/J/generations/7/checkpoints/checkpoint-{epoch:07}/operator-o/table-{transport_name}-000"
+                );
+                let metadata = export_typed(
+                    &snapshot, &namespace, &config, &storage, &path, epoch, 7, 0, MAX_FILES,
+                )
+                .await
+                .unwrap();
+                if epoch != 3 {
+                    assert!(metadata.files.len() > 1, "exercise paged full snapshots");
+                }
+                if epoch == 2 {
+                    // An incomplete export to the same checkpoint prefix must
+                    // not delete the already complete export's immutable files.
+                    assert!(
+                        export_typed(
+                            &snapshot, &namespace, &config, &storage, &path, epoch, 7, 0, 1,
+                        )
+                        .await
+                        .is_err()
+                    );
+                    for file in &metadata.files {
+                        assert!(!storage.get(file.path.clone()).await.unwrap().is_empty());
+                    }
+                }
+                for destination_rocks in [false, true] {
+                    if epoch == 2 {
+                        // Fail after at least one restored page. A partially
+                        // populated attempt must be discarded before retry.
+                        let missing = metadata.files.last().unwrap();
+                        let saved = storage.get(missing.path.clone()).await.unwrap();
+                        storage
+                            .delete_if_present(missing.path.clone())
+                            .await
+                            .unwrap();
+                        let interrupted = backend(
+                            destination_rocks,
+                            &directory
+                                .path()
+                                .join(format!("interrupted-{destination_rocks}")),
+                        )
+                        .await;
+                        assert!(
+                            restore_typed(
+                                interrupted.as_ref(),
+                                &namespace,
+                                &config,
+                                &metadata,
+                                &storage,
+                            )
+                            .await
+                            .is_err()
+                        );
+                        assert!(
+                            interrupted
+                                .get(
+                                    &key(0),
+                                    ReadOptions {
+                                        max_bytes: PAGE_BYTES
+                                    }
+                                )
+                                .await
+                                .unwrap()
+                                .is_some()
+                        );
+                        storage
+                            .put(missing.path.clone(), saved.to_vec())
+                            .await
+                            .unwrap();
+                        assert!(
+                            restore_typed(
+                                interrupted.as_ref(),
+                                &namespace,
+                                &config,
+                                &metadata,
+                                &storage,
+                            )
+                            .await
+                            .is_err(),
+                            "do not accept leftovers from a failed attempt"
+                        );
+                    }
+                    let restored = backend(
+                        destination_rocks,
+                        &directory
+                            .path()
+                            .join(format!("restored-{epoch}-{destination_rocks}")),
+                    )
+                    .await;
+                    restore_typed(restored.as_ref(), &namespace, &config, &metadata, &storage)
+                        .await
+                        .unwrap();
+                    for number in 0..64 {
+                        let expected = match (epoch, number) {
+                            (3, _) | (2, 1) => None,
+                            (2, 0) => Some(b"updated".to_vec()),
+                            _ => Some(vec![number as u8; 32 * 1024]),
+                        };
+                        assert_eq!(
+                            restored
+                                .get(
+                                    &key(number),
+                                    ReadOptions {
+                                        max_bytes: PAGE_BYTES
+                                    }
+                                )
+                                .await
+                                .unwrap(),
+                            expected,
+                            "source_rocks={source_rocks} destination_rocks={destination_rocks} epoch={epoch} key={number}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn full_snapshot_keeps_unchanged_rows_and_excludes_post_barrier_writes() {
         let directory = tempfile::tempdir().unwrap();
         let storage = storage(&directory).await;

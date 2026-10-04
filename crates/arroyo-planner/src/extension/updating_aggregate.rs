@@ -26,7 +26,7 @@ pub(crate) struct UpdatingAggregateExtension {
     pub(crate) key_fields: Vec<usize>,
     pub(crate) final_calculation: LogicalPlan,
     pub(crate) timestamp_qualifier: Option<TableReference>,
-    pub(crate) ttl: Duration,
+    pub(crate) ttl: Option<Duration>,
 }
 
 impl UpdatingAggregateExtension {
@@ -34,7 +34,7 @@ impl UpdatingAggregateExtension {
         aggregate: LogicalPlan,
         key_fields: Vec<usize>,
         timestamp_qualifier: Option<TableReference>,
-        ttl: Duration,
+        ttl: Option<Duration>,
     ) -> Result<Self> {
         let final_calculation = LogicalPlan::Extension(Extension {
             node: Arc::new(IsRetractExtension::new(
@@ -142,7 +142,8 @@ impl ArroyoExtension for UpdatingAggregateExtension {
                 .pipeline
                 .update_aggregate_flush_interval
                 .as_micros() as u64,
-            ttl_micros: self.ttl.as_micros() as u64,
+            ttl_micros: self.ttl.map(|ttl| ttl.as_micros() as u64).unwrap_or(0),
+            retain_indefinitely: self.ttl.is_none().then_some(true),
         };
 
         let node = LogicalNode::single(

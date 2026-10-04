@@ -276,6 +276,26 @@ impl Program {
                 table: "SQL state backend".into(),
                 error: error.to_string(),
             })?;
+        let has_updating_aggregate = logical.node_weights().any(|node| {
+            node.operator_chain
+                .iter()
+                .any(|(operator, _)| operator.operator_name == OperatorName::UpdatingAggregate)
+        });
+        if has_updating_aggregate {
+            if let Some(limits) = &worker_config.aggregate_state {
+                limits.validate().map_err(|error| StateError::Other {
+                    table: "native aggregate state".into(),
+                    error: error.to_string(),
+                })?;
+            } else if worker_config.sql_state_backend
+                == arroyo_rpc::config::SqlStateBackend::Rocksdb
+            {
+                return Err(StateError::Other {
+                    table: "native aggregate state".into(),
+                    error: "RocksDB updating aggregates require worker.aggregate-state limits; in-memory legacy aggregate execution cannot use a RocksDB state backend".into(),
+                });
+            }
+        }
         if worker_config.sql_state_backend == arroyo_rpc::config::SqlStateBackend::Rocksdb {
             let owners_per_node: HashMap<_, _> = logical
                 .node_weights()
@@ -287,7 +307,9 @@ impl Program {
                             .filter(|(operator, _)| {
                                 matches!(
                                     operator.operator_name,
-                                    OperatorName::StatefulProcessor | OperatorName::FusedStateTable
+                                    OperatorName::StatefulProcessor
+                                        | OperatorName::FusedStateTable
+                                        | OperatorName::UpdatingAggregate
                                 )
                             })
                             .count(),
@@ -335,6 +357,7 @@ impl Program {
                             | OperatorName::StatefulProcessor
                             | OperatorName::FusedStateTable
                             | OperatorName::StateTableCapture
+                            | OperatorName::UpdatingAggregate
                             | OperatorName::ConnectorSource
                             | OperatorName::ConnectorSink
                     ) {
