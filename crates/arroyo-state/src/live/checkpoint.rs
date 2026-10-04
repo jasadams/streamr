@@ -557,7 +557,10 @@ mod tests {
             worker::{BackendConstruction, construct_backend},
         };
 
-        async fn backend(rocks: bool, root: &std::path::Path) -> Arc<dyn LiveStateBackend> {
+        async fn backend(
+            rocks: bool,
+            root: &std::path::Path,
+        ) -> (Arc<dyn LiveStateBackend>, WorkerStateResources) {
             let resources = WorkerStateResources::new(ResourceConfig {
                 block_cache_bytes: 8 * 1024 * 1024,
                 memtable_bytes: 2 * 1024 * 1024,
@@ -587,7 +590,23 @@ mod tests {
                     max_resident_bytes: 32 * 1024 * 1024,
                 }
             };
-            construct_backend(construction, resources).await.unwrap()
+            (
+                construct_backend(construction, resources.clone())
+                    .await
+                    .unwrap(),
+                resources,
+            )
+        }
+
+        // RocksDB and its snapshots are destroyed on the resource pool's
+        // dedicated cleanup thread. The nextest test process must not exit
+        // while those native destructors are still running.
+        async fn drain_cleanup(resources: &WorkerStateResources) {
+            let (done, completed) = tokio::sync::oneshot::channel();
+            resources.cleanup().await.unwrap().submit(move || {
+                let _ = done.send(());
+            });
+            completed.await.unwrap();
         }
 
         for source_rocks in [false, true] {
@@ -617,7 +636,8 @@ mod tests {
                 key: number.to_be_bytes().to_vec(),
                 routing_hash: None,
             };
-            let source = backend(source_rocks, &directory.path().join("source")).await;
+            let (source, source_resources) =
+                backend(source_rocks, &directory.path().join("source")).await;
             for number in 0..64 {
                 source
                     .put(key(number), vec![number as u8; 32 * 1024], PAGE_BYTES)
@@ -677,7 +697,7 @@ mod tests {
                             .delete_if_present(missing.path.clone())
                             .await
                             .unwrap();
-                        let interrupted = backend(
+                        let (interrupted, interrupted_resources) = backend(
                             destination_rocks,
                             &directory
                                 .path()
@@ -723,8 +743,10 @@ mod tests {
                             .is_err(),
                             "do not accept leftovers from a failed attempt"
                         );
+                        drop(interrupted);
+                        drain_cleanup(&interrupted_resources).await;
                     }
-                    let restored = backend(
+                    let (restored, restored_resources) = backend(
                         destination_rocks,
                         &directory
                             .path()
@@ -754,8 +776,12 @@ mod tests {
                             "source_rocks={source_rocks} destination_rocks={destination_rocks} epoch={epoch} key={number}"
                         );
                     }
+                    drop(restored);
+                    drain_cleanup(&restored_resources).await;
                 }
             }
+            drop(source);
+            drain_cleanup(&source_resources).await;
         }
     }
 
