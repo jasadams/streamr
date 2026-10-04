@@ -109,8 +109,12 @@ in the container at `/tmp/streamr-native-state-table{,-timestamp}-fixtures-*.log
 Batch sizes 1/8 are source configuration targets; the direct callback regression
 independently exercises an actual three-row RecordBatch. These small captures
 do not establish beyond-RAM behavior, all fault points, backend switching, or
-STR-32's backfill/live gates. The new batch's full workspace build and
-current-head CI remain pending; the foundation's green CI does not cover it.
+STR-32's backfill/live gates. The integration source is committed at `67d9c96a`.
+Its full workspace build passed (3m 10s, container log
+`/tmp/streamr-m3-final-build.log`), and strict workspace all-target Clippy
+passed (1m 02s, `/tmp/streamr-m3-final-clippy.log`). Both 16-case capture suites
+above were rerun successfully after the final timestamp fix. Current-head CI
+remains pending; the foundation's green CI does not cover this source.
 The workspace all-target check and strict Clippy passed for this integration
 batch. The workspace library run initially failed six Kafka/MQTT connector
 tests because local brokers were absent. With dedicated Kafka 3.9.2 and
