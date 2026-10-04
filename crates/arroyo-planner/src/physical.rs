@@ -55,8 +55,8 @@ use futures::{
 };
 use prost::Message;
 use std::fmt::Debug;
-use tokio::sync::mpsc::UnboundedReceiver;
-use tokio_stream::wrappers::UnboundedReceiverStream;
+use tokio::sync::mpsc::{Receiver, UnboundedReceiver};
+use tokio_stream::wrappers::{ReceiverStream, UnboundedReceiverStream};
 
 #[derive(Debug)]
 pub struct WindowFunctionUdf {
@@ -179,6 +179,9 @@ pub enum DecodingContext {
     Planning,
     SingleLockedBatch(Arc<RwLock<Option<RecordBatch>>>),
     UnboundedBatchStream(Arc<RwLock<Option<UnboundedReceiver<RecordBatch>>>>),
+    /// A finite source for state-backed windows. Producers wait for the
+    /// aggregate consumer between pages, including on a hot window key.
+    BoundedBatchStream(Arc<RwLock<Option<Receiver<RecordBatch>>>>),
     LockedBatchVec(Arc<RwLock<Vec<RecordBatch>>>),
     LockedJoinPair {
         left: Arc<RwLock<Option<RecordBatch>>>,
@@ -233,6 +236,9 @@ impl PhysicalExtensionCodec for ArroyoPhysicalExtensionCodec {
                     )),
                     DecodingContext::UnboundedBatchStream(unbounded_stream) => Ok(Arc::new(
                         UnboundedRecordBatchReader::new(schema, unbounded_stream.clone()),
+                    )),
+                    DecodingContext::BoundedBatchStream(bounded_stream) => Ok(Arc::new(
+                        BoundedRecordBatchReader::new(schema, bounded_stream.clone()),
                     )),
                     DecodingContext::LockedBatchVec(locked_batches) => Ok(Arc::new(
                         RecordBatchVecReader::new(schema, locked_batches.clone()),
@@ -560,6 +566,77 @@ impl ExecutionPlan for UnboundedRecordBatchReader {
         Ok(datafusion::common::Statistics::new_unknown(&self.schema))
     }
 
+    fn reset(&self) -> Result<()> {
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct BoundedRecordBatchReader {
+    schema: SchemaRef,
+    receiver: Arc<RwLock<Option<Receiver<RecordBatch>>>>,
+    properties: PlanProperties,
+}
+
+impl BoundedRecordBatchReader {
+    fn new(schema: SchemaRef, receiver: Arc<RwLock<Option<Receiver<RecordBatch>>>>) -> Self {
+        Self {
+            schema: schema.clone(),
+            receiver,
+            properties: make_properties(schema),
+        }
+    }
+}
+
+impl DisplayAs for BoundedRecordBatchReader {
+    fn fmt_as(
+        &self,
+        _t: datafusion::physical_plan::DisplayFormatType,
+        f: &mut std::fmt::Formatter,
+    ) -> std::fmt::Result {
+        write!(f, "bounded record batch reader")
+    }
+}
+
+impl ExecutionPlan for BoundedRecordBatchReader {
+    fn name(&self) -> &str {
+        "bounded_reader"
+    }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    fn schema(&self) -> SchemaRef {
+        self.schema.clone()
+    }
+    fn properties(&self) -> &PlanProperties {
+        &self.properties
+    }
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![]
+    }
+    fn with_new_children(
+        self: Arc<Self>,
+        _children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        Err(DataFusionError::Internal("not supported".into()))
+    }
+    fn execute(
+        &self,
+        _partition: usize,
+        _context: Arc<TaskContext>,
+    ) -> Result<SendableRecordBatchStream> {
+        let receiver =
+            self.receiver.write().unwrap().take().ok_or_else(|| {
+                DataFusionError::Execution("bounded window input is missing".into())
+            })?;
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            self.schema.clone(),
+            ReceiverStream::new(receiver).map(Ok),
+        )))
+    }
+    fn statistics(&self) -> Result<Statistics> {
+        Ok(Statistics::new_unknown(&self.schema))
+    }
     fn reset(&self) -> Result<()> {
         Ok(())
     }

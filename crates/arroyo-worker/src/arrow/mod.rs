@@ -42,6 +42,8 @@ pub mod instant_join;
 pub mod join_with_expiration;
 pub mod lookup_join;
 pub mod session_aggregating_window;
+mod session_native;
+mod session_store;
 pub mod sliding_aggregating_window;
 pub mod state_table;
 pub mod state_table_owner;
@@ -52,6 +54,8 @@ pub mod tumbling_aggregating_window;
 mod updating_cache;
 pub mod watermark_generator;
 pub mod window_fn;
+mod window_native;
+mod window_store;
 
 pub struct ValueExecutionOperator {
     name: String,

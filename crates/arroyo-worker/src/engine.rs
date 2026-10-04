@@ -39,6 +39,7 @@ use futures::stream::FuturesUnordered;
 use petgraph::graph::{DiGraph, NodeIndex};
 use petgraph::visit::EdgeRef;
 use petgraph::{Direction, dot};
+use prost::Message;
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::{Debug, Formatter};
 use std::mem;
@@ -46,6 +47,21 @@ use std::sync::{Arc, RwLock};
 use tokio::sync::Barrier;
 use tokio::sync::mpsc::{Receiver, Sender, channel};
 use tracing::{debug, info, warn};
+
+fn native_fixed_window_enabled(name: &OperatorName, bytes: &[u8], configured: bool) -> bool {
+    if !configured {
+        return false;
+    }
+    match name {
+        OperatorName::TumblingWindowAggregate => {
+            api::TumblingWindowAggregateOperator::decode(bytes)
+                .is_ok_and(|window| window.width_micros > 0)
+        }
+        OperatorName::SlidingWindowAggregate => true,
+        OperatorName::SessionWindowAggregate => true,
+        _ => false,
+    }
+}
 
 pub struct SubtaskNode {
     pub node_id: u32,
@@ -310,6 +326,10 @@ impl Program {
                                     OperatorName::StatefulProcessor
                                         | OperatorName::FusedStateTable
                                         | OperatorName::UpdatingAggregate
+                                ) || native_fixed_window_enabled(
+                                    &operator.operator_name,
+                                    &operator.operator_config,
+                                    worker_config.window_state.is_some(),
                                 )
                             })
                             .count(),
@@ -360,6 +380,10 @@ impl Program {
                             | OperatorName::UpdatingAggregate
                             | OperatorName::ConnectorSource
                             | OperatorName::ConnectorSink
+                    ) && !native_fixed_window_enabled(
+                        &operator.operator_name,
+                        &operator.operator_config,
+                        worker_config.window_state.is_some(),
                     ) {
                         return Err(StateError::Other {
                             table: operator.operator_id.clone(),

@@ -38,8 +38,10 @@ milestone 4 unless a selected plan demonstrates a required narrow gap.
 All selected paths must use backend-neutral state interfaces and the configured
 live SQL backend: memory and RocksDB currently. New providers belong behind the
 construction/lifecycle/capability boundary, not in SQL operator logic. Existing
-SQL construction still has distinct memory/RocksDB paths; STR-39 corrects that
-boundary, and STR-17/19/20 depend on its common adapter work.
+Native aggregate, window, session and state-table owners now use one configured
+backend construction adapter in `live/worker.rs`. Legacy state-function execution
+remains a separate path until STR-43 removal; future providers belong in the
+construction adapter rather than these SQL owners.
 
 The five legacy functions are state_get, state_put, state_upsert, state_update
 and state_delete. They remain in the current code until STR-43's prerequisites
@@ -74,9 +76,9 @@ semantics are not assumed equivalent to an external timer-driven function.
 | `crates/arroyo-state/src/tables/table_manager.rs`, `live/checkpoint.rs` | Registered disk namespaces, shared barrier snapshots and exclusive logical page files | Restores selected remote state into a fresh attempt and exports full registered namespaces with checksums/schema/ownership. Sharing a database does not make unregistered namespaces durable. |
 | `crates/arroyo-worker/src/arrow/execution.rs`, `arrow/sync/streams.rs`, `StatelessPhysicalExecutor` | Shared DataFusion runtime, input/output reservations and bounded batch delivery | Opt-in cooperative execution accounting and per-batch checks. Spilling is disabled. Arbitrary UDF allocations, queues and legacy retained structures are not universally covered. |
 | `crates/arroyo-operator/src/operator.rs` / `ArrowOperator` | Serialized batch, watermark, tick and checkpoint callbacks | Generic execution hooks exist. Their presence does not provide durable timer registration, dispatch or application callback transactions. |
-| `arrow/session_aggregating_window.rs` / `SessionWindowAggregate` | Per-key computations, start/deadline maps, raw batches and unbounded internal channels; legacy tables | Generic SQL session windows remain an existing separate capability. They require retained-state migration and bounded scheduling before admission under the disk SQL setting. |
-| `arrow/tumbling_aggregating_window.rs`, `sliding_aggregating_window.rs` | Per-bin execution maps, panes/batches and internal channels | Selected retained/partial-aggregation paths still require migration and qualification. |
-| `arrow/incremental_aggregator.rs` | Accumulator/key cache, changed-key sets and updated values | Persisted bounded accumulators and incremental changed-key iteration remain needed. Checkpoint files alone do not bound these structures. |
+| `arrow/session_aggregating_window.rs`, `session_native.rs`, `session_store.rs` | Legacy per-key maps; selected native path uses paged raw rows, session/deadline metadata and bounded final-input delivery | Native memory/RocksDB value and fresh-worker recovery captures pass for scalar aggregates and exact-gap/bridge handling. Collection, late/idleness, backpressure and capacity qualification remains open. |
+| `arrow/tumbling_aggregating_window.rs`, `sliding_aggregating_window.rs`, `window_native.rs`, `window_store.rs` | Legacy per-bin maps; selected native path uses paged panes/partials and closure/expiry indexes | Scalar and ordered memory/RocksDB SQL and recovery captures pass. Collection admission, quiet-key/idleness, backpressure and capacity qualification remains open. |
+| `arrow/incremental_aggregator.rs`, `aggregate_store.rs` | Selected native path persists accumulators, counted extrema, ordered members, dirty output and expiry state | Both configured backends pass small updating-input value/recovery captures; indefinite retention is explicit. Hot-key/high-cardinality, backpressure and fault qualification remains open. |
 | `arrow/instant_join.rs`, `join_with_expiration.rs` | Execution holders/streams and legacy retained-table access | Unsupported under the disk SQL setting until the exact working-state paths are migrated and tested. |
 | `crates/arroyo-worker/src/engine.rs` | Operator construction and worker admission | Rejects unsupported retained-state operators under RocksDB SQL and checks database-owner capacity. Keep these gates until each generic path has its own evidence. |
 

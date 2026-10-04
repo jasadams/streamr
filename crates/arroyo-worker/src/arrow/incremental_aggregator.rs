@@ -22,7 +22,7 @@ use arroyo_operator::{
         OperatorConstructor, Registry,
     },
 };
-use arroyo_rpc::config::{AggregateStateConfig, SqlStateBackend, config};
+use arroyo_rpc::config::AggregateStateConfig;
 use arroyo_rpc::df::ArroyoSchema;
 use arroyo_rpc::errors::DataflowResult;
 use arroyo_rpc::grpc::{
@@ -32,8 +32,7 @@ use arroyo_rpc::grpc::{
 use arroyo_rpc::{TIMESTAMP_FIELD, UPDATING_META_FIELD, updating_meta_fields};
 use arroyo_state::live::{
     LiveStateBackend,
-    lifecycle::RocksStateConfig,
-    worker::{BackendConstruction, configured_worker_resources, construct_backend},
+    worker::{ConfiguredBackendOwner, configured_worker_resources, construct_configured_backend},
 };
 use arroyo_state::timestamp_table_config;
 use arroyo_types::{CheckpointBarrier, SignalMessage, to_nanos};
@@ -1165,7 +1164,6 @@ impl IncrementalAggregatingFunc {
                         .saturating_mul(limits.key_bytes.saturating_add(limits.value_bytes)),
             "native aggregate limits cannot admit one worst-case event with {indexed} indexed aggregates"
         );
-        let worker = &config().worker;
         let resources = configured_worker_resources()?
             .ok_or_else(|| anyhow!("native aggregate requires worker.live-state-resources"))?;
         ensure!(
@@ -1176,32 +1174,21 @@ impl IncrementalAggregatingFunc {
                 <= resources.config().decoded_value_bytes,
             "native aggregate decoded pool cannot hold output, scope, and one read together"
         );
-        let construction = match worker.sql_state_backend {
-            SqlStateBackend::Memory => BackendConstruction::Memory {
-                max_resident_bytes: limits.max_resident_bytes,
-            },
-            SqlStateBackend::Rocksdb => {
-                let disk = worker.disk_sql_state.as_ref().ok_or_else(|| {
-                    anyhow!("native RocksDB aggregate requires worker.disk-sql-state")
-                })?;
-                let generation = match ctx.task_info.checkpoint_file_path_layout {
-                    arroyo_types::CheckpointFilePathLayout::Protocol { generation, .. } => {
-                        generation
-                    }
-                    _ => 0,
-                };
-                BackendConstruction::Rocksdb(RocksStateConfig {
-                    root: disk.directory.join(uuid::Uuid::new_v4().to_string()),
-                    job_id: ctx.task_info.job_id.clone(),
-                    operator_id: ctx.task_info.operator_id.clone(),
-                    subtask: ctx.task_info.task_index,
-                    generation,
-                    attempt: 0,
-                })
-            }
+        let generation = match ctx.task_info.checkpoint_file_path_layout {
+            arroyo_types::CheckpointFilePathLayout::Protocol { generation, .. } => generation,
+            _ => 0,
         };
-        let backend: Arc<dyn LiveStateBackend> =
-            construct_backend(construction, resources.clone()).await?;
+        let backend: Arc<dyn LiveStateBackend> = construct_configured_backend(
+            ConfiguredBackendOwner {
+                job_id: ctx.task_info.job_id.clone(),
+                operator_id: ctx.task_info.operator_id.clone(),
+                subtask: ctx.task_info.task_index,
+                generation,
+            },
+            limits.max_resident_bytes,
+            resources.clone(),
+        )
+        .await?;
         let table = ctx
             .table_manager
             .register_live_table(NATIVE_AGGREGATE_TABLE, backend.clone())

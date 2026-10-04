@@ -444,6 +444,10 @@ pub struct WorkerConfig {
     #[serde(default)]
     pub aggregate_state: Option<AggregateStateConfig>,
 
+    /// Opt-in bounded native TUMBLE/HOP partial state on the configured live backend.
+    #[serde(default)]
+    pub window_state: Option<WindowStateConfig>,
+
     /// Explicit worker-wide budgets shared by disk-backed operators.
     #[serde(default)]
     pub live_state_resources: Option<LiveStateResourceConfig>,
@@ -560,6 +564,48 @@ impl AggregateStateConfig {
         {
             bail!(
                 "worker.aggregate-state requires positive limits, two output rows/write operations, and room for one maximum key/value in page, write, and overlay budgets"
+            );
+        }
+        Ok(())
+    }
+}
+
+/// One window owner's backend-neutral limits. Fixed windows retain typed
+/// partials; sessions retain bounded raw rows. Both use the configured state
+/// backend and share their SQL kernel between memory and RocksDB.
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct WindowStateConfig {
+    pub key_bytes: usize,
+    pub partial_bytes: usize,
+    pub page_bytes: usize,
+    pub page_entries: usize,
+    pub write_bytes: usize,
+    pub write_operations: usize,
+    pub max_resident_bytes: usize,
+}
+
+impl WindowStateConfig {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if [
+            self.key_bytes,
+            self.partial_bytes,
+            self.page_bytes,
+            self.page_entries,
+            self.write_bytes,
+            self.max_resident_bytes,
+        ]
+        .contains(&0)
+            || self.write_operations < 4
+            || self.page_bytes < self.key_bytes.saturating_add(self.partial_bytes)
+            || self.write_bytes
+                < self
+                    .key_bytes
+                    .saturating_add(self.partial_bytes)
+                    .saturating_mul(4)
+        {
+            bail!(
+                "worker.window-state requires positive limits and room for one partial and its indexes"
             );
         }
         Ok(())

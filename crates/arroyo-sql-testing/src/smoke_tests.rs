@@ -382,12 +382,29 @@ async fn run_until_finished(engine: &RunningEngine, control_rx: &mut Receiver<Co
 }
 
 fn set_internal_parallelism(graph: &mut Graph<LogicalNode, LogicalEdge>, parallelism: usize) {
-    // Stateful SQL maps currently support a singleton operator only. These
-    // fixtures still exercise checkpoint recovery, but cannot test rescaling.
+    // These live SQL owners currently require unchanged singleton ownership.
+    // The fixture still exercises checkpoint and replay; rescaling is not
+    // qualified by this run. Legacy window/aggregate fixtures still rescale.
+    let current = config::config();
+    let worker = &current.worker;
+    let native_window = worker.window_state.is_some();
+    let native_aggregate = worker.aggregate_state.is_some();
     if graph.node_weights().any(|node| {
         node.operator_chain
             .iter()
-            .any(|(config, _)| config.operator_name == OperatorName::StatefulProcessor)
+            .any(|(operator, _)| match operator.operator_name {
+                OperatorName::StatefulProcessor => true,
+                OperatorName::UpdatingAggregate => native_aggregate,
+                OperatorName::SlidingWindowAggregate => native_window,
+                OperatorName::SessionWindowAggregate => native_window,
+                OperatorName::TumblingWindowAggregate if native_window => {
+                    <arroyo_rpc::grpc::api::TumblingWindowAggregateOperator as prost::Message>::decode(
+                        operator.operator_config.as_slice(),
+                    )
+                    .is_ok_and(|window| window.width_micros > 0)
+                }
+                _ => false,
+            })
     }) {
         return;
     }
@@ -1923,6 +1940,38 @@ fn configure_test_worker() {
             );
             // Two native owners can each admit a complete 2 MiB write scope.
             resources.queued_write_bytes = 32 * 1024 * 1024;
+            resources.decoded_value_bytes = 16 * 1024 * 1024;
+        }
+        if std::env::var("STREAMR_TEST_NATIVE_WINDOWS").as_deref() == Ok("1") {
+            c.worker.execution_resources.get_or_insert(
+                arroyo_rpc::config::ExecutionResourceConfig {
+                    memory_bytes: 16 * 1024 * 1024,
+                    max_batch_bytes: 1024 * 1024,
+                },
+            );
+            c.worker.window_state = Some(arroyo_rpc::config::WindowStateConfig {
+                key_bytes: 512,
+                partial_bytes: 32 * 1024,
+                page_bytes: 128 * 1024,
+                page_entries: 64,
+                write_bytes: 512 * 1024,
+                write_operations: 64,
+                max_resident_bytes: 128 * 1024 * 1024,
+            });
+            let resources = c.worker.live_state_resources.get_or_insert(
+                arroyo_rpc::config::LiveStateResourceConfig {
+                    block_cache_bytes: 8 * 1024 * 1024,
+                    memtable_bytes: 4 * 1024 * 1024,
+                    queued_write_bytes: 4 * 1024 * 1024,
+                    decoded_value_bytes: 16 * 1024 * 1024,
+                    scan_page_bytes: 2 * 1024 * 1024,
+                    max_blocking_operations: 2,
+                    max_snapshots: 2,
+                    max_open_databases: 2,
+                    disk_reserve_bytes: 64 * 1024 * 1024,
+                },
+            );
+            resources.queued_write_bytes = resources.queued_write_bytes.max(4 * 1024 * 1024);
             resources.decoded_value_bytes = 16 * 1024 * 1024;
         }
     });

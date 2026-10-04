@@ -92,8 +92,8 @@ replay and checkpoint semantics. No aggregate TTL is inherited.
 
 ## Named MERGE output
 
-The syntax below is accepted by STR-40 and produces a generic state-table
-operator. It is **not executable** until STR-41 supplies fused serial ownership:
+The syntax below plans and executes through the STR-41 fused serial owner.
+Select the required output fields explicitly for a sink:
 
 ```sql
 CREATE VIEW applied_changes AS

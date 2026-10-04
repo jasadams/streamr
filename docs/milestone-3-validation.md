@@ -154,7 +154,8 @@ The separate backend-switch checkpoint unit test subsequently passed as part
 of the 70-test state library suite. It exercises all four source/destination
 backend pairs across full, updated/deleted and empty epochs, incomplete restore
 rejection and fresh-attempt retry. Integration build/test gates passed as recorded
-below; current-head CI remains pending for these additions.
+below. The subsequent cleanup fix at `4ffac3ff` passed all seven CI checks,
+as recorded below.
 
 ### Configured native updating-aggregate state
 
@@ -204,7 +205,101 @@ and `/tmp/streamr-m3-native-tables-aggregate-{batch,timestamp}.log`.
 
 These small operator captures and units do not qualify aggregate hot-key/high-
 cardinality capacity, every failure point, rescaling, native windows or the full
-backfill/live gates. Current-head CI remains pending for this batch.
+backfill/live gates. The subsequent cleanup fix at `4ffac3ff` passed all seven
+CI checks, as recorded below.
+
+### Checkpoint cleanup and live RocksDB directory races
+
+At `4ffac3ff90a94bedb179dd38256e0f7a512bdc96`, all seven PR checks passed,
+including both Rust jobs. The exact head was rechecked after the CI watch exited
+0. [Rust CI](https://github.com/jasadams/streamr/actions/runs/37175698196)
+passed after the backend-switch test awaited its cleanup executor before process
+exit. One Rust job on the preceding `aea39170` head had passed the test but then
+aborted during native cleanup; that preceding head was not fully green.
+
+Live RocksDB capacity scanning now tolerates child files disappearing during
+compaction, while a missing database root and other I/O failures remain errors.
+The final local workspace library run for this fix and the scalar/ordered native
+window draft passed 566 tests. Five separate processes each passed the exact
+backend-switch checkpoint test and exited 0. These results address cleanup and
+mutable-directory races; they do not complete the operator fault or capacity
+matrices.
+
+The native fixed-window draft passed 20 scalar and 20 ordered SQL captures:
+TUMBLE/HOP, configured memory/RocksDB, both checkpoint protocols and variable
+source batching, plus legacy memory comparison cases. Each capture checks full
+initial and fresh-worker recovered values. The ordered fixture uses 78 rows and
+checkpoints after 70; actual debug traces show 70 retained rows split into two
+partial chunks. Both existing `hourly_by_event_type` and `sliding_window_end`
+goldens passed on each backend. Artifacts are `target/native-windows-final`,
+`target/native-windows-ordered-final` and container logs
+`/tmp/streamr-m3-native-window-{final,ordered-final}-matrix.log`.
+
+These window results precede the subsequent collection, SESSION and centralized
+backend-construction edits. The combined edits passed formatting, workspace
+all-target checking, strict Clippy and 572 workspace library tests; their runtime
+SQL and full build qualification is separate and still in progress. STR-19 and
+STR-20 remain In Progress, with quiet-key, late/idleness, capacity, backpressure
+and fault acceptance still open.
+
+### Combined native windows, SESSION and backend construction
+
+The reviewed combined draft uses one configured backend construction adapter
+for aggregate, fixed-window, session and state-table owners. The final collection
+repair passed `cargo fmt --all -- --check`, workspace all-target checking, strict
+all-target Clippy, all 573 workspace library tests (four ignored), and a full
+workspace build. Container logs are
+`/tmp/streamr-m3-window-collection-repair-{fmt,check,clippy,units,build}.log`.
+The fresh SQL executable is
+`/app/target/milestone2-runtime/debug/deps/arroyo_sql_testing-df802a90a8396c4e`.
+
+The [collection driver](../scripts/test-native-window-collections.py) passed 16
+memory/RocksDB × controller/leader × source batch target 1/128 captures of
+ARRAY_AGG, ARRAY_AGG(DISTINCT), COUNT(DISTINCT) and single-column UNNEST. Full
+initial/recovered multisets preserve duplicates and NULL values. The 4096-row
+negative case rejected the oversized array before final aggregation, rather
+than truncating it. Final output admission counts logical flat payload bytes;
+working admission still counts decoded array allocations and aggregate state.
+Artifacts: `target/native-window-collections-repaired`; container log
+`/tmp/streamr-m3-native-window-collections-repaired.log`.
+
+The [SESSION driver](../scripts/test-native-sessions.py) passed eight delayed-
+watermark cases across both backends, protocols and source batch targets 1/8.
+It compares three complete session rows, including equal-gap joins and an
+out-of-order bridge, before and after an open-session checkpoint and fresh-worker
+restore. Its `--late-input` mode passed four direct-watermark cases at batch
+target 1: four rows below the advanced watermark are dropped and four exact
+singleton session rows remain. Watermark progression occurs between delivered
+batches; this late-drop oracle is intentionally not asserted for batch target 8.
+The default bridge test retains the same three-row oracle across batch targets.
+Artifacts: `target/native-sessions-{delayed,late}-combined`; logs
+`/tmp/streamr-m3-native-sessions-{delayed,late}-combined.log`.
+
+On this same final collection source, both the scalar and ordered window
+matrices passed their 16 native memory/RocksDB × protocol × batch cases again.
+Logs are `/tmp/streamr-m3-native-window-collection-source.log` and
+`/tmp/streamr-m3-native-window-ordered-collection-source.log`. The earlier
+legacy comparison and existing golden passes are recorded separately above.
+
+The [legacy equality driver](../scripts/test-legacy-session-equality.py) passed
+all four batch target 1/128 × controller/leader cases. Input times 0, 10, 12
+with gap 10 produce one `[0,22)` window with count 3 initially and after restore.
+This verifies the sorted-prefix/end-update repair against the existing native
+SESSION equality rule; it does not change an external application's lifecycle.
+
+After backend construction was centralized, native aggregates passed all eight
+value/recovery cases again. Both state-table suites passed their combined 16
+cases and 64 full output comparisons. Logs are
+`/tmp/streamr-m3-native-aggregate-factory-combined.log` and
+`/tmp/streamr-m3-native-tables-factory{,-timestamp}-combined.log`.
+
+These captures do not establish larger-than-budget window/session state,
+cancellation/backpressure, idleness, session collections, current rolling zero
+output or the full fault/live gates. UNNEST here projects one flat column; it
+does not qualify unrestricted expansion of companion columns. The actual
+STR-29 composition planner rejections and complete SQL are saved in
+[native result composition](native-result-composition.md). Subsequent CI must
+validate the committed combined head separately from the preceding `4ffac3ff`.
 
 ### Native aggregate value and recovery capture
 

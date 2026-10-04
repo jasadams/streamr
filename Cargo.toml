@@ -107,6 +107,7 @@ tracing-subscriber = { version = "0.3.20", features = ["env-filter", "json"] }
 typify = "0.0.13"
 url = { version = "2.5", features = ["serde"] }
 uuid = { version = "1.17.0", features = ["v4"] }
+sha2 = "0.10"
 
 [profile.release]
 debug = 1

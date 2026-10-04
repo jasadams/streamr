@@ -9,6 +9,7 @@ edition = "2024"
 arroyo-state-protocol = { path = "../arroyo-state-protocol" }
 arroyo-types = { path = "../arroyo-types" }
 arroyo-rpc = { path = "../arroyo-rpc" }
+uuid = { workspace = true }
 arroyo-storage = { path = "../arroyo-storage" }
 
 datafusion = { workspace = true }

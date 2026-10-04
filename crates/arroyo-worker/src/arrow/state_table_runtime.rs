@@ -11,7 +11,7 @@ use arroyo_operator::{
     operator::{ArrowOperator, ConstructedOperator, OperatorConstructor, Registry},
 };
 use arroyo_rpc::{
-    config::{SqlStateBackend, TypedSqlStateConfig, config},
+    config::{TypedSqlStateConfig, config},
     errors::{DataflowError, DataflowResult},
     grpc::{
         api::{FusedStateTableOperator, StateTableDefinition},
@@ -19,10 +19,9 @@ use arroyo_rpc::{
     },
 };
 use arroyo_state::live::{
-    lifecycle::RocksStateConfig,
     resources::WorkerStateResources,
     typed_table::{TableDescriptor, TableLimits, TypedTable},
-    worker::{BackendConstruction, configured_worker_resources, construct_backend},
+    worker::{ConfiguredBackendOwner, configured_worker_resources, construct_configured_backend},
 };
 use arroyo_state_protocol::typed_checkpoint::transport_table_name;
 use prost::Message;
@@ -331,35 +330,22 @@ impl ArrowOperator for FusedStateTable {
         let resources: WorkerStateResources = configured_worker_resources()
             .map_err(external)?
             .context("native state tables require worker live-state resources")?;
-        let worker_config = config().worker.clone();
-        let backend = match worker_config.sql_state_backend {
-            SqlStateBackend::Memory => BackendConstruction::Memory {
-                max_resident_bytes: self.limits.max_resident_bytes,
-            },
-            SqlStateBackend::Rocksdb => {
-                let disk = worker_config
-                    .disk_sql_state
-                    .as_ref()
-                    .context("RocksDB state tables require worker.disk-sql-state")?;
-                let generation = match ctx.task_info.checkpoint_file_path_layout {
-                    arroyo_types::CheckpointFilePathLayout::Protocol { generation, .. } => {
-                        generation
-                    }
-                    _ => 0,
-                };
-                BackendConstruction::Rocksdb(RocksStateConfig {
-                    root: disk.directory.join(uuid::Uuid::new_v4().to_string()),
-                    job_id: ctx.task_info.job_id.clone(),
-                    operator_id: ctx.task_info.operator_id.clone(),
-                    subtask: 0,
-                    generation,
-                    attempt: 0,
-                })
-            }
+        let generation = match ctx.task_info.checkpoint_file_path_layout {
+            arroyo_types::CheckpointFilePathLayout::Protocol { generation, .. } => generation,
+            _ => 0,
         };
-        let backend = construct_backend(backend, resources.clone())
-            .await
-            .map_err(external)?;
+        let backend = construct_configured_backend(
+            ConfiguredBackendOwner {
+                job_id: ctx.task_info.job_id.clone(),
+                operator_id: ctx.task_info.operator_id.clone(),
+                subtask: 0,
+                generation,
+            },
+            self.limits.max_resident_bytes,
+            resources.clone(),
+        )
+        .await
+        .map_err(external)?;
         let definitions = self
             .config
             .tables
