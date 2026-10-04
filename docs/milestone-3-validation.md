@@ -301,6 +301,28 @@ STR-29 composition planner rejections and complete SQL are saved in
 [native result composition](native-result-composition.md). Subsequent CI must
 validate the committed combined head separately from the preceding `4ffac3ff`.
 
+### Native window/session capacity fixture and streaming capture
+
+The capture harness now validates one JSON object at a time instead of retaining
+an entire output file. This avoids counting a 500 MiB capture file as retained
+engine state during RSS qualification. The reviewed helper passed formatting,
+workspace all-target checking, strict Clippy and all 573 library tests. Logs:
+`/tmp/streamr-m3-streaming-capture-{fmt,check,clippy,units}.log`.
+
+The [capacity driver](../scripts/test-native-window-capacity.py) passed eight
+small 8-row TUMBLE/SESSION × memory/RocksDB × controller/leader captures using
+8 KiB varied payloads and full checkpoints. These are fixture smoke tests,
+not larger-than-budget evidence. TUMBLE compares every key and full payload;
+SESSION compares its one emitted count/window/FIRST payload and does not expose
+every intermediate retained payload.
+
+At 65,000 rows, the proposed full open-state payload is 532,480,000 bytes
+(507.8 MiB), exceeding ten times the conservative 50 MiB fixture pool sum. The
+halfway checkpoint contains only 266,240,000 payload bytes (253.9 MiB); that
+checkpoint must not be described as 10×. Full capacity execution is still
+pending, so these figures describe fixture admission goals, not a passed
+capacity result. Physical compressed disk size is a separate quantity.
+
 ### Native aggregate value and recovery capture
 
 The SQL-testing binary rebuilt from this batch with `cargo test --locked -j4

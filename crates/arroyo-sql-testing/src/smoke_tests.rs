@@ -31,7 +31,8 @@ use arroyo_worker::job_controller::checkpoint_state::CheckpointState;
 use petgraph::{Direction, Graph};
 use serde_json::Value;
 use test_log::test as test_log;
-use tokio::fs::read_to_string;
+use tokio::fs::{File, read_to_string};
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::mpsc::error::TryRecvError;
 use tracing::info;
 
@@ -1523,24 +1524,38 @@ async fn external_sql_checkpoint_capture_inner() {
 }
 
 async fn capture_rows(path: &Path, expected: usize) {
-    let captured = read_to_string(path)
+    let file = File::open(path)
         .await
         .expect("external SQL capture file missing");
-    let rows: Vec<_> = captured.lines().collect();
-    assert_eq!(
-        rows.len(),
-        expected,
-        "unexpected capture row count in {}",
-        path.display()
-    );
-    for row in rows {
+    let mut reader = BufReader::new(file);
+    let mut row = String::new();
+    let mut count = 0usize;
+    loop {
+        row.clear();
+        if reader
+            .read_line(&mut row)
+            .await
+            .expect("external SQL capture read failed")
+            == 0
+        {
+            break;
+        }
+        count = count
+            .checked_add(1)
+            .expect("external SQL capture row count overflow");
         let value: Value =
-            serde_json::from_str(row).expect("external SQL capture contains invalid JSON");
+            serde_json::from_str(&row).expect("external SQL capture contains invalid JSON");
         assert!(
             value.is_object(),
             "external SQL capture must contain JSON objects"
         );
     }
+    assert_eq!(
+        count,
+        expected,
+        "unexpected capture row count in {}",
+        path.display()
+    );
 }
 
 /// Run separately: resources and RSS measurements belong to one worker process.
