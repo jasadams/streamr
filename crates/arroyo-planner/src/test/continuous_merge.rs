@@ -147,6 +147,41 @@ async fn captured_merge_is_one_producer_across_two_consumers() {
 }
 
 #[test(tokio::test)]
+async fn captured_merge_can_feed_an_updating_grouped_aggregate() {
+    let query = format!(
+        "{DECLARATIONS}
+         CREATE VIEW applied AS MERGE INTO inventory AS target USING events AS source
+         ON target.counter = source.counter
+         WHEN NOT MATCHED THEN INSERT (counter, quantity) VALUES (source.counter, 1)
+         RETURNING source AS source, old AS old, new AS new, action AS action;
+         CREATE VIEW flags AS SELECT source.counter AS counter,
+           CASE WHEN action = 'insert' THEN CAST(1 AS BIGINT)
+                ELSE CAST(0 AS BIGINT) END AS started FROM applied;
+         SELECT counter, SUM(started) AS total FROM flags GROUP BY counter"
+    );
+    let compiled = plan(&query).await;
+    let names = compiled
+        .program
+        .graph
+        .node_weights()
+        .flat_map(|node| node.operator_chain.iter())
+        .map(|(operator, _)| operator.operator_name)
+        .collect::<Vec<_>>();
+    assert_eq!(state_operators(&compiled).len(), 1);
+    assert_eq!(
+        names
+            .iter()
+            .filter(|name| **name == OperatorName::FusedStateTable)
+            .count(),
+        1
+    );
+    assert!(names.contains(&OperatorName::StateTableCapture));
+    assert!(names.contains(&OperatorName::ArrowKey));
+    assert!(names.contains(&OperatorName::UpdatingAggregate));
+    assert!(!names.contains(&OperatorName::StateTable));
+}
+
+#[test(tokio::test)]
 async fn unused_merge_remains_a_graph_root() {
     let query = format!(
         "{DECLARATIONS}

@@ -15,11 +15,154 @@ This revision does not qualify those paths or change the historical evidence
 below. Application query proposals and oracles remain in the application repo;
 they are not embedded engine implementations.
 
-## Fresh combined-source STR-29 evidence (uncommitted batch)
+## Current `d19c30e3` evidence and open gates
 
-The current batch on `fc347312` adds internal serial-owner point reads for native
-aggregate chunks without indexed accumulators, one stable native-window snapshot
-per watermark pass, and bounded append-only unordered FIRST/LAST. It also
+PR #6 at `d19c30e3` has seven successful CI checks. The generic native UUID,
+closed-HOP reaggregation and lifetime/latest-result composition fixtures each
+passed eight memory/RocksDB × source batch target 1/8 × controller/leader
+captures on this source. Their strict value, CDC and fresh-worker recovery
+artifacts are `target/native-uuid-snapshot-fixed/`,
+`target/native-window-composition-snapshot-fixed/` and
+`target/native-result-composition-snapshot-fixed/`, respectively. The latter
+shows ordinary existing-SQL lifetime and latest closed-window composition; it
+does not emit an autonomous zero for an idle key or qualify profile timing.
+
+The external application-owned native identity query using the original
+16-field source input passed eight captures and 16 initial/recovered strict
+comparisons of its complete 19-field output at
+`target/native-identity-snapshot-fixed/comparisons.json`. A separate
+application-owned 14-field profile-core SQL probe passed all eight
+backend/batch/protocol cases at
+`target/native-profile-core-snapshot-fixed/comparisons.json`. It checks the
+selected core field values and checkpoint/recovery prefixes, not the full
+33-field profile, emission/debounce timing or 12-session behavior. Streamr
+contains none of those application schemas or policies.
+
+The unchanged standard-SQL profile probes at
+`target/native-profile-standard-sql-text-sink-probes/planner-gaps.json`
+confirm two distinct planner gaps: `LAG` in the proposed session query fails
+with `Window functions require already windowed input`, and an updating left
+side of the daily rollup join fails with `can't handle updating left side of
+join`. An aliased `DATE` grouping variant passed one memory/batch-1/controller
+runtime and application-owned strict comparison at
+`target/native-profile-standard-sql-aliased-day-probe/`. The initial
+two-row CDC stream ends at October 3/4 counts 2/5; the committed two-row
+checkpoint prefix ends at 2/1; the recovered three-row stream ends at 2/5. This
+narrow successful grouping does not resolve the join, session transition,
+idle-calendar or full-profile gates; its wider matrix remains untested.
+
+At `target/native-tumble-capacity-snapshot-fixed-65000/`, a 65,000-key ×
+8,192-byte RocksDB TUMBLE controller run checkpointed after 64,999 real rows,
+restored in a fresh worker and compared all 65,000 keys and complete payloads.
+The checkpoint retained-payload floor was 532,471,808 bytes, above 10× the
+declared 50 MiB pool sum, and peak whole-child RSS was 355,414,016 bytes.
+The leader run on that `d19c30e3` source failed after 551.74 seconds at
+checkpoint publication: `disk checkpoint file metadata exceeds 3 MiB RPC
+limit`. That failure remains part of the historical evidence.
+
+A subsequent uncommitted batch shortened the immutable checkpoint-file
+basenames and added opt-in bounded idle-output capture to the external SQL
+test harness. The Bookworm logs
+`/tmp/streamr-m3-compact-checkpoint-idle-{fmt,check,clippy,units,build}.log`
+record passing formatting, workspace all-target check, strict Clippy, 25
+library suites (614 passed, four ignored) and full workspace build. Its SQL
+test binary had SHA-256
+`5c9ffa95810b282a3de29d6afa9ff342da668aa9025960b3cf8fabae85a68aa4`.
+On this source, `target/native-tumble-capacity-compact-leader-65000/` passed
+a RocksDB leader checkpoint after 64,999 real rows, fresh-worker recovery,
+and exact comparison of all 65,000 keys and complete 8,192-byte payloads.
+Its checkpoint retained-payload floor was 532,471,808 bytes, above 10× the
+declared 50 MiB pool sum; peak whole-child RSS was 361,074,688 bytes,
+below the 512 MiB fixture cap. The earlier controller run and this leader
+run qualify this selected capacity shape in both checkpoint protocols on
+their respective tested source revisions. The 3 MiB metadata RPC cap and
+other resource guards remain in place.
+
+A later test-only pre-idle JSON Pointer/value readiness option passed another
+Bookworm formatting, workspace all-target check, strict Clippy, 25 library
+suites (616 passed, four ignored) and full build at
+`/tmp/streamr-m3-idle-pre-match-{fmt,check,clippy,units,build}.log`. The
+65,000-key leader result above used the earlier binary; it is not runtime
+evidence for this later harness option. HOP capacity, quiet-key behavior,
+application timer/profile parity, packaged faults, backfill and 24-hour
+qualification remain open; milestone 3 is incomplete.
+
+## Subsequent application-owned SQL diagnostics
+
+The opt-in idle harness enabled an application-owned, three-real-event probe
+of selected native branch retention. All eight memory/RocksDB ×
+controller/leader × positive/negative cases at
+`target/native-profile-idle-ttl-pre-match/runtime-results.json` completed
+and passed the external strict comparator
+`/tmp/native_profile_branch_ttl_capture.py` (SHA-256
+`d0cce0093640d56c0ba0dd15f6586eda21dad6d3d215a75ba4c5d481bd6dea53`).
+In both initial and fresh-worker recovered phases, complete CDC snapshots
+showed `{lifetime_count: 3, recent_count: 2}` before an eight-second
+live-source pause and `{3, 0}` after it with indefinite lifetime state;
+the all-four-second-TTL negative control ended with deletion. The caller
+checked byte-prefix continuity, typed before images and that both snapshots
+preceded source EOF. This is processing-time TTL evidence for the selected
+query. It does not prove event-time decay, UTC calendar rollover, Flink
+timers, an autonomous idle-key zero for every SQL shape, or full profile
+timing.
+
+At `target/native-profile-rank-standard-sql/planner-runtime-results.json`,
+three unmodified, application-owned existing-SQL diagnostics ran in
+memory/controller/batch-1. Lifetime page and feature `COUNT` feeding
+`ROW_NUMBER` both failed planning with `Window functions require already
+windowed input`; a separate already-ranked `TEXT[]` `ARRAY_AGG` probe
+failed native aggregate construction with `no bounded retraction index
+codec`. These are precise implementation gaps, not a ranking value or
+recovery pass and not a reason by themselves to add SQL syntax.
+
+The application-owned keyed session cursor `MERGE` flags query passed all
+eight memory/RocksDB × batch 1/8 × controller/leader captures and strict
+initial/recovered comparisons at
+`target/native-session-cursor-current/flags-runtime-results.json`: source
+IDs `A,A,B,A,NULL,empty,A` produced flags `1,0,1,1,0,0,0`, with three
+committed rows after the checkpoint prefix. Its separate native
+`SUM(session_started)` totals variant failed planning on the first
+memory/batch-1/controller attempt with `unsupported ArrowKey between related
+state accesses`; no totals runtime matrix was qualified. The passing flags
+show per-row state-table `RETURNING` behavior, not inactivity closure,
+session timers, complete sessions or full profile parity.
+
+A later generic fusion repair retained unrelated downstream aggregate consumers
+outside the serial state-table owner while preserving rejection of unsupported
+operators between related state accesses. On that source, the Bookworm logs
+`/tmp/streamr-m3-native-boundary-{fmt,check,clippy,units,build}.log` record
+passing formatting, workspace all-target check, strict Clippy, 25 library
+suites (619 passed, four ignored) and full workspace build. The SQL test
+binary had SHA-256
+`aa1509e362b9ecbcfd96de050bca7aace96f58efbc0284a01c3d15380b74a248`.
+The parsed `MERGE → flags → SUM` plan and structural fanout/forbidden
+inter-access ArrowKey regressions passed. All 16 application-owned cursor
+captures and strict initial/recovered comparisons then passed across
+memory/RocksDB × batch 1/8 × controller/leader × flags/totals at
+`target/native-session-cursor-fusion-fixed/runtime-results.json`. The
+flags remained `1,0,1,1,0,0,0`; the native `SUM` plus `MAX(arrival_seq)`
+totals query reached `(total_sessions=2, last_arrival_seq=3)` at the
+checkpoint prefix and `(total_sessions=3, last_arrival_seq=7)` at EOF. The previous ArrowKey rejection is a historical failure,
+not a current blocker for this selected query. The comparator is
+application-owned (`/tmp/arcstream-native-session-cursor/native_session_cursor_capture.py`,
+SHA-256 `b80ea4b4b548f3af1af095c7acd78300d4c03505160132b7c20e579efa57904f`);
+it checks exact flags and typed CDC before images while allowing only valid
+coalesced increasing source prefixes. This does not establish inactivity
+closure, timer semantics, complete session records or full profile parity.
+
+Four fresh small HOP captures also passed on this fused-source binary at
+`target/native-hop-capacity-smoke-fusion-fixed/measurements.json`, covering
+memory/RocksDB × controller/leader with eight 64-byte item payloads. The
+full-payload oracle required both exact overlapping windows per item in
+initial and fresh-worker recovered outputs (16 rows each). The checkpoint
+retained-payload floor was only 448 bytes; this is a value/recovery smoke,
+not a 10× HOP capacity qualification.
+
+## Earlier combined-source STR-29 evidence
+
+The `fc347312`-based batch, incorporated into `d19c30e3`, added internal
+serial-owner point reads for native aggregate chunks without indexed
+accumulators, one stable native-window snapshot per watermark pass, and bounded append-only unordered FIRST/LAST. It also
 propagates a nested constructor error instead of accepting it as an empty
 result. These are existing-engine implementation repairs; they add no SQL
 syntax, public backend method, or application policy.
@@ -55,9 +198,9 @@ batch targets 1/8 and controller/leader checkpoints at
 `target/native-unordered-first-last-fixed/`. This does not qualify every
 ordered, FILTER, collection, or retraction variant. Full 33-profile and
 12-session gates remain open; the 10× TUMBLE capacity run on this source is
-pending. A new 14-field application SQL proposal is stored in the application
-repository but has not been executed here. No application-specific definitions
-were added to Streamr.
+pending. At this earlier validation point, a 14-field application SQL
+proposal was stored in the application repository but had not yet been executed.
+No application-specific definitions were added to Streamr.
 
 ## Current STR-28 evidence gate
 

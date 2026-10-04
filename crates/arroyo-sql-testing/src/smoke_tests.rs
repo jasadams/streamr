@@ -32,7 +32,7 @@ use petgraph::{Direction, Graph};
 use serde_json::Value;
 use test_log::test as test_log;
 use tokio::fs::{File, read_to_string};
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::sync::mpsc::error::TryRecvError;
 use tracing::info;
 
@@ -1186,6 +1186,319 @@ impl CaptureCounts {
     }
 }
 
+/// Opt-in pause after a real input row, with the source blocked on its
+/// existing control channel. The ordinary capture path does not use this.
+#[derive(Debug, PartialEq, Eq)]
+struct CaptureIdle {
+    source_row_target: i32,
+    duration: Duration,
+    min_pre_rows: usize,
+    max_output_bytes: usize,
+    pre_match: Option<CaptureIdlePreMatch>,
+}
+
+/// Optional, caller-owned value readiness for the last complete sink row.
+#[derive(Debug, PartialEq, Eq)]
+struct CaptureIdlePreMatch {
+    pointer: String,
+    expected: Value,
+}
+
+impl CaptureIdlePreMatch {
+    fn parse(
+        pointer: Option<&str>,
+        value: Option<&str>,
+    ) -> std::result::Result<Option<Self>, String> {
+        const POINTER: &str = "STREAMR_CAPTURE_IDLE_PRE_MATCH_POINTER";
+        const VALUE: &str = "STREAMR_CAPTURE_IDLE_PRE_MATCH_VALUE";
+        let (Some(pointer), Some(value)) = (pointer, value) else {
+            if pointer.is_some() || value.is_some() {
+                return Err(format!("{POINTER} and {VALUE} must be set together"));
+            }
+            return Ok(None);
+        };
+        if pointer.len() > 1024 || value.len() > 4096 {
+            return Err(format!(
+                "{POINTER} and {VALUE} exceed configured size limits"
+            ));
+        }
+        if !pointer.is_empty() && !pointer.starts_with('/') {
+            return Err(format!("{POINTER} must be a JSON Pointer"));
+        }
+        let bytes = pointer.as_bytes();
+        let mut index = 0;
+        while index < bytes.len() {
+            if bytes[index] == b'~' {
+                if index + 1 >= bytes.len() || !matches!(bytes[index + 1], b'0' | b'1') {
+                    return Err(format!("{POINTER} has an invalid escape"));
+                }
+                index += 1;
+            }
+            index += 1;
+        }
+        let expected = serde_json::from_str(value)
+            .map_err(|error| format!("{VALUE} must be valid JSON: {error}"))?;
+        Ok(Some(Self {
+            pointer: pointer.to_owned(),
+            expected,
+        }))
+    }
+
+    fn matches(&self, row: &Value) -> bool {
+        row.pointer(&self.pointer) == Some(&self.expected)
+    }
+}
+
+impl CaptureIdle {
+    fn from_env(capture: &CaptureCounts) -> std::result::Result<Option<Self>, String> {
+        fn optional(name: &str) -> std::result::Result<Option<String>, String> {
+            match env::var(name) {
+                Ok(value) => Ok(Some(value)),
+                Err(env::VarError::NotPresent) => Ok(None),
+                Err(error) => Err(format!("{name}: {error}")),
+            }
+        }
+        let target = optional("STREAMR_CAPTURE_IDLE_SOURCE_ROW_TARGET")?;
+        let seconds = optional("STREAMR_CAPTURE_IDLE_SECONDS")?;
+        let pre_rows = optional("STREAMR_CAPTURE_IDLE_MIN_PRE_ROWS")?;
+        let max_bytes = optional("STREAMR_CAPTURE_IDLE_MAX_BYTES")?;
+        let batch = optional("STREAMR_TEST_SOURCE_BATCH_ROWS")?;
+        let pre_match = CaptureIdlePreMatch::parse(
+            optional("STREAMR_CAPTURE_IDLE_PRE_MATCH_POINTER")?.as_deref(),
+            optional("STREAMR_CAPTURE_IDLE_PRE_MATCH_VALUE")?.as_deref(),
+        )?;
+        let mut idle = Self::parse(
+            target.as_deref(),
+            seconds.as_deref(),
+            pre_rows.as_deref(),
+            max_bytes.as_deref(),
+            batch.as_deref(),
+            capture.input_rows_before_checkpoint,
+            test_runtime_timeout(),
+        )?;
+        match idle.as_mut() {
+            Some(idle) => idle.pre_match = pre_match,
+            None if pre_match.is_some() => {
+                return Err("idle pre-match requires an idle capture".into());
+            }
+            None => {}
+        }
+        Ok(idle)
+    }
+
+    fn parse(
+        target: Option<&str>,
+        seconds: Option<&str>,
+        pre_rows: Option<&str>,
+        max_bytes: Option<&str>,
+        source_batch_rows: Option<&str>,
+        checkpoint_prefix: i32,
+        runtime_timeout: Duration,
+    ) -> std::result::Result<Option<Self>, String> {
+        const TARGET: &str = "STREAMR_CAPTURE_IDLE_SOURCE_ROW_TARGET";
+        const SECONDS: &str = "STREAMR_CAPTURE_IDLE_SECONDS";
+        const PRE_ROWS: &str = "STREAMR_CAPTURE_IDLE_MIN_PRE_ROWS";
+        const MAX_BYTES: &str = "STREAMR_CAPTURE_IDLE_MAX_BYTES";
+        let (Some(target), Some(seconds)) = (target, seconds) else {
+            if target.is_some() || seconds.is_some() || pre_rows.is_some() || max_bytes.is_some() {
+                return Err(format!(
+                    "{TARGET}, {SECONDS}, {PRE_ROWS}, and {MAX_BYTES} must be set together"
+                ));
+            }
+            return Ok(None);
+        };
+        let Some(pre_rows) = pre_rows else {
+            return Err(format!("{PRE_ROWS} is required for idle capture"));
+        };
+        let Some(max_bytes) = max_bytes else {
+            return Err(format!("{MAX_BYTES} is required for idle capture"));
+        };
+        fn decimal<T: std::str::FromStr>(name: &str, raw: &str) -> std::result::Result<T, String> {
+            if raw.is_empty() || !raw.bytes().all(|byte| byte.is_ascii_digit()) {
+                return Err(format!("{name} must be an unsigned decimal integer"));
+            }
+            raw.parse()
+                .map_err(|_| format!("{name} is outside the supported integer range"))
+        }
+        let source_row_target: i32 = decimal(TARGET, target)?;
+        let idle_seconds: u64 = decimal(SECONDS, seconds)?;
+        let min_pre_rows: usize = decimal(PRE_ROWS, pre_rows)?;
+        let max_output_bytes: usize = decimal(MAX_BYTES, max_bytes)?;
+        if source_row_target <= checkpoint_prefix {
+            return Err(format!("{TARGET} must exceed the checkpoint input prefix"));
+        }
+        if idle_seconds == 0 || idle_seconds > 120 {
+            return Err(format!("{SECONDS} must be in 1..=120"));
+        }
+        if min_pre_rows == 0 {
+            return Err(format!("{PRE_ROWS} must be positive"));
+        }
+        if max_output_bytes == 0 || max_output_bytes > 64 * 1024 * 1024 {
+            return Err(format!("{MAX_BYTES} must be in 1..=67108864"));
+        }
+        let duration = Duration::from_secs(idle_seconds);
+        if duration > runtime_timeout {
+            return Err(format!("{SECONDS} must fit within the runtime timeout"));
+        }
+        if source_batch_rows != Some("1") {
+            return Err("STREAMR_TEST_SOURCE_BATCH_ROWS must be 1 for idle capture".into());
+        }
+        Ok(Some(Self {
+            source_row_target,
+            duration,
+            min_pre_rows,
+            max_output_bytes,
+            pre_match: None,
+        }))
+    }
+
+    /// Single-file sources read the first available row without a NoOp.
+    fn additional_noops(&self, already_read: i32) -> i32 {
+        assert!(already_read > 0 && already_read <= self.source_row_target);
+        self.source_row_target - already_read
+    }
+}
+
+async fn advance_idle_target(engine: &RunningEngine, noops: i32) {
+    let sources = engine.source_controls();
+    assert_eq!(sources.len(), 1, "idle capture requires one source");
+    for _ in 0..noops {
+        sources[0]
+            .send(ControlMessage::NoOp)
+            .await
+            .expect("source ended before idle row target");
+    }
+}
+
+fn check_idle_response(response: Option<ControlResp>) {
+    match response {
+        Some(ControlResp::TaskFailed { error, .. }) => {
+            panic!("worker failed during idle hold: {error:?}")
+        }
+        Some(ControlResp::Error {
+            message, details, ..
+        }) => {
+            panic!("worker error during idle hold: {message}: {details}")
+        }
+        Some(ControlResp::TaskFinished {
+            task_id,
+            subtask_idx,
+        }) => {
+            panic!("task {task_id}/{subtask_idx} finished during idle hold")
+        }
+        Some(_) => {}
+        None => panic!("control channel closed during idle hold"),
+    }
+}
+
+async fn hold_capture_idle(
+    control_rx: &mut Receiver<ControlResp>,
+    phase: &str,
+    idle: &CaptureIdle,
+) {
+    let started = tokio::time::Instant::now();
+    let deadline = started + idle.duration;
+    println!(
+        "CAPTURE_IDLE phase={phase} event=start source_position={} duration_ms={}",
+        idle.source_row_target,
+        idle.duration.as_millis()
+    );
+    loop {
+        tokio::select! {
+            response = control_rx.recv() => check_idle_response(response),
+            () = tokio::time::sleep_until(deadline) => break,
+        }
+    }
+    while let Ok(response) = control_rx.try_recv() {
+        check_idle_response(Some(response));
+    }
+    assert!(
+        !control_rx.is_closed(),
+        "control channel closed during idle hold"
+    );
+    println!(
+        "CAPTURE_IDLE phase={phase} event=end source_position={} elapsed_ms={}",
+        idle.source_row_target,
+        started.elapsed().as_millis()
+    );
+}
+
+/// Snapshot complete sink rows while the control-waiting source remains live.
+/// The single-file sink writes directly to a tokio File, without a BufWriter.
+/// The caller compares these generic before/after byte prefixes with its own
+/// value oracle; row count alone does not establish which input was processed.
+fn complete_idle_jsonl_rows(bytes: &[u8]) -> Option<(usize, Value)> {
+    if !bytes.ends_with(b"\n") {
+        return None;
+    }
+    let mut rows = 0;
+    let mut last = None;
+    for line in bytes[..bytes.len() - 1].split(|&byte| byte == b'\n') {
+        assert!(
+            !line.is_empty(),
+            "idle output contains a blank JSONL record"
+        );
+        let value: Value =
+            serde_json::from_slice(line).expect("idle output contains malformed JSONL");
+        assert!(value.is_object(), "idle output JSONL row must be an object");
+        rows += 1;
+        last = Some(value);
+    }
+    Some((rows, last.expect("complete JSONL has at least one row")))
+}
+
+async fn capture_idle_output(
+    output_path: &Path,
+    phase: &str,
+    boundary: &str,
+    minimum_rows: usize,
+    max_bytes: usize,
+    pre_match: Option<&CaptureIdlePreMatch>,
+) -> (usize, Vec<u8>) {
+    // Four snapshots across the two phases must fit inside the outer 4x
+    // runtime timeout alongside the two bounded idle holds.
+    let deadline = tokio::time::Instant::now() + test_runtime_timeout() / 4;
+    loop {
+        match File::open(output_path).await {
+            Ok(file) => {
+                let mut bytes = Vec::new();
+                file.take(u64::try_from(max_bytes).unwrap() + 1)
+                    .read_to_end(&mut bytes)
+                    .await
+                    .expect("cannot read idle output");
+                assert!(
+                    bytes.len() <= max_bytes,
+                    "idle output exceeds configured byte limit"
+                );
+                // A sink write may be between its value and newline.
+                if let Some((rows, last)) = complete_idle_jsonl_rows(&bytes)
+                    && rows >= minimum_rows
+                    && pre_match.is_none_or(|expected| expected.matches(&last))
+                {
+                    let snapshot =
+                        output_path.with_extension(format!("idle-{phase}-{boundary}.jsonl"));
+                    tokio::fs::write(&snapshot, &bytes)
+                        .await
+                        .expect("failed to write idle output snapshot");
+                    println!(
+                        "CAPTURE_IDLE_OUTPUT phase={phase} boundary={boundary} rows={rows} bytes={} path={}",
+                        bytes.len(),
+                        snapshot.display()
+                    );
+                    return (rows, bytes);
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => panic!("cannot read idle output {}: {error}", output_path.display()),
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "idle output did not reach {minimum_rows} complete rows before timeout"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 #[test]
 fn capture_counts_require_explicit_bounded_parameters() {
     let parse = |input: &str, rows: &str, checkpoint_rows: &str, epoch: &str| {
@@ -1247,6 +1560,229 @@ fn capture_counts_require_explicit_bounded_parameters() {
     }
 }
 
+#[test]
+fn idle_capture_requires_one_row_batches_and_bounded_complete_configuration() {
+    let parse = |target, seconds, pre_rows, max_bytes, batch, timeout| {
+        CaptureIdle::parse(
+            target,
+            seconds,
+            pre_rows,
+            max_bytes,
+            batch,
+            4,
+            Duration::from_secs(timeout),
+        )
+    };
+    assert_eq!(parse(None, None, None, None, None, 120).unwrap(), None);
+    assert_eq!(
+        parse(
+            Some("5"),
+            Some("120"),
+            Some("2"),
+            Some("1024"),
+            Some("1"),
+            120
+        )
+        .unwrap(),
+        Some(CaptureIdle {
+            source_row_target: 5,
+            duration: Duration::from_secs(120),
+            min_pre_rows: 2,
+            max_output_bytes: 1024,
+            pre_match: None,
+        })
+    );
+    assert!(parse(Some("5"), None, Some("2"), Some("1024"), Some("1"), 120).is_err());
+    assert!(parse(None, Some("1"), Some("2"), Some("1024"), Some("1"), 120).is_err());
+    assert!(parse(Some("5"), Some("1"), None, Some("1024"), Some("1"), 120).is_err());
+    assert!(parse(Some("5"), Some("1"), Some("2"), None, Some("1"), 120).is_err());
+    assert!(parse(None, None, Some("1"), Some("1024"), None, 120).is_err());
+    assert!(
+        parse(
+            Some("4"),
+            Some("1"),
+            Some("2"),
+            Some("1024"),
+            Some("1"),
+            120
+        )
+        .is_err()
+    );
+    assert!(
+        parse(
+            Some("5"),
+            Some("0"),
+            Some("2"),
+            Some("1024"),
+            Some("1"),
+            120
+        )
+        .is_err()
+    );
+    assert!(
+        parse(
+            Some("5"),
+            Some("121"),
+            Some("2"),
+            Some("1024"),
+            Some("1"),
+            600
+        )
+        .is_err()
+    );
+    assert!(
+        parse(
+            Some("5"),
+            Some("11"),
+            Some("2"),
+            Some("1024"),
+            Some("1"),
+            10
+        )
+        .is_err()
+    );
+    assert!(parse(Some("5"), Some("1"), Some("2"), Some("0"), Some("1"), 120).is_err());
+    assert!(
+        parse(
+            Some("5"),
+            Some("1"),
+            Some("2"),
+            Some("67108865"),
+            Some("1"),
+            120
+        )
+        .is_err()
+    );
+    assert!(
+        parse(
+            Some("5"),
+            Some("1"),
+            Some("2"),
+            Some("1024"),
+            Some("8"),
+            120
+        )
+        .is_err()
+    );
+    assert!(parse(Some("5"), Some("1"), Some("2"), Some("1024"), None, 120).is_err());
+    for invalid in ["", "-1", "+5", "5x", "2147483648"] {
+        assert!(
+            parse(
+                Some(invalid),
+                Some("1"),
+                Some("2"),
+                Some("1024"),
+                Some("1"),
+                120
+            )
+            .is_err()
+        );
+    }
+    for invalid in ["", "-1", "+1", "1.5", "18446744073709551616"] {
+        assert!(
+            parse(
+                Some("5"),
+                Some(invalid),
+                Some("2"),
+                Some("1024"),
+                Some("1"),
+                120
+            )
+            .is_err()
+        );
+        assert!(
+            parse(
+                Some("5"),
+                Some("1"),
+                Some(invalid),
+                Some("1024"),
+                Some("1"),
+                120
+            )
+            .is_err()
+        );
+        assert!(
+            parse(
+                Some("5"),
+                Some("1"),
+                Some("2"),
+                Some(invalid),
+                Some("1"),
+                120
+            )
+            .is_err()
+        );
+    }
+}
+
+#[test]
+fn idle_control_counts_account_for_automatic_first_and_restored_suffix_rows() {
+    let idle = CaptureIdle {
+        source_row_target: 9,
+        duration: Duration::from_secs(1),
+        min_pre_rows: 1,
+        max_output_bytes: 1024,
+        pre_match: None,
+    };
+    assert_eq!(idle.additional_noops(1), 8); // initial reads row 1
+    assert_eq!(idle.additional_noops(5), 4); // prefix 4, restore reads row 5
+    assert_eq!(idle.additional_noops(9), 0); // target is first suffix row
+}
+
+#[test]
+fn idle_snapshot_requires_complete_object_jsonl_rows() {
+    assert_eq!(
+        complete_idle_jsonl_rows(b"{\"x\":1}\n{\"x\":2}\n"),
+        Some((2, serde_json::json!({"x": 2})))
+    );
+    assert_eq!(complete_idle_jsonl_rows(b"{\"x\":1}"), None);
+    for invalid in [
+        b"{\"x\":1}\n\n".as_slice(),
+        b"{\"x\":1}\n[]\n".as_slice(),
+        b"{\"x\":1}\n42\n".as_slice(),
+    ] {
+        assert!(std::panic::catch_unwind(|| complete_idle_jsonl_rows(invalid)).is_err());
+    }
+}
+
+#[test]
+fn idle_pre_match_requires_paired_bounded_json_pointer_and_value() {
+    let parse = CaptureIdlePreMatch::parse;
+    assert_eq!(parse(None, None).unwrap(), None);
+    assert!(parse(Some("/after"), None).is_err());
+    assert!(parse(None, Some("null")).is_err());
+    assert!(parse(Some("after"), Some("null")).is_err());
+    assert!(parse(Some("/after/~2"), Some("null")).is_err());
+    assert!(parse(Some("/after/~"), Some("null")).is_err());
+    assert!(parse(Some("/after"), Some("not JSON")).is_err());
+    assert!(parse(Some(&format!("/{}", "x".repeat(1024))), Some("null")).is_err());
+    assert!(parse(Some("/after"), Some(&" ".repeat(4097))).is_err());
+    let escaped = parse(Some("/a~1b/~0"), Some("null")).unwrap().unwrap();
+    assert!(escaped.matches(&serde_json::json!({"a/b": {"~": null}})));
+    assert!(!escaped.matches(&serde_json::json!({"a/b": {}})));
+    let root = parse(Some(""), Some("{\"x\":1}")).unwrap().unwrap();
+    assert!(root.matches(&serde_json::json!({"x": 1})));
+}
+
+#[test]
+fn idle_pre_match_checks_latest_complete_object_row() {
+    let expected = CaptureIdlePreMatch::parse(Some("/after"), Some("{\"x\":2}"))
+        .unwrap()
+        .unwrap();
+    let (rows, latest) =
+        complete_idle_jsonl_rows(b"{\"after\":{\"x\":1}}\n{\"after\":{\"x\":2}}\n").unwrap();
+    assert_eq!(rows, 2);
+    assert!(expected.matches(&latest));
+    let (_, latest) =
+        complete_idle_jsonl_rows(b"{\"after\":{\"x\":2}}\n{\"after\":{\"x\":1}}\n").unwrap();
+    assert!(!expected.matches(&latest));
+    let null = CaptureIdlePreMatch::parse(Some("/after"), Some("null"))
+        .unwrap()
+        .unwrap();
+    assert!(null.matches(&serde_json::json!({"after": null})));
+    assert!(!null.matches(&serde_json::json!({})));
+}
+
 /// Capture externally supplied SQL as JSONL before and after checkpoint recovery.
 /// Requires a singleton graph and one control-waiting single-file source.
 /// Input advancement and expected output counts are configured independently;
@@ -1265,6 +1801,7 @@ async fn external_sql_checkpoint_capture() {
 
 async fn external_sql_checkpoint_capture_inner() {
     let capture = CaptureCounts::from_env().expect("invalid external SQL capture configuration");
+    let idle = CaptureIdle::from_env(&capture).expect("invalid external SQL idle configuration");
     configure_test_worker();
     let selected_backend = env::var("STREAMR_TEST_BACKEND").unwrap_or_else(|_| "memory".into());
     let selected_checkpoint =
@@ -1345,7 +1882,16 @@ async fn external_sql_checkpoint_capture_inner() {
             .as_nanos()
     );
     let initial_path = output_path.with_extension("initial.jsonl");
-    for path in [&output_path, &initial_path] {
+    let mut stale_paths = vec![output_path.clone(), initial_path.clone()];
+    if idle.is_some() {
+        for phase in ["initial", "recovered"] {
+            for boundary in ["before", "after"] {
+                stale_paths
+                    .push(output_path.with_extension(format!("idle-{phase}-{boundary}.jsonl")));
+            }
+        }
+    }
+    for path in &stale_paths {
         match tokio::fs::remove_file(path).await {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -1359,6 +1905,29 @@ async fn external_sql_checkpoint_capture_inner() {
         .unwrap()
         .start()
         .await;
+    if let Some(idle) = &idle {
+        advance_idle_target(&running, idle.additional_noops(1)).await;
+        let (before_rows, before_bytes) = capture_idle_output(
+            &output_path,
+            "initial",
+            "before",
+            idle.min_pre_rows,
+            idle.max_output_bytes,
+            idle.pre_match.as_ref(),
+        )
+        .await;
+        hold_capture_idle(&mut control_rx, "initial", idle).await;
+        let (after_rows, after_bytes) = capture_idle_output(
+            &output_path,
+            "initial",
+            "after",
+            before_rows,
+            idle.max_output_bytes,
+            None,
+        )
+        .await;
+        assert!(after_bytes.starts_with(&before_bytes) && after_rows >= before_rows);
+    }
     run_until_finished(&running, &mut control_rx).await;
     let initial_rows = capture_rows(
         &output_path,
@@ -1521,6 +2090,35 @@ async fn external_sql_checkpoint_capture_inner() {
         .unwrap()
         .start()
         .await;
+    if let Some(idle) = &idle {
+        // Restore reads the first suffix row without a NoOp. The configured
+        // target is an absolute source row count across the checkpoint.
+        advance_idle_target(
+            &restored,
+            idle.additional_noops(capture.input_rows_before_checkpoint + 1),
+        )
+        .await;
+        let (before_rows, before_bytes) = capture_idle_output(
+            &output_path,
+            "recovered",
+            "before",
+            idle.min_pre_rows,
+            idle.max_output_bytes,
+            idle.pre_match.as_ref(),
+        )
+        .await;
+        hold_capture_idle(&mut control_rx, "recovered", idle).await;
+        let (after_rows, after_bytes) = capture_idle_output(
+            &output_path,
+            "recovered",
+            "after",
+            before_rows,
+            idle.max_output_bytes,
+            None,
+        )
+        .await;
+        assert!(after_bytes.starts_with(&before_bytes) && after_rows >= before_rows);
+    }
     run_until_finished(&restored, &mut control_rx).await;
     let recovered_rows = capture_rows(
         &output_path,

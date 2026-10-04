@@ -11,6 +11,53 @@ The input has one key and values 1, 2, 3 at event-time offsets 1, 3, 7 seconds.
 A lifetime aggregate must finish at count 3 and sum 6 independently of window
 retirement. Source and sink paths refer to disposable capture fixtures.
 
+## Current `d19c30e3` combined-source result
+
+The existing-SQL lifetime/latest-closed-HOP composition passed all eight
+memory/RocksDB × source batch target 1/8 × controller/leader captures at
+`target/native-result-composition-snapshot-fixed/`. Its strict reducer checks
+full CDC before images, checkpoint-prefix and final values. Generic native
+UUID and closed-HOP reaggregation also passed their separate eight-case
+captures at `target/native-uuid-snapshot-fixed/` and
+`target/native-window-composition-snapshot-fixed/`. These runs establish the
+selected ordinary SQL paths and fresh-worker recovery; they do not establish
+an idle-key zero, scheduled emission, session transition or a complete
+application profile.
+
+The application-owned profile-core probe passed 14 selected fields in eight
+backend/batch/protocol captures, while the standard-SQL session `LAG` and
+updating-left daily join probes still fail planning. One aliased `DATE`
+grouping probe passed memory/batch-1/controller. The precise artifacts and
+remaining profile gates are in [the validation record](milestone-3-validation.md).
+
+A subsequent uncommitted test-harness batch added an opt-in live-source idle
+hold and bounded complete-JSONL snapshots before and after it. A later
+test-only option lets the caller require a bounded JSON Pointer/value match
+on the last pre-idle row. The application still owns the value oracle. The
+base harness build passed 614 library tests (four ignored); the later
+pre-match build passed 616 (four ignored), with workspace checks, strict
+Clippy and full builds on both. See
+[the validation record](milestone-3-validation.md). These harness checks
+alone do not establish an idle-key zero, processing-time TTL result,
+event-time decay, or a complete application profile.
+
+A later application-owned external SQL probe did pass eight memory/RocksDB ×
+controller/leader positive/negative captures and strict initial/recovered
+comparisons with a real eight-second source pause. For its selected query,
+a four-second processing-time TTL expired the latest-result branch from two
+to zero while the indefinite lifetime branch stayed at three; an all-finite
+control deleted its output row. Artifacts are
+`target/native-profile-idle-ttl-pre-match/`. This result is specific to
+processing-time branch retention and does not supply event-time decay,
+calendar behavior, Flink session timers or complete profile emission
+semantics. The later generic fusion repair also let a selected application
+session cursor `MERGE RETURNING` result feed native `SUM` and `MAX`:
+16 flags/totals backend/batch/protocol captures passed strict checkpoint
+and recovery comparisons on the refreshed source. The earlier ArrowKey
+fusion rejection remains a historical diagnostic. Inactivity closure,
+timers, complete sessions and ranked top-K behavior remain unqualified;
+see [the validation record](milestone-3-validation.md).
+
 ## Existing SQL: closed windows feeding another aggregate
 
 After repairing the planner's inherited window scope when a projection keeps

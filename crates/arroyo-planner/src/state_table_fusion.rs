@@ -549,7 +549,18 @@ pub(crate) fn analyze(
                 }
                 let target = edge.target();
                 let op = single_operator(graph, target)?;
-                if op.operator_name == OperatorName::ConnectorSink {
+                // Every state access was walked backwards above. An unsupported
+                // operator on a path to another access would already have been
+                // rejected there; an unselected consumer is a downstream exit.
+                // Keep its original edge/schema for the capture extractor.
+                if !selected.contains(&target.index())
+                    && !matches!(
+                        op.operator_name,
+                        OperatorName::StateTable
+                            | OperatorName::Projection
+                            | OperatorName::ArrowValue
+                    )
+                {
                     continue;
                 }
                 classify(graph, target, admission)?;
@@ -1154,6 +1165,68 @@ mod tests {
         assert_eq!(rebuilt.edge_count(), 7); // source fanout, owner branches, three sink links
         assert!(!rebuilt.node_weights().any(|node| node.node_id == 1));
         assert!(rebuilt.node_weights().any(|node| node.node_id == 7));
+    }
+
+    #[test]
+    fn downstream_aggregate_exit_preserves_direct_fanout_and_dependent_access() {
+        let mut graph = LogicalGraph::new();
+        let source = graph.add_node(node(0, OperatorName::ConnectorSource, vec![]));
+        let first = graph.add_node(access(1, "inventory", false));
+        let projection = graph.add_node(projection(2));
+        let second = graph.add_node(access(3, "ledger", false));
+        let direct_sink = graph.add_node(node(4, OperatorName::ConnectorSink, vec![]));
+        let key = graph.add_node(node(5, OperatorName::ArrowKey, vec![]));
+        let aggregate = graph.add_node(node(6, OperatorName::UpdatingAggregate, vec![]));
+        let aggregate_sink = graph.add_node(node(7, OperatorName::ConnectorSink, vec![]));
+        let dependent_sink = graph.add_node(node(8, OperatorName::ConnectorSink, vec![]));
+        forward(&mut graph, source, first);
+        forward(&mut graph, first, projection);
+        forward(&mut graph, first, direct_sink);
+        forward(&mut graph, projection, second);
+        forward(&mut graph, projection, key);
+        forward(&mut graph, key, aggregate);
+        forward(&mut graph, aggregate, aggregate_sink);
+        forward(&mut graph, second, dependent_sink);
+
+        let regions = analyze(&graph, &AdmitTestScalar).unwrap();
+        assert_eq!(regions.len(), 1);
+        assert_eq!(regions[0].steps.len(), 3);
+        assert_eq!(regions[0].captures.len(), 3);
+        assert_eq!(regions[0].captures[0].consumers, vec![direct_sink]);
+        assert_eq!(regions[0].captures[1].consumers, vec![key]);
+        assert_eq!(regions[0].captures[2].consumers, vec![dependent_sink]);
+        let mut next_id = 9;
+        let rebuilt = rebuild(&graph, &regions, |region, edge| {
+            lower_region(region, edge, &mut next_id)
+        })
+        .unwrap();
+        assert_eq!(rebuilt.node_count(), 10);
+        assert_eq!(rebuilt.edge_count(), 9);
+        assert!(rebuilt.node_weights().any(|node| node.node_id == 5));
+        assert!(rebuilt.node_weights().any(|node| node.node_id == 6));
+        assert!(!rebuilt.node_weights().any(|node| node.node_id == 1));
+        assert!(!rebuilt.node_weights().any(|node| node.node_id == 2));
+        assert!(!rebuilt.node_weights().any(|node| node.node_id == 3));
+    }
+
+    #[test]
+    fn unsupported_keying_between_related_accesses_still_rejects() {
+        let mut graph = LogicalGraph::new();
+        let source = graph.add_node(node(0, OperatorName::ConnectorSource, vec![]));
+        let first = graph.add_node(access(1, "inventory", false));
+        let key = graph.add_node(node(2, OperatorName::ArrowKey, vec![]));
+        let second = graph.add_node(access(3, "ledger", false));
+        let sink = graph.add_node(node(4, OperatorName::ConnectorSink, vec![]));
+        forward(&mut graph, source, first);
+        forward(&mut graph, first, key);
+        forward(&mut graph, key, second);
+        forward(&mut graph, second, sink);
+        assert!(
+            analyze(&graph, &AdmitTestScalar)
+                .unwrap_err()
+                .to_string()
+                .contains("unsupported ArrowKey between related state accesses")
+        );
     }
 
     #[test]

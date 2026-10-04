@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""RocksDB native TUMBLE/SESSION checkpoint capacity and exact-output fixture.
+"""RocksDB native TUMBLE/HOP/SESSION checkpoint capacity and exact-output fixture.
 
 Small --rows runs validate the fixture. By default the checkpoint retains
 rows//2 payloads; --checkpoint-rows selects another positive prefix smaller
@@ -7,7 +7,8 @@ than the total row count. A high prefix can qualify a 10x checkpoint while
 leaving rows for replay. Full pre-EOF state holds all rows. Report checkpoint
 and full-state payload floors separately; each reaches 10x only when it
 contains ten times the fixed, conservative 50 MiB pool sum. RSS includes the
-whole SQL-test process. No rescaling is tested.
+whole SQL-test process. HOP overlaps do not multiply the per-input retained
+payload floor. No rescaling is tested.
 """
 
 import argparse
@@ -22,7 +23,8 @@ import time
 
 BASE = datetime.fromisoformat("2023-10-09T17:13:20")
 POOL_BUDGET_MIB = 50  # executor 16 + cache 8 + memtable 4 + write 4 + decoded 16 + scan 2
-CASES = ("tumble", "session")
+CASES = ("tumble", "hop", "session")
+DEFAULT_CASES = ("tumble", "session")
 PROTOCOLS = ("controller", "leader")
 BACKENDS = ("memory", "rocksdb")
 
@@ -52,7 +54,9 @@ CREATE TABLE capacity_input (
 WITH (connector='single_file', path='{input_path}', format='json',
       type='source', wait_for_control='true');
 """
-    if case == "tumble":
+    if case in ("tumble", "hop"):
+        window = ("TUMBLE(INTERVAL '2 second')" if case == "tumble"
+                  else "HOP(INTERVAL '2 second', INTERVAL '4 second')")
         return source + f"""
 CREATE TABLE capacity_output (
   item_id BIGINT, start TIMESTAMP, end TIMESTAMP, n BIGINT,
@@ -60,7 +64,7 @@ CREATE TABLE capacity_output (
 WITH (connector='single_file', path='{output_path}', format='json', type='sink');
 INSERT INTO capacity_output
 SELECT item_id, window.start, window.end, n, first_payload FROM (
-  SELECT item_id, TUMBLE(INTERVAL '2 second') AS window,
+  SELECT item_id, {window} AS window,
          COUNT(*) AS n,
          FIRST_VALUE(payload ORDER BY ordinal) AS first_payload
   FROM capacity_input GROUP BY 1, 2
@@ -117,31 +121,44 @@ def check_output(path, case, rows, payload_bytes):
         "tumble": (BASE.isoformat(), (BASE + timedelta(seconds=2)).isoformat()),
         "session": (BASE.isoformat(), (BASE + timedelta(seconds=10)).isoformat()),
     }
-    expected_start, expected_end = common[case]
     fields = {"start", "end", "n", "first_payload"}
-    if case == "tumble":
+    if case in ("tumble", "hop"):
         fields.add("item_id")
+        windows = (common["tumble"],) if case == "tumble" else (
+            ((BASE - timedelta(seconds=2)).isoformat(),
+             (BASE + timedelta(seconds=2)).isoformat()),
+            (BASE.isoformat(), (BASE + timedelta(seconds=4)).isoformat()),
+        )
         seen = bytearray(rows)
         count = 0
         with path.open() as output:
             for line in output:
                 row = json.loads(line)
-                if set(row) != fields:
-                    raise AssertionError((path, "field set", set(row), fields))
+                if not isinstance(row, dict) or set(row) != fields:
+                    raise AssertionError((path, "field set", row, fields))
                 item = row["item_id"]
-                if type(item) is not int or not 0 <= item < rows or seen[item]:
-                    raise AssertionError((path, "duplicate/invalid item", item))
+                if type(item) is not int or not 0 <= item < rows:
+                    raise AssertionError((path, "invalid item", item))
+                interval = (row["start"], row["end"])
+                if interval not in windows:
+                    raise AssertionError((path, "invalid window", item, interval, windows))
+                window_bit = 1 << windows.index(interval)
+                if seen[item] & window_bit:
+                    raise AssertionError((path, "duplicate item/window", item, interval))
                 expected_payload = payload_for(item, payload_bytes)
-                wanted = dict(item_id=item, start=expected_start, end=expected_end,
+                wanted = dict(item_id=item, start=interval[0], end=interval[1],
                               n=1, first_payload=expected_payload)
-                if row != wanted:
+                if type(row["n"]) is not int or row != wanted:
                     raise AssertionError((path, "wrong value", item, row, wanted))
-                seen[item] = 1
+                seen[item] |= window_bit
                 count += 1
-        if count != rows or not all(seen):
-            raise AssertionError((path, "missing rows", count, rows))
+        expected_count = rows * len(windows)
+        expected_bits = (1 << len(windows)) - 1
+        if count != expected_count or any(bits != expected_bits for bits in seen):
+            raise AssertionError((path, "missing item/windows", count, expected_count))
         return count
     fields.add("segment")
+    expected_start, expected_end = common[case]
     wanted = dict(segment="hot", start=expected_start, end=expected_end,
                   n=rows, first_payload=payload_for(0, payload_bytes))
     with path.open() as output:
@@ -158,6 +175,7 @@ def check_output(path, case, rows, payload_bytes):
 def run_case(binary, directory, case, backend, protocol, rows, payload_bytes,
              checkpoint_rows, rss_limit_mib, timeout_seconds):
     output_path = directory / "output.jsonl"
+    expected_output_rows = 1 if case == "session" else rows * (2 if case == "hop" else 1)
     env = dict(os.environ)
     for flag in ("STREAMR_TEST_TYPED_SQL", "STREAMR_TEST_NATIVE_AGGREGATES"):
         env.pop(flag, None)
@@ -171,9 +189,9 @@ def run_case(binary, directory, case, backend, protocol, rows, payload_bytes,
         STREAMR_CAPTURE_QUERY=str(directory / "query.sql"),
         STREAMR_CAPTURE_OUTPUT=str(output_path),
         STREAMR_CAPTURE_INPUT_ROWS_BEFORE_CHECKPOINT=str(checkpoint_rows),
-        STREAMR_CAPTURE_EXPECTED_INITIAL_ROWS=str(rows if case == "tumble" else 1),
+        STREAMR_CAPTURE_EXPECTED_INITIAL_ROWS=str(expected_output_rows),
         STREAMR_CAPTURE_EXPECTED_CHECKPOINT_ROWS="0",
-        STREAMR_CAPTURE_EXPECTED_ROWS=str(rows if case == "tumble" else 1),
+        STREAMR_CAPTURE_EXPECTED_ROWS=str(expected_output_rows),
         STREAMR_CAPTURE_CHECKPOINT_EPOCH="1",
     )
     log_path = directory / "runtime.log"
@@ -188,6 +206,8 @@ def run_case(binary, directory, case, backend, protocol, rows, payload_bytes,
     recovered = check_output(output_path, case, rows, payload_bytes)
     if peak_rss > rss_limit_mib * 1024 * 1024:
         raise RuntimeError(f"{case}/{backend}/{protocol} peak RSS {peak_rss} exceeds {rss_limit_mib} MiB")
+    # Count one retained source payload per event. HOP may retain two partial
+    # windows per event, but multiplying that is not a conservative floor.
     checkpoint_bytes = checkpoint_rows * payload_bytes
     full_open_bytes = rows * payload_bytes
     threshold = 10 * POOL_BUDGET_MIB * 1024 * 1024
@@ -200,7 +220,9 @@ def run_case(binary, directory, case, backend, protocol, rows, payload_bytes,
                   full_state_exceeds_10x_pool_budget=full_open_bytes >= threshold,
                   rss_limit_mib=rss_limit_mib,
                   peak_rss_bytes=peak_rss, initial_rows=initial, recovered_rows=recovered,
-                  oracle_scope=("all emitted keys and full payloads" if case == "tumble"
+                  oracle_scope=("all emitted item/window keys and full payloads"
+                                if case == "hop" else
+                                "all emitted keys and full payloads" if case == "tumble"
                                 else "hot-session count, window, and full first payload"))
     print(f"PASS {case}/{backend}/{protocol}: initial/recovered exact outputs; "
           f"RSS={peak_rss} bytes; full-open-10x={full_open_bytes >= threshold}; "
@@ -238,7 +260,7 @@ def main():
     if not args.prepare_only and not args.binary:
         parser.error("binary is required unless --prepare-only is set")
     root = args.directory.resolve()
-    cases = tuple(dict.fromkeys(args.case or CASES))
+    cases = tuple(dict.fromkeys(args.case or DEFAULT_CASES))
     protocols = tuple(dict.fromkeys(args.protocol or PROTOCOLS))
     backends = tuple(dict.fromkeys(args.backend or ("rocksdb",)))
     prepare(root, cases, protocols, backends, args.rows, args.payload_bytes)

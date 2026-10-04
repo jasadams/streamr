@@ -150,8 +150,11 @@ async fn export_snapshot_inner(
     // Track repeated-message wire bytes incrementally rather than rescanning
     // a growing full file list on every page (quadratic in checkpoint size).
     let mut metadata_wire_bytes = metadata.encoded_len();
+    // These components retain their uniqueness in hexadecimal. Checkpoint
+    // metadata stores complete immutable paths; readers and GC do not parse
+    // the numeric basename, so older decimal names remain readable.
     let upload_id = format!(
-        "{}-{}-{}",
+        "{:x}-{:x}-{:x}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
@@ -205,7 +208,8 @@ async fn export_snapshot_inner(
                     bytes.extend_from_slice(&entry.value);
                 }
                 let file = DiskCheckpointFile {
-                    path: format!("{path}/disk-{upload_id}-{:06}.bin", metadata.files.len()),
+                    // File replay follows metadata order, not basename order.
+                    path: format!("{path}/disk-{upload_id}-{:x}.bin", metadata.files.len()),
                     size_bytes: bytes.len() as u64,
                     checksum: Sha256::digest(&bytes).to_vec(),
                     row_count: rows,
@@ -605,6 +609,57 @@ mod tests {
         )
     }
 
+    #[test]
+    fn compact_immutable_paths_fit_large_leader_checkpoint_metadata() {
+        // Reproduce the observed 14,015-page boundary with a long, valid job
+        // path. Only the basename changes; paths still identify one exclusive
+        // generation/epoch/operator/table and the same per-export components.
+        let config = config();
+        let base = format!(
+            "P/{}/generations/0/checkpoints/checkpoint-0000001/operator-tumbling_window_8/table-map-000",
+            "x".repeat(48)
+        );
+        let pid = 676_578u32;
+        let nanos = 1_791_109_665_944_763_941u128;
+        let counter = 0u64;
+        let mut metadata = DiskKeyedTableSubtaskCheckpointMetadata {
+            subtask_index: 0,
+            format_version: 1,
+            encoding_version: 1,
+            schema_identity: config.schema_identity.clone(),
+            namespace: encoding::encode_namespace(&namespace()).unwrap(),
+            generation: 0,
+            epoch: 1,
+            empty: false,
+            files: (0..14_015)
+                .map(|index| DiskCheckpointFile {
+                    path: format!("{base}/disk-{pid}-{nanos}-{counter}-{index:06}.bin"),
+                    size_bytes: 54_613,
+                    checksum: vec![0; 32],
+                    row_count: 6,
+                })
+                .collect(),
+        };
+        arroyo_state_protocol::disk::validate_subtask(&config, &metadata).unwrap();
+        let previous_wire_bytes = metadata.encoded_len();
+        assert!(previous_wire_bytes > MAX_SUBTASK_CHECKPOINT_BYTES);
+        for (index, file) in metadata.files.iter_mut().enumerate() {
+            file.path = format!("{base}/disk-{pid:x}-{nanos:x}-{counter:x}-{index:x}.bin");
+        }
+        arroyo_state_protocol::disk::validate_subtask(&config, &metadata).unwrap();
+        let compact_wire_bytes = metadata.encoded_len();
+        assert!(compact_wire_bytes <= MAX_SUBTASK_CHECKPOINT_BYTES);
+        assert!(previous_wire_bytes - compact_wire_bytes > 35_922);
+        assert_eq!(
+            metadata.files[0].path.rsplit('/').next().unwrap(),
+            format!("disk-{pid:x}-{nanos:x}-{counter:x}-0.bin")
+        );
+        assert_eq!(
+            metadata.files[14_014].path.rsplit('/').next().unwrap(),
+            format!("disk-{pid:x}-{nanos:x}-{counter:x}-36be.bin")
+        );
+    }
+
     #[tokio::test]
     async fn checkpoint_metrics_count_only_successfully_transferred_encoded_pages() {
         let resources = WorkerStateResources::new(ResourceConfig {
@@ -846,6 +901,21 @@ mod tests {
         )
         .await
         .unwrap();
+        let basename = metadata.files[0].path.rsplit('/').next().unwrap();
+        let components = basename
+            .strip_prefix("disk-")
+            .unwrap()
+            .strip_suffix(".bin")
+            .unwrap()
+            .split('-')
+            .collect::<Vec<_>>();
+        assert_eq!(components.len(), 4);
+        assert_eq!(components[3], "0");
+        assert!(
+            components.iter().all(|part| {
+                !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_hexdigit())
+            })
+        );
         arroyo_state_protocol::typed_checkpoint::validate_subtask(&config, &metadata).unwrap();
         let restored = MemoryLiveState::new();
         restore_typed(&restored, &namespace, &config, &metadata, &storage)
