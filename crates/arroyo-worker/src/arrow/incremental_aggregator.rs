@@ -284,6 +284,8 @@ impl AggregateInput {
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 enum AccumulatorType {
     Sliding,
+    /// Native append-only aggregates use reconstructible ordinary state.
+    AppendOnly,
     Batch,
 }
 
@@ -291,6 +293,7 @@ impl AccumulatorType {
     fn state_fields(&self, agg: &AggregateFunctionExpr) -> DFResult<Vec<FieldRef>> {
         Ok(match self {
             AccumulatorType::Sliding => agg.sliding_state_fields()?,
+            AccumulatorType::AppendOnly => agg.state_fields()?,
             // state for batch tables is handled separately
             AccumulatorType::Batch => vec![],
         })
@@ -327,6 +330,7 @@ pub struct IncrementalAggregatingFunc {
     native_store: Option<AggregateStore>,
     retain_indefinitely: bool,
     native_schema_identity: Vec<u8>,
+    native_append_only: bool,
 }
 
 const GLOBAL_KEY: Vec<u8> = vec![];
@@ -621,6 +625,10 @@ impl IncrementalAggregatingFunc {
         row: usize,
         retract: bool,
     ) -> Result<()> {
+        ensure!(
+            !retract || !self.native_append_only,
+            "append-only native aggregate received a retraction",
+        );
         let storage_key = native_group_key(b'G', group_key)?;
         let previous = scope
             .get(&storage_key)
@@ -771,6 +779,10 @@ impl IncrementalAggregatingFunc {
             input_working_bytes <= max_input_batch_bytes,
             "native aggregate expressions exceed configured max-batch-bytes"
         );
+        ensure!(
+            !self.native_append_only || batch.column_by_name(UPDATING_META_FIELD).is_none(),
+            "append-only native aggregate received changelog metadata",
+        );
         let retracts = Self::get_retracts(batch);
         let limits = store.limits();
         let fallback = self
@@ -797,7 +809,14 @@ impl IncrementalAggregatingFunc {
         );
         for start in (0..batch.num_rows()).step_by(rows_per_chunk) {
             let end = batch.num_rows().min(start + rows_per_chunk);
-            let mut scope = store.begin().await?;
+            // Indexed/retracting accumulators scan a stable view. Scalar and
+            // ordered append-only accumulators only read their group key;
+            // the serial owner plus scope overlay supplies read-own-writes.
+            let mut scope = if fallback == 0 {
+                store.begin_point().await?
+            } else {
+                store.begin().await?
+            };
             for (row, key) in keys.iter().enumerate().take(end).skip(start) {
                 let retract = retracts.is_some_and(|flags| flags.value(row));
                 self.native_process_event(&mut scope, key, &inputs, row, retract)
@@ -1785,6 +1804,10 @@ impl IncrementalAggregatingFunc {
                     expr: agg.func.clone(),
                     accumulator: agg.func.create_sliding_accumulator().unwrap(),
                 },
+                AccumulatorType::AppendOnly => IncrementalState::Sliding {
+                    expr: agg.func.clone(),
+                    accumulator: agg.func.create_accumulator().unwrap(),
+                },
                 AccumulatorType::Batch => IncrementalState::Batch {
                     expr: agg.func.clone(),
                     data: Default::default(),
@@ -2145,7 +2168,6 @@ impl IncrementalAggregatingConstructor {
         if let Some(schema) = &config.final_schema {
             identity.update(schema.encode_to_vec());
         }
-        let native_schema_identity = identity.finalize().to_vec();
         let ttl = Duration::from_micros(if config.ttl_micros == 0 {
             warn!("ttl was not set for updating aggregate");
             24 * 60 * 60 * 1000 * 1000
@@ -2154,6 +2176,8 @@ impl IncrementalAggregatingConstructor {
         });
 
         let input_schema: ArroyoSchema = config.input_schema.unwrap().try_into()?;
+        let native_append_only =
+            native_config.is_some() && input_schema.schema.index_of(UPDATING_META_FIELD).is_err();
         let final_schema: ArroyoSchema = config.final_schema.unwrap().try_into()?;
         let mut schema_without_metadata = SchemaBuilder::from((*final_schema.schema).clone());
         schema_without_metadata.remove(final_schema.schema.index_of(UPDATING_META_FIELD).unwrap());
@@ -2216,7 +2240,7 @@ impl IncrementalAggregatingConstructor {
             .iter()
             .zip(aggregate_exec.aggr_expr_name.iter())
             .enumerate()
-            .map(|(index, (expr, name))| {
+            .map(|(index, (expr, name))| -> DFResult<_> {
                 Ok((
                     decode_aggregate(&input_schema.schema, name, expr, registry.as_ref())?,
                     filters.get(index).cloned().flatten(),
@@ -2230,17 +2254,23 @@ impl IncrementalAggregatingConstructor {
                     _ => false,
                 };
 
-                // Only these sliding accumulators have fixed-size,
-                // reconstructible state on the native path. DataFusion's
-                // moving MIN/MAX retains FIFO history that its state() omits;
-                // FIRST/LAST likewise need the persisted member index. Any
-                // other native aggregate must have an explicit index codec or
-                // fail at construction rather than retain hidden history.
+                // Moving MIN/MAX and FIRST/LAST need the member index on a
+                // changelog input. On a declared append-only input, ordinary
+                // DataFusion state holds only the current winner and its order
+                // tuple (if any); its state() is reconstructible without member
+                // history. Other native aggregates retain their admission gate.
                 let native_sliding = matches!(function.as_str(), "count" | "sum" | "avg");
+                let append_only_state = native_append_only
+                    && matches!(
+                        function.as_str(),
+                        "min" | "max" | "first_value" | "last_value"
+                    );
 
                 (
                     agg,
-                    if retract && (!native_state || native_sliding) {
+                    if append_only_state {
+                        AccumulatorType::AppendOnly
+                    } else if retract && (!native_state || native_sliding) {
                         AccumulatorType::Sliding
                     } else {
                         AccumulatorType::Batch
@@ -2261,9 +2291,18 @@ impl IncrementalAggregatingConstructor {
                 )?);
 
                 let fields = t.state_fields(&agg)?;
-
-                let field_names = fields.iter().map(|f| f.name().to_string()).collect_vec();
-                sliding_state_fields.extend(fields.into_iter().map(|f| (*f).clone()));
+                let first_state_col = sliding_state_fields.len();
+                sliding_state_fields.extend(fields.into_iter().enumerate().map(|(part, field)| {
+                    let field = (*field).clone();
+                    if t == AccumulatorType::AppendOnly {
+                        // FIRST/LAST state contains repeated names such as is_set.
+                        // Names are internal; ordinals identify the persisted state.
+                        field.with_name(format!("_native_state_{}", first_state_col + part))
+                    } else {
+                        field
+                    }
+                }));
+                let state_cols = (first_state_col..sliding_state_fields.len()).collect_vec();
 
                 let (index_converter, index_columns) =
                     if t == AccumulatorType::Batch && native_config.is_some() {
@@ -2278,14 +2317,20 @@ impl IncrementalAggregatingConstructor {
                     agg,
                     t,
                     row_converter,
-                    field_names,
+                    state_cols,
                     input_exprs,
                     filter,
                     index_converter,
                     index_columns,
                 ))
             })
-            .flatten_ok()
+            // The second map_ok returns an inner Result. flatten_ok would
+            // silently omit an aggregate when its native index codec fails.
+            .map(|result| {
+                result
+                    .map_err(anyhow::Error::from)
+                    .and_then(std::convert::identity)
+            })
             .collect::<Result<_>>()?;
 
         let state_schema = Schema::new(sliding_state_fields);
@@ -2293,14 +2338,14 @@ impl IncrementalAggregatingConstructor {
         let versioned_inputs = aggregates
             .iter()
             .any(|(agg, _, _, _, _, filter, _, _)| filter.is_some() || agg.order_bys().is_some());
-        let aggregates = aggregates
+        let aggregates: Vec<Aggregator> = aggregates
             .into_iter()
             .map(
                 |(
                     agg,
                     t,
                     row_converter,
-                    field_names,
+                    state_cols,
                     input_exprs,
                     filter,
                     index_converter,
@@ -2311,15 +2356,23 @@ impl IncrementalAggregatingConstructor {
                     filter,
                     accumulator_type: t,
                     row_converter,
-                    state_cols: field_names
-                        .iter()
-                        .map(|f| state_schema.index_of(f).unwrap())
-                        .collect(),
+                    state_cols,
                     index_converter,
                     index_columns,
                 },
             )
             .collect();
+
+        // Only the append-only ordinary-state layout is new. Preserve existing
+        // checkpoint identity for unchanged native COUNT/SUM/AVG and changelog
+        // index formats while rejecting old indexed checkpoints for this layout.
+        if aggregates
+            .iter()
+            .any(|aggregate| aggregate.accumulator_type == AccumulatorType::AppendOnly)
+        {
+            identity.update(b"\0append-only-ordinary-state.v1");
+        }
+        let native_schema_identity = identity.finalize().to_vec();
 
         // ensure the last field (timestamp) has the expected name before creating the arroyo schema
         let mut state_fields = state_schema.fields().to_vec();
@@ -2381,6 +2434,7 @@ impl IncrementalAggregatingConstructor {
             native_store: None,
             retain_indefinitely: config.retain_indefinitely == Some(true),
             native_schema_identity,
+            native_append_only,
         })
     }
 }
@@ -2446,6 +2500,12 @@ mod tests {
     // Exercise the production protobuf decoder and constructor, with generic
     // physical expressions rather than application SQL or replacement logic.
     fn native_config() -> (UpdatingAggregateOperator, Arc<Registry>) {
+        native_config_with_unordered(false)
+    }
+
+    fn native_config_with_unordered(
+        include_unordered: bool,
+    ) -> (UpdatingAggregateOperator, Arc<Registry>) {
         let schema = input_schema();
         let value: Arc<dyn PhysicalExpr> = Arc::new(Column::new("value", 0));
         let sequence: Arc<dyn PhysicalExpr> = Arc::new(Column::new("sequence", 1));
@@ -2512,6 +2572,33 @@ mod tests {
                 .unwrap(),
         ));
         filters.push(None);
+        if include_unordered {
+            for (name, function, argument, filtered) in [
+                ("arrival_first", first_value_udaf(), sequence.clone(), false),
+                ("arrival_last", last_value_udaf(), sequence.clone(), false),
+                (
+                    "selected_arrival_last",
+                    last_value_udaf(),
+                    value.clone(),
+                    true,
+                ),
+                (
+                    "arrival_first_value",
+                    first_value_udaf(),
+                    value.clone(),
+                    false,
+                ),
+            ] {
+                expressions.push(Arc::new(
+                    AggregateExprBuilder::new(function, vec![argument])
+                        .schema(schema.clone())
+                        .alias(name)
+                        .build()
+                        .unwrap(),
+                ));
+                filters.push(filtered.then(|| include.clone()));
+            }
+        }
         let codec = DefaultPhysicalExtensionCodec {};
         let aggregate = AggregateExecNode {
             aggr_expr: expressions
@@ -2569,6 +2656,32 @@ mod tests {
     }
 
     fn native_operator() -> IncrementalAggregatingFunc {
+        let (mut config, registry) = native_config();
+        // Retraction fixtures declare a changelog input. An undeclared metadata
+        // column must never silently select the indexed recovery format.
+        let mut schema = SchemaBuilder::from(input_schema().as_ref().clone());
+        schema.push(Field::new(
+            UPDATING_META_FIELD,
+            DataType::Struct(updating_meta_fields()),
+            false,
+        ));
+        config.input_schema = Some(
+            ArroyoSchema::from_schema_unkeyed(Arc::new(schema.finish()))
+                .unwrap()
+                .into(),
+        );
+        let mut operator = IncrementalAggregatingConstructor::build_with_native_config(
+            config,
+            registry,
+            Some(native_test_config()),
+        )
+        .unwrap();
+        operator.retain_indefinitely = true;
+        assert!(!operator.native_append_only);
+        operator
+    }
+
+    fn native_append_only_operator() -> IncrementalAggregatingFunc {
         let (config, registry) = native_config();
         let mut operator = IncrementalAggregatingConstructor::build_with_native_config(
             config,
@@ -2577,6 +2690,7 @@ mod tests {
         )
         .unwrap();
         operator.retain_indefinitely = true;
+        assert!(operator.native_append_only);
         operator
     }
 
@@ -2739,6 +2853,344 @@ mod tests {
                 .await
                 .unwrap()
                 .get(&native_group_key(b'D', &GLOBAL_KEY).unwrap())
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn append_only_native_state_keeps_winners_without_member_history() {
+        let store = native_test_store();
+        let operator = native_append_only_operator();
+        assert_ne!(
+            operator.native_schema_identity,
+            native_operator().native_schema_identity
+        );
+        for aggregate in &operator.aggregates {
+            if matches!(
+                aggregate.func.fun().name().to_ascii_lowercase().as_str(),
+                "min" | "max" | "first_value" | "last_value"
+            ) {
+                assert_eq!(aggregate.accumulator_type, AccumulatorType::AppendOnly);
+            }
+        }
+        let values = (0..100)
+            .map(|rank| format!("v{rank:03}"))
+            .collect::<Vec<_>>();
+        let refs = values
+            .iter()
+            .map(|value| Some(value.as_str()))
+            .collect::<Vec<_>>();
+        let order = (0usize..100)
+            .map(|rank| ((rank * 37) % 101) as i64)
+            .collect::<Vec<_>>();
+        let include = (0..100).map(|rank| Some(rank % 3 != 0)).collect::<Vec<_>>();
+        let input = batch(&refs, &order, &include);
+        let inputs = operator.compute_inputs(&input).unwrap();
+        let mut first_size = 0;
+        for row in 0..input.num_rows() {
+            let mut scope = store.begin().await.unwrap();
+            operator
+                .native_process_event(&mut scope, &GLOBAL_KEY, &inputs, row, false)
+                .await
+                .unwrap();
+            scope.commit().await.unwrap();
+            if row == 9 {
+                let read = store.begin().await.unwrap();
+                first_size = read
+                    .get(&native_group_key(b'G', &GLOBAL_KEY).unwrap())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .len();
+            }
+        }
+        let scope = store.begin().await.unwrap();
+        assert!(scope.first(b"M").await.unwrap().is_none());
+        assert!(scope.first(b"R").await.unwrap().is_none());
+        let encoded = scope
+            .get(&native_group_key(b'G', &GLOBAL_KEY).unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            encoded.len() <= first_size + 64,
+            "append-only state grew with input cardinality"
+        );
+        let fresh = native_append_only_operator();
+        let group = decode_group(
+            &encoded,
+            &fresh.native_state_types(),
+            &fresh.native_output_types(),
+            scope.limits().value_bytes,
+        )
+        .unwrap();
+        let mut states = fresh.native_accumulators(Some(&group)).unwrap();
+        let actual = states
+            .iter_mut()
+            .map(IncrementalState::evaluate)
+            .collect::<DFResult<Vec<_>>>()
+            .unwrap();
+        let smallest = (0..100).min_by_key(|&rank| order[rank]).unwrap();
+        let largest = (0..100).max_by_key(|&rank| order[rank]).unwrap();
+        let selected = (0..100)
+            .filter(|&rank| include[rank] == Some(true))
+            .max_by_key(|&rank| order[rank])
+            .unwrap();
+        assert_eq!(actual[0], ScalarValue::Utf8(Some(values[smallest].clone())));
+        assert_eq!(actual[1], ScalarValue::Utf8(Some(values[largest].clone())));
+        assert_eq!(actual[2], ScalarValue::Utf8(Some(values[largest].clone())));
+        assert_eq!(actual[3], ScalarValue::Utf8(Some(values[smallest].clone())));
+        assert_eq!(actual[4], ScalarValue::Utf8(Some(values[selected].clone())));
+        assert_eq!(actual[5], ScalarValue::Int64(Some(100)));
+        assert_eq!(actual[6], ScalarValue::Int64(Some(66)));
+        assert_eq!(actual[7], ScalarValue::Utf8(Some("v099".into())));
+        assert_eq!(
+            actual[8],
+            ScalarValue::TimestampNanosecond(Some(*order.iter().max().unwrap()), None)
+        );
+    }
+
+    #[tokio::test]
+    async fn append_only_native_restores_filter_null_and_tied_order_state() {
+        let store = native_test_store();
+        let operator = native_append_only_operator();
+        let rows = batch(
+            &[None, Some("B"), None, Some("C"), Some("D")],
+            &[0, 3, 5, 1, 1],
+            &[Some(true), Some(false), Some(true), Some(true), Some(true)],
+        );
+        let inputs = operator.compute_inputs(&rows).unwrap();
+        for row in 0..rows.num_rows() {
+            let mut scope = store.begin().await.unwrap();
+            operator
+                .native_process_event(&mut scope, &GLOBAL_KEY, &inputs, row, false)
+                .await
+                .unwrap();
+            scope.commit().await.unwrap();
+        }
+        let fresh = native_append_only_operator();
+        let scope = store.begin().await.unwrap();
+        let bytes = scope
+            .get(&native_group_key(b'G', &GLOBAL_KEY).unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        let group = decode_group(
+            &bytes,
+            &fresh.native_state_types(),
+            &fresh.native_output_types(),
+            scope.limits().value_bytes,
+        )
+        .unwrap();
+        let mut states = fresh.native_accumulators(Some(&group)).unwrap();
+        let actual = states
+            .iter_mut()
+            .map(IncrementalState::evaluate)
+            .collect::<DFResult<Vec<_>>>()
+            .unwrap();
+        // Both non-null rows share the earliest eligible ORDER BY key.
+        assert!(matches!(&actual[0], ScalarValue::Utf8(Some(value))
+            if value == "C" || value == "D"));
+        assert_eq!(actual[1], ScalarValue::Utf8(None));
+        assert_eq!(actual[4], ScalarValue::Utf8(None));
+        assert_eq!(actual[5], ScalarValue::Int64(Some(5)));
+        assert_eq!(actual[6], ScalarValue::Int64(Some(4)));
+        assert_eq!(actual[7], ScalarValue::Utf8(Some("D".into())));
+        assert_eq!(actual[2], ScalarValue::Utf8(None));
+        assert_eq!(actual[3], ScalarValue::Utf8(None));
+    }
+
+    #[tokio::test]
+    async fn append_only_native_unordered_first_last_restore_across_chunks() {
+        let store = native_test_store();
+        let (config, registry) = native_config_with_unordered(true);
+        let operator = IncrementalAggregatingConstructor::build_with_native_config(
+            config,
+            registry,
+            Some(native_test_config()),
+        )
+        .unwrap();
+        for index in 9..13 {
+            assert_eq!(
+                operator.aggregates[index].accumulator_type,
+                AccumulatorType::AppendOnly
+            );
+        }
+        let first_chunk = batch(
+            &[None, Some("start")],
+            &[100, 50],
+            &[Some(false), Some(false)],
+        );
+        let inputs = operator.compute_inputs(&first_chunk).unwrap();
+        for row in 0..first_chunk.num_rows() {
+            let mut scope = store.begin().await.unwrap();
+            operator
+                .native_process_event(&mut scope, &GLOBAL_KEY, &inputs, row, false)
+                .await
+                .unwrap();
+            scope.commit().await.unwrap();
+        }
+        let scope = store.begin().await.unwrap();
+        let checkpoint_bytes = scope
+            .get(&native_group_key(b'G', &GLOBAL_KEY).unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        let checkpoint_group = decode_group(
+            &checkpoint_bytes,
+            &operator.native_state_types(),
+            &operator.native_output_types(),
+            scope.limits().value_bytes,
+        )
+        .unwrap();
+        let mut checkpoint_state = operator
+            .native_accumulators(Some(&checkpoint_group))
+            .unwrap();
+        assert_eq!(
+            checkpoint_state[9].evaluate().unwrap(),
+            ScalarValue::Int64(Some(100))
+        );
+        assert_eq!(
+            checkpoint_state[10].evaluate().unwrap(),
+            ScalarValue::Int64(Some(50))
+        );
+        assert_eq!(
+            checkpoint_state[11].evaluate().unwrap(),
+            ScalarValue::Utf8(None)
+        );
+        assert_eq!(
+            checkpoint_state[12].evaluate().unwrap(),
+            ScalarValue::Utf8(None)
+        );
+        drop(scope);
+
+        // Construct another operator and continue from the serialized group.
+        let (config, registry) = native_config_with_unordered(true);
+        let fresh = IncrementalAggregatingConstructor::build_with_native_config(
+            config,
+            registry,
+            Some(native_test_config()),
+        )
+        .unwrap();
+        assert_eq!(
+            operator.native_schema_identity,
+            fresh.native_schema_identity
+        );
+        let second_chunk = batch(
+            &[Some(""), Some("end"), None],
+            &[40, 30, 20],
+            &[Some(false), Some(true), Some(false)],
+        );
+        let inputs = fresh.compute_inputs(&second_chunk).unwrap();
+        for row in 0..second_chunk.num_rows() {
+            let mut scope = store.begin().await.unwrap();
+            fresh
+                .native_process_event(&mut scope, &GLOBAL_KEY, &inputs, row, false)
+                .await
+                .unwrap();
+            scope.commit().await.unwrap();
+        }
+        let scope = store.begin().await.unwrap();
+        assert!(scope.first(b"M").await.unwrap().is_none());
+        assert!(scope.first(b"R").await.unwrap().is_none());
+        let group = decode_group(
+            &scope
+                .get(&native_group_key(b'G', &GLOBAL_KEY).unwrap())
+                .await
+                .unwrap()
+                .unwrap(),
+            &fresh.native_state_types(),
+            &fresh.native_output_types(),
+            scope.limits().value_bytes,
+        )
+        .unwrap();
+        let mut states = fresh.native_accumulators(Some(&group)).unwrap();
+        assert_eq!(states[9].evaluate().unwrap(), ScalarValue::Int64(Some(100)));
+        assert_eq!(states[10].evaluate().unwrap(), ScalarValue::Int64(Some(20)));
+        assert_eq!(
+            states[11].evaluate().unwrap(),
+            ScalarValue::Utf8(Some("end".into()))
+        );
+        assert_eq!(states[12].evaluate().unwrap(), ScalarValue::Utf8(None));
+    }
+
+    #[test]
+    fn native_unordered_first_last_still_rejects_changelog_input() {
+        let (mut config, registry) = native_config_with_unordered(true);
+        let mut schema = SchemaBuilder::from(input_schema().as_ref().clone());
+        schema.push(Field::new(
+            UPDATING_META_FIELD,
+            DataType::Struct(updating_meta_fields()),
+            false,
+        ));
+        config.input_schema = Some(
+            ArroyoSchema::from_schema_unkeyed(Arc::new(schema.finish()))
+                .unwrap()
+                .into(),
+        );
+        let input: ArroyoSchema = config.input_schema.clone().unwrap().try_into().unwrap();
+        assert!(input.schema.index_of(UPDATING_META_FIELD).is_ok());
+        let plan = PhysicalPlanNode::decode(config.aggregate_exec.as_slice()).unwrap();
+        let Some(PhysicalPlanType::Aggregate(aggregate)) = plan.physical_plan_type else {
+            panic!("expected aggregate plan");
+        };
+        assert_eq!(aggregate.aggr_expr.len(), 13);
+        for index in 9..13 {
+            let decoded = decode_aggregate(
+                &input.schema,
+                &aggregate.aggr_expr_name[index],
+                &aggregate.aggr_expr[index],
+                registry.as_ref(),
+            )
+            .unwrap();
+            assert!(
+                decoded.order_bys().is_none(),
+                "aggregate {index} has ORDER BY"
+            );
+        }
+        match IncrementalAggregatingConstructor::build_with_native_config(
+            config,
+            registry,
+            Some(native_test_config()),
+        ) {
+            Ok(operator) => panic!(
+                "unordered changelog aggregate admitted: append_only={}, types={:?}",
+                operator.native_append_only,
+                operator
+                    .aggregates
+                    .iter()
+                    .map(|a| a.accumulator_type)
+                    .collect::<Vec<_>>()
+            ),
+            Err(error) => assert!(
+                error
+                    .to_string()
+                    .contains("requires an explicit ORDER BY for bounded retraction")
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn append_only_native_rejects_undeclared_retraction_before_writes() {
+        let store = native_test_store();
+        let operator = native_append_only_operator();
+        let input = batch(&[Some("v")], &[1], &[Some(true)]);
+        let inputs = operator.compute_inputs(&input).unwrap();
+        let mut scope = store.begin().await.unwrap();
+        let error = operator
+            .native_process_event(&mut scope, &GLOBAL_KEY, &inputs, 0, true)
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("append-only native aggregate received a retraction")
+        );
+        assert!(
+            scope
+                .get(&native_group_key(b'G', &GLOBAL_KEY).unwrap())
                 .await
                 .unwrap()
                 .is_none()

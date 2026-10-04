@@ -4,7 +4,7 @@
 //! batches live and how the final plan receives one group's paged partials.
 use super::{
     StatelessPhysicalExecutor,
-    window_store::{WindowStore, WindowStoreLimits},
+    window_store::{WindowSnapshot, WindowStore, WindowStoreLimits},
 };
 use anyhow::{Context, Result, ensure};
 use arrow::{
@@ -571,18 +571,16 @@ impl NativeWindow {
 
     async fn emit_interval(
         &mut self,
+        snapshot: &WindowSnapshot,
         start: i64,
         end: i64,
         collector: &mut dyn Collector,
     ) -> Result<()> {
+        // All intervals at this watermark share one stable view. Each next
+        // interval starts at or beyond the prior expiry cutoff.
         let mut after_group = None;
         loop {
-            let group = self
-                .store()?
-                .snapshot()
-                .await?
-                .next_group(after_group.as_deref())
-                .await?;
+            let group = snapshot.next_group(after_group.as_deref()).await?;
             let Some((key, latest)) = group else {
                 break;
             };
@@ -590,13 +588,19 @@ impl NativeWindow {
             if latest < start {
                 continue;
             }
-            let snapshot = self.store()?.snapshot().await?;
-            let first = snapshot.next_partial(&key, start, end, None).await?;
-            let has_partial = first.is_some();
-            drop(first);
-            if !has_partial {
+            let Some(first) = snapshot.next_partial(&key, start, end, None).await? else {
                 continue;
-            }
+            };
+            // Collection preflight counts the same snapshot and reserves its
+            // final-state workspace. Keep its existing lifetime and budget:
+            // only scalar/ordered groups carry this decoded first partial
+            // into the bounded producer.
+            let first_for_producer = if self.collection_columns.is_empty() {
+                Some(first)
+            } else {
+                drop(first);
+                None
+            };
             let execution = super::execution::configured_execution_resources()?
                 .context("native windows require worker.execution-resources")?;
             // ARRAY_AGG and DISTINCT retain cardinality-growing final state.
@@ -653,9 +657,23 @@ impl NativeWindow {
             let mut finish = self.finish.execute(0, execution.task_context())?;
             // Move the sender into the producer so the input stream observes
             // EOF as soon as all paged partials have been sent.
+            let producer_snapshot = snapshot;
             let producer = async move {
                 let mut after = None;
-                while let Some(partial) = snapshot
+                if let Some(first) = first_for_producer {
+                    after = Some(first.key.clone());
+                    // RecordBatch::clone shares Arrow buffers. Retain the
+                    // decoded permit through channel admission, then release
+                    // it before reading another partial; the one-slot queue
+                    // has its own reservation for the transferred batch.
+                    sender.send(first.batch.clone()).await.map_err(|_| {
+                        anyhow::anyhow!(
+                            "native window final aggregate stopped before consuming partials"
+                        )
+                    })?;
+                    drop(first);
+                }
+                while let Some(partial) = producer_snapshot
                     .next_partial(&key, start, end, after.as_deref())
                     .await?
                 {
@@ -730,10 +748,15 @@ impl NativeWindow {
         };
         let width = i64::try_from(self.width.as_nanos())?;
         let slide = i64::try_from(self.slide.as_nanos())?;
+        let snapshot = self.store()?.snapshot().await?;
+        let mut retired_through = None;
         if self.hopping {
             let mut progress = self.store()?.progress().await?;
             loop {
-                let Some(earliest) = self.store()?.earliest_time().await? else {
+                let Some(earliest) = snapshot
+                    .next_expiry_time(retired_through.as_deref())
+                    .await?
+                else {
                     break;
                 };
                 // No input contributes to the empty slide intervals before
@@ -743,6 +766,7 @@ impl NativeWindow {
                     break;
                 }
                 self.emit_interval(
+                    &snapshot,
                     next.checked_sub(width)
                         .context("native window start overflow")?,
                     next,
@@ -755,23 +779,26 @@ impl NativeWindow {
                     .checked_add(slide)
                     .and_then(|time| time.checked_sub(width))
                     .context("native window expiry overflow")?;
-                while self.store()?.expire_page(expiry).await? != 0 {
-                    tokio::task::yield_now().await;
-                }
+                self.store()?
+                    .expire_before_snapshot(&snapshot, expiry, &mut retired_through)
+                    .await?;
             }
         } else {
-            while let Some(first) = self.store()?.earliest_time().await? {
+            while let Some(first) = snapshot
+                .next_expiry_time(retired_through.as_deref())
+                .await?
+            {
                 if floor.is_some_and(|floor| first >= floor) {
                     break;
                 }
                 let end = first
                     .checked_add(width)
                     .context("native window end overflow")?;
-                self.emit_interval(first, end, collector).await?;
+                self.emit_interval(&snapshot, first, end, collector).await?;
                 self.store()?.set_progress(end).await?;
-                while self.store()?.expire_page(end).await? != 0 {
-                    tokio::task::yield_now().await;
-                }
+                self.store()?
+                    .expire_before_snapshot(&snapshot, end, &mut retired_through)
+                    .await?;
             }
         }
         Ok(())

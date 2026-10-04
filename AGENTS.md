@@ -32,6 +32,15 @@ Arcstream is an external consumer, not part of this engine.
   TUMBLE/HOP/SESSION windows. Do not manually recreate supported SQL behavior in
   opaque state blobs or application UDFs. Demonstrate a specific missing
   capability with planned SQL and value assertions before proposing a primitive.
+- The bar for adding SQL or public-interface extensions is high. Exhaust existing
+  native SQL patterns and investigate upstream Arroyo capabilities before
+  proposing new syntax or primitives. A rejection in the current fork alone
+  does not establish that an extension is needed. Record runnable attempts,
+  exact remaining semantics and evidence, then discuss the smallest necessary
+  contract with the user before implementation.
+- Distinguish SQL expressiveness from planner/runtime support. Repair engine
+  support for existing SQL before proposing language changes; an implementation
+  limitation alone does not justify new syntax.
 - SQL/operator semantics depend on generic state interfaces. Select the live
   backend through configuration and construction/lifecycle adapters; do not
   duplicate SQL execution for memory versus RocksDB. Future adapters must satisfy
@@ -45,6 +54,11 @@ Arcstream is an external consumer, not part of this engine.
 Preserve unrelated user changes. Follow [.claude/build-test.md](.claude/build-test.md)
 for the required development container and checks. Record exact validation
 evidence; pending tests and partial milestones do not establish completion.
+
+Reuse one container build target and serialize builds and capacity runs. Check
+disk space before large runs and remove unused build targets when safe. Audit
+worktree changes, PR dependencies and active process/container references before
+removing obsolete worktrees; preserve uncommitted work and validation evidence.
 
 ## Delegation
 

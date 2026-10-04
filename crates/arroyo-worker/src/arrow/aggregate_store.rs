@@ -56,7 +56,9 @@ pub(crate) struct AggregateStore {
 
 pub(crate) struct AggregateScope<'a> {
     store: &'a AggregateStore,
-    snapshot: StateSnapshot,
+    // Scan scopes retain the original stable view. Point-only scopes belong to
+    // the serial aggregate owner and read live committed state plus `overlay`.
+    snapshot: Option<StateSnapshot>,
     writes: AdmittedWriteBatch,
     overlay: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
     overlay_bytes: usize,
@@ -129,6 +131,16 @@ impl AggregateStore {
     }
 
     pub async fn begin(&self) -> Result<AggregateScope<'_>> {
+        self.begin_scope(true).await
+    }
+
+    /// Only for a serial owner that will perform keyed reads, never a scan.
+    /// No public snapshot contract changes: `begin` remains stable-view.
+    pub async fn begin_point(&self) -> Result<AggregateScope<'_>> {
+        self.begin_scope(false).await
+    }
+
+    async fn begin_scope(&self, stable_scan: bool) -> Result<AggregateScope<'_>> {
         // Reserve every retained decoded value/overlay before processing input.
         let decoded = self.resources.try_decoded_value(
             self.limits
@@ -141,7 +153,11 @@ impl AggregateStore {
             self.limits.write_bytes,
             self.limits.write_operations,
         )?;
-        let snapshot = self.backend.snapshot().await?;
+        let snapshot = if stable_scan {
+            Some(self.backend.snapshot().await?)
+        } else {
+            None
+        };
         Ok(AggregateScope {
             store: self,
             snapshot,
@@ -183,15 +199,14 @@ impl AggregateScope<'_> {
         if let Some(value) = self.overlay.get(key) {
             return Ok(value.clone());
         }
-        Ok(self
-            .snapshot
-            .try_get(
-                &self.store.table.key(key.to_vec(), None),
-                ReadOptions {
-                    max_bytes: self.store.limits.value_bytes,
-                },
-            )
-            .await?)
+        let key = self.store.table.key(key.to_vec(), None);
+        let options = ReadOptions {
+            max_bytes: self.store.limits.value_bytes,
+        };
+        Ok(match &self.snapshot {
+            Some(snapshot) => snapshot.try_get(&key, options).await?,
+            None => self.store.backend.try_get(&key, options).await?,
+        })
     }
 
     fn admit_overlay(&mut self, key: &[u8], value: Option<&[u8]>) -> Result<()> {
@@ -246,6 +261,10 @@ impl AggregateScope<'_> {
         prefix: &[u8],
         after: Option<&[u8]>,
     ) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+        let snapshot = self
+            .snapshot
+            .as_ref()
+            .context("native aggregate point-read scope cannot scan")?;
         self.check_key(prefix)?;
         if let Some(after) = after {
             self.check_key(after)?;
@@ -257,8 +276,7 @@ impl AggregateScope<'_> {
         let mut cursor = None;
         let mut backend_first = None;
         loop {
-            let page = self
-                .snapshot
+            let page = snapshot
                 .try_scan(ScanRequest {
                     range: ScanRange {
                         namespace: self.store.table.namespace().clone(),
@@ -463,6 +481,74 @@ mod tests {
         assert_eq!(
             third.first(b"member/").await.unwrap().unwrap().0,
             b"member/a"
+        );
+    }
+
+    #[tokio::test]
+    async fn point_scope_reads_own_writes_without_consuming_snapshot_slot() {
+        let resources = WorkerStateResources::new(ResourceConfig {
+            block_cache_bytes: 1024 * 1024,
+            memtable_bytes: 1024 * 1024,
+            queued_write_bytes: 1024 * 1024,
+            decoded_value_bytes: 1024 * 1024,
+            scan_page_bytes: 1024 * 1024,
+            max_blocking_operations: 2,
+            max_snapshots: 1,
+            max_open_databases: 1,
+            disk_reserve_bytes: 0,
+        })
+        .unwrap();
+        let backend: Arc<dyn LiveStateBackend> =
+            Arc::new(MemoryLiveState::bounded(resources.clone(), 1024 * 1024).unwrap());
+        let mut manager = LiveTableManager::new(
+            backend.clone(),
+            Ownership::PartitionLocal {
+                subtask: 0,
+                parallelism: 1,
+            },
+        )
+        .unwrap();
+        let table = manager.register("point-scope").unwrap();
+        let store = AggregateStore::new(
+            backend.clone(),
+            table,
+            resources,
+            AggregateStoreLimits {
+                key_bytes: 64,
+                value_bytes: 128,
+                page_bytes: 1024,
+                page_entries: 1,
+                write_bytes: 4096,
+                write_operations: 8,
+                overlay_bytes: 4096,
+            },
+        )
+        .unwrap();
+        let held = backend.snapshot().await.unwrap();
+        let mut scope =
+            tokio::time::timeout(std::time::Duration::from_secs(1), store.begin_point())
+                .await
+                .expect("point scope must not wait for a snapshot slot")
+                .unwrap();
+        assert_eq!(scope.get(b"group").await.unwrap(), None);
+        scope.put(b"group", b"first").unwrap();
+        assert_eq!(scope.get(b"group").await.unwrap(), Some(b"first".to_vec()));
+        assert!(scope.first(b"group").await.is_err());
+        scope.commit().await.unwrap();
+        let read = tokio::time::timeout(std::time::Duration::from_secs(1), store.begin_point())
+            .await
+            .expect("point read must not wait for a snapshot slot")
+            .unwrap();
+        assert_eq!(read.get(b"group").await.unwrap(), Some(b"first".to_vec()));
+        // The stable view remains unchanged while the point scope commits.
+        assert_eq!(
+            held.try_get(
+                &store.table.key(b"group".to_vec(), None),
+                ReadOptions { max_bytes: 128 }
+            )
+            .await
+            .unwrap(),
+            None
         );
     }
 }

@@ -10,7 +10,7 @@ use arrow::ipc::{reader::StreamReader, writer::StreamWriter};
 use arrow_array::{RecordBatch, UInt32Array};
 use arrow_schema::SchemaRef;
 use arroyo_state::live::{
-    LiveStateBackend, ReadOptions, ScanRange, ScanRequest, StateSnapshot, encoding,
+    LiveStateBackend, ReadOptions, ScanEntry, ScanRange, ScanRequest, StateSnapshot, encoding,
     resources::{ResourcePermit, WorkerStateResources},
     table::LiveTable,
     write::AdmittedWriteBatch,
@@ -46,8 +46,11 @@ pub(crate) struct WindowStore {
     limits: WindowStoreLimits,
 }
 
-pub(crate) struct WindowSnapshot<'a> {
-    store: &'a WindowStore,
+pub(crate) struct WindowSnapshot {
+    table: LiveTable,
+    resources: WorkerStateResources,
+    schema: SchemaRef,
+    limits: WindowStoreLimits,
     snapshot: StateSnapshot,
 }
 
@@ -120,6 +123,29 @@ fn expiry_key(group: &[u8], time: i64, sequence: [u8; 16]) -> Result<Vec<u8>> {
     Ok(key)
 }
 
+fn expiry_group(entry: &ScanEntry) -> Result<Vec<u8>> {
+    ensure!(
+        entry.key.key.len() >= 13 && entry.value.first() == Some(&PARTIAL),
+        "native window expiry points outside partial index"
+    );
+    let group_len = u32::from_be_bytes(entry.key.key[9..13].try_into()?) as usize;
+    ensure!(
+        entry.key.key.len() == 13 + group_len + 16,
+        "native window expiry key is malformed"
+    );
+    let group = entry.key.key[13..13 + group_len].to_vec();
+    let expected = partial_key(
+        &group,
+        (u64::from_be_bytes(entry.key.key[1..9].try_into()?) ^ (1 << 63)) as i64,
+        entry.key.key[13 + group_len..].try_into()?,
+    )?;
+    ensure!(
+        entry.value == expected,
+        "native window expiry index is inconsistent"
+    );
+    Ok(group)
+}
+
 impl WindowStore {
     pub fn new(
         backend: Arc<dyn LiveStateBackend>,
@@ -190,9 +216,12 @@ impl WindowStore {
         })
     }
 
-    pub async fn snapshot(&self) -> Result<WindowSnapshot<'_>> {
+    pub async fn snapshot(&self) -> Result<WindowSnapshot> {
         Ok(WindowSnapshot {
-            store: self,
+            table: self.table.clone(),
+            resources: self.resources.clone(),
+            schema: self.schema.clone(),
+            limits: self.limits,
             snapshot: self.backend.snapshot().await?,
         })
     }
@@ -256,6 +285,7 @@ impl WindowStore {
         Ok(())
     }
 
+    #[cfg(test)]
     pub async fn earliest_time(&self) -> Result<Option<i64>> {
         let snapshot = self.backend.snapshot().await?;
         let page = snapshot
@@ -413,6 +443,7 @@ impl WindowStore {
         Ok(())
     }
 
+    #[cfg(test)]
     pub async fn expire_page(&self, before: i64) -> Result<usize> {
         let snapshot = self.backend.snapshot().await?;
         let mut end = vec![EXPIRY];
@@ -441,25 +472,7 @@ impl WindowStore {
         )?;
         let mut expired_groups = Vec::with_capacity(count);
         for entry in page.entries {
-            ensure!(
-                entry.key.key.len() >= 13 && entry.value.first() == Some(&PARTIAL),
-                "native window expiry points outside partial index"
-            );
-            let group_len = u32::from_be_bytes(entry.key.key[9..13].try_into()?) as usize;
-            ensure!(
-                entry.key.key.len() == 13 + group_len + 16,
-                "native window expiry key is malformed"
-            );
-            let group = entry.key.key[13..13 + group_len].to_vec();
-            let expected = partial_key(
-                &group,
-                (u64::from_be_bytes(entry.key.key[1..9].try_into()?) ^ (1 << 63)) as i64,
-                entry.key.key[13 + group_len..].try_into()?,
-            )?;
-            ensure!(
-                entry.value == expected,
-                "native window expiry index is inconsistent"
-            );
+            let group = expiry_group(&entry)?;
             writes.delete(&self.table.key(entry.value, None))?;
             writes.delete(&entry.key)?;
             expired_groups.push(group);
@@ -471,6 +484,112 @@ impl WindowStore {
         Ok(count)
     }
 
+    /// Retire due partials through a caller-owned stable view. `after` is the
+    /// last committed expiry key in that view; later watermark intervals skip
+    /// deleted keys without creating another physical Rocks checkpoint.
+    pub async fn expire_before_snapshot(
+        &self,
+        snapshot: &WindowSnapshot,
+        before: i64,
+        after: &mut Option<Vec<u8>>,
+    ) -> Result<usize> {
+        let max_key = self.table.key(vec![0; self.limits.key_bytes], None);
+        let max_delete_bytes = encoding::encoded_key_size(&max_key)?;
+        let per_entry = max_delete_bytes
+            .checked_mul(3)
+            .context("native window expiry write bound overflow")?;
+        let max_entries = self
+            .limits
+            .page_entries
+            .min(self.limits.write_operations / 3)
+            .min(self.limits.write_bytes / per_entry);
+        ensure!(
+            max_entries > 0,
+            "native window expiry cannot admit one indexed row"
+        );
+        let mut end = vec![EXPIRY];
+        end.extend_from_slice(&time_key(before));
+        let range = ScanRange {
+            namespace: self.table.namespace().clone(),
+            prefix: Some(vec![EXPIRY]),
+            start: after.clone(),
+            end: Some(end),
+        };
+        let mut cursor = None;
+        let mut total = 0usize;
+        loop {
+            let page = snapshot
+                .snapshot
+                .try_scan(ScanRequest {
+                    range: range.clone(),
+                    max_entries,
+                    max_bytes: self.limits.page_bytes,
+                    cursor,
+                })
+                .await?;
+            if page.entries.is_empty() {
+                ensure!(
+                    page.next_cursor.is_none(),
+                    "native window expiry cursor made no progress"
+                );
+                break;
+            }
+            let next_cursor = page.next_cursor;
+            let mut writes = AdmittedWriteBatch::try_reserve(
+                self.resources.clone(),
+                self.limits.write_bytes,
+                self.limits.write_operations,
+            )?;
+            let mut count = 0usize;
+            let mut last_key = None;
+            for entry in page.entries {
+                if after.as_ref().is_some_and(|key| entry.key.key <= *key) {
+                    continue;
+                }
+                let group = expiry_group(&entry)?;
+                last_key = Some(entry.key.key.clone());
+                writes.delete(&self.table.key(entry.value, None))?;
+                writes.delete(&entry.key)?;
+                let catalogue = group_index_key(&group)?;
+                if let Some(value) = self
+                    .table
+                    .get(catalogue.clone(), None, ReadOptions { max_bytes: 9 })
+                    .await?
+                {
+                    ensure!(
+                        value.len() == 9 && value[0] == VERSION,
+                        "native window group index version changed"
+                    );
+                    if i64::from_be_bytes(value[1..9].try_into()?) < before {
+                        writes.delete(&self.table.key(catalogue, None))?;
+                    }
+                }
+                count += 1;
+            }
+            if count > 0 {
+                self.backend.write_admitted(writes).await?;
+                *after = last_key;
+                total = total
+                    .checked_add(count)
+                    .context("native window expired row count overflow")?;
+            }
+            let Some(next) = next_cursor else {
+                break;
+            };
+            cursor = Some(next);
+            tokio::task::yield_now().await;
+        }
+        Ok(total)
+    }
+
+    #[cfg(test)]
+    pub async fn expire_before(&self, before: i64) -> Result<usize> {
+        let snapshot = self.snapshot().await?;
+        self.expire_before_snapshot(&snapshot, before, &mut None)
+            .await
+    }
+
+    #[cfg(test)]
     pub async fn delete_group_if_older(&self, group: &[u8], before: i64) -> Result<()> {
         let key = group_index_key(group)?;
         let Some(value) = self
@@ -497,13 +616,48 @@ impl WindowStore {
     }
 }
 
-impl WindowSnapshot<'_> {
+impl WindowSnapshot {
+    /// First expiry remaining after the last successfully retired key in this
+    /// stable view. A one-entry page can contain only the inclusive start;
+    /// follow its cursor until the next key or EOF.
+    pub async fn next_expiry_time(&self, after: Option<&[u8]>) -> Result<Option<i64>> {
+        let range = ScanRange {
+            namespace: self.table.namespace().clone(),
+            prefix: Some(vec![EXPIRY]),
+            start: after.map(<[u8]>::to_vec),
+            end: None,
+        };
+        let mut cursor = None;
+        loop {
+            let page = self
+                .snapshot
+                .try_scan(ScanRequest {
+                    range: range.clone(),
+                    max_entries: self.limits.page_entries.min(2),
+                    max_bytes: self.limits.page_bytes,
+                    cursor,
+                })
+                .await?;
+            for entry in page.entries {
+                if after.is_some_and(|key| entry.key.key.as_slice() <= key) {
+                    continue;
+                }
+                expiry_group(&entry)?;
+                let sorted = u64::from_be_bytes(entry.key.key[1..9].try_into()?);
+                return Ok(Some((sorted ^ (1 << 63)) as i64));
+            }
+            let Some(next) = page.next_cursor else {
+                return Ok(None);
+            };
+            cursor = Some(next);
+        }
+    }
     /// Returns the next catalogue key after `after`, without materializing the
     /// catalogue. The returned group is a caller-defined opaque Arrow row key.
     pub async fn next_group(&self, after: Option<&[u8]>) -> Result<Option<(Vec<u8>, i64)>> {
         let key = after.map(group_index_key).transpose()?;
         let range = ScanRange {
-            namespace: self.store.table.namespace().clone(),
+            namespace: self.table.namespace().clone(),
             prefix: Some(vec![GROUP]),
             start: key.clone(),
             end: None,
@@ -514,8 +668,8 @@ impl WindowSnapshot<'_> {
                 .snapshot
                 .try_scan(ScanRequest {
                     range: range.clone(),
-                    max_entries: self.store.limits.page_entries.min(2),
-                    max_bytes: self.store.limits.page_bytes,
+                    max_entries: self.limits.page_entries.min(2),
+                    max_bytes: self.limits.page_bytes,
                     cursor,
                 })
                 .await?;
@@ -562,7 +716,7 @@ impl WindowSnapshot<'_> {
             "native window cursor is outside group"
         );
         let range = ScanRange {
-            namespace: self.store.table.namespace().clone(),
+            namespace: self.table.namespace().clone(),
             prefix: Some(prefix),
             start: Some(scan_start),
             end: Some(upper),
@@ -573,8 +727,8 @@ impl WindowSnapshot<'_> {
                 .snapshot
                 .try_scan(ScanRequest {
                     range: range.clone(),
-                    max_entries: self.store.limits.page_entries.min(2),
-                    max_bytes: self.store.limits.page_bytes,
+                    max_entries: self.limits.page_entries.min(2),
+                    max_bytes: self.limits.page_bytes,
                     cursor,
                 })
                 .await?;
@@ -583,20 +737,19 @@ impl WindowSnapshot<'_> {
                     continue;
                 }
                 ensure!(
-                    entry.key.key.len() <= self.store.limits.key_bytes,
+                    entry.key.key.len() <= self.limits.key_bytes,
                     "native window partial key exceeds configured limit"
                 );
                 ensure!(
-                    entry.value.len() <= self.store.limits.value_bytes,
+                    entry.value.len() <= self.limits.value_bytes,
                     "native window partial value exceeds configured limit"
                 );
                 let permit = self
-                    .store
                     .resources
-                    .try_decoded_value(self.store.limits.value_bytes.saturating_mul(3))?;
+                    .try_decoded_value(self.limits.value_bytes.saturating_mul(3))?;
                 let mut reader = StreamReader::try_new(Cursor::new(&entry.value), None)?;
                 ensure!(
-                    reader.schema() == self.store.schema,
+                    reader.schema() == self.schema,
                     "native window partial schema changed"
                 );
                 let batch = reader
@@ -634,7 +787,7 @@ mod tests {
         Ownership, memory::MemoryLiveState, resources::ResourceConfig, table::LiveTableManager,
     };
 
-    fn store() -> WindowStore {
+    fn store_with_page_entries(page_entries: usize) -> WindowStore {
         let resources = WorkerStateResources::new(ResourceConfig {
             block_cache_bytes: 1024 * 1024,
             memtable_bytes: 1024 * 1024,
@@ -671,13 +824,17 @@ mod tests {
                 key_bytes: 128,
                 value_bytes: 8192,
                 page_bytes: 32768,
-                page_entries: 1,
+                page_entries,
                 write_bytes: 65536,
                 write_operations: 16,
                 max_resident_bytes: 8 * 1024 * 1024,
             },
         )
         .unwrap()
+    }
+
+    fn store() -> WindowStore {
+        store_with_page_entries(1)
     }
 
     fn partial(value: i64) -> RecordBatch {
@@ -737,6 +894,114 @@ mod tests {
         assert_eq!(store.earliest_time().await.unwrap(), Some(0));
         store.set_progress(5).await.unwrap();
         assert_eq!(store.progress().await.unwrap(), Some(5));
+    }
+
+    #[tokio::test]
+    async fn one_snapshot_expiry_walks_pages_and_preserves_future_group_index() {
+        let store = store_with_page_entries(8);
+        for item in 0..14 {
+            store
+                .append(format!("group-{item}").as_bytes(), 0, &partial(item))
+                .await
+                .unwrap();
+        }
+        store.append(b"group-0", 20, &partial(20)).await.unwrap();
+        assert_eq!(store.expire_before(10).await.unwrap(), 14);
+        assert_eq!(store.expire_before(10).await.unwrap(), 0);
+        assert_eq!(store.earliest_time().await.unwrap(), Some(20));
+        let snapshot = store.snapshot().await.unwrap();
+        assert!(
+            snapshot
+                .next_partial(b"group-0", 0, 10, None)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            snapshot
+                .next_partial(b"group-0", 20, 21, None)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            snapshot.next_group(None).await.unwrap().unwrap().0,
+            b"group-0".to_vec()
+        );
+        assert!(
+            snapshot
+                .next_group(Some(&b"group-0"[..]))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        drop(snapshot);
+        assert_eq!(store.expire_before(21).await.unwrap(), 1);
+        assert_eq!(store.earliest_time().await.unwrap(), None);
+        assert!(
+            store
+                .snapshot()
+                .await
+                .unwrap()
+                .next_group(None)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn one_watermark_view_skips_retired_prefix_with_single_entry_pages() {
+        let store = store_with_page_entries(1);
+        store.append(b"a", 0, &partial(1)).await.unwrap();
+        store.append(b"b", 10, &partial(2)).await.unwrap();
+        store.append(b"c", 20, &partial(3)).await.unwrap();
+        let view = store.snapshot().await.unwrap();
+        let mut retired = None;
+        assert_eq!(view.next_expiry_time(None).await.unwrap(), Some(0));
+        assert_eq!(
+            store
+                .expire_before_snapshot(&view, 10, &mut retired)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            view.next_expiry_time(retired.as_deref()).await.unwrap(),
+            Some(10)
+        );
+        assert_eq!(
+            store
+                .expire_before_snapshot(&view, 20, &mut retired)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            view.next_expiry_time(retired.as_deref()).await.unwrap(),
+            Some(20)
+        );
+        // The stable view still has the old rows, but the monotone bound
+        // prevents their emission after live deletion.
+        assert!(
+            view.next_partial(b"a", 0, 10, None)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(store.earliest_time().await.unwrap(), Some(20));
+        assert_eq!(
+            store
+                .expire_before_snapshot(&view, 30, &mut retired)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            view.next_expiry_time(retired.as_deref()).await.unwrap(),
+            None
+        );
+        assert_eq!(store.earliest_time().await.unwrap(), None);
     }
 
     #[test]

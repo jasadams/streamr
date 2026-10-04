@@ -373,6 +373,268 @@ async fn related_merge_and_lookup_share_one_event_owner() {
 }
 
 #[test(tokio::test)]
+async fn lookup_then_dependent_merges_keep_event_ownership() {
+    let query = format!(
+        "{DECLARATIONS}
+         CREATE STATE TABLE limits (counter BIGINT PRIMARY KEY, allowed BOOLEAN)
+         PARTITION BY counter;
+         CREATE STATE TABLE totals (counter BIGINT PRIMARY KEY, quantity BIGINT)
+         PARTITION BY counter;
+         CREATE VIEW looked AS SELECT events.counter AS event_counter, limits.allowed
+         FROM events LEFT JOIN limits ON events.counter = limits.counter;
+         CREATE VIEW written AS MERGE INTO inventory AS target USING looked AS source
+         ON target.counter = source.event_counter
+         WHEN NOT MATCHED THEN INSERT (counter, quantity)
+         VALUES (source.event_counter, 1)
+         RETURNING source AS source, old AS old, new AS new, action AS action;
+         CREATE VIEW next_events AS SELECT written.source.event_counter AS event_counter
+         FROM written;
+         CREATE VIEW followed AS MERGE INTO totals AS target USING next_events AS source
+         ON target.counter = source.event_counter
+         WHEN NOT MATCHED THEN INSERT (counter, quantity)
+         VALUES (source.event_counter, 1)
+         RETURNING source AS source, old AS old, new AS new, action AS action;
+         SELECT action FROM followed"
+    );
+    let configs = state_operators(&plan(&query).await);
+    assert_eq!(configs.len(), 3);
+    assert!(
+        configs
+            .iter()
+            .all(|config| config.event_scope_id == configs[0].event_scope_id)
+    );
+    assert!(
+        configs
+            .iter()
+            .all(|config| config.ownership_bindings == configs[0].ownership_bindings)
+    );
+}
+
+#[test(tokio::test)]
+async fn materialized_uuid_value_is_shared_by_dependent_merges_and_fanout() {
+    let query = "CREATE TABLE events WITH (connector = 'impulse', event_rate = '1');
+        CREATE STATE TABLE inventory (counter BIGINT PRIMARY KEY, candidate TEXT)
+        PARTITION BY counter;
+        CREATE STATE TABLE observed (counter BIGINT PRIMARY KEY, candidate TEXT)
+        PARTITION BY counter;
+        CREATE VIEW candidates AS SELECT events.counter AS counter,
+          uuid() AS candidate FROM events;
+        CREATE VIEW before_write AS SELECT c.counter, c.candidate,
+          inventory.candidate AS prior
+          FROM candidates AS c LEFT JOIN inventory
+          ON c.counter = inventory.counter;
+        CREATE VIEW first_write AS MERGE INTO inventory AS target
+          USING before_write AS source ON target.counter = source.counter
+          WHEN NOT MATCHED THEN INSERT (counter, candidate)
+          VALUES (source.counter, source.candidate)
+          RETURNING source AS source, old AS old, new AS new, action AS action;
+        CREATE VIEW forwarded AS SELECT r.source.counter AS counter,
+          r.source.candidate AS candidate FROM first_write AS r;
+        CREATE VIEW second_write AS MERGE INTO observed AS target
+          USING forwarded AS source ON target.counter = source.counter
+          WHEN NOT MATCHED THEN INSERT (counter, candidate)
+          VALUES (source.counter, source.candidate)
+          RETURNING source AS source, old AS old, new AS new, action AS action;
+        SELECT source.counter, source.candidate, new.candidate FROM first_write;
+        SELECT source.counter, source.candidate, new.candidate FROM second_write";
+    let compiled = plan(query).await;
+    let graph = &compiled.program.graph;
+    let owners = graph
+        .node_weights()
+        .flat_map(|node| node.operator_chain.iter())
+        .filter(|(operation, _)| operation.operator_name == OperatorName::FusedStateTable)
+        .map(|(operation, _)| {
+            FusedStateTableOperator::decode(operation.operator_config.as_slice()).unwrap()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(owners.len(), 1);
+    let owner = &owners[0];
+    assert_eq!(
+        owner
+            .steps
+            .iter()
+            .filter(|step| step.kind == "state_access")
+            .count(),
+        3
+    );
+    assert!(
+        owner.capture_schemas.len() >= 2,
+        "both outputs must be captured"
+    );
+    let uuid_producers = graph
+        .node_weights()
+        .flat_map(|node| node.operator_chain.iter())
+        .filter(|(operation, _)| operation.operator_name == OperatorName::ArrowValue)
+        .filter(|(operation, _)| {
+            operation
+                .operator_config
+                .windows(4)
+                .any(|bytes| bytes == b"uuid")
+        })
+        .count()
+        + owner
+            .steps
+            .iter()
+            .filter(|step| {
+                step.operator_config
+                    .windows(4)
+                    .any(|bytes| bytes == b"uuid")
+            })
+            .count();
+    assert_eq!(
+        uuid_producers, 1,
+        "one UUID-producing projection per input event"
+    );
+    let accesses = state_operators(&compiled);
+    assert!(
+        accesses
+            .iter()
+            .all(|access| access.ownership_bindings == accesses[0].ownership_bindings)
+    );
+}
+
+#[test(tokio::test)]
+async fn uuid_cannot_define_state_ownership_or_a_fused_filter() {
+    let key = "CREATE TABLE events WITH (connector = 'impulse', event_rate = '1');
+      CREATE STATE TABLE generated (id TEXT PRIMARY KEY, candidate TEXT) PARTITION BY id;
+      CREATE VIEW applied AS MERGE INTO generated AS target USING events AS source
+      ON target.id = uuid()
+      WHEN NOT MATCHED THEN INSERT (id, candidate) VALUES (uuid(), 'value')
+      RETURNING source AS source, old AS old, new AS new, action AS action;
+      SELECT action FROM applied";
+    reject(
+        key,
+        "volatile functions cannot define any state-table primary-key expression",
+    )
+    .await;
+    let filter = "CREATE TABLE events WITH (connector = 'impulse', event_rate = '1');
+      CREATE STATE TABLE inventory (counter BIGINT PRIMARY KEY, candidate TEXT)
+      PARTITION BY counter;
+      CREATE VIEW filtered AS SELECT counter FROM events WHERE uuid() <> '';
+      CREATE VIEW applied AS MERGE INTO inventory AS target USING filtered AS source
+      ON target.counter = source.counter
+      WHEN NOT MATCHED THEN INSERT (counter, candidate) VALUES (source.counter, 'value')
+      RETURNING source AS source, old AS old, new AS new, action AS action;
+      SELECT action FROM applied";
+    reject(filter, "unqualified purity or allocation bounds").await;
+}
+
+#[test(tokio::test)]
+async fn lookup_target_alias_cannot_define_later_merge_ownership() {
+    let query = format!(
+        "{DECLARATIONS}
+         CREATE STATE TABLE limits (counter BIGINT PRIMARY KEY, allowed BOOLEAN)
+         PARTITION BY counter;
+         CREATE VIEW looked AS SELECT limits.counter AS event_counter
+         FROM events LEFT JOIN limits ON events.counter = limits.counter;
+         CREATE VIEW written AS MERGE INTO inventory AS target USING looked AS source
+         ON target.counter = source.event_counter
+         WHEN MATCHED THEN DELETE
+         RETURNING source AS source, old AS old, new AS new, action AS action;
+         SELECT action FROM written"
+    );
+    reject(
+        &query,
+        "state ownership must be bound to captured source fields",
+    )
+    .await;
+}
+
+#[test(tokio::test)]
+async fn previous_merge_target_cannot_define_followup_ownership() {
+    let query = format!(
+        "{DECLARATIONS}
+         CREATE STATE TABLE totals (counter BIGINT PRIMARY KEY, quantity BIGINT)
+         PARTITION BY counter;
+         CREATE VIEW written AS MERGE INTO inventory AS target USING events AS source
+         ON target.counter = source.counter WHEN MATCHED THEN DELETE
+         RETURNING source AS source, old AS old, new AS new, action AS action;
+         CREATE VIEW next_events AS SELECT written.old.quantity AS event_counter
+         FROM written;
+         CREATE VIEW followed AS MERGE INTO totals AS target USING next_events AS source
+         ON target.counter = source.event_counter WHEN MATCHED THEN DELETE
+         RETURNING source AS source, old AS old, new AS new, action AS action;
+         SELECT action FROM followed"
+    );
+    reject(&query, "state ownership must use the captured MERGE source").await;
+}
+
+#[test(tokio::test)]
+async fn lookup_timestamp_lineage_distinguishes_event_from_same_named_target_field() {
+    let declarations = "CREATE TABLE events (
+          event_time TIMESTAMP NOT NULL, counter BIGINT NOT NULL
+        ) WITH (connector = 'single_file', path = '/tmp/streamr-planner-events.json',
+          format = 'json', type = 'source', event_time_field = 'event_time');
+        CREATE STATE TABLE retained (event_time TIMESTAMP PRIMARY KEY, _timestamp TIMESTAMP)
+        PARTITION BY event_time;
+        CREATE STATE TABLE timed (event_time TIMESTAMP PRIMARY KEY, quantity BIGINT)
+        PARTITION BY event_time;";
+    let looked = "FROM events LEFT JOIN retained AS target
+        ON events.event_time = target.event_time";
+    let source_event = format!(
+        "{declarations}
+         CREATE VIEW looked AS SELECT events.event_time AS event_time,
+         target._timestamp AS stored_time {looked};
+         CREATE VIEW written AS MERGE INTO timed AS target USING looked AS source
+         ON target.event_time = source.event_time WHEN MATCHED THEN DELETE
+         RETURNING source AS source, old AS old, new AS new, action AS action;
+         SELECT action FROM written"
+    );
+    let configs = state_operators(&plan(&source_event).await);
+    assert_eq!(configs.len(), 2);
+    assert_eq!(configs[0].ownership_bindings, configs[1].ownership_bindings);
+
+    let target_alias = format!(
+        "{declarations}
+         CREATE VIEW looked AS SELECT target._timestamp AS event_time {looked};
+         CREATE VIEW written AS MERGE INTO timed AS target USING looked AS source
+         ON target.event_time = source.event_time WHEN MATCHED THEN DELETE
+         RETURNING source AS source, old AS old, new AS new, action AS action;
+         SELECT action FROM written"
+    );
+    reject(
+        &target_alias,
+        "state ownership must be bound to captured source fields",
+    )
+    .await;
+}
+
+#[test(tokio::test)]
+async fn second_lookup_keeps_appended_event_timestamp_owned_by_source() {
+    let query = format!(
+        "{DECLARATIONS}
+         CREATE STATE TABLE limits (counter BIGINT PRIMARY KEY, allowed BOOLEAN)
+         PARTITION BY counter;
+         CREATE STATE TABLE flags (counter BIGINT PRIMARY KEY, enabled BOOLEAN)
+         PARTITION BY counter;
+         CREATE VIEW looked AS SELECT events.counter AS event_counter
+         FROM events LEFT JOIN limits ON events.counter = limits.counter
+         LEFT JOIN flags ON events.counter = flags.counter;
+         CREATE VIEW written AS MERGE INTO inventory AS target USING looked AS source
+         ON target.counter = source.event_counter WHEN MATCHED THEN DELETE
+         RETURNING source AS source, old AS old, new AS new, action AS action;
+         SELECT action FROM written"
+    );
+    let configs = state_operators(&plan(&query).await);
+    assert_eq!(configs.len(), 3);
+    assert!(
+        configs
+            .iter()
+            .all(|config| config.ownership_bindings == configs[0].ownership_bindings)
+    );
+    let lookups = configs
+        .iter()
+        .filter(|config| config.lookup_join_type.is_some())
+        .collect::<Vec<_>>();
+    assert_eq!(lookups.len(), 2);
+    assert!(lookups.iter().all(|lookup| {
+        let output = lookup.output_schema.as_ref().unwrap();
+        let schema: arrow_schema::Schema = serde_json::from_str(&output.arrow_schema).unwrap();
+        output.timestamp_index as usize == schema.fields().len() - 1
+    }));
+}
+
+#[test(tokio::test)]
 async fn related_tables_reject_mismatched_ownership_fields() {
     let query = format!(
         "{DECLARATIONS}

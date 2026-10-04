@@ -29,10 +29,12 @@ fn reject(message: impl Into<String>) -> DataFusionError {
 }
 
 /// The caller must inspect the *physical* ArrowValue plan and prove that it
-/// contains only pure projection/filter operations over one input event. In
-/// particular it must reject aggregate, limit, sort, union, join, repartition,
-/// table scan, volatile/UDF and row-expanding nodes. A graph-level operator
-/// name alone cannot establish that proof.
+/// contains only bounded projection/filter operations over one input event.
+/// The sole admitted volatile value function is the concrete, zero-argument
+/// DataFusion UUID v4 function as a direct projected field. Predicates, nested
+/// expressions, and state ownership keys cannot depend on it. Aggregate, limit, sort,
+/// union, join, repartition, table scan, arbitrary UDF, and row-expanding
+/// nodes remain unsupported. An operator name alone cannot prove this.
 pub(crate) trait ScalarPlanAdmission {
     fn admit_projection(
         &self,
@@ -48,22 +50,30 @@ pub(crate) trait ScalarPlanAdmission {
     ) -> Result<()>;
 }
 
-pub(crate) struct PureScalarAdmission<'a> {
+pub(crate) struct BoundedScalarAdmission<'a> {
     pub registry: &'a crate::ArroyoSchemaProvider,
 }
 
-fn admit_expression(expr: &dyn PhysicalExpr) -> Result<()> {
+fn admit_expression(expr: &dyn PhysicalExpr, uuid_value_root: bool) -> Result<()> {
     if let Some(function) = expr
         .as_any()
         .downcast_ref::<datafusion::physical_expr::ScalarFunctionExpr>()
     {
         let implementation = function.fun().inner();
-        // Match the concrete built-ins, not a user UDF's possibly identical
-        // name. Fixed-schema field selection and these null operators remain
-        // bounded by the per-event output checks in the owner.
-        if !implementation
-            .as_any()
-            .is::<datafusion_functions::core::getfield::GetFieldFunc>()
+        // Match implementations, not a user UDF's possibly identical name.
+        // DataFusion's UUID v4 returns one 36-character UTF8 value per input
+        // row. It is admitted only as a materialized value, never a filter or
+        // ownership key; the owner evaluates one event at a time.
+        let bounded_uuid = uuid_value_root
+            && implementation
+                .as_any()
+                .is::<datafusion_functions::string::uuid::UuidFunc>()
+            && function.args().is_empty()
+            && function.return_type() == &DataType::Utf8;
+        if !bounded_uuid
+            && !implementation
+                .as_any()
+                .is::<datafusion_functions::core::getfield::GetFieldFunc>()
             && !implementation
                 .as_any()
                 .is::<datafusion_functions::core::coalesce::CoalesceFunc>()
@@ -87,9 +97,42 @@ fn admit_expression(expr: &dyn PhysicalExpr) -> Result<()> {
         ));
     }
     for child in expr.children() {
-        admit_expression(child.as_ref())?;
+        admit_expression(child.as_ref(), false)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod uuid_admission_tests {
+    use super::admit_expression;
+    use arrow_schema::{DataType, Field};
+    use datafusion::logical_expr::{Volatility, create_udf};
+    use datafusion::physical_expr::ScalarFunctionExpr;
+    use datafusion_functions::string::uuid::UuidFunc;
+    use std::sync::Arc;
+
+    #[test]
+    fn only_concrete_uuid_values_are_admitted() {
+        let field = Arc::new(Field::new("candidate", DataType::Utf8, false));
+        let built_in = ScalarFunctionExpr::new(
+            "uuid",
+            Arc::new(UuidFunc::new().into()),
+            vec![],
+            field.clone(),
+        );
+        admit_expression(&built_in, true).unwrap();
+        assert!(admit_expression(&built_in, false).is_err());
+
+        let spoof = create_udf(
+            "uuid",
+            vec![],
+            DataType::Utf8,
+            Volatility::Volatile,
+            Arc::new(|_| unreachable!("admission must not evaluate a UDF")),
+        );
+        let spoof_expr = ScalarFunctionExpr::new("uuid", Arc::new(spoof), vec![], field);
+        assert!(admit_expression(&spoof_expr, true).is_err());
+    }
 }
 
 fn admit_plan(
@@ -108,10 +151,10 @@ fn admit_plan(
     }
     if let Some(projection) = plan.as_any().downcast_ref::<ProjectionExec>() {
         for (expr, _) in projection.expr() {
-            admit_expression(expr.as_ref())?;
+            admit_expression(expr.as_ref(), true)?;
         }
     } else if let Some(filter) = plan.as_any().downcast_ref::<FilterExec>() {
-        admit_expression(filter.predicate().as_ref())?;
+        admit_expression(filter.predicate().as_ref(), false)?;
     } else {
         return Err(reject(format!(
             "physical plan {} can expand, reorder, or retain input events",
@@ -125,7 +168,7 @@ fn admit_plan(
     admit_plan(children[0].as_ref(), input_count, expected_input)
 }
 
-impl ScalarPlanAdmission for PureScalarAdmission<'_> {
+impl ScalarPlanAdmission for BoundedScalarAdmission<'_> {
     fn admit_projection(
         &self,
         plan: &ProjectionOperator,
@@ -159,7 +202,7 @@ impl ScalarPlanAdmission for PureScalarAdmission<'_> {
                 input.schema.as_ref(),
                 &DefaultPhysicalExtensionCodec {},
             )?;
-            admit_expression(expr.as_ref())?;
+            admit_expression(expr.as_ref(), true)?;
         }
         Ok(())
     }

@@ -197,6 +197,61 @@ fn column_at(schema: &DFSchema, index: usize) -> Column {
     Column::new(qualifier.cloned(), field.name())
 }
 
+/// A lookup preserves its event fields and appends target fields. DataFusion
+/// sometimes omits the event timestamp from the JOIN schema; plan_lookup then
+/// appends that exact field after the target. Only proven event-side ordinals
+/// may define ownership for a later state access.
+fn lookup_event_input_index(
+    input: &DFSchema,
+    output: &DFSchema,
+    target_len: usize,
+    timestamp_index: usize,
+    output_index: usize,
+) -> Result<usize> {
+    let input_len = input.fields().len();
+    if output.fields().len() != input_len + target_len {
+        return plan_err!("lookup field lineage differs from its event and target schemas");
+    }
+    if output.iter().take(input_len).eq(input.iter()) {
+        if timestamp_index >= input_len {
+            return plan_err!("lookup event timestamp is outside its event fields");
+        }
+        if output_index < input_len {
+            return Ok(output_index);
+        }
+    } else {
+        let event_len = input_len.checked_sub(1).ok_or_else(|| {
+            datafusion::common::plan_datafusion_err!("lookup has no event input fields")
+        })?;
+        if timestamp_index != output.fields().len() - 1 {
+            return plan_err!("lookup event timestamp is not after its target fields");
+        }
+        let candidates = (0..input_len)
+            .filter(|&removed| {
+                input.field(removed).name() == arroyo_rpc::TIMESTAMP_FIELD
+                    && input.qualified_field(removed) == output.qualified_field(timestamp_index)
+                    && output.iter().take(event_len).eq(input
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(index, field)| (index != removed).then_some(field)))
+            })
+            .collect::<Vec<_>>();
+        if candidates.len() != 1 {
+            return plan_err!("lookup event timestamp input lineage is ambiguous");
+        }
+        let removed = candidates[0];
+        if output_index == timestamp_index {
+            return Ok(removed);
+        }
+        if output_index < event_len {
+            return Ok(output_index + usize::from(output_index >= removed));
+        }
+    }
+    plan_err!(
+        "state ownership must be bound to captured source fields, not previous/resulting target rows"
+    )
+}
+
 fn canonical_expression(expr: &Expr, plan: &LogicalPlan) -> Result<String> {
     match expr {
         Expr::Alias(alias) => canonical_expression(&alias.expr, plan),
@@ -219,7 +274,26 @@ fn canonical_expression(expr: &Expr, plan: &LogicalPlan) -> Result<String> {
                             &remote.input,
                         );
                     }
-                    if e.node.as_any().is::<StateTableAccess>() {
+                    if let Some(access) = e.node.as_any().downcast_ref::<StateTableAccess>() {
+                        if access.lookup_join.is_some() {
+                            let timestamp_index =
+                                access.event_timestamp_index.ok_or_else(|| {
+                                    datafusion::common::plan_datafusion_err!(
+                                        "lookup has no event timestamp ordinal"
+                                    )
+                                })?;
+                            let input_index = lookup_event_input_index(
+                                access.input.schema(),
+                                &access.schema,
+                                access.table.schema.fields().len(),
+                                timestamp_index,
+                                index,
+                            )?;
+                            return canonical_expression(
+                                &Expr::Column(column_at(access.input.schema(), input_index)),
+                                &access.input,
+                            );
+                        }
                         return plan_err!(
                             "state ownership must be bound to captured source fields, not previous/resulting target rows"
                         );
@@ -634,4 +708,70 @@ pub(crate) fn plan_lookup(join: &Join) -> Result<Option<LogicalPlan>> {
     Ok(Some(LogicalPlan::Extension(Extension {
         node: Arc::new(access),
     })))
+}
+
+#[cfg(test)]
+mod lineage_tests {
+    use super::*;
+    use arrow_schema::{DataType, Field, TimeUnit};
+
+    #[test]
+    fn lookup_event_ordinals_cover_middle_and_appended_timestamp_layouts() {
+        let event = TableReference::bare("event");
+        let target = TableReference::bare("target");
+        let counter = (
+            Some(event.clone()),
+            Arc::new(Field::new("counter", DataType::Int64, false)),
+        );
+        let event_time = (
+            Some(event),
+            Arc::new(Field::new(
+                arroyo_rpc::TIMESTAMP_FIELD,
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                false,
+            )),
+        );
+        let target_key = (
+            Some(target.clone()),
+            Arc::new(Field::new("counter", DataType::Int64, true)),
+        );
+        let target_time = (
+            Some(target),
+            Arc::new(Field::new(
+                arroyo_rpc::TIMESTAMP_FIELD,
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                true,
+            )),
+        );
+        let schema = |fields| DFSchema::new_with_metadata(fields, HashMap::new()).unwrap();
+        let input = schema(vec![counter.clone(), event_time.clone()]);
+        let middle = schema(vec![
+            counter.clone(),
+            event_time.clone(),
+            target_key.clone(),
+            target_time.clone(),
+        ]);
+        assert_eq!(
+            lookup_event_input_index(&input, &middle, 2, 1, 0).unwrap(),
+            0
+        );
+        assert_eq!(
+            lookup_event_input_index(&input, &middle, 2, 1, 1).unwrap(),
+            1
+        );
+        assert!(lookup_event_input_index(&input, &middle, 2, 1, 2).is_err());
+        assert!(lookup_event_input_index(&input, &middle, 2, 1, 3).is_err());
+
+        let appended = schema(vec![counter, target_key, target_time, event_time]);
+        assert_eq!(
+            lookup_event_input_index(&input, &appended, 2, 3, 0).unwrap(),
+            0
+        );
+        assert_eq!(
+            lookup_event_input_index(&input, &appended, 2, 3, 3).unwrap(),
+            1
+        );
+        assert!(lookup_event_input_index(&input, &appended, 2, 3, 1).is_err());
+        assert!(lookup_event_input_index(&input, &appended, 2, 3, 2).is_err());
+    }
 }

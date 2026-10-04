@@ -15,7 +15,193 @@ This revision does not qualify those paths or change the historical evidence
 below. Application query proposals and oracles remain in the application repo;
 they are not embedded engine implementations.
 
+## Fresh combined-source STR-29 evidence (uncommitted batch)
+
+The current batch on `fc347312` adds internal serial-owner point reads for native
+aggregate chunks without indexed accumulators, one stable native-window snapshot
+per watermark pass, and bounded append-only unordered FIRST/LAST. It also
+propagates a nested constructor error instead of accepting it as an empty
+result. These are existing-engine implementation repairs; they add no SQL
+syntax, public backend method, or application policy.
+
+The Bookworm container logs
+`/tmp/streamr-m3-native-first-snapshot-fixed-{fmt,check,clippy,units,build}.log`
+record passing formatting, workspace all-target check (16.48 seconds), strict
+Clippy (18.85 seconds), 25 library suites (610 passed, four ignored, none
+failed), and full workspace build (57.26 seconds). The SQL test executable was
+`arroyo_sql_testing-df802a90a8396c4e` (SHA-256
+`b38ee120315ed1490d9bf96de23de44f6f6e697be8809c52eab42f07bbe35364`).
+
+On this same source, all 16 native current-result retention captures passed:
+eight ten-event retraction cases across memory/RocksDB, source batch targets
+1/8 and controller/leader checkpoints, and eight many-window cases across
+memory/RocksDB, 64/4,096 groups and controller/leader at batch target 8. The
+strict CDC/recovery fixture checks before images, checkpoint-prefix values and
+final values, including a recent-count 2-to-1 replacement. Artifacts and the
+SHA-256 comparison manifest are at
+`target/native-result-retention-snapshot-fixed/`. The selected aggregate
+checkpoint inventory has the same 11 keys and 4,708 stored value bytes at 64
+and 4,096 groups in all four backend/protocol pairings. This count excludes
+window/source/sink state, RocksDB overhead and RSS. The prior 120.24- and
+900.27-second RocksDB/controller timeouts remain historical failures; the
+4,096-group RocksDB controller and leader cases now completed initial and
+recovered captures in 166.55 and 143.94 seconds total, respectively. These are
+end-to-end observations, not a controlled CPU speedup measurement. See
+[native result composition](native-result-composition.md) and
+[checkpoint inventory](native-checkpoint-inventory.md) for the exact scope.
+
+All eight unordered FIRST/LAST captures passed across memory/RocksDB, source
+batch targets 1/8 and controller/leader checkpoints at
+`target/native-unordered-first-last-fixed/`. This does not qualify every
+ordered, FILTER, collection, or retraction variant. Full 33-profile and
+12-session gates remain open; the 10× TUMBLE capacity run on this source is
+pending. A new 14-field application SQL proposal is stored in the application
+repository but has not been executed here. No application-specific definitions
+were added to Streamr.
+
 ## Current STR-28 evidence gate
+
+### Uncommitted combined native engine batch
+
+The subsequent batch based on `fc347312` adds reviewed SESSION cache/paged
+retirement, finalized-window projection support, the existing STR-37 Kafka
+recovery implementation, bounded append-only MIN/MAX/ordered FIRST/LAST state,
+and admission of the existing native `uuid()` function as a bounded projected
+value. No new SQL syntax is introduced by these repairs.
+
+Bookworm formatting, workspace all-target checks (31.78 seconds) and strict
+Clippy (34.97 seconds) passed. The first library run stopped at one UUID
+negative-test diagnostic mismatch; the planner correctly rejected the volatile
+primary key. After independently reviewing the one-line assertion correction,
+the retry passed 604 library tests with four explicitly ignored, and the full
+workspace build completed. Container logs are
+`/tmp/streamr-m3-native-combined-{fmt,check,clippy,units}.log`,
+`/tmp/streamr-m3-native-combined-{fmt,units}-retry.log`, and
+`/tmp/streamr-m3-native-combined-build.log`.
+
+The fresh executable passed eight closed-HOP-to-updating-aggregate captures
+with strict initial/recovered CDC value and before-image assertions across
+memory/RocksDB, source batch targets 1/8 and controller/leader checkpoints.
+Artifacts are `target/native-window-composition-combined`. This qualifies
+ordinary window-result reaggregation, not lifetime/current-result joins or
+quiet-key zero emission. The first native UUID runtime probe completed its
+checkpoint and restore but its oracle incorrectly compared random IDs from
+two independent fresh runs. After independently reviewing that fixture-only
+correction, all eight native UUID captures passed across the same backend,
+batch and protocol matrix. Both keys are inserted before the checkpoint and
+repeated afterward; lookup results, dependent MERGE no-action values and
+output branches agree with each run's own committed bindings. Artifacts are
+`target/native-uuid-state-current`. This is a generic native UUID proof, not
+application identity qualification without an extra candidate input field.
+Full combined-source capacity, application parity, packaged faults, backfill
+and 24-hour gates remain open.
+
+On this combined executable, the external identity SQL then passed eight
+captures and 16 strict initial/recovered business comparisons against the
+application-owned Flink oracle: 13 unified events and two directed merges in
+every phase, across both backends, batch targets 1/8 and checkpoint protocols.
+The application now supplies only its original 16 fields; one native SQL
+`uuid()` producer precedes the lookups/MERGEs, replacing the fixture-only
+prepared candidate field. Query/preparation changes remain external.
+Artifacts are `target/native-identity-uuid-combined` (checkpoint 41, prefix 10,
+16 MiB execution budget). Whitespace/fault/capacity variants on this route and
+packaged Kafka delivery still need qualification.
+
+The 1,024-row SESSION RocksDB smoke and 65,000-row hot-session captures passed
+both checkpoint protocols on this executable. Full pre-EOF retained payload
+floor is 532,480,000 bytes, above 10 times the conservative 50 MiB pool sum;
+peak whole-child RSS is 366,272,512 bytes (controller) and 358,846,464 bytes
+(leader), below 512 MiB. The oracle checks exact count, window and complete
+first payload in both initial/recovered outputs, not every raw input payload.
+The checkpoint prefix is only 32,500 rows (266,240,000 payload bytes), so this
+does not qualify 10x checkpoint/export/restore. Artifacts are
+`target/native-session-capacity-combined-{smoke,65000}`. A reviewed generic
+`--checkpoint-rows` option permits 64,999 retained rows with one suffix row.
+That stronger run exited successfully for both protocols at
+`target/native-session-capacity-combined-checkpoint-65000`. The checkpoint
+retained-payload floor is 532,471,808 bytes, also above 10 times the 50 MiB
+pool sum. Whole-child RSS peaks are 361,672,704 bytes (controller) and
+365,682,688 bytes (leader); initial and fresh-worker recovered outputs match
+the count/window/full-first-payload oracle. This qualifies that hot-session
+checkpoint shape, not high-cardinality sessions, arbitrary raw payload parity,
+backfill, packaged Kafka faults or the 24-hour gate.
+
+The subsequent four-owner capture harness batch passed formatting, workspace
+all-target checks (37.73 seconds), strict Clippy (39.90 seconds), all 604 library
+tests (four ignored, 25 suites) and the full workspace/all-target build
+(3 minutes 48 seconds). Logs are
+`/tmp/streamr-m3-four-owners-{fmt,check,clippy,units,build}.log` inside the
+development container. This compiles the test-only owner-limit overrides;
+the native lifetime/latest-window UNION value/recovery matrix is separate.
+
+The generic UNION nullability repair passed its branch-order/non-null control
+regression and all 605 library tests, strict Clippy, workspace checks and build.
+After a test-only 4 MiB scan-page override for four owners, the final combined
+batch again passed formatting, checks (4.38 seconds), Clippy (2.19 seconds),
+605 tests (four ignored) and full build (8.86 seconds). Logs are
+`/tmp/streamr-m3-composition-scan-pages-{fmt,check,clippy,units,build}.log`.
+Four memory composition captures passed on the preceding executable; the
+subsequent run encountered a valid extra initial CDC update and failed its
+exact row-count assumption before RocksDB cases ran. See
+`docs/native-result-composition.md`; full composition qualification remains
+pending. The read-only checkpoint inspector passed synthetic corruption checks
+and inspected all four actual memory prefix checkpoints successfully, without
+establishing many-window retention or application emission parity.
+
+### Uncommitted checkpoint/window/lineage batch
+
+The combined batch based on `fc347312` passed Bookworm formatting, workspace
+all-target checks (56.50 seconds), and strict Clippy (64 seconds). Its first
+workspace library run failed four Kafka connector tests: the isolated
+`streamr-m3-test-kafka` broker had exited with a JVM SIGBUS and admin requests
+timed out. Restarting that test broker restored topic-list access. The retry
+then failed two new planner timestamp-lineage tests (an unavailable source
+column and an incorrect assumed output layout). Neither failed run establishes
+full-batch acceptance.
+
+After independently reviewed fixture corrections and direct qualified-schema
+coverage for middle/appended timestamp layouts, the final combined run exited
+zero: formatting, all-target checks (31.38 seconds), strict Clippy (34.07
+seconds), 582 library tests (four ignored), and full workspace build (61
+seconds). Logs in the development container are
+`/tmp/streamr-m3-perf-metrics-lineage-{fmt,check-retry,clippy-retry,units-final,build-final}.log`.
+
+The fresh `arroyo_sql_testing-df802a90a8396c4e` then ran an externally supplied
+native identity query with memory state, controller checkpoints, source batches
+of eight and 16 MiB execution accounting. Initial and checkpoint-41 recovered
+captures each contained 13 rows; the application-owned adapter/oracle compared
+all 13 unified events and two directed identity merges successfully in both
+phases. Artifacts are `target/native-identity-current`, with runtime log
+`/tmp/streamr-native-identity-current-retry.log` in the development container.
+This is one backend/protocol/batch combination, not full identity qualification
+or profile/window composition evidence. Other runtime matrices, capacity runs
+on this final source, and milestone acceptance gates remain open.
+
+The expanded external native identity matrix then passed eight captures and
+16 strict business comparisons: memory/RocksDB × source batches 1/8 ×
+controller/leader, each with initial and checkpoint-41 recovered output. Every
+phase matched 13 unified events and two directed identity merges through the
+application-owned oracle. Artifacts are `target/native-identity-matrix-lineage`.
+Whitespace, injected mutation failures, Kafka/process faults and capacity are
+not covered by this 13-event matrix.
+
+A separate whitespace variant then passed eight captures and 16 strict
+initial/recovered comparisons on this same earlier source. It replaces every
+`alice` user ID with a space, tab and space, and applies the same bijective rename to the
+baseline reference expectations. This checks nonempty whitespace handling,
+not a new execution of the Flink oracle. Artifacts are
+`target/native-identity-matrix-whitespace`; later combined-source qualification
+is still required.
+
+On the same source, the scalar, ordered and collection/UNNEST window scripts
+passed all 48 initial/recovered capture cases across both configured backends
+and checkpoint protocols; the oversized collection case rejected its output
+before final execution as expected. Logs are
+`/tmp/streamr-m3-first-partial-{windows,ordered,collections,oversize}.log` in the
+development container, with matching `target/native-*first-partial` artifacts.
+The ordered fixture requests 128-row source batching and checkpoints 70 input
+rows; these logs do not observe the actual operator batch length. Full capacity
+and session qualification on subsequent source changes remain separate gates.
 
 ### Current foundation batch
 
@@ -319,9 +505,54 @@ every intermediate retained payload.
 At 65,000 rows, the proposed full open-state payload is 532,480,000 bytes
 (507.8 MiB), exceeding ten times the conservative 50 MiB fixture pool sum. The
 halfway checkpoint contains only 266,240,000 payload bytes (253.9 MiB); that
-checkpoint must not be described as 10×. Full capacity execution is still
-pending, so these figures describe fixture admission goals, not a passed
-capacity result. Physical compressed disk size is a separate quantity.
+checkpoint must not be described as 10×. These figures describe fixture admission goals, not a passed capacity result.
+Physical compressed disk size is a separate quantity.
+
+
+### Window snapshot reuse: correctness passed, capacity recovery still open
+
+The working-tree window repair on top of `fc347312` reuses one stable snapshot
+for a window's group traversal and one for an expiry traversal, rather than
+creating physical RocksDB checkpoint snapshots repeatedly within those loops.
+Expiry writes remain bounded and recheck the live catalogue to preserve groups
+with future panes. Independent review found no blocker. Formatting, workspace
+all-target checking, strict Clippy, all 574 library tests and the workspace build
+passed; container logs are `/tmp/streamr-m3-window-closure-{fmt,check,clippy,units,build}.log`.
+
+The repaired binary passed 16 scalar, 16 ordered and 16 collection/UNNEST
+captures, with exact initial and recovered outputs across memory/RocksDB and
+controller/leader checkpoint modes. The oversized collection was rejected before
+final execution as expected. Artifacts are `target/native-windows-snapshot-reuse`,
+`target/native-window-ordered-snapshot-reuse` and
+`target/native-window-collections-snapshot-reuse`.
+
+The full 65,000-row RocksDB/controller TUMBLE run at
+`target/native-window-capacity-reused-snapshot` timed out after 900 seconds during
+recovery. Its uninterrupted initial output separately passed the complete
+65,000-key, full-payload oracle; the interrupted recovered output contained
+49,258 rows. This is **not** a passed recovery, RSS or full capacity gate. A live
+observation of peak RSS was below 512 MiB, but no completed child measurement was
+returned. The earlier full attempt was deliberately terminated because repeated
+snapshot creation made little progress. Neither failed attempt establishes the
+milestone's capacity acceptance.
+
+The subsequent 1,800-second-per-capture retry passed both controller and leader
+RocksDB TUMBLE modes. Each compared all 65,000 keys and complete 8 KiB payloads
+in both uninterrupted and recovered output. Full retained payload was
+532,480,000 bytes, above 10× the conservative 50 MiB pool sum; the halfway
+checkpoint was only 266,240,000 payload bytes and is **not** a 10× checkpoint.
+Whole-child peak RSS was 361,066,496 bytes (controller) and 359,043,072 bytes
+(leader), both below the declared 512 MiB limit. Capture elapsed times were
+876.81 and 1,020.59 seconds respectively; the timeout was extended without
+changing counts, values or memory assertions. Artifacts and measurements:
+`target/native-window-capacity-snapshot-reuse-1800/measurements.json` and each
+case's `runtime.log`, `output.initial.jsonl` and `output.jsonl`.
+
+This qualification used `fc347312` plus the first snapshot-reuse/expiry repair,
+before the later first-partial reuse and checkpoint metrics changes. The latter
+changes need their own combined checks and runtime qualification. SESSION
+capacity, broader failure points and representative backfill/live gates remain
+open.
 
 ### Native aggregate value and recovery capture
 
@@ -412,6 +643,113 @@ expiry-to-zero, processing-time coalescing and last-emitted changed-field deltas
 are not demonstrated by scalar sketches or timer storage tests. Old SQL callers
 and serialized plans/checkpoints need an explicit removal/migration policy before
 STR-43. Source audit is a partial STR-28 milestone, not STR-28 or M3 completion.
+
+### Current composition and retention status
+
+The bounded-capture source passed formatting, workspace all-target checking
+(5.52 seconds), strict Clippy (2.34 seconds), 606 library tests with four
+ignored across 25 suites, and full workspace build (9.59 seconds). Logs are
+`/tmp/streamr-m3-bounded-capture-{fmt,check,clippy,units,build}.log`. On the
+subsequent composition-queue batch, formatting, checking (2.58 seconds) and
+Clippy (2.15 seconds) passed. Its concurrent library run failed one Kafka
+metadata-source test after a timeout; the serial rerun passed all 606 tests
+(four ignored), including all 67 connector tests. The SQL-testing smoke suite
+within that run passed 43 tests with four ignored in 113.34 seconds. The full
+workspace build passed in 8.06 seconds. Logs are
+`/tmp/streamr-m3-composition-queue-{fmt,check,clippy,units,units-serial,build-serial}.log`.
+
+The prior 32 MiB RocksDB queued-write attempt reached runtime: the job and all
+operators started, then task 17 failed queued-write admission with
+`ResourceExhausted` (`queued_write_bytes=33554432`) shortly after startup and
+before initial capture/checkpoint. The three aggregate owners need five 2 MiB buffers
+each and the window owner needs five 0.5 MiB buffers: 32.5 MiB before metadata.
+A reviewed 64 MiB queue
+override is confined to both generic test fixtures; production limits and source
+guards are unchanged.
+
+The current-result UNION capture passed all eight memory/RocksDB × source batch
+target 1/8 × controller/leader cases with strict CDC, before-image, checkpoint-
+prefix and final-value comparisons. The prefix has lifetime count 1 and recent
+count NULL; final materialized values are lifetime count 3 and recent count 1.
+Artifacts are `target/native-result-composition-queue-qualified`; log:
+`/tmp/streamr-m3-composition-queue-runtime.log`.
+
+A separate four-event retention probe passed memory/batch-1 controller and
+leader checkpoint inspection: each of three owners had `G=1`, and the outer
+aggregate had `M=4,R=4`. Its batch-8 companion expected recent count 2 but
+observed NULL: the watermark generator takes the minimum event time in each
+source batch, including the batch values `[1,3,5]`. That expectation is invalid
+for this batch shape and does not demonstrate an engine defect.
+
+The earlier retention qualification attempt contained 16 scopes: eight
+ten-event retraction captures (memory/RocksDB × batch target 1/8 × controller/leader) and eight
+many-window captures (memory/RocksDB × 64/4096 groups × controller/leader at
+batch target 8). Fourteen scopes passed on that earlier source: all eight
+retraction cases, all four many-window memory cases, and both 64-group RocksDB
+cases. Their artifacts are
+under `target/native-result-retention-tail-qualified`; the two then remaining
+scopes were the 4096-group RocksDB controller and leader cases.
+
+The checkpoint inventories for the 64- and 4096-group memory cases match across
+cardinality and both checkpoint protocols. The three owners each have `G=1`;
+the latest result stores 1,840 bytes, the lifetime aggregate 1,456 bytes, and
+the outer aggregate 1,200 bytes plus `M=4` entries of 9 bytes and `R=4` entries
+of 44 bytes. Total logical value bytes are 4,708 in each checkpoint. This
+qualifies the measured many-window fixture's constant checkpoint shape across
+64 and 4096 groups; it does not qualify arbitrary retention workloads.
+
+An earlier 4096-group memory capture had prefix recent count 1 rather than 2;
+that observation's cause was not established. The revised tail fixture asserts
+latest count 2 across last-batch partitions of lengths 1–8, and both 4096-group
+memory protocol cases now pass.
+
+The first 4096-group RocksDB/controller attempt ended at the default 120.24-second
+runtime timeout before initial capture finished. Its log is preserved at
+`target/native-result-retention-tail-qualified/many-4096-rocksdb-8-controller/capture.log`;
+the source task ended at 1.6 seconds and the lifetime aggregate at 55 seconds,
+which is not a full capture pass. A second controller attempt used an explicit
+900-second timeout in `target/native-result-retention-long-rocksdb` and failed
+after 900.27 seconds with `worker runtime timed out` before any checkpoint. The
+source task ended at 1.6 seconds and the lifetime aggregate at about 30 seconds;
+the window, latest-result and outer aggregate tasks did not finish. Its incomplete
+log is preserved at
+`target/native-result-retention-long-rocksdb/many-4096-rocksdb-8-controller/capture.log`.
+The serial runner uses `set -e`, so the leader case did not run. The previous 120
+and 900 second attempts are failures, not completed captures or performance
+passes.
+
+The historical controller invocation inside `streamr-state-build` is reproduced
+here; it failed as described above:
+
+```sh
+STREAMR_TEST_RUNTIME_TIMEOUT_SECONDS=900 python3 /app/scripts/test-native-result-retention.py \
+  /app/target/native-result-retention-long-rocksdb/many-4096-rocksdb-8-controller \
+  --scenario many --groups 4096 \
+  --binary /app/target/milestone2-runtime/debug/deps/arroyo_sql_testing-df802a90a8396c4e \
+  --backend rocksdb --batch 8 --mode controller \
+  --checkpoint-root /app/target/native-result-checkpoints \
+  --inspector /app/scripts/checkpoint_inventory.py
+```
+
+At that historical source, the 4096-group RocksDB controller and leader scopes
+were pending; the 14 other scopes passed. See
+[the composition record](native-result-composition.md) and
+[checkpoint inventory](native-checkpoint-inventory.md).
+
+The final native captures used the existing `arroyo_sql_testing-df802a90a8396c4e`
+executable from the 606-library-test/full-workspace-build candidate; only
+fixtures and documentation changed after that build. Native UUID dependent-write,
+fan-out and recovery passed all eight memory/RocksDB × batch target 1/8 ×
+controller/leader captures at `target/native-uuid-final-combined`. Closed-HOP
+reaggregation passed the same eight-case matrix and strict value/recovery oracle
+at `target/native-window-composition-final-combined`. The external native identity
+query passed all eight captures; the application-owned adapter/comparator passed
+16 strict initial/recovered comparisons, each with 13 unified events and two
+directed merges, recorded in
+`target/native-identity-final-combined/comparisons.json`. Application SQL,
+oracle and comparator remain external to Streamr. These fixture results do not
+establish full M3 completion, profile/session parity, packaged fault handling or
+capacity qualification.
 
 ## Execution accounting
 

@@ -2,6 +2,7 @@
 use super::{
     LiveStateBackend, ScanRange, ScanRequest, StateNamespace, StateSnapshot, WriteBatch,
     WriteOperation, encoding,
+    resources::{CheckpointDirection, CheckpointObservation, WorkerStateResources},
 };
 use anyhow::{Result, bail, ensure};
 use arroyo_rpc::grpc::rpc::{
@@ -83,6 +84,47 @@ async fn export_snapshot(
     subtask: u32,
     max_files: usize,
 ) -> Result<DiskKeyedTableSubtaskCheckpointMetadata> {
+    let resources = super::worker::configured_worker_resources()?;
+    let mut observation =
+        CheckpointObservation::new(resources.clone(), CheckpointDirection::Export);
+    let result = export_snapshot_inner(
+        snapshot,
+        namespace,
+        transport_name,
+        table_identity,
+        schema_identity,
+        encoding_version,
+        storage,
+        path,
+        epoch,
+        generation,
+        subtask,
+        max_files,
+        resources,
+        &observation,
+    )
+    .await;
+    observation.finish(&result);
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn export_snapshot_inner(
+    snapshot: &StateSnapshot,
+    namespace: &StateNamespace,
+    transport_name: &str,
+    table_identity: &[u8],
+    schema_identity: &[u8],
+    encoding_version: u32,
+    storage: &StorageProviderRef,
+    path: &str,
+    epoch: u32,
+    generation: u64,
+    subtask: u32,
+    max_files: usize,
+    resources: Option<WorkerStateResources>,
+    observation: &CheckpointObservation,
+) -> Result<DiskKeyedTableSubtaskCheckpointMetadata> {
     ensure!(
         !transport_name.is_empty()
             && !transport_name.contains(['/', '\\'])
@@ -116,7 +158,6 @@ async fn export_snapshot(
             .as_nanos(),
         UPLOAD_ID.fetch_add(1, Ordering::Relaxed)
     );
-    let resources = super::worker::configured_worker_resources()?;
     let page_bytes = resources.as_ref().map_or(PAGE_BYTES, |r| {
         PAGE_BYTES
             .min(r.config().scan_page_bytes / (8 * r.config().max_open_databases.saturating_add(1)))
@@ -182,6 +223,7 @@ async fn export_snapshot(
                     "disk checkpoint file metadata exceeds 3 MiB RPC limit"
                 );
                 storage.put_if_not_exists(file.path.clone(), bytes).await?;
+                observation.page_transferred(file.size_bytes);
                 metadata.files.push(file);
                 metadata.empty = false;
             }
@@ -215,34 +257,64 @@ pub async fn export_typed(
     subtask: u32,
     max_files: usize,
 ) -> Result<TypedStateTableSubtaskCheckpointMetadata> {
-    arroyo_state_protocol::typed_checkpoint::validate_config(config)
-        .map_err(|error| anyhow::anyhow!(error))?;
-    let metadata = export_snapshot(
-        snapshot,
-        namespace,
-        &config.transport_name,
-        &config.table_identity,
-        &config.schema_identity,
-        config.encoding_version,
-        storage,
-        path,
-        epoch,
-        generation,
-        subtask,
-        max_files,
+    let resources = super::worker::configured_worker_resources()?;
+    export_typed_with_resources(
+        snapshot, namespace, config, storage, path, epoch, generation, subtask, max_files,
+        resources,
     )
-    .await?;
-    Ok(TypedStateTableSubtaskCheckpointMetadata {
-        subtask_index: metadata.subtask_index,
-        format_version: metadata.format_version,
-        encoding_version: metadata.encoding_version,
-        schema_identity: metadata.schema_identity,
-        namespace: metadata.namespace,
-        generation: metadata.generation,
-        epoch: metadata.epoch,
-        empty: metadata.empty,
-        files: metadata.files,
-    })
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn export_typed_with_resources(
+    snapshot: &StateSnapshot,
+    namespace: &StateNamespace,
+    config: &TypedStateTableConfig,
+    storage: &StorageProviderRef,
+    path: &str,
+    epoch: u32,
+    generation: u64,
+    subtask: u32,
+    max_files: usize,
+    resources: Option<WorkerStateResources>,
+) -> Result<TypedStateTableSubtaskCheckpointMetadata> {
+    let mut observation =
+        CheckpointObservation::new(resources.clone(), CheckpointDirection::Export);
+    let result = async {
+        arroyo_state_protocol::typed_checkpoint::validate_config(config)
+            .map_err(|error| anyhow::anyhow!(error))?;
+        let metadata = export_snapshot_inner(
+            snapshot,
+            namespace,
+            &config.transport_name,
+            &config.table_identity,
+            &config.schema_identity,
+            config.encoding_version,
+            storage,
+            path,
+            epoch,
+            generation,
+            subtask,
+            max_files,
+            resources,
+            &observation,
+        )
+        .await?;
+        Ok(TypedStateTableSubtaskCheckpointMetadata {
+            subtask_index: metadata.subtask_index,
+            format_version: metadata.format_version,
+            encoding_version: metadata.encoding_version,
+            schema_identity: metadata.schema_identity,
+            namespace: metadata.namespace,
+            generation: metadata.generation,
+            epoch: metadata.epoch,
+            empty: metadata.empty,
+            files: metadata.files,
+        })
+    }
+    .await;
+    observation.finish(&result);
+    result
 }
 
 /// Restore into a fresh namespace only. A failed restore poisons that attempt:
@@ -272,28 +344,49 @@ pub async fn restore_typed(
     metadata: &TypedStateTableSubtaskCheckpointMetadata,
     storage: &StorageProviderRef,
 ) -> Result<()> {
-    arroyo_state_protocol::typed_checkpoint::validate_subtask(config, metadata)
-        .map_err(|error| anyhow::anyhow!(error))?;
-    let disk = DiskKeyedTableSubtaskCheckpointMetadata {
-        subtask_index: metadata.subtask_index,
-        format_version: metadata.format_version,
-        encoding_version: metadata.encoding_version,
-        schema_identity: metadata.schema_identity.clone(),
-        namespace: metadata.namespace.clone(),
-        generation: metadata.generation,
-        epoch: metadata.epoch,
-        empty: metadata.empty,
-        files: metadata.files.clone(),
-    };
-    restore_snapshot(
-        backend,
-        namespace,
-        config.encoding_version,
-        &config.schema_identity,
-        &disk,
-        storage,
-    )
-    .await
+    let resources = super::worker::configured_worker_resources()?;
+    restore_typed_with_resources(backend, namespace, config, metadata, storage, resources).await
+}
+
+async fn restore_typed_with_resources(
+    backend: &dyn LiveStateBackend,
+    namespace: &StateNamespace,
+    config: &TypedStateTableConfig,
+    metadata: &TypedStateTableSubtaskCheckpointMetadata,
+    storage: &StorageProviderRef,
+    resources: Option<WorkerStateResources>,
+) -> Result<()> {
+    let mut observation =
+        CheckpointObservation::new(resources.clone(), CheckpointDirection::Restore);
+    let result = async {
+        arroyo_state_protocol::typed_checkpoint::validate_subtask(config, metadata)
+            .map_err(|error| anyhow::anyhow!(error))?;
+        let disk = DiskKeyedTableSubtaskCheckpointMetadata {
+            subtask_index: metadata.subtask_index,
+            format_version: metadata.format_version,
+            encoding_version: metadata.encoding_version,
+            schema_identity: metadata.schema_identity.clone(),
+            namespace: metadata.namespace.clone(),
+            generation: metadata.generation,
+            epoch: metadata.epoch,
+            empty: metadata.empty,
+            files: metadata.files.clone(),
+        };
+        restore_snapshot_inner(
+            backend,
+            namespace,
+            config.encoding_version,
+            &config.schema_identity,
+            &disk,
+            storage,
+            resources,
+            &observation,
+        )
+        .await
+    }
+    .await;
+    observation.finish(&result);
+    result
 }
 
 async fn restore_snapshot(
@@ -303,6 +396,35 @@ async fn restore_snapshot(
     schema_identity: &[u8],
     metadata: &DiskKeyedTableSubtaskCheckpointMetadata,
     storage: &StorageProviderRef,
+) -> Result<()> {
+    let resources = super::worker::configured_worker_resources()?;
+    let mut observation =
+        CheckpointObservation::new(resources.clone(), CheckpointDirection::Restore);
+    let result = restore_snapshot_inner(
+        backend,
+        namespace,
+        encoding_version,
+        schema_identity,
+        metadata,
+        storage,
+        resources,
+        &observation,
+    )
+    .await;
+    observation.finish(&result);
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn restore_snapshot_inner(
+    backend: &dyn LiveStateBackend,
+    namespace: &StateNamespace,
+    encoding_version: u32,
+    schema_identity: &[u8],
+    metadata: &DiskKeyedTableSubtaskCheckpointMetadata,
+    storage: &StorageProviderRef,
+    resources: Option<WorkerStateResources>,
+    observation: &CheckpointObservation,
 ) -> Result<()> {
     ensure!(
         metadata.format_version == 1 && metadata.encoding_version == 1 && encoding_version == 1,
@@ -325,7 +447,6 @@ async fn restore_snapshot(
         metadata.files.len() <= MAX_FILES,
         "disk checkpoint exceeds maximum page-file count"
     );
-    let resources = super::worker::configured_worker_resources()?;
     let mut previous_key: Option<Vec<u8>> = None;
     let mut paths = std::collections::HashSet::new();
     for file in &metadata.files {
@@ -409,6 +530,7 @@ async fn restore_snapshot(
                 max_bytes: PAGE_BYTES + PAGE_ROWS,
             })
             .await?;
+        observation.page_transferred(file.size_bytes);
     }
     Ok(())
 }
@@ -446,7 +568,9 @@ pub async fn ensure_empty(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::live::{Ownership, ReadOptions, StateKey, memory::MemoryLiveState};
+    use crate::live::{
+        Ownership, ReadOptions, StateKey, memory::MemoryLiveState, resources::ResourceConfig,
+    };
     use arroyo_storage::StorageProvider;
     use std::sync::Arc;
 
@@ -479,6 +603,198 @@ mod tests {
                 .await
                 .unwrap(),
         )
+    }
+
+    #[tokio::test]
+    async fn checkpoint_metrics_count_only_successfully_transferred_encoded_pages() {
+        let resources = WorkerStateResources::new(ResourceConfig {
+            block_cache_bytes: 1024 * 1024,
+            memtable_bytes: 512 * 1024,
+            queued_write_bytes: 16 * 1024 * 1024,
+            decoded_value_bytes: 16 * 1024 * 1024,
+            scan_page_bytes: 16 * 1024 * 1024,
+            max_blocking_operations: 1,
+            max_snapshots: 1,
+            max_open_databases: 1,
+            disk_reserve_bytes: 1,
+        })
+        .unwrap();
+        let registry = prometheus::Registry::new();
+        resources.register_metrics(&registry).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let storage = storage(&directory).await;
+        let source = MemoryLiveState::new();
+        source
+            .put(key(0), b"value".to_vec(), PAGE_BYTES)
+            .await
+            .unwrap();
+        let snapshot = source.snapshot().await.unwrap();
+        let config = config();
+        let mut export =
+            CheckpointObservation::new(Some(resources.clone()), CheckpointDirection::Export);
+        let metadata = export_snapshot_inner(
+            &snapshot,
+            &namespace(),
+            &config.table_name,
+            config.table_name.as_bytes(),
+            &config.schema_identity,
+            config.encoding_version,
+            &storage,
+            "checkpoint/metrics",
+            1,
+            1,
+            0,
+            MAX_FILES,
+            Some(resources.clone()),
+            &export,
+        )
+        .await;
+        export.finish(&metadata);
+        drop(export);
+        let metadata = metadata.unwrap();
+        assert_eq!(metadata.files.len(), 1);
+        let encoded_bytes = metadata.files[0].size_bytes as f64;
+
+        let restored = MemoryLiveState::new();
+        let mut restore =
+            CheckpointObservation::new(Some(resources.clone()), CheckpointDirection::Restore);
+        let result = restore_snapshot_inner(
+            &restored,
+            &namespace(),
+            config.encoding_version,
+            &config.schema_identity,
+            &metadata,
+            &storage,
+            Some(resources.clone()),
+            &restore,
+        )
+        .await;
+        restore.finish(&result);
+        drop(restore);
+        result.unwrap();
+
+        storage
+            .put(
+                metadata.files[0].path.clone(),
+                vec![0; metadata.files[0].size_bytes as usize],
+            )
+            .await
+            .unwrap();
+        let mut failed_restore =
+            CheckpointObservation::new(Some(resources.clone()), CheckpointDirection::Restore);
+        let result = restore_snapshot_inner(
+            &MemoryLiveState::new(),
+            &namespace(),
+            config.encoding_version,
+            &config.schema_identity,
+            &metadata,
+            &storage,
+            Some(resources.clone()),
+            &failed_restore,
+        )
+        .await;
+        failed_restore.finish(&result);
+        drop(failed_restore);
+        assert!(result.is_err());
+
+        let malformed_typed = TypedStateTableConfig {
+            transport_name: String::new(),
+            table_identity: vec![],
+            schema_identity: vec![],
+            schema_json: vec![],
+            primary_key: vec![],
+            partition_key: vec![],
+            encoding_version: 0,
+        };
+        assert!(
+            export_typed_with_resources(
+                &snapshot,
+                &namespace(),
+                &malformed_typed,
+                &storage,
+                "checkpoint/invalid-typed",
+                1,
+                1,
+                0,
+                MAX_FILES,
+                Some(resources.clone()),
+            )
+            .await
+            .is_err()
+        );
+        let malformed_metadata = TypedStateTableSubtaskCheckpointMetadata {
+            subtask_index: 0,
+            format_version: 0,
+            encoding_version: 0,
+            schema_identity: vec![],
+            namespace: vec![],
+            generation: 0,
+            epoch: 0,
+            empty: true,
+            files: vec![],
+        };
+        assert!(
+            restore_typed_with_resources(
+                &MemoryLiveState::new(),
+                &namespace(),
+                &malformed_typed,
+                &malformed_metadata,
+                &storage,
+                Some(resources),
+            )
+            .await
+            .is_err()
+        );
+
+        let families = registry.gather();
+        let bytes = families
+            .iter()
+            .find(|family| family.name() == "arroyo_live_state_checkpoint_encoded_page_bytes_total")
+            .unwrap();
+        let value = |direction: &str| {
+            bytes
+                .get_metric()
+                .iter()
+                .find(|metric| {
+                    metric
+                        .get_label()
+                        .iter()
+                        .any(|label| label.name() == "direction" && label.value() == direction)
+                })
+                .unwrap()
+                .get_counter()
+                .as_ref()
+                .unwrap()
+                .value()
+        };
+        assert_eq!(value("export"), encoded_bytes);
+        assert_eq!(value("restore"), encoded_bytes);
+        let operations = families
+            .iter()
+            .find(|family| family.name() == "arroyo_live_state_checkpoint_operations_total")
+            .unwrap();
+        let errors = |direction: &str| {
+            operations
+                .get_metric()
+                .iter()
+                .find(|metric| {
+                    metric
+                        .get_label()
+                        .iter()
+                        .any(|label| label.name() == "direction" && label.value() == direction)
+                        && metric
+                            .get_label()
+                            .iter()
+                            .any(|label| label.name() == "outcome" && label.value() == "error")
+                })
+                .unwrap()
+                .get_counter()
+                .as_ref()
+                .unwrap()
+                .value()
+        };
+        assert_eq!(errors("export"), 1.0);
+        assert_eq!(errors("restore"), 2.0);
     }
 
     #[tokio::test]

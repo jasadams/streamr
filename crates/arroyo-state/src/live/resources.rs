@@ -8,9 +8,12 @@ use std::{
         Arc, Mutex, OnceLock,
         mpsc::{self, SyncSender},
     },
+    time::Instant,
 };
 
-use prometheus::{HistogramOpts, HistogramTimer, HistogramVec, IntGaugeVec, Opts, Registry};
+use prometheus::{
+    HistogramOpts, HistogramTimer, HistogramVec, IntCounterVec, IntGaugeVec, Opts, Registry,
+};
 use rocksdb::{Cache, WriteBufferManager};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
@@ -281,7 +284,83 @@ struct Inner {
     cleanup: CleanupExecutor,
     metrics: IntGaugeVec,
     operation_latency: HistogramVec,
+    checkpoint_duration: HistogramVec,
+    checkpoint_operations: IntCounterVec,
+    checkpoint_encoded_page_bytes: IntCounterVec,
 }
+
+/// Only fixed labels are accepted; checkpoint table names and paths are never labels.
+#[derive(Clone, Copy)]
+pub(crate) enum CheckpointDirection {
+    Export,
+    Restore,
+}
+
+impl CheckpointDirection {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Export => "export",
+            Self::Restore => "restore",
+        }
+    }
+}
+
+pub(crate) struct CheckpointObservation {
+    resources: Option<WorkerStateResources>,
+    direction: CheckpointDirection,
+    started: Instant,
+    outcome: &'static str,
+}
+
+impl CheckpointObservation {
+    pub(crate) fn new(
+        resources: Option<WorkerStateResources>,
+        direction: CheckpointDirection,
+    ) -> Self {
+        Self {
+            resources,
+            direction,
+            started: Instant::now(),
+            outcome: "cancelled",
+        }
+    }
+
+    /// Count an encoded page only after upload or restore write succeeds.
+    /// Failed attempts retain the count of pages transferred before failure.
+    pub(crate) fn page_transferred(&self, bytes: u64) {
+        if let Some(resources) = &self.resources {
+            resources
+                .0
+                .checkpoint_encoded_page_bytes
+                .with_label_values(&[self.direction.label()])
+                .inc_by(bytes);
+        }
+    }
+
+    pub(crate) fn finish<T, E>(&mut self, result: &Result<T, E>) {
+        self.outcome = if result.is_ok() { "success" } else { "error" };
+    }
+}
+
+impl Drop for CheckpointObservation {
+    fn drop(&mut self) {
+        if let Some(resources) = &self.resources {
+            let direction = self.direction.label();
+            let labels = &[direction, self.outcome];
+            resources
+                .0
+                .checkpoint_duration
+                .with_label_values(labels)
+                .observe(self.started.elapsed().as_secs_f64());
+            resources
+                .0
+                .checkpoint_operations
+                .with_label_values(labels)
+                .inc();
+        }
+    }
+}
+
 /// Create once per worker, then clone into all task-local databases.
 #[derive(Clone)]
 pub struct WorkerStateResources(Arc<Inner>);
@@ -364,6 +443,43 @@ impl WorkerStateResources {
         for operation in ["read", "write", "scan", "snapshot", "open"] {
             operation_latency.with_label_values(&[operation]);
         }
+        let checkpoint_duration = HistogramVec::new(
+            HistogramOpts::new(
+                "arroyo_live_state_checkpoint_duration_seconds",
+                "Full logical checkpoint namespace export/restore duration",
+            )
+            // Full namespace checkpoints can take minutes; the default 10s
+            // upper bucket would collapse ordinary long-running exports.
+            .buckets(vec![
+                0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0,
+                600.0, 1800.0, 3600.0,
+            ]),
+            &["direction", "outcome"],
+        )
+        .map_err(|e| ResourceError::InvalidConfig(e.to_string()))?;
+        let checkpoint_operations = IntCounterVec::new(
+            Opts::new(
+                "arroyo_live_state_checkpoint_operations_total",
+                "Full logical checkpoint namespace operations by outcome",
+            ),
+            &["direction", "outcome"],
+        )
+        .map_err(|e| ResourceError::InvalidConfig(e.to_string()))?;
+        let checkpoint_encoded_page_bytes = IntCounterVec::new(
+            Opts::new(
+                "arroyo_live_state_checkpoint_encoded_page_bytes_total",
+                "Encoded logical checkpoint page bytes successfully uploaded or applied; not live logical state size or remote physical bytes",
+            ),
+            &["direction"],
+        )
+        .map_err(|e| ResourceError::InvalidConfig(e.to_string()))?;
+        for direction in ["export", "restore"] {
+            checkpoint_encoded_page_bytes.with_label_values(&[direction]);
+            for outcome in ["success", "error", "cancelled"] {
+                checkpoint_duration.with_label_values(&[direction, outcome]);
+                checkpoint_operations.with_label_values(&[direction, outcome]);
+            }
+        }
         let cache = Cache::new_lru_cache(config.block_cache_bytes);
         let manager = WriteBufferManager::new_write_buffer_manager_with_cache(
             config.memtable_bytes,
@@ -387,6 +503,9 @@ impl WorkerStateResources {
             manager,
             metrics,
             operation_latency,
+            checkpoint_duration,
+            checkpoint_operations,
+            checkpoint_encoded_page_bytes,
         })))
     }
     pub fn same_pool(&self, other: &Self) -> bool {
@@ -524,6 +643,15 @@ impl prometheus::core::Collector for WorkerStateResources {
     fn desc(&self) -> Vec<&prometheus::core::Desc> {
         let mut descriptions = prometheus::core::Collector::desc(&self.0.metrics);
         descriptions.extend(prometheus::core::Collector::desc(&self.0.operation_latency));
+        descriptions.extend(prometheus::core::Collector::desc(
+            &self.0.checkpoint_duration,
+        ));
+        descriptions.extend(prometheus::core::Collector::desc(
+            &self.0.checkpoint_operations,
+        ));
+        descriptions.extend(prometheus::core::Collector::desc(
+            &self.0.checkpoint_encoded_page_bytes,
+        ));
         descriptions
     }
     fn collect(&self) -> Vec<prometheus::proto::MetricFamily> {
@@ -531,6 +659,15 @@ impl prometheus::core::Collector for WorkerStateResources {
         let mut families = prometheus::core::Collector::collect(&self.0.metrics);
         families.extend(prometheus::core::Collector::collect(
             &self.0.operation_latency,
+        ));
+        families.extend(prometheus::core::Collector::collect(
+            &self.0.checkpoint_duration,
+        ));
+        families.extend(prometheus::core::Collector::collect(
+            &self.0.checkpoint_operations,
+        ));
+        families.extend(prometheus::core::Collector::collect(
+            &self.0.checkpoint_encoded_page_bytes,
         ));
         families
     }
@@ -805,6 +942,126 @@ mod tests {
             .unwrap();
         assert_eq!(read.get_histogram().get_sample_count(), 1);
         assert_eq!(latency.get_metric().len(), 5);
+    }
+
+    #[test]
+    fn checkpoint_metrics_count_success_error_cancelled_and_transferred_pages() {
+        let resources = WorkerStateResources::new(config()).unwrap();
+        let registry = Registry::new();
+        resources.register_metrics(&registry).unwrap();
+        {
+            let mut export =
+                CheckpointObservation::new(Some(resources.clone()), CheckpointDirection::Export);
+            export.page_transferred(11);
+            export.page_transferred(13);
+            export.finish(&Ok::<(), ()>(()));
+        }
+        {
+            let mut export =
+                CheckpointObservation::new(Some(resources.clone()), CheckpointDirection::Export);
+            export.page_transferred(17);
+            export.finish(&Err::<(), ()>(()));
+        }
+        {
+            let restore =
+                CheckpointObservation::new(Some(resources.clone()), CheckpointDirection::Restore);
+            restore.page_transferred(19);
+            // Dropping an unfinished future records cancellation, including any
+            // pages already applied before that cancellation.
+        }
+        let families = registry.gather();
+        let operations = families
+            .iter()
+            .find(|family| family.name() == "arroyo_live_state_checkpoint_operations_total")
+            .unwrap();
+        let duration = families
+            .iter()
+            .find(|family| family.name() == "arroyo_live_state_checkpoint_duration_seconds")
+            .unwrap();
+        let pages = families
+            .iter()
+            .find(|family| family.name() == "arroyo_live_state_checkpoint_encoded_page_bytes_total")
+            .unwrap();
+        assert_eq!(operations.get_metric().len(), 6);
+        assert_eq!(duration.get_metric().len(), 6);
+        assert_eq!(pages.get_metric().len(), 2);
+        assert_eq!(
+            duration.get_metric()[0]
+                .get_histogram()
+                .get_bucket()
+                .last()
+                .unwrap()
+                .upper_bound(),
+            3600.0
+        );
+        fn value<'a>(
+            family: &'a prometheus::proto::MetricFamily,
+            direction: &str,
+            outcome: Option<&str>,
+        ) -> &'a prometheus::proto::Metric {
+            family
+                .get_metric()
+                .iter()
+                .find(|metric| {
+                    metric
+                        .get_label()
+                        .iter()
+                        .any(|label| label.name() == "direction" && label.value() == direction)
+                        && outcome.is_none_or(|outcome| {
+                            metric
+                                .get_label()
+                                .iter()
+                                .any(|label| label.name() == "outcome" && label.value() == outcome)
+                        })
+                })
+                .unwrap()
+        }
+        assert_eq!(
+            value(operations, "export", Some("success"))
+                .get_counter()
+                .as_ref()
+                .unwrap()
+                .value(),
+            1.0
+        );
+        assert_eq!(
+            value(operations, "export", Some("error"))
+                .get_counter()
+                .as_ref()
+                .unwrap()
+                .value(),
+            1.0
+        );
+        assert_eq!(
+            value(operations, "restore", Some("cancelled"))
+                .get_counter()
+                .as_ref()
+                .unwrap()
+                .value(),
+            1.0
+        );
+        assert_eq!(
+            value(pages, "export", None)
+                .get_counter()
+                .as_ref()
+                .unwrap()
+                .value(),
+            41.0
+        );
+        assert_eq!(
+            value(pages, "restore", None)
+                .get_counter()
+                .as_ref()
+                .unwrap()
+                .value(),
+            19.0
+        );
+        assert_eq!(
+            value(duration, "export", Some("success"))
+                .get_histogram()
+                .get_sample_count(),
+            1
+        );
     }
 
     #[test]

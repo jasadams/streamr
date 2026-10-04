@@ -1360,13 +1360,18 @@ async fn external_sql_checkpoint_capture_inner() {
         .start()
         .await;
     run_until_finished(&running, &mut control_rx).await;
-    capture_rows(&output_path, capture.expected_initial_rows).await;
+    let initial_rows = capture_rows(
+        &output_path,
+        capture.expected_initial_rows,
+        "STREAMR_CAPTURE_MAX_INITIAL_ROWS",
+    )
+    .await;
     tokio::fs::rename(&output_path, &initial_path)
         .await
         .unwrap();
     println!(
         "CAPTURE_RESULT phase=initial rows={} path={}",
-        capture.expected_initial_rows,
+        initial_rows,
         initial_path.display()
     );
 
@@ -1427,7 +1432,12 @@ async fn external_sql_checkpoint_capture_inner() {
         &mut finished_tasks,
     )
     .await;
-    capture_rows(&output_path, capture.expected_checkpoint_rows).await;
+    let checkpoint_rows = capture_rows(
+        &output_path,
+        capture.expected_checkpoint_rows,
+        "STREAMR_CAPTURE_MAX_CHECKPOINT_ROWS",
+    )
+    .await;
     if leader_mode() {
         use arroyo_state_protocol::store::read_protobuf;
         let paths = arroyo_state_protocol::ProtocolPaths::new(
@@ -1512,18 +1522,58 @@ async fn external_sql_checkpoint_capture_inner() {
         .start()
         .await;
     run_until_finished(&restored, &mut control_rx).await;
-    capture_rows(&output_path, capture.expected_rows).await;
+    let recovered_rows = capture_rows(
+        &output_path,
+        capture.expected_rows,
+        "STREAMR_CAPTURE_MAX_ROWS",
+    )
+    .await;
     println!(
         "CAPTURE_RESULT phase=recovered checkpoint={} input_rows_before_checkpoint={} committed_rows={} rows={} bytes={checkpoint_bytes} path={} job={job_id}",
         capture.checkpoint_epoch,
         capture.input_rows_before_checkpoint,
-        capture.expected_checkpoint_rows,
-        capture.expected_rows,
+        checkpoint_rows,
+        recovered_rows,
         output_path.display()
     );
 }
 
-async fn capture_rows(path: &Path, expected: usize) {
+fn capture_max_rows(expected: usize, configured: Option<&str>, name: &str) -> usize {
+    let Some(configured) = configured else {
+        return expected;
+    };
+    assert!(
+        !configured.is_empty() && configured.bytes().all(|byte| byte.is_ascii_digit()),
+        "{name} must be an unsigned decimal integer"
+    );
+    let max: usize = configured
+        .parse()
+        .expect("capture row maximum is out of range");
+    assert!(
+        max >= expected,
+        "{name} must be at least the expected row minimum"
+    );
+    max
+}
+
+#[test]
+fn capture_max_rows_defaults_to_exact_and_rejects_invalid_ranges() {
+    assert_eq!(capture_max_rows(2, None, "test"), 2);
+    assert_eq!(capture_max_rows(2, Some("4"), "test"), 4);
+    assert_eq!(capture_max_rows(0, None, "test"), 0);
+    assert_eq!(capture_max_rows(0, Some("0"), "test"), 0);
+    assert_eq!(capture_max_rows(0, Some("2"), "test"), 2);
+    assert!(std::panic::catch_unwind(|| capture_max_rows(2, Some("1"), "test")).is_err());
+    assert!(std::panic::catch_unwind(|| capture_max_rows(2, Some("1x"), "test")).is_err());
+}
+
+async fn capture_rows(path: &Path, expected: usize, max_name: &str) -> usize {
+    let configured_max = match env::var(max_name) {
+        Ok(value) => Some(value),
+        Err(env::VarError::NotPresent) => None,
+        Err(error) => panic!("{max_name}: {error}"),
+    };
+    let max = capture_max_rows(expected, configured_max.as_deref(), max_name);
     let file = File::open(path)
         .await
         .expect("external SQL capture file missing");
@@ -1550,12 +1600,12 @@ async fn capture_rows(path: &Path, expected: usize) {
             "external SQL capture must contain JSON objects"
         );
     }
-    assert_eq!(
-        count,
-        expected,
-        "unexpected capture row count in {}",
+    assert!(
+        (expected..=max).contains(&count),
+        "unexpected capture row count in {}: {count} outside {expected}..={max}",
         path.display()
     );
+    count
 }
 
 /// Run separately: resources and RSS measurements belong to one worker process.
@@ -1988,6 +2038,43 @@ fn configure_test_worker() {
             );
             resources.queued_write_bytes = resources.queued_write_bytes.max(4 * 1024 * 1024);
             resources.decoded_value_bytes = 16 * 1024 * 1024;
+        }
+        // A composition fixture can run several independent native state
+        // owners. Keep the ordinary two-owner defaults unless the test asks
+        // for a larger shared worker admission limit explicitly.
+        let positive_limit = |name: &str| -> Option<usize> {
+            std::env::var(name).ok().map(|value| {
+                let count: usize = value.parse().unwrap_or_else(|_| panic!("invalid {name}"));
+                assert!(count > 0, "{name} must be positive");
+                count
+            })
+        };
+        let databases = positive_limit("STREAMR_TEST_MAX_OPEN_DATABASES");
+        let snapshots = positive_limit("STREAMR_TEST_MAX_SNAPSHOTS");
+        let scan_page_bytes = positive_limit("STREAMR_TEST_SCAN_PAGE_BYTES");
+        let queued_write_bytes = positive_limit("STREAMR_TEST_QUEUED_WRITE_BYTES");
+        if databases.is_some()
+            || snapshots.is_some()
+            || scan_page_bytes.is_some()
+            || queued_write_bytes.is_some()
+        {
+            let resources = c
+                .worker
+                .live_state_resources
+                .as_mut()
+                .expect("test live-state limit requires configured live-state resources");
+            if let Some(databases) = databases {
+                resources.max_open_databases = databases;
+            }
+            if let Some(snapshots) = snapshots {
+                resources.max_snapshots = snapshots;
+            }
+            if let Some(scan_page_bytes) = scan_page_bytes {
+                resources.scan_page_bytes = scan_page_bytes;
+            }
+            if let Some(queued_write_bytes) = queued_write_bytes {
+                resources.queued_write_bytes = queued_write_bytes;
+            }
         }
     });
 }

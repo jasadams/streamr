@@ -6,9 +6,10 @@ use crate::{SqlConfig, parse_and_get_program};
 use arroyo_datastream::logical::OperatorName;
 use arroyo_rpc::grpc::api::{
     SessionWindowAggregateOperator, SlidingWindowAggregateOperator,
-    TumblingWindowAggregateOperator, UpdatingAggregateOperator,
+    TumblingWindowAggregateOperator, UpdatingAggregateOperator, ValuePlanOperator,
 };
 use datafusion_proto::protobuf::PhysicalPlanNode;
+use petgraph::Direction;
 use prost::Message;
 use test_log::test;
 
@@ -50,6 +51,55 @@ async fn rejects_with(sql: &str, diagnostic: &str) {
         error.to_string().contains(diagnostic),
         "expected {diagnostic:?}, received {error}"
     );
+}
+
+#[test(tokio::test)]
+async fn union_materialization_widens_nullability_from_either_branch() {
+    for nullable_first in [false, true] {
+        let present = "SELECT CAST(7 AS BIGINT) AS stable, CAST(1 AS BIGINT) AS variant \
+                       FROM nexmark WHERE bid IS NOT NULL";
+        let absent = "SELECT CAST(7 AS BIGINT) AS stable, CAST(NULL AS BIGINT) AS variant \
+                      FROM nexmark WHERE bid IS NOT NULL";
+        let sql = if nullable_first {
+            format!("{absent} UNION ALL {present}")
+        } else {
+            format!("{present} UNION ALL {absent}")
+        };
+        let compiled =
+            parse_and_get_program(&sql, get_test_schema_provider(), SqlConfig::default())
+                .await
+                .unwrap_or_else(|error| panic!("UNION failed to plan: {error}\n{sql}"));
+        let graph = &compiled.program.graph;
+        let mut branches = 0;
+        for node_index in graph.node_indices() {
+            let node = &graph[node_index];
+            for (operator, internal_schema) in node.operator_chain.iter() {
+                if operator.operator_name != OperatorName::ArrowValue {
+                    continue;
+                }
+                let config =
+                    ValuePlanOperator::decode(operator.operator_config.as_slice()).unwrap();
+                if config.name != "value_calculation(union_input)" {
+                    continue;
+                }
+                branches += 1;
+                let output = internal_schema
+                    .map(|schema| schema.as_ref())
+                    .or_else(|| {
+                        graph
+                            .edges_directed(node_index, Direction::Outgoing)
+                            .next()
+                            .map(|edge| edge.weight().schema.as_ref())
+                    })
+                    .expect("materialized UNION branch must have an output schema");
+                let schema = output.schema.as_ref();
+                assert!(!schema.field_with_name("stable").unwrap().is_nullable());
+                assert!(schema.field_with_name("variant").unwrap().is_nullable());
+                assert!(schema.field_with_name("_timestamp").is_ok());
+            }
+        }
+        assert_eq!(branches, 2, "each UNION input must use the widened schema");
+    }
 }
 
 #[test(tokio::test)]
@@ -96,6 +146,100 @@ async fn native_hop_aggregate_plan() {
     assert_eq!(config.width_micros, 300_000_000);
     assert_physical_plan(&config.partial_aggregation_plan);
     assert_physical_plan(&config.final_aggregation_plan);
+}
+
+#[test(tokio::test)]
+async fn finalized_hop_projection_can_feed_an_ordinary_aggregate() {
+    let sql = "WITH closed AS (
+        SELECT bid.auction AS k, HOP(INTERVAL '2 seconds', INTERVAL '4 seconds') AS window,
+               COUNT(*) AS n FROM nexmark WHERE bid IS NOT NULL GROUP BY bid.auction, window
+      )
+      SELECT k, COUNT(*) AS closed_windows, SUM(n) AS pane_memberships,
+             MAX(n) AS peak, MAX(window_end) AS latest_end
+      FROM (SELECT k, window.end AS window_end, n FROM closed) AS finished GROUP BY k";
+    let compiled = parse_and_get_program(sql, get_test_schema_provider(), SqlConfig::default())
+        .await
+        .unwrap_or_else(|error| panic!("finalized HOP aggregate failed to plan: {error}\n{sql}"));
+    let operators = compiled
+        .program
+        .graph
+        .node_weights()
+        .flat_map(|node| node.operator_chain.iter())
+        .map(|(operator, _)| operator.operator_name)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        operators
+            .iter()
+            .filter(|name| **name == OperatorName::SlidingWindowAggregate)
+            .count(),
+        1
+    );
+    assert_eq!(
+        operators
+            .iter()
+            .filter(|name| **name == OperatorName::UpdatingAggregate)
+            .count(),
+        1
+    );
+}
+
+#[test(tokio::test)]
+async fn carrying_the_window_struct_keeps_window_scope() {
+    let sql = "WITH closed AS (
+        SELECT bid.auction AS k, HOP(INTERVAL '2 seconds', INTERVAL '4 seconds') AS window,
+               COUNT(*) AS n FROM nexmark WHERE bid IS NOT NULL GROUP BY bid.auction, window
+      )
+      SELECT k, COUNT(carried_window.end) AS closed_windows
+      FROM (SELECT k, window AS carried_window, n FROM closed) AS carried GROUP BY k";
+    rejects_with(sql, "must have window in aggregate").await;
+}
+
+#[test(tokio::test)]
+async fn carrying_an_aliased_window_still_allows_nested_window_aggregation() {
+    let sql = "WITH closed AS (
+        SELECT bid.auction AS k, HOP(INTERVAL '2 seconds', INTERVAL '4 seconds') AS window,
+               COUNT(*) AS n FROM nexmark WHERE bid IS NOT NULL GROUP BY bid.auction, window
+      )
+      SELECT k, carried_window, SUM(n) AS total
+      FROM (SELECT k, window AS carried_window, n FROM closed) AS carried
+      GROUP BY k, carried_window";
+    let compiled = parse_and_get_program(sql, get_test_schema_provider(), SqlConfig::default())
+        .await
+        .unwrap_or_else(|error| panic!("aliased nested window failed to plan: {error}\n{sql}"));
+    let operators = compiled
+        .program
+        .graph
+        .node_weights()
+        .flat_map(|node| node.operator_chain.iter())
+        .map(|(operator, _)| operator)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        operators
+            .iter()
+            .filter(|operator| operator.operator_name == OperatorName::SlidingWindowAggregate)
+            .count(),
+        1,
+    );
+    let nested = operators
+        .iter()
+        .filter(|operator| operator.operator_name == OperatorName::TumblingWindowAggregate)
+        .collect::<Vec<_>>();
+    assert_eq!(nested.len(), 1);
+    let config =
+        TumblingWindowAggregateOperator::decode(nested[0].operator_config.as_slice()).unwrap();
+    assert_eq!(config.name, "InstantWindow");
+    assert_eq!(config.width_micros, 0);
+    let input: arrow_schema::Schema =
+        serde_json::from_str(&config.input_schema.unwrap().arrow_schema).unwrap();
+    assert!(matches!(
+        input.field_with_name("carried_window").unwrap().data_type(),
+        arrow_schema::DataType::Struct(_)
+    ));
+    assert!(
+        operators
+            .iter()
+            .all(|operator| operator.operator_name != OperatorName::UpdatingAggregate)
+    );
 }
 
 #[test(tokio::test)]

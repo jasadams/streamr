@@ -1047,7 +1047,7 @@ pub async fn parse_and_get_arrow_program(
         plan_to_graph_visitor.add_plan(mutation)?;
     }
     let graph = plan_to_graph_visitor.into_graph();
-    let admission = state_table_fusion::PureScalarAdmission {
+    let admission = state_table_fusion::BoundedScalarAdmission {
         registry: &schema_provider,
     };
     let regions = state_table_fusion::analyze(&graph, &admission)?;

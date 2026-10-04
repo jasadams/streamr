@@ -8,14 +8,14 @@ use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
 use arroyo_rpc::config::WindowStateConfig;
 use arroyo_state::live::{
-    LiveStateBackend, ReadOptions, ScanRange, ScanRequest, StateSnapshot, encoding,
+    LiveStateBackend, ReadOptions, ScanEntry, ScanRange, ScanRequest, StateSnapshot, encoding,
     resources::{ResourcePermit, WorkerStateResources},
     table::LiveTable,
     write::AdmittedWriteBatch,
 };
 use std::{
     io::{Cursor, Write},
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 
 const ROW: u8 = b'R';
@@ -43,6 +43,22 @@ pub(crate) struct SessionStore {
     schema: SchemaRef,
     limits: WindowStateConfig,
     gap: i64,
+    /// One admitted group only. A proof is never serialized and starts cold
+    /// after restore; all mutations pass through this serial owner.
+    last_group: Mutex<Option<CachedGroup>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GroupProof {
+    Empty,
+    Sole(SessionMeta),
+    Unknown,
+}
+
+struct CachedGroup {
+    group: Vec<u8>,
+    proof: GroupProof,
+    _permit: ResourcePermit,
 }
 
 struct CappedWriter {
@@ -167,6 +183,7 @@ impl SessionStore {
             schema,
             limits,
             gap,
+            last_group: Mutex::new(None),
         })
     }
 
@@ -211,9 +228,151 @@ impl SessionStore {
         Ok(())
     }
 
+    fn cached_proof(&self, group: &[u8]) -> Result<Option<GroupProof>> {
+        let cache = self
+            .last_group
+            .lock()
+            .map_err(|_| anyhow::anyhow!("native SESSION group cache lock poisoned"))?;
+        Ok(cache
+            .as_ref()
+            .filter(|entry| entry.group == group)
+            .map(|entry| entry.proof))
+    }
+
+    fn remember_group(&self, group: &[u8], proof: GroupProof) -> Result<()> {
+        let mut cache = self
+            .last_group
+            .lock()
+            .map_err(|_| anyhow::anyhow!("native SESSION group cache lock poisoned"))?;
+        if let Some(entry) = cache.as_mut()
+            && entry.group == group
+        {
+            entry.proof = proof;
+            return Ok(());
+        }
+        // The cache is an optimization. Release the previous group's permit
+        // before trying another; a tight pool falls back to a backend read.
+        *cache = None;
+        if group.len() > self.limits.key_bytes {
+            return Ok(());
+        }
+        let Some(charge) = group
+            .len()
+            .checked_mul(2)
+            .and_then(|bytes| bytes.checked_add(std::mem::size_of::<CachedGroup>() + 128))
+        else {
+            return Ok(());
+        };
+        // The final reader can concurrently hold a two-slot queue (6 rows)
+        // and decode one more row (3 rows). A cache may use only headroom above
+        // the constructor's mandatory nine-row decoded reservation.
+        if self
+            .limits
+            .partial_bytes
+            .checked_mul(9)
+            .and_then(|required| required.checked_add(charge))
+            .is_none_or(|required| required > self.resources.config().decoded_value_bytes)
+        {
+            return Ok(());
+        }
+        if let Ok(permit) = self.resources.try_decoded_value(charge) {
+            *cache = Some(CachedGroup {
+                group: group.to_vec(),
+                proof,
+                _permit: permit,
+            });
+        }
+        Ok(())
+    }
+
+    /// No cache proof survives a write whose completion is still ambiguous.
+    /// On success the caller may publish a proof derived from this prior state.
+    fn invalidate_group(&self, group: &[u8]) -> Result<Option<GroupProof>> {
+        let mut cache = self
+            .last_group
+            .lock()
+            .map_err(|_| anyhow::anyhow!("native SESSION group cache lock poisoned"))?;
+        Ok(cache
+            .as_mut()
+            .filter(|entry| entry.group == group)
+            .map(|entry| {
+                let prior = entry.proof;
+                entry.proof = GroupProof::Unknown;
+                prior
+            }))
+    }
+
+    fn decode_session(entry: &ScanEntry, prefix: &[u8]) -> Result<SessionMeta> {
+        ensure!(
+            entry.key.key.len() == prefix.len() + 8
+                && entry.value.len() == 9
+                && entry.value[0] == VERSION,
+            "native SESSION metadata is malformed"
+        );
+        let start = decode_time(&entry.key.key[prefix.len()..])?;
+        let end = i64::from_be_bytes(entry.value[1..9].try_into()?);
+        ensure!(
+            start <= end,
+            "native SESSION metadata has reversed interval"
+        );
+        Ok(SessionMeta { start, end })
+    }
+
     async fn next_session(&self, group: &[u8], after: Option<i64>) -> Result<Option<SessionMeta>> {
+        if let Some(proof) = self.cached_proof(group)? {
+            match proof {
+                GroupProof::Empty => return Ok(None),
+                GroupProof::Sole(session) => {
+                    return Ok((after.is_none_or(|after| session.start > after)).then_some(session));
+                }
+                GroupProof::Unknown => {}
+            }
+        }
         let snapshot = self.snapshot().await?;
         let prefix = prefix(SESSION, group)?;
+        // A full-prefix page proves empty or sole only if no continuation
+        // exists. A page-byte cutoff can return one entry plus a cursor.
+        let proof_page = snapshot
+            .try_scan(ScanRequest {
+                range: ScanRange {
+                    namespace: self.table.namespace().clone(),
+                    prefix: Some(prefix.clone()),
+                    start: None,
+                    end: None,
+                },
+                max_entries: self.limits.page_entries.min(2),
+                max_bytes: self.limits.page_bytes,
+                cursor: None,
+            })
+            .await?;
+        let proof = if proof_page.next_cursor.is_none() {
+            match proof_page.entries.as_slice() {
+                [] => GroupProof::Empty,
+                [entry] => GroupProof::Sole(Self::decode_session(entry, &prefix)?),
+                _ => GroupProof::Unknown,
+            }
+        } else {
+            GroupProof::Unknown
+        };
+        self.remember_group(group, proof)?;
+        match proof {
+            GroupProof::Empty => return Ok(None),
+            GroupProof::Sole(session) => {
+                return Ok((after.is_none_or(|after| session.start > after)).then_some(session));
+            }
+            GroupProof::Unknown => {}
+        }
+        self.next_session_from_snapshot(&snapshot, group, after, prefix)
+            .await
+    }
+
+    async fn next_session_from_snapshot(
+        &self,
+        snapshot: &StateSnapshot,
+        group: &[u8],
+        after: Option<i64>,
+        prefix: Vec<u8>,
+    ) -> Result<Option<SessionMeta>> {
         let start = after.map(|time| session_key(group, time)).transpose()?;
         let mut cursor = None;
         loop {
@@ -234,19 +393,7 @@ impl SessionStore {
                 if start.as_ref().is_some_and(|key| entry.key.key <= *key) {
                     continue;
                 }
-                ensure!(
-                    entry.key.key.len() == prefix.len() + 8
-                        && entry.value.len() == 9
-                        && entry.value[0] == VERSION,
-                    "native SESSION metadata is malformed"
-                );
-                let start = decode_time(&entry.key.key[prefix.len()..])?;
-                let end = i64::from_be_bytes(entry.value[1..9].try_into()?);
-                ensure!(
-                    start <= end,
-                    "native SESSION metadata has reversed interval"
-                );
-                return Ok(Some(SessionMeta { start, end }));
+                return Ok(Some(Self::decode_session(&entry, &prefix)?));
             }
             let Some(next) = page.next_cursor else {
                 return Ok(None);
@@ -264,8 +411,17 @@ impl SessionStore {
         let expiry = deadline_key(group, session.start, deadline)?;
         let mut value = vec![VERSION];
         value.extend_from_slice(&session.end.to_be_bytes());
+        let prior = self.invalidate_group(group)?;
         self.write_pair((&key, Some(&value)), (&expiry, Some(&[])))
-            .await
+            .await?;
+        if let Some(prior) = prior {
+            let proof = match prior {
+                GroupProof::Empty => GroupProof::Sole(session),
+                GroupProof::Sole(_) | GroupProof::Unknown => GroupProof::Unknown,
+            };
+            self.remember_group(group, proof)?;
+        }
+        Ok(())
     }
 
     async fn remove_session(&self, group: &[u8], session: SessionMeta) -> Result<()> {
@@ -275,7 +431,18 @@ impl SessionStore {
             .checked_add(self.gap)
             .context("native SESSION deadline overflow")?;
         let expiry = deadline_key(group, session.start, deadline)?;
-        self.write_pair((&key, None), (&expiry, None)).await
+        let prior = self.invalidate_group(group)?;
+        self.write_pair((&key, None), (&expiry, None)).await?;
+        if let Some(prior) = prior {
+            let proof = match prior {
+                GroupProof::Sole(sole) if sole == session => GroupProof::Empty,
+                GroupProof::Empty | GroupProof::Sole(_) | GroupProof::Unknown => {
+                    GroupProof::Unknown
+                }
+            };
+            self.remember_group(group, proof)?;
+        }
+        Ok(())
     }
 
     /// Each source row is processed by the sole operator owner. A bounded
@@ -496,14 +663,18 @@ impl SessionStore {
         }
     }
 
-    /// Delete one indexed row per admitted batch, retaining no result history.
-    /// The metadata and counter are dropped only after all rows are gone.
-    pub async fn retire(&self, group: &[u8], session: SessionMeta) -> Result<()> {
-        loop {
-            let snapshot = self.snapshot().await?;
-            let Some(row) = self.next_row(&snapshot, group, session, None).await? else {
-                break;
-            };
+    async fn retire_single_rows(
+        &self,
+        snapshot: &StateSnapshot,
+        group: &[u8],
+        session: SessionMeta,
+    ) -> Result<()> {
+        let mut after = None;
+        while let Some(row) = self
+            .next_row(snapshot, group, session, after.as_deref())
+            .await?
+        {
+            after = Some(row.key.clone());
             let key = self.table.key(row.key, None);
             let mut writes = AdmittedWriteBatch::try_reserve(
                 self.resources.clone(),
@@ -513,6 +684,107 @@ impl SessionStore {
             writes.delete(&key)?;
             self.backend.write_admitted(writes).await?;
             tokio::task::yield_now().await;
+        }
+        Ok(())
+    }
+
+    async fn retire_pages(
+        &self,
+        snapshot: &StateSnapshot,
+        group: &[u8],
+        session: SessionMeta,
+        max_entries: usize,
+    ) -> Result<()> {
+        let prefix = prefix(ROW, group)?;
+        let mut start = prefix.clone();
+        start.extend_from_slice(&ordered_time(session.start));
+        let range = ScanRange {
+            namespace: self.table.namespace().clone(),
+            prefix: Some(prefix.clone()),
+            start: Some(start),
+            end: None,
+        };
+        let mut cursor = None;
+        loop {
+            let page = snapshot
+                .try_scan(ScanRequest {
+                    range: range.clone(),
+                    max_entries,
+                    max_bytes: self.limits.page_bytes,
+                    cursor,
+                })
+                .await?;
+            if page.entries.is_empty() {
+                ensure!(
+                    page.next_cursor.is_none(),
+                    "native SESSION retirement cursor made no progress"
+                );
+                break;
+            }
+            let next_cursor = page.next_cursor;
+            let mut writes = AdmittedWriteBatch::try_reserve(
+                self.resources.clone(),
+                self.limits.write_bytes,
+                self.limits.write_operations,
+            )?;
+            let mut count = 0;
+            let mut past_end = false;
+            for entry in page.entries {
+                ensure!(
+                    entry.key.key.len() == prefix.len() + 16
+                        && entry.value.len() <= self.limits.partial_bytes,
+                    "native SESSION retained row key/value is malformed"
+                );
+                let time = decode_time(&entry.key.key[prefix.len()..prefix.len() + 8])?;
+                if time > session.end {
+                    past_end = true;
+                    break;
+                }
+                writes.delete(&entry.key)?;
+                count += 1;
+            }
+            if count != 0 {
+                self.backend.write_admitted(writes).await?;
+                tokio::task::yield_now().await;
+            }
+            if past_end {
+                break;
+            }
+            let Some(next) = next_cursor else {
+                break;
+            };
+            cursor = Some(next);
+        }
+        Ok(())
+    }
+
+    /// One stable snapshot drives bounded row-key pages while admitted batches
+    /// delete from live state. A retry starts with a fresh snapshot and sees
+    /// only rows still present; no raw result history is retained here.
+    pub async fn retire(&self, group: &[u8], session: SessionMeta) -> Result<()> {
+        let snapshot = self.snapshot().await?;
+        let max_key = self.table.key(vec![0; self.limits.key_bytes], None);
+        let max_delete_bytes = encoding::encoded_key_size(&max_key)?;
+        let max_entries = self
+            .limits
+            .page_entries
+            .min(self.limits.write_operations)
+            .min(self.limits.write_bytes / max_delete_bytes);
+        let page_charge = self.limits.page_bytes.checked_mul(3).and_then(|bytes| {
+            max_entries
+                .checked_mul(std::mem::size_of::<ScanEntry>() * 2)
+                .and_then(|containers| bytes.checked_add(containers))
+        });
+        if let Some(_page_permit) = page_charge
+            .filter(|_| max_entries > 0)
+            .and_then(|bytes| self.resources.try_decoded_value(bytes).ok())
+        {
+            self.retire_pages(&snapshot, group, session, max_entries)
+                .await?;
+        } else {
+            // A conservative page reservation must not make a configuration
+            // that admitted one row lose its existing retirement path.
+            self.retire_single_rows(&snapshot, group, session).await?;
         }
         self.remove_session(group, session).await?;
         if self.next_session(group, None).await?.is_none() {
@@ -538,12 +810,12 @@ mod tests {
         Ownership, memory::MemoryLiveState, resources::ResourceConfig, table::LiveTableManager,
     };
 
-    fn store() -> SessionStore {
+    fn store_with_decoded(decoded_value_bytes: usize) -> SessionStore {
         let resources = WorkerStateResources::new(ResourceConfig {
             block_cache_bytes: 1024 * 1024,
             memtable_bytes: 1024 * 1024,
             queued_write_bytes: 1024 * 1024,
-            decoded_value_bytes: 1024 * 1024,
+            decoded_value_bytes,
             scan_page_bytes: 1024 * 1024,
             max_blocking_operations: 2,
             max_snapshots: 8,
@@ -584,6 +856,10 @@ mod tests {
             10,
         )
         .unwrap()
+    }
+
+    fn store() -> SessionStore {
+        store_with_decoded(1024 * 1024)
     }
 
     fn row(schema: SchemaRef, value: i64) -> RecordBatch {
@@ -647,6 +923,224 @@ mod tests {
         assert_eq!(
             store.first_due(Some(51)).await.unwrap().unwrap().1,
             SessionMeta { start: 40, end: 40 }
+        );
+    }
+
+    #[tokio::test]
+    async fn one_group_proof_handles_empty_sole_unknown_and_after_bounds() {
+        let store = store();
+        assert_eq!(store.next_session(b"a", None).await.unwrap(), None);
+        assert_eq!(store.cached_proof(b"a").unwrap(), Some(GroupProof::Empty));
+        store
+            .insert(b"a", 0, &row(store.schema.clone(), 0))
+            .await
+            .unwrap();
+        assert_eq!(
+            store.cached_proof(b"a").unwrap(),
+            Some(GroupProof::Sole(SessionMeta { start: 0, end: 0 }))
+        );
+        assert_eq!(
+            store
+                .next_session(b"a", Some(-1))
+                .await
+                .unwrap()
+                .unwrap()
+                .start,
+            0
+        );
+        assert_eq!(store.next_session(b"a", Some(0)).await.unwrap(), None);
+        store
+            .insert(b"a", 30, &row(store.schema.clone(), 30))
+            .await
+            .unwrap();
+        assert_eq!(store.cached_proof(b"a").unwrap(), Some(GroupProof::Unknown));
+        assert_eq!(
+            store
+                .next_session(b"a", Some(0))
+                .await
+                .unwrap()
+                .unwrap()
+                .start,
+            30
+        );
+        // An out-of-order bridge collapses the unproven catalogue back to one
+        // session; the next full-prefix proof can then be cached.
+        for time in [10, 20] {
+            store
+                .insert(b"a", time, &row(store.schema.clone(), time))
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            store.next_session(b"a", None).await.unwrap(),
+            Some(SessionMeta { start: 0, end: 30 })
+        );
+        assert_eq!(
+            store.cached_proof(b"a").unwrap(),
+            Some(GroupProof::Sole(SessionMeta { start: 0, end: 30 }))
+        );
+        store
+            .insert(b"b", 5, &row(store.schema.clone(), 5))
+            .await
+            .unwrap();
+        assert_eq!(store.cached_proof(b"a").unwrap(), None);
+        assert_eq!(
+            store.next_session(b"a", None).await.unwrap().unwrap().end,
+            30
+        );
+    }
+
+    #[tokio::test]
+    async fn cache_skips_when_nine_row_reader_budget_has_no_headroom() {
+        let store = store_with_decoded(9 * 1024);
+        assert_eq!(store.next_session(b"a", None).await.unwrap(), None);
+        assert_eq!(store.cached_proof(b"a").unwrap(), None);
+        store
+            .insert(b"a", 0, &row(store.schema.clone(), 0))
+            .await
+            .unwrap();
+        assert_eq!(store.cached_proof(b"a").unwrap(), None);
+        assert_eq!(
+            store.next_session(b"a", None).await.unwrap(),
+            Some(SessionMeta { start: 0, end: 0 })
+        );
+    }
+
+    #[tokio::test]
+    async fn one_entry_scan_limit_still_proves_sole_only_without_cursor() {
+        let mut store = store();
+        store.limits.page_entries = 1;
+        assert_eq!(store.next_session(b"a", None).await.unwrap(), None);
+        store
+            .insert(b"a", 0, &row(store.schema.clone(), 0))
+            .await
+            .unwrap();
+        assert_eq!(
+            store.cached_proof(b"a").unwrap(),
+            Some(GroupProof::Sole(SessionMeta { start: 0, end: 0 }))
+        );
+        store
+            .insert(b"a", 30, &row(store.schema.clone(), 30))
+            .await
+            .unwrap();
+        assert_eq!(store.cached_proof(b"a").unwrap(), Some(GroupProof::Unknown));
+        assert_eq!(
+            store.next_session(b"a", Some(0)).await.unwrap(),
+            Some(SessionMeta { start: 30, end: 30 })
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_session_write_invalidates_proof_and_new_store_starts_cold() {
+        let mut store = store();
+        store
+            .insert(b"a", 0, &row(store.schema.clone(), 0))
+            .await
+            .unwrap();
+        let current = SessionMeta { start: 0, end: 0 };
+        assert_eq!(
+            store.cached_proof(b"a").unwrap(),
+            Some(GroupProof::Sole(current))
+        );
+        let old_limit = store.limits.write_bytes;
+        store.limits.write_bytes = 1;
+        assert!(store.remove_session(b"a", current).await.is_err());
+        assert_eq!(store.cached_proof(b"a").unwrap(), Some(GroupProof::Unknown));
+        store.limits.write_bytes = old_limit;
+        assert_eq!(store.next_session(b"a", None).await.unwrap(), Some(current));
+        let recovered = SessionStore::new(
+            store.backend.clone(),
+            store.table.clone(),
+            store.resources.clone(),
+            store.schema.clone(),
+            store.limits,
+            store.gap,
+        )
+        .unwrap();
+        assert_eq!(recovered.cached_proof(b"a").unwrap(), None);
+        assert_eq!(
+            recovered.next_session(b"a", None).await.unwrap(),
+            Some(current)
+        );
+    }
+
+    #[tokio::test]
+    async fn paged_retirement_retries_remaining_repeated_timestamp_rows() {
+        let mut store = store();
+        for value in 0..11 {
+            store
+                .insert(b"a", 7, &row(store.schema.clone(), value))
+                .await
+                .unwrap();
+        }
+        store.limits.page_entries = 2;
+        let session = SessionMeta { start: 7, end: 7 };
+        let snapshot = store.snapshot().await.unwrap();
+        let first = store
+            .next_row(&snapshot, b"a", session, None)
+            .await
+            .unwrap()
+            .unwrap();
+        let first_key = first.key.clone();
+        drop(first);
+        let mut interrupted = AdmittedWriteBatch::try_reserve(
+            store.resources.clone(),
+            store.limits.write_bytes,
+            store.limits.write_operations,
+        )
+        .unwrap();
+        interrupted
+            .delete(&store.table.key(first_key, None))
+            .unwrap();
+        store.backend.write_admitted(interrupted).await.unwrap();
+        drop(snapshot);
+        // A failed attempt can leave a committed prefix of row deletes. The
+        // next attempt scans live state and finishes the remaining pages.
+        store.retire(b"a", session).await.unwrap();
+        let remaining = store.snapshot().await.unwrap();
+        assert!(
+            store
+                .next_row(&remaining, b"a", session, None)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(store.first_due(None).await.unwrap(), None);
+        store
+            .insert(b"a", 8, &row(store.schema.clone(), 99))
+            .await
+            .unwrap();
+        assert_eq!(
+            store.next_session(b"a", None).await.unwrap().unwrap().start,
+            8
+        );
+    }
+
+    #[tokio::test]
+    async fn paged_retirement_stops_before_next_session_in_same_group() {
+        let mut store = store();
+        for time in [0, 0, 0, 30] {
+            store
+                .insert(b"a", time, &row(store.schema.clone(), time))
+                .await
+                .unwrap();
+        }
+        store.limits.page_entries = 2;
+        store
+            .retire(b"a", SessionMeta { start: 0, end: 0 })
+            .await
+            .unwrap();
+        assert_eq!(
+            store.next_session(b"a", None).await.unwrap(),
+            Some(SessionMeta { start: 30, end: 30 })
+        );
+        let snapshot = store.snapshot().await.unwrap();
+        assert!(
+            store
+                .next_row(&snapshot, b"a", SessionMeta { start: 30, end: 30 }, None,)
+                .await
+                .unwrap()
+                .is_some()
         );
     }
 }

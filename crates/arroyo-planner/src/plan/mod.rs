@@ -2,7 +2,7 @@ use arroyo_datastream::WindowType;
 use arroyo_rpc::{TIMESTAMP_FIELD, UPDATING_META_FIELD};
 use datafusion::common::tree_node::{Transformed, TreeNodeRecursion};
 use datafusion::common::{
-    Column, DataFusionError, Result, Spans, TableReference, plan_err,
+    Column, DFSchema, DataFusionError, Result, Spans, TableReference, plan_err,
     tree_node::{TreeNode, TreeNodeRewriter, TreeNodeVisitor},
 };
 use std::{collections::HashSet, sync::Arc};
@@ -120,6 +120,13 @@ impl TreeNodeVisitor<'_> for WindowDetectingVisitor {
                             .transpose()
                     })
                     .collect::<Result<Vec<_>>>()?;
+                // A finalized window result is an ordinary append relation once
+                // this projection stops carrying its complete window field.
+                // A scalar such as `window.end` is data, not window scope for
+                // an aggregate further downstream.
+                if window_expressions.is_empty() {
+                    self.window = None;
+                }
                 self.fields.clear();
                 for (index, window) in window_expressions {
                     // if there's already a window they should match
@@ -454,7 +461,40 @@ impl TreeNodeRewriter for ArroyoRewriter<'_> {
                 );
             }
             LogicalPlan::Union(mut union) => {
-                union.schema = union.inputs[0].schema().clone();
+                // Input rewrites can add the event timestamp and changelog
+                // metadata after DataFusion first derived the UNION schema.
+                // Keep the first rewritten input's names, qualifiers, types,
+                // and metadata, but a column is nullable if *any* branch can
+                // produce NULL. The materializing branch extensions and the
+                // union edge must agree on that widened Arrow contract.
+                let first = union
+                    .inputs
+                    .first()
+                    .ok_or_else(|| DataFusionError::Plan("UNION has no inputs".to_string()))?;
+                let first_schema = first.schema();
+                let width = first_schema.fields().len();
+                for input in union.inputs.iter().skip(1) {
+                    if input.schema().fields().len() != width {
+                        return plan_err!("rewritten UNION inputs have different column counts");
+                    }
+                }
+                let fields = (0..width)
+                    .map(|index| {
+                        let (qualifier, field) = first_schema.qualified_field(index);
+                        let nullable = union
+                            .inputs
+                            .iter()
+                            .any(|input| input.schema().field(index).is_nullable());
+                        (
+                            qualifier.cloned(),
+                            Arc::new(field.clone().with_nullable(nullable)),
+                        )
+                    })
+                    .collect();
+                union.schema = Arc::new(DFSchema::new_with_metadata(
+                    fields,
+                    first_schema.metadata().clone(),
+                )?);
 
                 // Need all the elements of the union to be materialized
                 for input in union.inputs.iter_mut() {

@@ -59,10 +59,13 @@ external SQL is not physical-plan/native-runtime evidence.
 The [STR-28 native capability audit](milestone-3-native-capabilities.md) maps all
 external profile/session fields and lifecycle rules, records source-level
 composition restrictions, retained ownership and the STR-43 removal inventory.
-It is source evidence, not a frozen runnable graph or passing native values.
-Ordered FIRST_VALUE/LAST_VALUE remain a reported defect until value tests pass.
-Memory planning/execution and RocksDB admission are separate gates; SESSION
-semantics are not assumed equivalent to an external timer-driven function.
+Its source review is based on an earlier implementation snapshot; current tested
+routes and limitations are in the [validation record](milestone-3-validation.md).
+Generic ordered FIRST_VALUE/LAST_VALUE value and recovery cases now pass on the
+configured memory/RocksDB paths. That does not establish application arrival
+ordering or full profile/session parity. Memory and RocksDB evidence remains
+path-specific, and native SESSION semantics are not assumed equivalent to an
+external timer-driven function.
 
 ## Retained-state inventory
 
@@ -76,8 +79,8 @@ semantics are not assumed equivalent to an external timer-driven function.
 | `crates/arroyo-state/src/tables/table_manager.rs`, `live/checkpoint.rs` | Registered disk namespaces, shared barrier snapshots and exclusive logical page files | Restores selected remote state into a fresh attempt and exports full registered namespaces with checksums/schema/ownership. Sharing a database does not make unregistered namespaces durable. |
 | `crates/arroyo-worker/src/arrow/execution.rs`, `arrow/sync/streams.rs`, `StatelessPhysicalExecutor` | Shared DataFusion runtime, input/output reservations and bounded batch delivery | Opt-in cooperative execution accounting and per-batch checks. Spilling is disabled. Arbitrary UDF allocations, queues and legacy retained structures are not universally covered. |
 | `crates/arroyo-operator/src/operator.rs` / `ArrowOperator` | Serialized batch, watermark, tick and checkpoint callbacks | Generic execution hooks exist. Their presence does not provide durable timer registration, dispatch or application callback transactions. |
-| `arrow/session_aggregating_window.rs`, `session_native.rs`, `session_store.rs` | Legacy per-key maps; selected native path uses paged raw rows, session/deadline metadata and bounded final-input delivery | Native memory/RocksDB value and fresh-worker recovery captures pass for scalar aggregates and exact-gap/bridge handling. Collection, late/idleness, backpressure and capacity qualification remains open. |
-| `arrow/tumbling_aggregating_window.rs`, `sliding_aggregating_window.rs`, `window_native.rs`, `window_store.rs` | Legacy per-bin maps; selected native path uses paged panes/partials and closure/expiry indexes | Scalar and ordered memory/RocksDB SQL and recovery captures pass. Collection admission, quiet-key/idleness, backpressure and capacity qualification remains open. |
+| `arrow/session_aggregating_window.rs`, `session_native.rs`, `session_store.rs` | Legacy per-key maps; selected native path uses paged raw rows, session/deadline metadata and bounded final-input delivery | Native memory/RocksDB value and fresh-worker recovery captures pass for scalar aggregates and exact-gap/bridge handling; direct late-drop probes also pass at batch target 1. A 65,000-row hot SESSION passes both checkpoint protocols with a retained-payload floor above 10× the declared 50 MiB pool sum, including a 64,999-row checkpoint. High-cardinality sessions, broader late/idleness behavior, collections, backpressure and fault qualification remain open. |
+| `arrow/tumbling_aggregating_window.rs`, `sliding_aggregating_window.rs`, `window_native.rs`, `window_store.rs` | Legacy per-bin maps; selected native path uses paged panes/partials and closure/expiry indexes | Scalar and ordered memory/RocksDB SQL and recovery captures pass. An earlier snapshot-reuse candidate passed 65,000-key TUMBLE initial and recovered full-payload/RSS checks in both checkpoint protocols; fresh combined-source capacity qualification remains pending. Its halfway checkpoint was below 10×. HOP capacity and quiet-key/idleness remain open. Selected collection cases for ARRAY_AGG, DISTINCT aggregates and single-column UNNEST pass, including oversized-value rejection; broader collection shapes, capacity and backpressure remain open. |
 | `arrow/incremental_aggregator.rs`, `aggregate_store.rs` | Selected native path persists accumulators, counted extrema, ordered members, dirty output and expiry state | Both configured backends pass small updating-input value/recovery captures; indefinite retention is explicit. Hot-key/high-cardinality, backpressure and fault qualification remains open. |
 | `arrow/instant_join.rs`, `join_with_expiration.rs` | Execution holders/streams and legacy retained-table access | Unsupported under the disk SQL setting until the exact working-state paths are migrated and tested. |
 | `crates/arroyo-worker/src/engine.rs` | Operator construction and worker admission | Rejects unsupported retained-state operators under RocksDB SQL and checks database-owner capacity. Keep these gates until each generic path has its own evidence. |

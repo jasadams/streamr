@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """RocksDB native TUMBLE/SESSION checkpoint capacity and exact-output fixture.
 
-Small --rows runs validate the fixture. The middle checkpoint retains only
-rows//2 payloads; full pre-EOF state holds all rows. A 10x result is eligible
-only for full pre-EOF state that reaches ten times the fixed, conservative
-50 MiB pool sum. RSS includes the whole SQL-test process. No rescaling is tested.
+Small --rows runs validate the fixture. By default the checkpoint retains
+rows//2 payloads; --checkpoint-rows selects another positive prefix smaller
+than the total row count. A high prefix can qualify a 10x checkpoint while
+leaving rows for replay. Full pre-EOF state holds all rows. Report checkpoint
+and full-state payload floors separately; each reaches 10x only when it
+contains ten times the fixed, conservative 50 MiB pool sum. RSS includes the
+whole SQL-test process. No rescaling is tested.
 """
 
 import argparse
@@ -153,7 +156,7 @@ def check_output(path, case, rows, payload_bytes):
 
 
 def run_case(binary, directory, case, backend, protocol, rows, payload_bytes,
-             rss_limit_mib, timeout_seconds):
+             checkpoint_rows, rss_limit_mib, timeout_seconds):
     output_path = directory / "output.jsonl"
     env = dict(os.environ)
     for flag in ("STREAMR_TEST_TYPED_SQL", "STREAMR_TEST_NATIVE_AGGREGATES"):
@@ -167,7 +170,7 @@ def run_case(binary, directory, case, backend, protocol, rows, payload_bytes,
         STREAMR_TEST_RUNTIME_TIMEOUT_SECONDS=str(timeout_seconds),
         STREAMR_CAPTURE_QUERY=str(directory / "query.sql"),
         STREAMR_CAPTURE_OUTPUT=str(output_path),
-        STREAMR_CAPTURE_INPUT_ROWS_BEFORE_CHECKPOINT=str(rows // 2),
+        STREAMR_CAPTURE_INPUT_ROWS_BEFORE_CHECKPOINT=str(checkpoint_rows),
         STREAMR_CAPTURE_EXPECTED_INITIAL_ROWS=str(rows if case == "tumble" else 1),
         STREAMR_CAPTURE_EXPECTED_CHECKPOINT_ROWS="0",
         STREAMR_CAPTURE_EXPECTED_ROWS=str(rows if case == "tumble" else 1),
@@ -185,10 +188,11 @@ def run_case(binary, directory, case, backend, protocol, rows, payload_bytes,
     recovered = check_output(output_path, case, rows, payload_bytes)
     if peak_rss > rss_limit_mib * 1024 * 1024:
         raise RuntimeError(f"{case}/{backend}/{protocol} peak RSS {peak_rss} exceeds {rss_limit_mib} MiB")
-    checkpoint_bytes = (rows // 2) * payload_bytes
+    checkpoint_bytes = checkpoint_rows * payload_bytes
     full_open_bytes = rows * payload_bytes
     threshold = 10 * POOL_BUDGET_MIB * 1024 * 1024
     result = dict(case=case, backend=backend, protocol=protocol,
+                  checkpoint_rows=checkpoint_rows,
                   checkpoint_retained_payload_floor_bytes=checkpoint_bytes,
                   full_open_state_payload_floor_bytes=full_open_bytes,
                   declared_pool_budget_mib=POOL_BUDGET_MIB,
@@ -212,6 +216,8 @@ def main():
                         default=Path("/app/target/native-window-capacity"))
     parser.add_argument("--rows", type=int, default=65000)
     parser.add_argument("--payload-bytes", type=int, default=8192)
+    parser.add_argument("--checkpoint-rows", type=int,
+                        help="Rows retained at the open checkpoint (default: rows // 2)")
     parser.add_argument("--rss-limit-mib", type=int, default=512)
     parser.add_argument("--timeout-seconds", type=int, default=900)
     parser.add_argument("--case", choices=CASES, action="append")
@@ -224,6 +230,11 @@ def main():
         parser.error("all counts, sizes and timeouts must be positive")
     if args.rows < 2:
         parser.error("at least two rows are needed for an open checkpoint")
+    checkpoint_rows = (
+        args.rows // 2 if args.checkpoint_rows is None else args.checkpoint_rows
+    )
+    if not 0 < checkpoint_rows < args.rows:
+        parser.error("checkpoint rows must be positive and less than total rows")
     if not args.prepare_only and not args.binary:
         parser.error("binary is required unless --prepare-only is set")
     root = args.directory.resolve()
@@ -231,11 +242,13 @@ def main():
     protocols = tuple(dict.fromkeys(args.protocol or PROTOCOLS))
     backends = tuple(dict.fromkeys(args.backend or ("rocksdb",)))
     prepare(root, cases, protocols, backends, args.rows, args.payload_bytes)
-    checkpoint_bytes = (args.rows // 2) * args.payload_bytes
+    checkpoint_bytes = checkpoint_rows * args.payload_bytes
     full_open_bytes = args.rows * args.payload_bytes
-    print(f"PREPARED {root}: checkpoint retained floor={checkpoint_bytes} bytes; "
+    print(f"PREPARED {root}: checkpoint rows={checkpoint_rows}, "
+          f"retained payload floor={checkpoint_bytes} bytes; "
           f"full pre-EOF retained floor={full_open_bytes} bytes; "
           f"conservative pool sum={POOL_BUDGET_MIB} MiB; "
+          f"checkpoint-10x={checkpoint_bytes >= 10 * POOL_BUDGET_MIB * 1024 * 1024}; "
           f"full-open-10x={full_open_bytes >= 10 * POOL_BUDGET_MIB * 1024 * 1024}",
           flush=True)
     if args.prepare_only:
@@ -247,6 +260,7 @@ def main():
             for protocol in protocols:
                 result = run_case(binary, root / f"{case}-{backend}-{protocol}",
                                   case, backend, protocol, args.rows, args.payload_bytes,
+                                  checkpoint_rows,
                                   args.rss_limit_mib, args.timeout_seconds)
                 results.append(result)
                 (root / "measurements.json").write_text(json.dumps(results, indent=2) + "\n")
