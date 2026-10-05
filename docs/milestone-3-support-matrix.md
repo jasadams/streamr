@@ -95,11 +95,12 @@ also passed. A subsequent 65,000-key RocksDB controller HOP run matched all
 130,000 item/window pairs and full payloads after a 64,999-row checkpoint
 and fresh-worker recovery: retained payload exceeded 10× the declared
 50 MiB pool sum, with 355,061,760-byte peak RSS below the 512 MiB cap.
-The subsequent HOP leader attempt on current source `8649bf44` emitted
+The subsequent HOP leader attempt on the earlier source `8649bf44` emitted
 130,000 initial rows, then failed during checkpoint with `disk checkpoint file
 metadata exceeds 3 MiB RPC limit`; those initial rows were counted but not
 full-payload compared, and no fresh-worker recovery occurred. Strong HOP leader
-qualification remains pending. Lifetime
+qualification remained pending on that revision; the bounded Parquet adapter
+qualification below closes that selected capacity gap. Lifetime
 `COUNT → ROW_NUMBER` page/feature probes and an already-ranked ordered
 `ARRAY_AGG` probe originally failed at planning/construction. The later
 bounded ARRAY_AGG repair now passes eight typed CDC recovery cases and eight
@@ -138,7 +139,7 @@ full profile/session, lifetime ranking and broader milestone gates remain open.
 | `crates/arroyo-worker/src/arrow/execution.rs`, `arrow/sync/streams.rs`, `StatelessPhysicalExecutor` | Shared DataFusion runtime, input/output reservations and bounded batch delivery | Opt-in cooperative execution accounting and per-batch checks. Spilling is disabled. Arbitrary UDF allocations, queues and legacy retained structures are not universally covered. |
 | `crates/arroyo-operator/src/operator.rs` / `ArrowOperator` | Serialized batch, watermark, tick and checkpoint callbacks | Generic execution hooks exist. Their presence does not provide durable timer registration, dispatch or application callback transactions. |
 | `arrow/session_aggregating_window.rs`, `session_native.rs`, `session_store.rs` | Legacy per-key maps; selected native path uses paged raw rows, session/deadline metadata and bounded final-input delivery | Native memory/RocksDB value and fresh-worker recovery captures pass for scalar aggregates and exact-gap/bridge handling; direct late-drop probes also pass at batch target 1. A 65,000-row hot SESSION passes both checkpoint protocols with a retained-payload floor above 10× the declared 50 MiB pool sum, including a 64,999-row checkpoint. High-cardinality sessions, broader late/idleness behavior, collections, backpressure and fault qualification remain open. |
-| `arrow/tumbling_aggregating_window.rs`, `sliding_aggregating_window.rs`, `window_native.rs`, `window_store.rs` | Legacy per-bin maps; selected native path uses paged panes/partials and closure/expiry indexes | Scalar and ordered memory/RocksDB SQL and recovery captures pass. An earlier snapshot-reuse candidate passed 65,000-key TUMBLE initial and recovered full-payload/RSS checks in both protocols, but its halfway checkpoint was below 10×. On `d19c30e3`, the stronger 64,999-row RocksDB checkpoint passed controller restore and all 65,000 full-payload comparisons above the 10× floor at 355,414,016-byte peak RSS; leader failed the unchanged 3 MiB checkpoint-metadata cap. The subsequent compact-basename and bounded idle-harness build passed workspace checks and 614 library tests (four ignored), then repeated the 64,999-row checkpoint under the leader protocol: all 65,000 full payloads matched after fresh-worker recovery at 361,074,688-byte peak RSS. The later test-only idle pre-match build passed 616 library tests (four ignored), but the leader capacity run used the earlier binary. These controller and leader results are from their respective tested source revisions; the 3 MiB metadata cap remains unchanged. A stronger HOP controller run on the later fused source passed the 10× checkpoint floor and full-payload recovery at 355,061,760-byte peak RSS; strong HOP leader and broader quiet-key/idleness qualification remain open. Selected collection cases for ARRAY_AGG, DISTINCT aggregates and single-column UNNEST pass, including oversized-value rejection; broader collection shapes, capacity and backpressure remain open. |
+| `arrow/tumbling_aggregating_window.rs`, `sliding_aggregating_window.rs`, `window_native.rs`, `window_store.rs` | Legacy per-bin maps; selected native path uses paged panes/partials and closure/expiry indexes | Scalar and ordered memory/RocksDB SQL and recovery captures pass. An earlier snapshot-reuse candidate passed 65,000-key TUMBLE initial and recovered full-payload/RSS checks in both protocols, but its halfway checkpoint was below 10×. On `d19c30e3`, the stronger 64,999-row RocksDB checkpoint passed controller restore and all 65,000 full-payload comparisons above the 10× floor at 355,414,016-byte peak RSS; leader failed the unchanged 3 MiB checkpoint-metadata cap. The subsequent compact-basename and bounded idle-harness build passed workspace checks and 614 library tests (four ignored), then repeated the 64,999-row checkpoint under the leader protocol: all 65,000 full payloads matched after fresh-worker recovery at 361,074,688-byte peak RSS. The later test-only idle pre-match build passed 616 library tests (four ignored), but the leader capacity run used the earlier binary. These controller and leader results are from their respective tested source revisions; the 3 MiB metadata cap remains unchanged. A stronger HOP controller run on the later fused source passed the 10× checkpoint floor and full-payload recovery at 355,061,760-byte peak RSS; the subsequent bounded Parquet adapter at `4fbd740a` passed the strong 65,000-key HOP case in both protocols: all 130,000 initial/recovered item-window pairs and full payloads matched, controller/leader peak RSS was 356,876,288/352,108,544 bytes, and both 1,476-file inventories fit the unchanged metadata cap. Broader quiet-key/idleness qualification remains open. Selected collection cases for ARRAY_AGG, DISTINCT aggregates and single-column UNNEST pass, including oversized-value rejection; broader collection shapes, capacity and backpressure remain open. |
 | `arrow/incremental_aggregator.rs`, `aggregate_store.rs` | Selected native path persists accumulators, counted extrema, ordered members, dirty output and expiry state | Both configured backends pass small updating-input value/recovery captures; indefinite retention is explicit. Hot-key/high-cardinality, backpressure and fault qualification remains open. |
 | `arrow/instant_join.rs`, `join_with_expiration.rs` | Execution holders/streams and legacy retained-table access | Unsupported under the disk SQL setting until the exact working-state paths are migrated and tested. |
 | `crates/arroyo-worker/src/engine.rs` | Operator construction and worker admission | Rejects unsupported retained-state operators under RocksDB SQL and checks database-owner capacity. Keep these gates until each generic path has its own evidence. |
@@ -264,3 +265,16 @@ rules, ownership choices and compatibility decisions belong to the application
 repository. They do not authorize built-in application operators or define
 Streamr platform policy. Platform verification must remain runnable without an
 application checkout; application parity is a separate opt-in acceptance suite.
+
+## Bounded native checkpoint adapter qualification
+
+The [Parquet adapter](native-checkpoint-parquet-adapter.md) on `4fbd740a`
+passed all five Bookworm gates, 645 library tests (four ignored), 60 small
+recovery captures and four RocksDB checkpoint fault tests. Its two strong HOP
+captures retain at least 532,471,808 payload bytes at the checkpoint, above ten
+times the declared 50 MiB pool sum, and validate all 130,000 initial/recovered
+item-window outputs and full 8,192-byte payloads. Controller/leader peak RSS is
+356,876,288/352,108,544 bytes. Both inventories have 1,476 Parquet files;
+operator metadata is 304,062/339,486 bytes. All seven engine-head CI checks
+passed. The selected prior HOP leader capacity failure is closed; broader
+resource, timing and full milestone-3 acceptance remain open.

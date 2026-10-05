@@ -1104,6 +1104,42 @@ This shows a fixed query-planning value in this tested path, not a dynamic
 emission clock or timer. Both probes used the same `8649bf44` source and
 executable SHA-256 above. No clock semantics were changed.
 
+## Native Parquet checkpoint correction (2026-10-05)
+
+Source `4fbd740a0861dddf1bbdd9e264f2e6fd11742413` replaces the live-state
+binary page exporter with a bounded adapter to Arroyo's existing keyed-state
+Parquet schema/writer/reader. Existing checkpoint coordination and ownership
+remain; legacy binary reads are retained. See
+[the correction record](native-checkpoint-parquet-adapter.md).
+
+All five Bookworm gates passed with 645 library tests (four ignored). Exact
+initial/checkpoint/fresh-worker comparisons passed 60 generic captures: 24
+updating timestamp/count/MAX, eight typed arrays, eight existing-SQL top-five,
+eight typed state-table MERGE/lookup and twelve TUMBLE/HOP/SESSION cases.
+Four RocksDB checkpoint fault tests passed across controller and leader modes.
+The executable SHA-256 is
+`1c57540e44ff31ba736a9ac037212fad8628729adaa6841e5e0dd1c954f980ac`.
+Source inventories, gate logs, complete pipeline results and independent review
+are retained in `target/native-hop-capacity-parquet-v3-65000/build-evidence/`.
+The failed first two qualification attempts are separately archived; their
+results are not substituted for the final source.
+
+Both 65,000-key RocksDB HOP protocols passed exact comparisons of every one of
+130,000 initial and recovered item/window outputs and full 8,192-byte payloads.
+Each retained checkpoint has a conservative 532,471,808-byte payload floor above
+ten times the declared 50 MiB pool sum. Controller peak whole-child RSS was
+356,876,288 bytes; leader peak was 352,108,544 bytes, both below 512 MiB.
+Each published window inventory has 1,476 Parquet files, with all references,
+sizes and SHA-256 checksums verified. Operator metadata is 304,062 bytes for
+controller and 339,486 bytes for leader, under the unchanged 3 MiB cap.
+The leader's complete published manifest is 340,747 bytes. Results are at
+`target/native-hop-capacity-parquet-v3-65000/{measurements.json,checkpoint-measurements.json,source-evidence.json}`.
+The combined pipeline exited zero with frozen Rust source hashes unchanged;
+all seven CI checks passed on `4fbd740a`. This closes the observed selected HOP
+leader capacity failure. Broader window/quiet-key behavior, profile/session
+parity, timers/emission, backpressure, backfill and live/fault gates remain open.
+Milestone 3 is incomplete.
+
 ## Validation status
 
 Qualification of `a2d2aba7` passed 153 Bookworm units (33 RPC, 56 state, 64

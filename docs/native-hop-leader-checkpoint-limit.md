@@ -16,7 +16,7 @@ metadata file is **2,840,928 bytes**. The files and metadata are retained in
 partial upload; its exact attempted page count and metadata size were not
 measured.
 
-Both protocols use the same [page exporter](../crates/arroyo-state/src/live/checkpoint.rs):
+At the failed revision, both protocols used the same [page exporter](https://github.com/jasadams/streamr/blob/8649bf440fd55e4cf4289b2bbc72969348b821f7/crates/arroyo-state/src/live/checkpoint.rs):
 each bounded scan page becomes one `STRDS001` object, and the
 `DiskKeyedTableSubtaskCheckpointMetadata.files` field contains its full path,
 size, checksum and row count. The exporter incrementally rejects file-list
@@ -47,12 +47,24 @@ complete their subtask checkpoints, so it cannot bypass this worker-side file
 list limit. Existing checkpoint compaction likewise does not reduce the list
 before this export check.
 
-A scalable repair would version the disk/typed subtask metadata so one
+The investigation initially proposed versioning disk/typed subtask metadata so one
 validated owner prefix is stored once and each page carries a relative suffix,
 while keeping old full-path metadata readable. Restore, controller and leader
 ownership checks, checksum and ordering validation, and remote garbage
 collection would need to reconstruct and validate the complete owned path.
-This is an **unimplemented checkpoint-format proposal** requiring contract
-review; it is not new SQL or a change to application behavior. An alternative
-page-packing design would need separate resource-admission and concurrent
-export/restore deadlock proof before use.
+That common-prefix proposal was **not implemented**. The user rejected the
+separate exporter architecture and authorized reuse of Arroyo's existing
+Parquet machinery through a bounded backend adapter instead. See
+[the correction and qualification record](native-checkpoint-parquet-adapter.md).
+The adapter decouples scan-page size from file size without changing the RPC
+metadata cap or adding a new common-prefix metadata representation. Its current
+runtime qualification status is recorded in that document; this historical
+failed capture remains a failure.
+
+The subsequent Parquet adapter at `4fbd740a` passed the same 65,000-key HOP
+checkpoint and fresh-worker recovery in both protocols. Both inventories contain
+1,476 files; controller operator metadata is 304,062 bytes and leader operator
+metadata is 339,486 bytes. Exact full-payload comparisons passed for all 130,000
+initial and recovered item/window outputs, with peak RSS below 512 MiB. See the
+linked correction record for source, executable, checksum and resource evidence.
+The 3 MiB metadata cap remains unchanged.
