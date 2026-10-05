@@ -95,12 +95,22 @@ also passed. A subsequent 65,000-key RocksDB controller HOP run matched all
 130,000 item/window pairs and full payloads after a 64,999-row checkpoint
 and fresh-worker recovery: retained payload exceeded 10× the declared
 50 MiB pool sum, with 355,061,760-byte peak RSS below the 512 MiB cap.
-Strong HOP leader qualification remains pending. Lifetime
+The subsequent HOP leader attempt on current source `8649bf44` emitted
+130,000 initial rows, then failed during checkpoint with `disk checkpoint file
+metadata exceeds 3 MiB RPC limit`; those initial rows were counted but not
+full-payload compared, and no fresh-worker recovery occurred. Strong HOP leader
+qualification remains pending. Lifetime
 `COUNT → ROW_NUMBER` page/feature probes and an already-ranked ordered
 `ARRAY_AGG` probe originally failed at planning/construction. The later
 bounded ARRAY_AGG repair now passes eight typed CDC recovery cases and eight
 external already-ranked array cases; lifetime ROW_NUMBER remains unsupported.
-There is no ranked value/recovery qualification. See
+A query using existing SQL groups `COUNT(*)` by `(k, v)`, builds an ordered
+`ARRAY_AGG`, then calls `array_slice(1, 5)`. It subsequently passed eight
+small-cardinality backend/batch/protocol captures
+with exact top-five array values and checkpoint recovery. It retains and
+materializes the complete outer collection before slicing, so this does not
+qualify bounded top-K state, arbitrary-cardinality ranking or five ranked SQL
+rows. See [the query and limits](native-updating-top5-sql.md) and
 [validation](milestone-3-validation.md) for exact artifacts and gates.
 
 The approved timestamp repair and UNION consolidation passed 24 generic

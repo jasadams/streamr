@@ -171,9 +171,15 @@ checkpointed after 64,999 of 65,000 real rows, retaining a conservative
 Both initial and fresh-worker recovered streams matched all 130,000
 item/window pairs and their complete 8,192-byte payloads. Whole-child peak
 RSS was 355,061,760 bytes, below the 512 MiB cap; runtime was 1,339.62
-seconds. Strong HOP leader qualification remains pending. This selected
-shape does not establish arbitrary window collections, backpressure,
-application parity, packaged faults, backfill or the 24-hour gate.
+seconds. On the later `8649bf440fd55e4cf4289b2bbc72969348b821f7`
+source, the RocksDB leader attempt at
+`target/native-hop-capacity-timestamp-fixed-65000-leader/hop-rocksdb-leader/runtime.log`
+reported 130,000 initial output rows, checked by count only. Checkpoint then
+failed with exit 101: `disk checkpoint file metadata exceeds 3 MiB RPC limit`
+for the window state table. There was no recovered output or qualified
+full-payload comparison. Strong HOP leader qualification remains pending.
+This selected shape does not establish arbitrary window collections,
+backpressure, application parity, packaged faults, backfill or the 24-hour gate.
 
 ## Earlier combined-source STR-29 evidence
 
@@ -1062,6 +1068,41 @@ These results do not qualify lifetime ROW_NUMBER ranking, general nested
 collections, hot/unrestricted collection capacity, full profile/session output,
 all timing rules or complete milestone 3 readiness. External schemas and oracles
 remain application-owned.
+
+## Existing-SQL updating top-five array (2026-10-05)
+
+The [generic 23-event fixture](native-updating-top5-sql.md) uses existing SQL:
+keyed `COUNT(*)` per item, ordered typed-Struct `ARRAY_AGG` of the changing
+counts, then `array_slice(..., 1, 5)`. All eight memory/RocksDB ×
+controller/leader × batch-1/8 captures passed strict typed CDC, the 21-event
+committed checkpoint and fresh-worker final-value comparisons on source
+`8649bf440fd55e4cf4289b2bbc72969348b821f7` and executable SHA-256
+`35dafbefefc91699a486e686615dbbdc580888e6ff4764ad101a5db75471fa2f`.
+The exact results, source inventory and per-case manifests are at
+`target/native-updating-top5-existing-sql/{comparisons.json,source-evidence.json,manifest.json}`.
+The checkpoint `c` array is `f:2,g:2,a:1,b:1,c:1`; the recovered final array is
+`a:1,b:1,c:1,d:1,e:1`, while `b` remains `y:1`. CDC before images and every
+emitted typed array were checked against forward source-prefix values. The
+small fixture's intermediate comparison assumes each item's count becomes
+visible in source-prefix order; it is not a general cross-group atomicity test.
+
+This result bounds only the output array. The aggregate still retains all
+distinct item counts and materializes its complete ordered member array before
+slicing, under existing collection limits. It does not qualify bounded top-K
+state, high-cardinality/hot-key capacity or SQL `ROW_NUMBER` output rows.
+
+## Existing SQL clock diagnostic (2026-10-05)
+
+`target/native-clock-probe/runtime.log` records a planner rejection for
+`CURRENT_TIMESTAMP`: `Invalid function 'current_timestamp'`. A separate
+`NOW()`-only projection at `target/native-clock-probe-now-only/comparison.json`
+passed initial, one-row checkpoint and three-row recovered value comparison
+with real pre-EOF idle holds of 5,001 and 5,000 ms. Its two `NOW()` columns
+were identical and stayed at `2026-10-05T02:36:28.071163175` across initial
+and recovered phases, while the source event timestamps varied by one second.
+This shows a fixed query-planning value in this tested path, not a dynamic
+emission clock or timer. Both probes used the same `8649bf44` source and
+executable SHA-256 above. No clock semantics were changed.
 
 ## Validation status
 
