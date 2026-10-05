@@ -6,8 +6,7 @@ use arroyo_state::{BackingStore, StateBackend, StorageProviderFor};
 use rand::random;
 
 use crate::kafka::SourceOffset;
-use arrow::array::{Array, StringArray};
-use arrow::datatypes::DataType::UInt64;
+use arrow::array::{Array, Int64Array, StringArray};
 use arrow::datatypes::TimeUnit;
 use arroyo_operator::context::{
     ArrowCollector, BatchReceiver, OperatorContext, SourceCollector, SourceContext, batch_bounded,
@@ -407,7 +406,7 @@ async fn test_kafka_with_metadata_fields() {
     let metadata_fields = vec![MetadataField {
         field_name: "offset".to_string(),
         key: "offset_id".to_string(),
-        data_type: Some(UInt64),
+        data_type: Some(DataType::Int64),
     }];
 
     // Set metadata fields in KafkaSourceFunc
@@ -427,9 +426,9 @@ async fn test_kafka_with_metadata_fields() {
         metadata_fields,
     };
 
-    let (_to_control_tx, control_rx) = channel(128);
-    let (command_tx, _from_control_rx) = channel(128);
-    let (data_tx, _recv) = batch_bounded(128);
+    let (to_control_tx, control_rx) = channel(128);
+    let (command_tx, from_control_rx) = channel(128);
+    let (data_tx, data_recv) = batch_bounded(128);
 
     let checkpoint_metadata = None;
 
@@ -479,9 +478,11 @@ async fn test_kafka_with_metadata_fields() {
         kafka.run(&mut ctx, &mut collector).await.unwrap();
     });
 
-    let mut reader = kafka_topic_tester
-        .get_source_with_reader((*task_info).clone(), None)
-        .await;
+    let mut reader = KafkaSourceWithReads {
+        to_control_tx,
+        from_control_rx,
+        data_recv,
+    };
     let mut producer = kafka_topic_tester.get_producer();
 
     // Send test data
@@ -494,9 +495,34 @@ async fn test_kafka_with_metadata_fields() {
         .collect();
 
     // Verify received messages
-    reader
-        .assert_next_message_record_values(expected_messages.into())
-        .await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let mut received = 0;
+    while received < expected_messages.len() {
+        let ArrowMessage::Data(record) = reader.next_non_idle_message(deadline).await else {
+            panic!("expected metadata-bearing Kafka data");
+        };
+        let values = record
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let offsets = record
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        for row in 0..record.num_rows() {
+            assert!(
+                received < expected_messages.len(),
+                "unexpected extra Kafka row"
+            );
+            assert!(!values.is_null(row));
+            assert_eq!(values.value(row), expected_messages[received]);
+            assert!(!offsets.is_null(row));
+            assert_eq!(offsets.value(row), received as i64);
+            received += 1;
+        }
+    }
 
     reader
         .to_control_tx
