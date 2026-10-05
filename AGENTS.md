@@ -51,6 +51,16 @@ Arcstream is an external consumer, not part of this engine.
 
 ## Work and verification
 
+- Before fixing a regression, trace the existing behavior and relevant upstream
+  implementation. Distinguish a bug introduced by Streamr changes from a missing
+  capability; do not turn an implementation bug into a request for new semantics.
+- Ask the user before changing observable semantics or introducing architectural
+  redesign, including changes presented as bug fixes. Explain the existing
+  behavior, evidence, proposed change and tradeoffs in plain language, and wait
+  for agreement before implementing the change. Do not stop asking merely to
+  avoid interrupting progress. Repairs that preserve the established contract
+  can proceed within the authorized task.
+
 Preserve unrelated user changes. Follow [.claude/build-test.md](.claude/build-test.md)
 for the required development container and checks. Record exact validation
 evidence; pending tests and partial milestones do not establish completion.

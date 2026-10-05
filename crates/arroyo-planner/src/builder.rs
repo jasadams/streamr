@@ -263,7 +263,10 @@ impl ExtensionPlanner for ArroyoExtensionPlanner {
                 }
                 TO_DEBEZIUM_EXTENSION_NAME => {
                     let input = physical_inputs[0].clone();
-                    return Ok(Some(Arc::new(ToDebeziumExec::try_new(input)?)));
+                    return Ok(Some(Arc::new(ToDebeziumExec::try_new(
+                        input,
+                        Arc::new(schema),
+                    )?)));
                 }
                 _ => return Ok(None),
             }

@@ -158,6 +158,23 @@ initial and fresh-worker recovered outputs (16 rows each). The checkpoint
 retained-payload floor was only 448 bytes; this is a value/recovery smoke,
 not a 10× HOP capacity qualification.
 
+## Published fusion source and stronger HOP controller evidence
+
+All seven PR #6 CI checks passed on published commit
+`f58be0845a9ced64f3eeab75367709441258e83b`. This includes the compact
+checkpoint filenames, idle harness and fusion repair described above.
+The stronger HOP RocksDB controller run at
+`target/native-hop-capacity-fusion-fixed-65000-controller/measurements.json`
+then passed with the same `aa1509e3…` executable and source inventory. It
+checkpointed after 64,999 of 65,000 real rows, retaining a conservative
+532,471,808-byte payload floor, above 10× the configured 50 MiB pool sum.
+Both initial and fresh-worker recovered streams matched all 130,000
+item/window pairs and their complete 8,192-byte payloads. Whole-child peak
+RSS was 355,061,760 bytes, below the 512 MiB cap; runtime was 1,339.62
+seconds. Strong HOP leader qualification remains pending. This selected
+shape does not establish arbitrary window collections, backpressure,
+application parity, packaged faults, backfill or the 24-hour gate.
+
 ## Earlier combined-source STR-29 evidence
 
 The `fc347312`-based batch, incorporated into `d19c30e3`, added internal
@@ -1007,6 +1024,44 @@ comparisons passed at Streamr `a2d2aba7` with 16 MiB execution accounting. That 
 historical external evaluation evidence, not an engine dependency or profile/session
 readiness claim. The timer and collection tests separately exercise the generic
 production logical exporter and fresh RocksDB restoration.
+
+## Native updating timestamp and typed-array repair (2026-10-05)
+
+All five Bookworm gates passed on the repaired worker and planner, with 636
+library tests (four ignored). The SQL capture executable SHA-256 is
+`35dafbefefc91699a486e686615dbbdc580888e6ff4764ad101a5db75471fa2f`.
+The compiler-source hashes and exact gate references are recorded in each
+proof directory's `source-evidence.json`. Combined results are at
+`/tmp/streamr-m3-timestamp-identities-union-fixed-v3-pipeline-results.json`.
+
+| Selected proof | Captures and strict comparisons | Artifact |
+| --- | --- | --- |
+| Current-member hidden timestamp MAX; COUNT and caller MAX; direct/duplicate UNION/shared CTE; updates, group moves, deletions | 24 | `target/native-updating-timestamp-identities-union-fixed/comparisons.json` |
+| Ordered TEXT and flat STRUCT ARRAY_AGG; NULL, duplicates, FILTER, retraction and deleted-group removal | 8 | `target/native-updating-array-cdc-timestamp-identities-union-fixed/comparisons.json` |
+| Standard COALESCE for empty filtered TEXT/STRUCT arrays | 8 | `target/native-array-empty-coalesce-timestamp-identities-union-fixed/comparisons.json` |
+| External already-ranked TEXT array assembly | 8 | `target/native-profile-ranked-array-timestamp-identities-union-fixed/comparisons.json` |
+| External 14-field profile core | 8 | `target/native-profile-core-timestamp-identities-union-fixed/*/comparison.json` |
+
+All matrices span configured memory/RocksDB, controller/leader checkpoint
+ownership and source batches 1/8. They compare uninterrupted final, committed
+checkpoint and fresh-worker recovered values, including exact CDC before-images.
+A separate 64-KiB member against the 32-KiB native aggregate value limit failed
+with exit 101 and the expected collection budget diagnostic; it is a negative
+resource test and is excluded from the 56 successful captures.
+
+The [regression investigation](updating-aggregate-timestamp-regression.md)
+records the upstream sliding-MAX limitation, Streamr's exact-retraction failure,
+the approved row-ID index repair and the separate UNION graph consolidation.
+The [generic array fixture](native-updating-array-cdc.md) retains the earlier
+constructor, schema and zero-count failures and records the final qualified
+result. Caller aggregate semantics and configured collection limits are
+unchanged. Native state codec fingerprints reject incompatible old checkpoints;
+recompiled/reordered-program migration is not qualified.
+
+These results do not qualify lifetime ROW_NUMBER ranking, general nested
+collections, hot/unrestricted collection capacity, full profile/session output,
+all timing rules or complete milestone 3 readiness. External schemas and oracles
+remain application-owned.
 
 ## Validation status
 

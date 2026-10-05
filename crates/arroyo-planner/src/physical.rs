@@ -333,16 +333,15 @@ impl PhysicalExtensionCodec for ArroyoPhysicalExtensionCodec {
                 let schema = Arc::new(serde_json::from_str::<Schema>(&debezium.schema).map_err(
                     |e| DataFusionError::Internal(format!("invalid schema in exec codec: {e:?}")),
                 )?);
-                Ok(Arc::new(ToDebeziumExec {
-                    input: inputs
+                Ok(Arc::new(ToDebeziumExec::try_new(
+                    inputs
                         .first()
                         .ok_or_else(|| {
                             DataFusionError::Internal("no input for debezium node".to_string())
                         })?
                         .clone(),
-                    schema: schema.clone(),
-                    properties: make_properties(schema),
-                }))
+                    schema,
+                )?))
             }
         }
     }
@@ -1048,8 +1047,116 @@ pub struct ToDebeziumExec {
     properties: PlanProperties,
 }
 
+// Physical nullability is an estimate; the declared SQL result controls the
+// CDC schema. Types and field attributes must agree, while runtime array
+// reconstruction checks actual nulls against declared nested fields.
+fn debezium_type_compatible(actual: &DataType, declared: &DataType) -> bool {
+    match (actual, declared) {
+        (DataType::Struct(actual), DataType::Struct(declared)) => {
+            actual.len() == declared.len()
+                && actual
+                    .iter()
+                    .zip(declared.iter())
+                    .all(|(actual, declared)| debezium_field_compatible(actual, declared))
+        }
+        (DataType::List(actual), DataType::List(declared))
+        | (DataType::LargeList(actual), DataType::LargeList(declared)) => {
+            debezium_field_compatible(actual, declared)
+        }
+        (
+            DataType::FixedSizeList(actual, actual_len),
+            DataType::FixedSizeList(declared, declared_len),
+        ) => actual_len == declared_len && debezium_field_compatible(actual, declared),
+        _ => actual == declared,
+    }
+}
+
+// Arrow 55 exposes dictionary identity only through this deprecated accessor;
+// dropping the check would silently relabel dictionary values at the CDC sink.
+#[allow(deprecated)]
+fn debezium_field_compatible(actual: &arrow_schema::Field, declared: &arrow_schema::Field) -> bool {
+    actual.name() == declared.name()
+        && actual.metadata() == declared.metadata()
+        && actual.dict_id() == declared.dict_id()
+        && actual.dict_is_ordered() == declared.dict_is_ordered()
+        && debezium_type_compatible(actual.data_type(), declared.data_type())
+}
+
+fn debezium_relabel_array(array: &Arc<dyn Array>, declared: &DataType) -> Result<Arc<dyn Array>> {
+    if !debezium_type_compatible(array.data_type(), declared) {
+        return plan_err!("physical Debezium value type conflicts with declared SQL schema");
+    }
+    match declared {
+        DataType::Struct(fields) => {
+            let actual = array
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .ok_or_else(|| {
+                    DataFusionError::Plan("physical Debezium struct has wrong array type".into())
+                })?;
+            let columns = fields
+                .iter()
+                .enumerate()
+                .map(|(index, field)| {
+                    debezium_relabel_array(actual.column(index), field.data_type())
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok(Arc::new(StructArray::try_new_with_length(
+                fields.clone(),
+                columns,
+                actual.nulls().cloned(),
+                actual.len(),
+            )?))
+        }
+        DataType::List(field) => {
+            let actual = array
+                .as_any()
+                .downcast_ref::<arrow_array::ListArray>()
+                .ok_or_else(|| {
+                    DataFusionError::Plan("physical Debezium list has wrong array type".into())
+                })?;
+            Ok(Arc::new(arrow_array::ListArray::try_new(
+                field.clone(),
+                actual.offsets().clone(),
+                debezium_relabel_array(actual.values(), field.data_type())?,
+                actual.nulls().cloned(),
+            )?))
+        }
+        DataType::LargeList(field) => {
+            let actual = array
+                .as_any()
+                .downcast_ref::<arrow_array::LargeListArray>()
+                .ok_or_else(|| {
+                    DataFusionError::Plan("physical Debezium list has wrong array type".into())
+                })?;
+            Ok(Arc::new(arrow_array::LargeListArray::try_new(
+                field.clone(),
+                actual.offsets().clone(),
+                debezium_relabel_array(actual.values(), field.data_type())?,
+                actual.nulls().cloned(),
+            )?))
+        }
+        DataType::FixedSizeList(field, size) => {
+            let actual = array
+                .as_any()
+                .downcast_ref::<arrow_array::FixedSizeListArray>()
+                .ok_or_else(|| {
+                    DataFusionError::Plan("physical Debezium list has wrong array type".into())
+                })?;
+            Ok(Arc::new(arrow_array::FixedSizeListArray::try_new(
+                field.clone(),
+                *size,
+                debezium_relabel_array(actual.values(), field.data_type())?,
+                actual.nulls().cloned(),
+            )?))
+        }
+        _ if array.data_type() == declared => Ok(array.clone()),
+        _ => plan_err!("physical Debezium value type conflicts with declared SQL schema"),
+    }
+}
+
 impl ToDebeziumExec {
-    pub fn try_new(input: Arc<dyn ExecutionPlan>) -> Result<Self> {
+    pub fn try_new(input: Arc<dyn ExecutionPlan>, declared_schema: SchemaRef) -> Result<Self> {
         let input_schema = input.schema();
         let timestamp_index = input_schema.index_of(TIMESTAMP_FIELD)?;
         let struct_fields: Vec<_> = input_schema
@@ -1085,10 +1192,20 @@ impl ToDebeziumExec {
             timestamp_field,
         ]));
 
+        if output_schema.fields().len() != declared_schema.fields().len()
+            || !output_schema
+                .fields()
+                .iter()
+                .zip(declared_schema.fields().iter())
+                .all(|(actual, declared)| debezium_field_compatible(actual, declared))
+        {
+            return plan_err!("physical Debezium schema conflicts with declared SQL schema");
+        }
+
         Ok(Self {
             input,
-            schema: output_schema.clone(),
-            properties: make_properties(output_schema),
+            schema: declared_schema.clone(),
+            properties: make_properties(declared_schema),
         })
     }
 }
@@ -1133,7 +1250,10 @@ impl ExecutionPlan for ToDebeziumExec {
                 "ToDebeziumExec wrong number of children".to_string(),
             ));
         }
-        Ok(Arc::new(ToDebeziumExec::try_new(children[0].clone())?))
+        Ok(Arc::new(ToDebeziumExec::try_new(
+            children[0].clone(),
+            self.schema.clone(),
+        )?))
     }
 
     fn execute(
@@ -1176,7 +1296,27 @@ struct ToDebeziumStream {
 
 impl ToDebeziumStream {
     fn as_debezium_batch(&mut self, batch: &RecordBatch) -> Result<RecordBatch> {
-        let value_struct = batch.project(&self.struct_projection)?;
+        let physical_value = batch.project(&self.struct_projection)?;
+        let DataType::Struct(declared_fields) = self.schema.field(0).data_type() else {
+            return plan_err!("declared Debezium before field is not a struct");
+        };
+        if physical_value.num_columns() != declared_fields.len() {
+            return plan_err!("physical Debezium value width conflicts with declared SQL schema");
+        }
+        let columns = physical_value
+            .columns()
+            .iter()
+            .zip(declared_fields.iter())
+            .enumerate()
+            .map(|(index, (column, field))| {
+                if !debezium_field_compatible(physical_value.schema().field(index), field) {
+                    return plan_err!("physical Debezium value conflicts with declared SQL schema");
+                }
+                debezium_relabel_array(column, field.data_type())
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let value_struct =
+            RecordBatch::try_new(Arc::new(Schema::new(declared_fields.clone())), columns)?;
         let timestamps = batch
             .column(self.timestamp_index)
             .as_primitive::<TimestampNanosecondType>();
@@ -1333,5 +1473,90 @@ impl Stream for ToDebeziumStream {
 impl RecordBatchStream for ToDebeziumStream {
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
+    }
+}
+
+#[cfg(test)]
+mod debezium_declared_schema_tests {
+    use super::*;
+    use arrow::array::new_empty_array;
+    use arrow_schema::Field;
+    use std::collections::HashMap;
+
+    #[test]
+    #[allow(deprecated)]
+    fn physical_nested_nonnull_refinement_keeps_declared_nullable_cdc_type() {
+        let physical = DataType::List(Arc::new(Field::new(
+            "item",
+            DataType::Struct(vec![Arc::new(Field::new("label", DataType::Utf8, false))].into()),
+            false,
+        )));
+        let declared = DataType::List(Arc::new(Field::new(
+            "item",
+            DataType::Struct(vec![Arc::new(Field::new("label", DataType::Utf8, true))].into()),
+            true,
+        )));
+        assert!(debezium_type_compatible(&physical, &declared));
+        assert!(debezium_type_compatible(&declared, &physical));
+        let physical_array = new_empty_array(&physical);
+        let relabeled = debezium_relabel_array(&physical_array, &declared).unwrap();
+        assert_eq!(relabeled.data_type(), &declared);
+        assert_eq!(
+            debezium_relabel_array(&relabeled, &physical)
+                .unwrap()
+                .data_type(),
+            &physical
+        );
+        assert!(!debezium_type_compatible(
+            &physical,
+            &DataType::List(Arc::new(Field::new("item", DataType::Int64, true)))
+        ));
+        let metadata = HashMap::from([("semantic".to_string(), "special".to_string())]);
+        assert!(!debezium_field_compatible(
+            &Field::new("value", physical.clone(), false).with_metadata(metadata),
+            &Field::new("value", declared.clone(), true),
+        ));
+        assert!(!debezium_field_compatible(
+            &Field::new_dict(
+                "value",
+                DataType::Dictionary(Box::new(DataType::Int64), Box::new(DataType::Utf8)),
+                false,
+                7,
+                true,
+            ),
+            &Field::new_dict(
+                "value",
+                DataType::Dictionary(Box::new(DataType::Int64), Box::new(DataType::Utf8)),
+                true,
+                8,
+                true,
+            ),
+        ));
+    }
+
+    #[test]
+    fn declared_nonnull_struct_child_rejects_only_unmasked_physical_nulls() {
+        let physical_fields = vec![Arc::new(Field::new("value", DataType::Utf8, true))].into();
+        let declared =
+            DataType::Struct(vec![Arc::new(Field::new("value", DataType::Utf8, false))].into());
+        let child = Arc::new(StringArray::from(vec![None::<&str>])) as Arc<dyn Array>;
+        let unmasked = Arc::new(StructArray::try_new(physical_fields, vec![child], None).unwrap())
+            as Arc<dyn Array>;
+        assert!(debezium_relabel_array(&unmasked, &declared).is_err());
+
+        let masked = Arc::new(
+            StructArray::try_new(
+                vec![Arc::new(Field::new("value", DataType::Utf8, true))].into(),
+                vec![Arc::new(StringArray::from(vec![None::<&str>]))],
+                Some(NullBuffer::new_null(1)),
+            )
+            .unwrap(),
+        ) as Arc<dyn Array>;
+        assert_eq!(
+            debezium_relabel_array(&masked, &declared)
+                .unwrap()
+                .data_type(),
+            &declared
+        );
     }
 }

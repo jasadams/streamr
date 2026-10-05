@@ -11,7 +11,8 @@ use arrow_array::builder::{
 use arrow_array::cast::AsArray;
 use arrow_array::types::UInt64Type;
 use arrow_array::{
-    Array, ArrayRef, BinaryArray, BooleanArray, RecordBatch, StructArray, UInt32Array, UInt64Array,
+    Array, ArrayRef, BinaryArray, BooleanArray, FixedSizeBinaryArray, RecordBatch, StructArray,
+    UInt32Array, UInt64Array,
 };
 use arrow_schema::{DataType, Field, FieldRef, Schema, SchemaBuilder, TimeUnit};
 use arroyo_operator::context::Collector;
@@ -37,6 +38,8 @@ use arroyo_state::live::{
 use arroyo_state::timestamp_table_config;
 use arroyo_types::{CheckpointBarrier, SignalMessage, to_nanos};
 use datafusion::common::{Result as DFResult, ScalarValue};
+use datafusion::functions_aggregate::min_max::Max;
+use datafusion::physical_expr::expressions::Column;
 use datafusion::physical_plan::aggregates::{AggregateMode, aggregate_expressions};
 use datafusion::physical_plan::udaf::AggregateFunctionExpr;
 use datafusion::physical_plan::{Accumulator, PhysicalExpr};
@@ -70,6 +73,41 @@ struct NativeMemberChange<'a> {
     values: &'a [ArrayRef],
     retract: bool,
     ordinal: u64,
+    /// Stable changelog row identity, required for the planner-injected
+    /// event-time MAX. A CDC before row carries its new envelope time rather
+    /// than the timestamp of the member it removes.
+    row_id: Option<&'a [u8]>,
+}
+
+/// Persistent, per-group collection admission. All counters include duplicate
+/// occurrences; DISTINCT still needs those occurrences for exact retractions.
+#[derive(Clone, Copy, Default)]
+struct CollectionStats {
+    members: u64,
+    encoded_args_bytes: u64,
+    scalar_bytes: u64,
+}
+
+impl CollectionStats {
+    fn decode(value: Option<Vec<u8>>) -> Result<Self> {
+        let Some(value) = value else {
+            return Ok(Self::default());
+        };
+        ensure!(value.len() == 24, "invalid native collection member totals");
+        Ok(Self {
+            members: u64::from_be_bytes(value[..8].try_into()?),
+            encoded_args_bytes: u64::from_be_bytes(value[8..16].try_into()?),
+            scalar_bytes: u64::from_be_bytes(value[16..].try_into()?),
+        })
+    }
+
+    fn encode(self) -> [u8; 24] {
+        let mut bytes = [0; 24];
+        bytes[..8].copy_from_slice(&self.members.to_be_bytes());
+        bytes[8..16].copy_from_slice(&self.encoded_args_bytes.to_be_bytes());
+        bytes[16..].copy_from_slice(&self.scalar_bytes.to_be_bytes());
+        bytes
+    }
 }
 
 impl BatchData {
@@ -311,6 +349,8 @@ struct Aggregator {
     /// Ordered member-key codec for the bounded native fallback index.
     index_converter: Option<Arc<RowConverter>>,
     index_columns: Vec<usize>,
+    collection: bool,
+    injected_timestamp: bool,
 }
 
 pub struct IncrementalAggregatingFunc {
@@ -390,6 +430,33 @@ fn native_index_codec(
                 .collect();
             ((first..input_exprs.len()).collect(), options)
         }
+        "array_agg"
+            if aggregate
+                .fun()
+                .inner()
+                .as_any()
+                .is::<datafusion::functions_aggregate::array_agg::ArrayAgg>() =>
+        {
+            ensure!(
+                !input_exprs.is_empty(),
+                "native ARRAY_AGG requires one argument"
+            );
+            if let Some(order) = aggregate.order_bys() {
+                ensure!(
+                    !order.is_empty() && order.len() < input_exprs.len(),
+                    "native ARRAY_AGG has incompatible ORDER BY input columns"
+                );
+                let first = input_exprs.len() - order.len();
+                (
+                    (first..input_exprs.len()).collect(),
+                    order.iter().map(|item| item.options).collect(),
+                )
+            } else {
+                // SQL leaves unordered ARRAY_AGG order unspecified. Sorting by
+                // value keeps duplicates adjacent and makes restore stable.
+                (vec![0], vec![SortOptions::default()])
+            }
+        }
         _ => bail!(
             "native aggregate '{}' has no bounded retraction index codec",
             aggregate.fun().name()
@@ -458,7 +525,264 @@ fn native_cleanup_key(group: &[u8], generation: u64) -> Result<Vec<u8>> {
     Ok(key)
 }
 
+fn native_collection_totals_key(group: &[u8], aggregate: usize) -> Result<Vec<u8>> {
+    let mut key = native_group_key(b'L', group)?;
+    key.extend_from_slice(&u32::try_from(aggregate)?.to_be_bytes());
+    Ok(key)
+}
+
+// A keyed GROUP BY has no output row after its last input is retracted.
+// Aggregate values cannot establish that fact: COUNT(*) evaluates to zero,
+// while filtered aggregates may be NULL even for a live group.
+fn native_live_rows_key(group: &[u8]) -> Result<Vec<u8>> {
+    native_group_key(b'P', group)
+}
+
+fn native_collection_member(value: &[u8]) -> Result<(usize, &[u8])> {
+    ensure!(value.len() >= 8, "invalid native collection member value");
+    Ok((
+        usize::try_from(u64::from_be_bytes(value[..8].try_into()?))?,
+        &value[8..],
+    ))
+}
+
+// Member rows are stored in RowConverter form. Materialization reconstructs
+// fresh, compact Arrow arrays from those bytes; a one-row slice of an incoming
+// batch can retain the entire source buffer and is not a measure of the
+// collection's retained or eventual output size.
+fn native_collection_scalar_bytes(converter: &RowConverter, args: &[u8]) -> Result<usize> {
+    let parser = converter.parser();
+    let columns = converter.convert_rows(std::iter::once(parser.parse(args)))?;
+    columns.iter().try_fold(0usize, |total, value| {
+        total
+            .checked_add(ScalarValue::try_from_array(value, 0)?.size())
+            .context("native collection scalar size overflow")
+    })
+}
+
+/// Admission for the one-row Arrow decode used to account a collection
+/// member. Arrow's row decoder can materialize children for a NULL struct, so
+/// its shape must be charged independently of the encoded row length. This
+/// codec currently admits scalar leaves and one flat struct layer only.
+fn native_collection_shape_bytes(data_type: &DataType) -> Result<usize> {
+    let children: &[FieldRef] = match data_type {
+        DataType::Struct(fields) => {
+            for field in fields {
+                ensure!(
+                    !matches!(field.data_type(), DataType::Struct(_))
+                        && native_collection_scalar_type(field.data_type()),
+                    "native ARRAY_AGG collection value has unsupported nested type: {}",
+                    field.data_type()
+                );
+            }
+            &fields[..]
+        }
+        other if native_collection_scalar_type(other) => &[],
+        other => bail!("native ARRAY_AGG collection value has unsupported nested type: {other}"),
+    };
+    let mut shape = data_type.size();
+    let array_wrapper = [
+        std::mem::size_of::<StructArray>(),
+        std::mem::size_of::<arrow_array::StringArray>(),
+        std::mem::size_of::<arrow_array::LargeStringArray>(),
+        std::mem::size_of::<arrow_array::BinaryArray>(),
+        std::mem::size_of::<arrow_array::LargeBinaryArray>(),
+        std::mem::size_of::<arrow_array::FixedSizeBinaryArray>(),
+        std::mem::size_of::<arrow_array::NullArray>(),
+        std::mem::size_of::<arrow_array::BooleanArray>(),
+        std::mem::size_of::<arrow_array::Int64Array>(),
+        std::mem::size_of::<arrow_array::Decimal256Array>(),
+    ]
+    .into_iter()
+    .max()
+    .context("native collection array wrapper is missing")?;
+    for node in std::iter::once(data_type).chain(children.iter().map(|field| field.data_type())) {
+        // Arrow 55's flat row decode can hold an ArrayData, its builder and a
+        // copied child ArrayData entry, the largest admitted concrete array
+        // wrapper, up to four Buffer objects, two ArrayRefs, Arc headers and
+        // three owned buffer headers. Three rounded cache lines cover the
+        // one-row validity, values and offsets. The fixed-width payload is
+        // charged even when the parent or child is NULL.
+        shape = shape
+            .checked_add(node.size())
+            .and_then(|n| n.checked_add(2 * std::mem::size_of::<arrow::array::ArrayData>()))
+            .and_then(|n| n.checked_add(std::mem::size_of::<arrow::array::ArrayDataBuilder>()))
+            .and_then(|n| n.checked_add(array_wrapper))
+            .and_then(|n| n.checked_add(4 * std::mem::size_of::<arrow::buffer::Buffer>()))
+            .and_then(|n| n.checked_add(std::mem::size_of::<ScalarValue>()))
+            .and_then(|n| n.checked_add(std::mem::size_of::<ArrayRef>() * 2))
+            .and_then(|n| n.checked_add(std::mem::size_of::<usize>() * (2 + 3 * 8)))
+            .and_then(|n| n.checked_add(3 * 64))
+            .and_then(|n| match node {
+                DataType::FixedSizeBinary(width) => usize::try_from(*width)
+                    .ok()
+                    .and_then(|width| n.checked_add(width)),
+                _ => Some(n),
+            })
+            .context("native collection shape size overflow")?;
+    }
+    Ok(shape)
+}
+
+fn native_collection_scalar_type(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Null
+            | DataType::Boolean
+            | DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64
+            | DataType::Float16
+            | DataType::Float32
+            | DataType::Float64
+            | DataType::Decimal128(_, _)
+            | DataType::Decimal256(_, _)
+            | DataType::Date32
+            | DataType::Date64
+            | DataType::Time32(_)
+            | DataType::Time64(_)
+            | DataType::Timestamp(_, _)
+            | DataType::Duration(_)
+            | DataType::Interval(_)
+            | DataType::Binary
+            | DataType::LargeBinary
+            | DataType::Utf8
+            | DataType::LargeUtf8
+            | DataType::FixedSizeBinary(_)
+    )
+}
+
+fn native_collection_decode_bound(types: &[DataType], encoded_bytes: usize) -> Result<usize> {
+    let shape = types.iter().try_fold(0usize, |total, data_type| {
+        total
+            .checked_add(native_collection_shape_bytes(data_type)?)
+            .context("native collection decoded shape overflow")
+    })?;
+    // Encoded row, decoded Arrow buffers, and ScalarValue materialization can
+    // coexist. Charge three copies of payload and schema-driven wrappers.
+    encoded_bytes
+        .checked_add(shape)
+        .and_then(|n| n.checked_mul(3))
+        .context("native collection decoded bound overflow")
+}
+
 impl IncrementalAggregatingFunc {
+    fn native_collection_budget(
+        &self,
+        scope: &AggregateScope<'_>,
+        stats: impl Iterator<Item = (usize, CollectionStats)>,
+    ) -> Result<()> {
+        let config = self
+            .native_config
+            .context("native collection limits are missing")?;
+        // A collection's output and last-emitted value are both materialized
+        // during a flush. Charge each member, including NULL and duplicate
+        // occurrences, for scalar slots, Arrow buffers and transient copies.
+        // The threefold pending-output reservation is acquired before flush.
+        let mut working = 0usize;
+        for (index, stats) in stats {
+            let count = usize::try_from(stats.members)?;
+            let bytes = usize::try_from(stats.encoded_args_bytes)?;
+            let scalar_bytes = usize::try_from(stats.scalar_bytes)?;
+            let scalar_slots = count
+                .checked_mul(self.aggregates[index].input_exprs.len())
+                .and_then(|n| n.checked_mul(std::mem::size_of::<ScalarValue>()))
+                .context("native collection scalar workspace overflow")?;
+            working = working
+                .checked_add(bytes)
+                .and_then(|n| n.checked_add(scalar_bytes))
+                .and_then(|n| n.checked_add(scalar_slots))
+                .and_then(|n| n.checked_add(count.checked_mul(32)?))
+                .context("native collection workspace overflow")?;
+        }
+        let admitted = working
+            .checked_mul(8)
+            .context("native collection workspace overflow")?;
+        ensure!(
+            // Keep a conservative per-group preflight under the value limit.
+            // Arrow IPC framing is checked exactly by encode_group before the
+            // group is written; the eightfold transient materialization
+            // allowance belongs to the separate pending-output pool.
+            working <= scope.limits().value_bytes
+                && admitted <= config.max_pending_output_bytes / 3,
+            "native collection exceeds configured encoded-state or pending-output budget"
+        );
+        Ok(())
+    }
+
+    async fn native_collection_change(
+        &self,
+        scope: &mut AggregateScope<'_>,
+        group: &[u8],
+        aggregate_index: usize,
+        encoded_args_bytes: usize,
+        scalar_bytes: usize,
+        retract: bool,
+    ) -> Result<()> {
+        let key = native_collection_totals_key(group, aggregate_index)?;
+        let mut updated = CollectionStats::decode(scope.get(&key).await?)?;
+        let bytes = u64::try_from(encoded_args_bytes)?;
+        let scalar_bytes = u64::try_from(scalar_bytes)?;
+        if retract {
+            updated.members = updated
+                .members
+                .checked_sub(1)
+                .context("native collection member underflow")?;
+            updated.encoded_args_bytes = updated
+                .encoded_args_bytes
+                .checked_sub(bytes)
+                .context("native collection byte count underflow")?;
+            updated.scalar_bytes = updated
+                .scalar_bytes
+                .checked_sub(scalar_bytes)
+                .context("native collection scalar byte count underflow")?;
+        } else {
+            updated.members = updated
+                .members
+                .checked_add(1)
+                .context("native collection member overflow")?;
+            updated.encoded_args_bytes = updated
+                .encoded_args_bytes
+                .checked_add(bytes)
+                .context("native collection byte count overflow")?;
+            updated.scalar_bytes = updated
+                .scalar_bytes
+                .checked_add(scalar_bytes)
+                .context("native collection scalar byte count overflow")?;
+        }
+        let mut totals = Vec::new();
+        for (index, aggregate) in self.aggregates.iter().enumerate() {
+            if aggregate.collection {
+                let stats = if index == aggregate_index {
+                    updated
+                } else {
+                    CollectionStats::decode(
+                        scope
+                            .get(&native_collection_totals_key(group, index)?)
+                            .await?,
+                    )?
+                };
+                totals.push((index, stats));
+            }
+        }
+        self.native_collection_budget(scope, totals.into_iter())?;
+        if updated.members == 0 {
+            ensure!(
+                updated.encoded_args_bytes == 0 && updated.scalar_bytes == 0,
+                "native collection empty member count has retained bytes"
+            );
+            scope.delete(&key)?;
+        } else {
+            scope.put(&key, &updated.encode())?;
+        }
+        Ok(())
+    }
+
     fn native_state_types(&self) -> Vec<DataType> {
         self.aggregates
             .iter()
@@ -479,6 +803,27 @@ impl IncrementalAggregatingFunc {
             .iter()
             .map(|field| field.data_type().clone())
             .collect()
+    }
+
+    fn native_has_group_keys(&self) -> bool {
+        self.schema_without_metadata.fields().len() > self.aggregates.len()
+    }
+
+    async fn native_group_is_live(
+        &self,
+        scope: &AggregateScope<'_>,
+        group_key: &[u8],
+    ) -> Result<bool> {
+        if !self.native_has_group_keys() {
+            // A global SQL aggregate retains its single row on empty input.
+            return Ok(true);
+        }
+        let count = scope
+            .get(&native_live_rows_key(group_key)?)
+            .await?
+            .context("native aggregate keyed group is missing its live-row count")?;
+        ensure!(count.len() == 8, "invalid native aggregate live-row count");
+        Ok(u64::from_be_bytes(count.as_slice().try_into()?) > 0)
     }
 
     fn native_accumulators(&self, group: Option<&EncodedGroup>) -> Result<Vec<IncrementalState>> {
@@ -566,32 +911,137 @@ impl IncrementalAggregatingFunc {
     ) -> Result<()> {
         let aggregate = &self.aggregates[change.aggregate_index];
         let name = aggregate.func.fun().name().to_ascii_lowercase();
+        ensure!(
+            !aggregate.injected_timestamp || !change.values[0].is_null(0),
+            "native injected event time cannot be NULL"
+        );
         if change.values[0].is_null(0)
             && (matches!(name.as_str(), "min" | "max") || aggregate.func.ignore_nulls())
         {
             return Ok(());
         }
-        let (primary, secondary, args) = self.native_member_keys(
+        let (primary, mut secondary, args) = self.native_member_keys(
             change.group,
             change.generation,
             change.aggregate_index,
             change.values,
             change.ordinal,
         )?;
+        if aggregate.injected_timestamp {
+            let id = change
+                .row_id
+                .context("native injected timestamp requires a changelog row ID")?;
+            ensure!(id.len() == 16, "native changelog row ID must have 16 bytes");
+            secondary =
+                native_tuple_prefix(change.group, change.generation, change.aggregate_index, id)?;
+        }
+        let scalar_bytes = if aggregate.collection && !change.retract {
+            // Bound the encoded member before reconstructing its compact Arrow
+            // value for accounting. The scope already holds its decoded-value
+            // reservation; even a nested member cannot expand from an
+            // unbounded encoded input here.
+            ensure!(
+                args.len() <= scope.limits().value_bytes,
+                "native collection exceeds configured encoded-state or pending-output budget"
+            );
+            let decoded_allowance = scope
+                .limits()
+                .value_bytes
+                .checked_mul(3)
+                .context("native collection decoded allowance overflow")?;
+            let types = change
+                .values
+                .iter()
+                .map(|value| value.data_type().clone())
+                .collect::<Vec<_>>();
+            let decode_bound = native_collection_decode_bound(&types, args.len())?;
+            ensure!(
+                decode_bound <= decoded_allowance,
+                "native collection exceeds configured encoded-state or pending-output budget"
+            );
+            let store = self
+                .native_store
+                .as_ref()
+                .context("native collection store was not initialized")?;
+            let _decoded_permit = store.resources().try_decoded_value(decode_bound)?;
+            let scalar_bytes = native_collection_scalar_bytes(&aggregate.row_converter, &args)?;
+            ensure!(
+                scalar_bytes <= decode_bound,
+                "native collection member exceeds configured decoded allowance"
+            );
+            scalar_bytes
+        } else {
+            0
+        };
         if change.retract {
-            let prefix = &secondary[..secondary.len() - 8];
-            let Some((secondary_key, primary_key)) = scope.first(prefix).await? else {
-                // An unmatched retract preserves the old aggregate behavior.
-                return Ok(());
+            let (secondary_key, primary_key) = if aggregate.injected_timestamp {
+                let primary_key = scope
+                    .get(&secondary)
+                    .await?
+                    .context("native aggregate retracts a nonmatching indexed row ID")?;
+                (secondary.clone(), primary_key)
+            } else {
+                let prefix = &secondary[..secondary.len() - 8];
+                scope
+                    .first(prefix)
+                    .await?
+                    .context("native aggregate retracts a nonmatching indexed member")?
             };
             ensure!(
-                scope.get(&primary_key).await?.as_deref() == Some(args.as_slice()),
-                "aggregate member indexes disagree"
+                primary_key.starts_with(&native_member_prefix(
+                    change.group,
+                    change.generation,
+                    change.aggregate_index,
+                )?),
+                "native aggregate row ID points outside its member index"
             );
+            let stored = scope
+                .get(&primary_key)
+                .await?
+                .context("aggregate member index is missing")?;
+            if aggregate.collection {
+                let (retained_scalar_bytes, stored_args) = native_collection_member(&stored)?;
+                ensure!(stored_args == args, "aggregate member indexes disagree");
+                self.native_collection_change(
+                    scope,
+                    change.group,
+                    change.aggregate_index,
+                    args.len(),
+                    retained_scalar_bytes,
+                    true,
+                )
+                .await?;
+            } else if !aggregate.injected_timestamp {
+                ensure!(stored == args, "aggregate member indexes disagree");
+            }
             scope.delete(&secondary_key)?;
             scope.delete(&primary_key)?;
         } else {
-            scope.put(&primary, &args)?;
+            if aggregate.injected_timestamp {
+                ensure!(
+                    scope.get(&secondary).await?.is_none(),
+                    "native aggregate appends a duplicate live row ID"
+                );
+            }
+            if aggregate.collection {
+                self.native_collection_change(
+                    scope,
+                    change.group,
+                    change.aggregate_index,
+                    args.len(),
+                    scalar_bytes,
+                    false,
+                )
+                .await?;
+            }
+            if aggregate.collection {
+                let mut stored = Vec::with_capacity(8 + args.len());
+                stored.extend_from_slice(&u64::try_from(scalar_bytes)?.to_be_bytes());
+                stored.extend_from_slice(&args);
+                scope.put(&primary, &stored)?;
+            } else {
+                scope.put(&primary, &args)?;
+            }
             scope.put(&secondary, &primary)?;
         }
         Ok(())
@@ -607,12 +1057,22 @@ impl IncrementalAggregatingFunc {
         let aggregate = &self.aggregates[aggregate_index];
         let prefix = native_member_prefix(group, generation, aggregate_index)?;
         let mut accumulator = aggregate.func.create_accumulator()?;
-        if let Some((_, args)) = scope.first(&prefix).await? {
+        let mut after = None;
+        while let Some((key, stored)) = scope.first_from(&prefix, after.as_deref()).await? {
+            let args = if aggregate.collection {
+                native_collection_member(&stored)?.1
+            } else {
+                stored.as_slice()
+            };
             let parser = aggregate.row_converter.parser();
             let columns = aggregate
                 .row_converter
-                .convert_rows(std::iter::once(parser.parse(&args)))?;
+                .convert_rows(std::iter::once(parser.parse(args)))?;
             accumulator.update_batch(&columns)?;
+            if !aggregate.collection {
+                break;
+            }
+            after = Some(key);
         }
         Ok(accumulator.evaluate_mut()?)
     }
@@ -624,6 +1084,7 @@ impl IncrementalAggregatingFunc {
         inputs: &[AggregateInput],
         row: usize,
         retract: bool,
+        row_id: Option<&[u8]>,
     ) -> Result<()> {
         ensure!(
             !retract || !self.native_append_only,
@@ -642,12 +1103,46 @@ impl IncrementalAggregatingFunc {
                 )
             })
             .transpose()?;
+        let live_rows_key = self
+            .native_has_group_keys()
+            .then(|| native_live_rows_key(group_key))
+            .transpose()?;
+        let prior_rows = if let Some(key) = &live_rows_key {
+            let encoded = scope.get(key).await?;
+            ensure!(
+                previous.is_some() == encoded.is_some(),
+                "native aggregate keyed group is missing its live-row count"
+            );
+            encoded
+                .map(|bytes| {
+                    ensure!(bytes.len() == 8, "invalid native aggregate live-row count");
+                    Ok(u64::from_be_bytes(bytes.as_slice().try_into()?))
+                })
+                .transpose()?
+                .unwrap_or(0)
+        } else {
+            0
+        };
         let now = to_nanos(SystemTime::now()) as i64;
         let ttl_nanos = i64::try_from(self.ttl.as_nanos())?;
         let expired = !self.retain_indefinitely
             && previous
                 .as_ref()
                 .is_some_and(|group| now.saturating_sub(group.last_update_nanos) >= ttl_nanos);
+        let next_group_rows = if let Some(key) = &live_rows_key {
+            let rows = if expired { 0 } else { prior_rows };
+            let next_rows = if retract {
+                rows.checked_sub(1)
+                    .context("native aggregate retracts a missing keyed row")?
+            } else {
+                rows.checked_add(1)
+                    .context("native aggregate live-row count overflow")?
+            };
+            scope.put(key, &next_rows.to_be_bytes())?;
+            Some(next_rows)
+        } else {
+            None
+        };
         let generation = previous
             .as_ref()
             .map_or(0, |group| group.generation)
@@ -667,6 +1162,13 @@ impl IncrementalAggregatingFunc {
         };
         let mut accumulators =
             self.native_accumulators(if expired { None } else { previous.as_ref() })?;
+        if expired {
+            for (index, aggregate) in self.aggregates.iter().enumerate() {
+                if aggregate.collection {
+                    scope.delete(&native_collection_totals_key(group_key, index)?)?;
+                }
+            }
+        }
         if let Some(group) = &previous {
             if !self.retain_indefinitely {
                 let old_deadline = group.last_update_nanos.saturating_add(ttl_nanos);
@@ -698,9 +1200,33 @@ impl IncrementalAggregatingFunc {
                             values: &values,
                             retract,
                             ordinal,
+                            row_id,
                         },
                     )
                     .await?;
+                }
+            }
+        }
+        if next_group_rows == Some(0) {
+            for (index, aggregate) in self.aggregates.iter().enumerate() {
+                if aggregate.collection {
+                    ensure!(
+                        scope
+                            .get(&native_collection_totals_key(group_key, index)?)
+                            .await?
+                            .is_none(),
+                        "native aggregate empty group retains collection totals"
+                    );
+                }
+                if aggregate.accumulator_type == AccumulatorType::Batch {
+                    let primary = native_member_prefix(group_key, generation, index)?;
+                    let mut secondary = native_generation_prefix(b'R', group_key, generation)?;
+                    secondary.extend_from_slice(&u32::try_from(index)?.to_be_bytes());
+                    ensure!(
+                        scope.first(&primary).await?.is_none()
+                            && scope.first(&secondary).await?.is_none(),
+                        "native aggregate retracts a nonmatching keyed row"
+                    );
                 }
             }
         }
@@ -783,15 +1309,25 @@ impl IncrementalAggregatingFunc {
             !self.native_append_only || batch.column_by_name(UPDATING_META_FIELD).is_none(),
             "append-only native aggregate received changelog metadata",
         );
-        let retracts = Self::get_retracts(batch);
+        let changelog = if self.native_append_only {
+            None
+        } else {
+            Some(native_changelog_columns(batch)?)
+        };
         let limits = store.limits();
         let fallback = self
             .aggregates
             .iter()
             .filter(|aggregate| aggregate.accumulator_type == AccumulatorType::Batch)
             .count();
-        let worst_operations = 2usize
+        let collections = self
+            .aggregates
+            .iter()
+            .filter(|aggregate| aggregate.collection)
+            .count();
+        let worst_operations = (2 + usize::from(self.native_has_group_keys()))
             .checked_add(fallback.saturating_mul(2))
+            .and_then(|value| value.checked_add(collections.saturating_mul(2)))
             .and_then(|value| value.checked_add(3 * usize::from(!self.retain_indefinitely)))
             .ok_or_else(|| anyhow!("native aggregate operation count overflow"))?;
         let worst_overlay_bytes = worst_operations
@@ -818,8 +1354,9 @@ impl IncrementalAggregatingFunc {
                 store.begin().await?
             };
             for (row, key) in keys.iter().enumerate().take(end).skip(start) {
-                let retract = retracts.is_some_and(|flags| flags.value(row));
-                self.native_process_event(&mut scope, key, &inputs, row, retract)
+                let retract = changelog.is_some_and(|(flags, _)| flags.value(row));
+                let row_id = changelog.map(|(_, ids)| ids.value(row));
+                self.native_process_event(&mut scope, key, &inputs, row, retract, row_id)
                     .await?;
             }
             scope.commit().await?;
@@ -840,11 +1377,18 @@ impl IncrementalAggregatingFunc {
             .ok_or_else(|| anyhow!("native aggregate store missing"))?;
         let ttl_nanos = i64::try_from(self.ttl.as_nanos())?;
         let now = to_nanos(SystemTime::now()) as i64;
-        let rows_per_chunk = (store.limits().write_operations / 4)
-            .min(store.limits().write_bytes / (4 * store.max_encoded_entry_bytes()))
+        let operations_per_expiry = 4
+            + usize::from(self.native_has_group_keys())
+            + self.aggregates.iter().filter(|a| a.collection).count();
+        let rows_per_chunk = (store.limits().write_operations / operations_per_expiry)
+            .min(
+                store.limits().write_bytes
+                    / (operations_per_expiry * store.max_encoded_entry_bytes()),
+            )
             .min(
                 store.limits().overlay_bytes
-                    / (4 * (store.limits().key_bytes + store.limits().value_bytes)),
+                    / (operations_per_expiry
+                        * (store.limits().key_bytes + store.limits().value_bytes)),
             )
             .min(store.limits().page_entries);
         ensure!(
@@ -887,7 +1431,15 @@ impl IncrementalAggregatingFunc {
                         &encode_group(&group, scope.limits().value_bytes)?,
                     )?;
                     scope.put(&native_group_key(b'D', group_key)?, &[1])?;
+                    if self.native_has_group_keys() {
+                        scope.put(&native_live_rows_key(group_key)?, &0_u64.to_be_bytes())?;
+                    }
                     scope.put(&native_cleanup_key(group_key, old_generation)?, b"M")?;
+                    for (index, aggregate) in self.aggregates.iter().enumerate() {
+                        if aggregate.collection {
+                            scope.delete(&native_collection_totals_key(group_key, index)?)?;
+                        }
+                    }
                 }
             }
             scope.delete(&key)?;
@@ -900,23 +1452,69 @@ impl IncrementalAggregatingFunc {
         Ok(processed > 0)
     }
 
-    async fn cleanup_native(&self) -> Result<()> {
+    async fn cleanup_native(&self) -> Result<bool> {
         let store = self
             .native_store
             .as_ref()
             .ok_or_else(|| anyhow!("native aggregate store missing"))?;
         let mut scope = store.begin().await?;
         let Some((cleanup_key, phase)) = scope.first(b"C").await? else {
-            return Ok(());
+            return Ok(false);
         };
         ensure!(cleanup_key.len() >= 13, "invalid aggregate cleanup key");
         let group_end = cleanup_key.len() - 8;
         let group = &cleanup_key[5..group_end];
         let generation = u64::from_be_bytes(cleanup_key[group_end..].try_into()?);
         ensure!(
-            phase == b"M" || phase == b"R",
+            phase == b"M" || phase == b"R" || phase == b"T",
             "invalid aggregate cleanup phase"
         );
+        if phase == b"T" {
+            if !self.native_has_group_keys() {
+                scope.delete(&cleanup_key)?;
+                scope.commit().await?;
+                return Ok(true);
+            }
+            let cleanup_prefix = native_group_key(b'C', group)?;
+            if scope
+                .first_from(&cleanup_prefix, Some(&cleanup_key))
+                .await?
+                .is_some()
+            {
+                // A later generation still needs cleanup. Its marker will
+                // reclaim the tombstone after every earlier generation ends.
+                scope.delete(&cleanup_key)?;
+            } else {
+                let group_key = native_group_key(b'G', group)?;
+                let rows_key = native_live_rows_key(group)?;
+                let encoded_group = scope.get(&group_key).await?;
+                let encoded_rows = scope.get(&rows_key).await?;
+                ensure!(
+                    encoded_group.is_some() == encoded_rows.is_some(),
+                    "native aggregate keyed group is missing its live-row count"
+                );
+                if let (Some(_), Some(rows)) = (encoded_group, encoded_rows) {
+                    ensure!(rows.len() == 8, "invalid native aggregate live-row count");
+                    if u64::from_be_bytes(rows.as_slice().try_into()?) == 0
+                        && scope.get(&native_group_key(b'D', group)?).await?.is_none()
+                    {
+                        // The serial owner has already drained the dirty row,
+                        // including its emitted retract. The pair is one
+                        // admitted atomic write batch. Leave the harmless T
+                        // marker until the next cleanup step; its only
+                        // remaining action is to delete itself.
+                        scope.delete(&group_key)?;
+                        scope.delete(&rows_key)?;
+                    } else {
+                        scope.delete(&cleanup_key)?;
+                    }
+                } else {
+                    scope.delete(&cleanup_key)?;
+                }
+            }
+            scope.commit().await?;
+            return Ok(true);
+        }
         let prefix = native_generation_prefix(phase[0], group, generation)?;
         let mut after = None;
         let mut exhausted = false;
@@ -946,11 +1544,11 @@ impl IncrementalAggregatingFunc {
             if phase == b"M" {
                 scope.put(&cleanup_key, b"R")?;
             } else {
-                scope.delete(&cleanup_key)?;
+                scope.put(&cleanup_key, b"T")?;
             }
         }
         scope.commit().await?;
-        Ok(())
+        Ok(true)
     }
 
     async fn flush_native(
@@ -963,10 +1561,14 @@ impl IncrementalAggregatingFunc {
         self.drain_native_dirty(ctx, collector).await?;
         while self.expire_native().await? {
             self.drain_native_dirty(ctx, collector).await?;
-            self.cleanup_native().await?;
             tokio::task::yield_now().await;
         }
-        self.cleanup_native().await?;
+        // Each invocation owns at most one admitted cleanup page. Drain the
+        // finite backlog through EOF/barriers as well as timer flushes, so an
+        // idle keyed group does not retain a tombstone indefinitely.
+        while self.cleanup_native().await? {
+            tokio::task::yield_now().await;
+        }
         Ok(())
     }
 
@@ -987,15 +1589,23 @@ impl IncrementalAggregatingFunc {
             "native aggregate pending-output rows must fit one retract/append pair"
         );
         let store_limits = store.limits();
+        let writes_per_group = 2
+            + usize::from(self.native_has_group_keys())
+            + usize::from(self.native_has_group_keys() && !self.retain_indefinitely);
         let max_dirty_groups = (configured.max_pending_output_rows / 2)
-            .min(store_limits.write_operations / 2)
-            .min(store_limits.write_bytes / store.max_encoded_entry_bytes().saturating_mul(2))
+            .min(store_limits.write_operations / writes_per_group)
+            .min(
+                store_limits.write_bytes
+                    / store
+                        .max_encoded_entry_bytes()
+                        .saturating_mul(writes_per_group),
+            )
             .min(
                 store_limits.overlay_bytes
                     / store_limits
                         .key_bytes
                         .saturating_add(store_limits.value_bytes)
-                        .saturating_mul(2),
+                        .saturating_mul(writes_per_group),
             );
         ensure!(
             max_dirty_groups > 0,
@@ -1046,14 +1656,15 @@ impl IncrementalAggregatingFunc {
                             }
                         });
                     }
-                    let unchanged = group.last_emitted.as_ref().is_some_and(|old| {
-                        old.iter()
-                            .zip(next.iter())
-                            .take(old.len().saturating_sub(1))
-                            .all(|(old, new)| old == new)
-                    });
+                    let append = self.native_group_is_live(&scope, &group_key).await?;
+                    let unchanged = append
+                        && group.last_emitted.as_ref().is_some_and(|old| {
+                            old.iter()
+                                .zip(next.iter())
+                                .take(old.len().saturating_sub(1))
+                                .all(|(old, new)| old == new)
+                        });
                     if !unchanged {
-                        let append = !next.last().is_some_and(ScalarValue::is_null);
                         let old_bytes = group.last_emitted.as_ref().map_or(0, |old| {
                             old.iter()
                                 .map(ScalarValue::size)
@@ -1096,6 +1707,24 @@ impl IncrementalAggregatingFunc {
                                 column.push(value.clone());
                             }
                             group.last_emitted = Some(next);
+                        }
+                    }
+                    if !append && self.native_has_group_keys() {
+                        // Retain an empty tombstone only while the old member
+                        // generation is being cleaned. A reinsert gets the new
+                        // generation and cannot be erased by that cleanup.
+                        let old_generation = group.generation;
+                        group.generation = group
+                            .generation
+                            .checked_add(1)
+                            .context("aggregate generation overflow")?;
+                        group.next_ordinal = 0;
+                        scope.put(&native_cleanup_key(&group_key, old_generation)?, b"M")?;
+                        if !self.retain_indefinitely {
+                            let deadline = group
+                                .last_update_nanos
+                                .saturating_add(i64::try_from(self.ttl.as_nanos())?);
+                            scope.delete(&native_expiry_key(deadline, &group_key)?)?;
                         }
                     }
                     scope.put(
@@ -1168,12 +1797,18 @@ impl IncrementalAggregatingFunc {
             .iter()
             .filter(|aggregate| aggregate.accumulator_type == AccumulatorType::Batch)
             .count();
-        let required_operations = 2usize
+        let collections = self
+            .aggregates
+            .iter()
+            .filter(|aggregate| aggregate.collection)
+            .count();
+        let required_operations = (2 + usize::from(self.native_has_group_keys()))
             .checked_add(
                 indexed
                     .checked_mul(2)
                     .context("aggregate index count overflow")?,
             )
+            .and_then(|count| count.checked_add(collections.saturating_mul(2)))
             .and_then(|count| count.checked_add(3 * usize::from(!self.retain_indefinitely)))
             .context("aggregate operation count overflow")?;
         ensure!(
@@ -2120,6 +2755,36 @@ fn set_retract_metadata(metadata: ArrayRef, is_retract: Arc<BooleanArray>) -> Ar
     Arc::new(StructArray::new(updating_meta_fields(), arrays, None))
 }
 
+fn native_changelog_columns(batch: &RecordBatch) -> Result<(&BooleanArray, &FixedSizeBinaryArray)> {
+    let metadata = batch
+        .column_by_name(UPDATING_META_FIELD)
+        .context("native changelog input has no updating metadata")?
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .context("native changelog metadata is not a struct")?;
+    ensure!(
+        metadata.null_count() == 0,
+        "native changelog metadata contains NULL"
+    );
+    let retracts = metadata
+        .column_by_name("is_retract")
+        .context("native changelog metadata has no retract flag")?
+        .as_any()
+        .downcast_ref::<BooleanArray>()
+        .context("native changelog retract flag is not Boolean")?;
+    let ids = metadata
+        .column_by_name("id")
+        .context("native changelog metadata has no row ID")?
+        .as_any()
+        .downcast_ref::<FixedSizeBinaryArray>()
+        .context("native changelog row ID is not FixedSizeBinary")?;
+    ensure!(
+        retracts.null_count() == 0 && ids.null_count() == 0 && ids.value_length() == 16,
+        "native changelog requires non-null Boolean retractions and 16-byte row IDs"
+    );
+    Ok((retracts, ids))
+}
+
 pub struct IncrementalAggregatingConstructor;
 
 impl OperatorConstructor for IncrementalAggregatingConstructor {
@@ -2283,6 +2948,32 @@ impl IncrementalAggregatingConstructor {
                     aggregate_expressions(std::slice::from_ref(&agg), &AggregateMode::Single, 0)?
                         .pop()
                         .unwrap();
+                let collection = native_config.is_some()
+                    && agg
+                        .fun()
+                        .inner()
+                        .as_any()
+                        .is::<datafusion::functions_aggregate::array_agg::ArrayAgg>();
+                if collection {
+                    ensure!(
+                        agg.expressions().len() == 1,
+                        "native ARRAY_AGG requires one value argument"
+                    );
+                    let types = input_exprs
+                        .iter()
+                        .map(|expr| expr.data_type(&input_schema.schema))
+                        .collect::<DFResult<Vec<_>>>()?;
+                    let bound = native_collection_decode_bound(&types, 0)?;
+                    let allowance = native_config
+                        .context("native ARRAY_AGG limits are missing")?
+                        .value_bytes
+                        .checked_mul(3)
+                        .context("native collection decoded allowance overflow")?;
+                    ensure!(
+                        bound <= allowance,
+                        "native ARRAY_AGG collection schema exceeds configured decoded allowance"
+                    );
+                }
                 let row_converter = Arc::new(RowConverter::new(
                     input_exprs
                         .iter()
@@ -2322,6 +3013,7 @@ impl IncrementalAggregatingConstructor {
                     filter,
                     index_converter,
                     index_columns,
+                    collection,
                 ))
             })
             // The second map_ok returns an inner Result. flatten_ok would
@@ -2335,21 +3027,78 @@ impl IncrementalAggregatingConstructor {
 
         let state_schema = Schema::new(sliding_state_fields);
 
-        let versioned_inputs = aggregates
-            .iter()
-            .any(|(agg, _, _, _, _, filter, _, _)| filter.is_some() || agg.order_bys().is_some());
+        let versioned_inputs = aggregates.iter().any(|(agg, _, _, _, _, filter, _, _, _)| {
+            filter.is_some() || agg.order_bys().is_some()
+        });
+        // The planner appends this engine-owned event-time MAX after caller
+        // expressions. Validate its physical expression, rather than treating
+        // any caller MAX or alias named `_timestamp` as the row-ID index.
+        let injected_timestamp_index = if native_config.is_some() && !native_append_only {
+            let index = aggregates
+                .len()
+                .checked_sub(1)
+                .context("native aggregate has no injected event-time MAX")?;
+            let (agg, kind, _, _, args, filter, _, _, _) = &aggregates[index];
+            let event_column = args
+                .first()
+                .and_then(|arg| arg.as_any().downcast_ref::<Column>());
+            ensure!(
+                *kind == AccumulatorType::Batch
+                    && agg.fun().inner().as_any().is::<Max>()
+                    && agg.name() == TIMESTAMP_FIELD
+                    && args.len() == 1
+                    && event_column
+                        .is_some_and(|column| column.index() == input_schema.timestamp_index)
+                    && input_schema
+                        .schema
+                        .field(input_schema.timestamp_index)
+                        .name()
+                        == TIMESTAMP_FIELD
+                    && input_schema
+                        .schema
+                        .field(input_schema.timestamp_index)
+                        .data_type()
+                        == &DataType::Timestamp(TimeUnit::Nanosecond, None)
+                    && filter.is_none()
+                    && agg.order_bys().is_none()
+                    && !agg.is_distinct()
+                    && !agg.ignore_nulls()
+                    && final_schema.schema.fields().len()
+                        == key_fields.len() + aggregates.len() + 1
+                    && final_schema.timestamp_index + 1 == final_schema.schema.fields().len() - 1
+                    && final_schema
+                        .schema
+                        .field(final_schema.timestamp_index)
+                        .name()
+                        == TIMESTAMP_FIELD
+                    && final_schema
+                        .schema
+                        .field(final_schema.timestamp_index)
+                        .data_type()
+                        == &DataType::Timestamp(TimeUnit::Nanosecond, None),
+                "native aggregate final event-time MAX does not match the planner-injected expression"
+            );
+            Some(index)
+        } else {
+            None
+        };
         let aggregates: Vec<Aggregator> = aggregates
             .into_iter()
+            .enumerate()
             .map(
                 |(
-                    agg,
-                    t,
-                    row_converter,
-                    state_cols,
-                    input_exprs,
-                    filter,
-                    index_converter,
-                    index_columns,
+                    index,
+                    (
+                        agg,
+                        t,
+                        row_converter,
+                        state_cols,
+                        input_exprs,
+                        filter,
+                        index_converter,
+                        index_columns,
+                        collection,
+                    ),
                 )| Aggregator {
                     func: agg,
                     input_exprs,
@@ -2359,6 +3108,8 @@ impl IncrementalAggregatingConstructor {
                     state_cols,
                     index_converter,
                     index_columns,
+                    collection,
+                    injected_timestamp: Some(index) == injected_timestamp_index,
                 },
             )
             .collect();
@@ -2372,13 +3123,36 @@ impl IncrementalAggregatingConstructor {
         {
             identity.update(b"\0append-only-ordinary-state.v1");
         }
+        // Keyed native groups now persist their input-row cardinality alongside
+        // the accumulator. An older checkpoint lacks that key and cannot safely
+        // distinguish an empty group from NULL-valued aggregate results.
+        if final_schema.schema.fields().len() > aggregates.len() + 1 {
+            identity.update(b"\0keyed-live-rows.v1");
+        }
+        if injected_timestamp_index.is_some() {
+            // Previous R keys contain the timestamp argument, not the stable
+            // source row ID. They cannot recover a CDC before row's old time.
+            identity.update(b"\0injected-timestamp-row-id.v1");
+        }
         let native_schema_identity = identity.finalize().to_vec();
 
-        // ensure the last field (timestamp) has the expected name before creating the arroyo schema
+        // An indexed-only plan has no sliding accumulator state to carry the
+        // legacy timestamp field. Keep its key columns intact and supply the
+        // schema sentinel explicitly; native state still persists through G/M/R.
         let mut state_fields = state_schema.fields().to_vec();
-        let timestamp_field = state_fields.pop().unwrap();
+        let timestamp_field = if state_fields.len() == key_fields.len() {
+            Field::new(
+                TIMESTAMP_FIELD,
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                false,
+            )
+        } else {
+            (*state_fields.pop().unwrap())
+                .clone()
+                .with_name(TIMESTAMP_FIELD)
+        };
         state_fields.push(Arc::new(versioned_state_timestamp(
-            (*timestamp_field).clone().with_name(TIMESTAMP_FIELD),
+            timestamp_field,
             versioned_inputs,
         )));
 
@@ -2452,6 +3226,7 @@ mod tests {
     };
     use datafusion::execution::FunctionRegistry;
     use datafusion::functions_aggregate::{
+        array_agg::array_agg_udaf,
         count::count_udaf,
         first_last::{first_value_udaf, last_value_udaf},
         min_max::max_udaf,
@@ -2694,6 +3469,108 @@ mod tests {
         operator
     }
 
+    fn native_array_operator(
+        distinct: bool,
+        ignore_nulls: bool,
+        filtered: bool,
+    ) -> IncrementalAggregatingFunc {
+        let schema = input_schema();
+        let value: Arc<dyn PhysicalExpr> = Arc::new(Column::new("value", 0));
+        let sequence: Arc<dyn PhysicalExpr> = Arc::new(Column::new("sequence", 1));
+        let include: Arc<dyn PhysicalExpr> = Arc::new(Column::new("include", 2));
+        let timestamp: Arc<dyn PhysicalExpr> = Arc::new(Column::new(TIMESTAMP_FIELD, 3));
+        let mut registry = Registry::default();
+        registry.register_udaf(array_agg_udaf()).unwrap();
+        registry.register_udaf(max_udaf()).unwrap();
+        let mut builder = AggregateExprBuilder::new(array_agg_udaf(), vec![value])
+            .schema(schema.clone())
+            .alias("items");
+        if distinct {
+            builder = builder.distinct();
+        } else {
+            builder = builder.order_by(LexOrdering::new(vec![PhysicalSortExpr::new(
+                sequence,
+                SortOptions {
+                    descending: false,
+                    nulls_first: false,
+                },
+            )]));
+        }
+        if ignore_nulls {
+            builder = builder.ignore_nulls();
+        }
+        let expressions = [
+            Arc::new(builder.build().unwrap()),
+            Arc::new(
+                AggregateExprBuilder::new(max_udaf(), vec![timestamp])
+                    .schema(schema.clone())
+                    .alias(TIMESTAMP_FIELD)
+                    .build()
+                    .unwrap(),
+            ),
+        ];
+        let codec = DefaultPhysicalExtensionCodec {};
+        let aggregate = AggregateExecNode {
+            aggr_expr: expressions
+                .iter()
+                .map(|expr| serialize_physical_aggr_expr(expr.clone(), &codec).unwrap())
+                .collect(),
+            aggr_expr_name: expressions
+                .iter()
+                .map(|expr| expr.name().to_string())
+                .collect(),
+            filter_expr: vec![
+                MaybeFilter {
+                    expr: filtered.then(|| serialize_physical_expr(&include, &codec).unwrap()),
+                },
+                MaybeFilter { expr: None },
+            ],
+            ..Default::default()
+        };
+        let mut fields: Vec<_> = expressions.iter().map(|expr| expr.field()).collect();
+        fields.push(Arc::new(Field::new(
+            UPDATING_META_FIELD,
+            DataType::Struct(updating_meta_fields()),
+            false,
+        )));
+        let mut input_fields = SchemaBuilder::from(schema.as_ref().clone());
+        input_fields.push(Field::new(
+            UPDATING_META_FIELD,
+            DataType::Struct(updating_meta_fields()),
+            false,
+        ));
+        let metadata: Arc<dyn PhysicalExpr> = Arc::new(Literal::new(ScalarValue::Null));
+        let config = UpdatingAggregateOperator {
+            name: "native-array-aggregate".into(),
+            input_schema: Some(
+                ArroyoSchema::from_schema_unkeyed(Arc::new(input_fields.finish()))
+                    .unwrap()
+                    .into(),
+            ),
+            final_schema: Some(
+                ArroyoSchema::from_schema_unkeyed(Arc::new(Schema::new(fields)))
+                    .unwrap()
+                    .into(),
+            ),
+            aggregate_exec: PhysicalPlanNode {
+                physical_plan_type: Some(PhysicalPlanType::Aggregate(Box::new(aggregate))),
+            }
+            .encode_to_vec(),
+            metadata_expr: serialize_physical_expr(&metadata, &codec)
+                .unwrap()
+                .encode_to_vec(),
+            flush_interval_micros: 1_000_000,
+            ttl_micros: 3_600_000_000,
+            retain_indefinitely: Some(true),
+        };
+        IncrementalAggregatingConstructor::build_with_native_config(
+            config,
+            Arc::new(registry),
+            Some(native_test_config()),
+        )
+        .unwrap()
+    }
+
     fn native_test_config() -> AggregateStateConfig {
         AggregateStateConfig {
             key_bytes: 256,
@@ -2746,6 +3623,508 @@ mod tests {
         .unwrap();
         let table = manager.register(NATIVE_AGGREGATE_TABLE).unwrap();
         AggregateStore::new(backend, table, resources, limits).unwrap()
+    }
+
+    async fn array_members(
+        store: &AggregateStore,
+        operator: &IncrementalAggregatingFunc,
+    ) -> Vec<ScalarValue> {
+        let scope = store.begin().await.unwrap();
+        let ScalarValue::List(list) = operator
+            .native_fallback_value(&scope, &GLOBAL_KEY, 0, 0)
+            .await
+            .unwrap()
+        else {
+            panic!("ARRAY_AGG did not produce a list")
+        };
+        let values = list.value(0);
+        (0..values.len())
+            .map(|index| ScalarValue::try_from_array(&values, index).unwrap())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn native_array_index_preserves_order_nulls_duplicates_filter_and_retractions() {
+        let mut operator = native_array_operator(false, false, true);
+        operator.native_store = Some(native_test_store());
+        let store = operator.native_store.as_ref().unwrap();
+        let input = batch(
+            &[Some("z"), Some("a"), None, Some("a"), Some("ignored")],
+            &[4, 1, 3, 2, 5],
+            &[Some(true), Some(true), Some(true), Some(true), Some(false)],
+        );
+        let inputs = operator.compute_inputs(&input).unwrap();
+        let mut scope = store.begin().await.unwrap();
+        for row in 0..input.num_rows() {
+            operator
+                .native_process_event(
+                    &mut scope,
+                    &GLOBAL_KEY,
+                    &inputs,
+                    row,
+                    false,
+                    Some(&test_row_id(&input, row)),
+                )
+                .await
+                .unwrap();
+        }
+        scope.commit().await.unwrap();
+        assert_eq!(
+            array_members(store, &operator).await,
+            vec![
+                ScalarValue::Utf8(Some("a".into())),
+                ScalarValue::Utf8(Some("a".into())),
+                ScalarValue::Utf8(None),
+                ScalarValue::Utf8(Some("z".into())),
+            ]
+        );
+        // A fresh operator sees only the durable indexed state. A matching
+        // retraction removes one occurrence, not every equal value.
+        let fresh = native_array_operator(false, false, true);
+        let mut scope = store.begin().await.unwrap();
+        fresh
+            .native_process_event(
+                &mut scope,
+                &GLOBAL_KEY,
+                &inputs,
+                1,
+                true,
+                Some(&test_row_id(&input, 1)),
+            )
+            .await
+            .unwrap();
+        scope.commit().await.unwrap();
+        assert_eq!(
+            array_members(store, &fresh).await,
+            vec![
+                ScalarValue::Utf8(Some("a".into())),
+                ScalarValue::Utf8(None),
+                ScalarValue::Utf8(Some("z".into())),
+            ]
+        );
+        assert_eq!(
+            CollectionStats::decode(
+                store
+                    .begin()
+                    .await
+                    .unwrap()
+                    .get(&native_collection_totals_key(&GLOBAL_KEY, 0).unwrap())
+                    .await
+                    .unwrap()
+            )
+            .unwrap()
+            .members,
+            3
+        );
+    }
+
+    #[tokio::test]
+    async fn keyed_native_group_tracks_last_retraction_independently_of_aggregate_values() {
+        let store = native_test_store();
+        let mut operator = native_operator();
+        let mut fields = operator.schema_without_metadata.fields().to_vec();
+        fields.insert(0, Arc::new(Field::new("group_key", DataType::Utf8, false)));
+        operator.schema_without_metadata = Arc::new(Schema::new(fields));
+        operator.key_converter = RowConverter::new(vec![SortField::new(DataType::Utf8)]).unwrap();
+        let group_columns: Vec<ArrayRef> = vec![Arc::new(StringArray::from(vec!["same-group"]))];
+        let group = operator
+            .key_converter
+            .convert_columns(&group_columns)
+            .unwrap()
+            .row(0)
+            .as_ref()
+            .to_vec();
+        let input = batch(&[Some("value")], &[1], &[Some(true)]);
+        let inputs = operator.compute_inputs(&input).unwrap();
+
+        let mut scope = store.begin().await.unwrap();
+        assert!(operator.native_group_is_live(&scope, &group).await.is_err());
+        assert!(
+            operator
+                .native_process_event(
+                    &mut scope,
+                    &group,
+                    &inputs,
+                    0,
+                    true,
+                    Some(&test_row_id(&input, 0))
+                )
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("retracts a missing keyed row")
+        );
+        operator
+            .native_process_event(
+                &mut scope,
+                &group,
+                &inputs,
+                0,
+                false,
+                Some(&test_row_id(&input, 0)),
+            )
+            .await
+            .unwrap();
+        assert!(operator.native_group_is_live(&scope, &group).await.unwrap());
+        scope.commit().await.unwrap();
+
+        let id = ScalarValue::FixedSizeBinary(16, None).to_array().unwrap();
+        let metadata = StructArray::new(
+            updating_meta_fields(),
+            vec![Arc::new(BooleanArray::from(vec![false])), id],
+            None,
+        );
+        operator.metadata_expr = Arc::new(Literal::new(ScalarValue::Struct(Arc::new(metadata))));
+        let mut output = SchemaBuilder::from(operator.schema_without_metadata.as_ref().clone());
+        output.push(Field::new(
+            UPDATING_META_FIELD,
+            DataType::Struct(updating_meta_fields()),
+            false,
+        ));
+        let output_schema = ArroyoSchema::from_schema_unkeyed(Arc::new(output.finish())).unwrap();
+        let (config, _) = native_config();
+        let input_schema: ArroyoSchema = config.input_schema.unwrap().try_into().unwrap();
+        let (control_tx, _control_rx) = tokio::sync::mpsc::channel(16);
+        let mut ctx = OperatorContext::new(
+            Arc::new(arroyo_types::TaskInfo {
+                job_id: "native-keyed-empty-group".into(),
+                operator_idx: 0,
+                operator_name: "UpdatingAggregate".into(),
+                operator_id: "native-keyed-empty-group".into(),
+                task_index: 0,
+                parallelism: 1,
+                key_range: 0..=u64::MAX,
+                checkpoint_file_path_layout: Default::default(),
+            }),
+            None,
+            control_tx,
+            1,
+            vec![Arc::new(input_schema)],
+            Some(Arc::new(output_schema)),
+            HashMap::new(),
+        )
+        .await;
+        operator.native_store = Some(store);
+        let mut collector = AggregateCollector::default();
+        operator
+            .drain_native_dirty(&mut ctx, &mut collector)
+            .await
+            .unwrap();
+        assert_eq!(collector.batches.len(), 1);
+        assert_eq!(collector.batches[0].num_rows(), 1);
+        assert!(
+            !IncrementalAggregatingFunc::get_retracts(&collector.batches[0])
+                .unwrap()
+                .value(0)
+        );
+
+        let store = operator.native_store.as_ref().unwrap();
+        let mut scope = store.begin().await.unwrap();
+        operator
+            .native_process_event(
+                &mut scope,
+                &group,
+                &inputs,
+                0,
+                true,
+                Some(&test_row_id(&input, 0)),
+            )
+            .await
+            .unwrap();
+        assert!(!operator.native_group_is_live(&scope, &group).await.unwrap());
+        scope.commit().await.unwrap();
+        operator
+            .drain_native_dirty(&mut ctx, &mut collector)
+            .await
+            .unwrap();
+        assert_eq!(collector.batches.len(), 2);
+        assert_eq!(collector.batches[1].num_rows(), 1);
+        assert!(
+            IncrementalAggregatingFunc::get_retracts(&collector.batches[1])
+                .unwrap()
+                .value(0)
+        );
+        for _ in 0..8 {
+            if !operator.cleanup_native().await.unwrap() {
+                break;
+            }
+        }
+        let reloaded = store.begin().await.unwrap();
+        assert!(
+            reloaded
+                .get(&native_group_key(b'G', &group).unwrap())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            reloaded
+                .get(&native_live_rows_key(&group).unwrap())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(reloaded.first(b"C").await.unwrap().is_none());
+        let unkeyed = native_operator();
+        assert!(
+            unkeyed
+                .native_group_is_live(&reloaded, &GLOBAL_KEY)
+                .await
+                .unwrap()
+        );
+        drop(reloaded);
+        let mut scope = store.begin().await.unwrap();
+        operator
+            .native_process_event(
+                &mut scope,
+                &group,
+                &inputs,
+                0,
+                false,
+                Some(&test_row_id(&input, 0)),
+            )
+            .await
+            .unwrap();
+        scope.commit().await.unwrap();
+        operator
+            .drain_native_dirty(&mut ctx, &mut collector)
+            .await
+            .unwrap();
+        assert_eq!(collector.batches.len(), 3);
+        assert!(
+            !IncrementalAggregatingFunc::get_retracts(&collector.batches[2])
+                .unwrap()
+                .value(0)
+        );
+    }
+
+    #[tokio::test]
+    async fn native_array_distinct_and_ignore_nulls_keep_occurrence_counts() {
+        let mut operator = native_array_operator(true, true, false);
+        operator.native_store = Some(native_test_store());
+        let store = operator.native_store.as_ref().unwrap();
+        let input = batch(
+            &[Some("b"), None, Some("b"), Some("a")],
+            &[1, 2, 3, 4],
+            &[Some(true); 4],
+        );
+        let inputs = operator.compute_inputs(&input).unwrap();
+        let mut scope = store.begin().await.unwrap();
+        for row in 0..input.num_rows() {
+            operator
+                .native_process_event(
+                    &mut scope,
+                    &GLOBAL_KEY,
+                    &inputs,
+                    row,
+                    false,
+                    Some(&test_row_id(&input, row)),
+                )
+                .await
+                .unwrap();
+        }
+        scope.commit().await.unwrap();
+        let mut values = array_members(store, &operator).await;
+        values.sort_by_key(|value| format!("{value:?}"));
+        assert_eq!(
+            values,
+            vec![
+                ScalarValue::Utf8(Some("a".into())),
+                ScalarValue::Utf8(Some("b".into()))
+            ]
+        );
+        let mut scope = store.begin().await.unwrap();
+        operator
+            .native_process_event(
+                &mut scope,
+                &GLOBAL_KEY,
+                &inputs,
+                0,
+                true,
+                Some(&test_row_id(&input, 0)),
+            )
+            .await
+            .unwrap();
+        scope.commit().await.unwrap();
+        assert_eq!(array_members(store, &operator).await.len(), 2);
+        let mut scope = store.begin().await.unwrap();
+        operator
+            .native_process_event(
+                &mut scope,
+                &GLOBAL_KEY,
+                &inputs,
+                2,
+                true,
+                Some(&test_row_id(&input, 2)),
+            )
+            .await
+            .unwrap();
+        scope.commit().await.unwrap();
+        assert_eq!(
+            array_members(store, &operator).await,
+            vec![ScalarValue::Utf8(Some("a".into()))]
+        );
+    }
+
+    #[tokio::test]
+    async fn native_array_rejects_large_member_before_writing_any_index() {
+        let mut operator = native_array_operator(false, false, false);
+        operator.native_store = Some(native_test_store());
+        let store = operator.native_store.as_ref().unwrap();
+        let large = "x".repeat(8 * 1024);
+        let input = batch(&[Some(&large)], &[1], &[Some(true)]);
+        let inputs = operator.compute_inputs(&input).unwrap();
+        let mut scope = store.begin().await.unwrap();
+        assert!(
+            operator
+                .native_process_event(
+                    &mut scope,
+                    &GLOBAL_KEY,
+                    &inputs,
+                    0,
+                    false,
+                    Some(&test_row_id(&input, 0))
+                )
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("native collection exceeds")
+        );
+        drop(scope);
+        let scope = store.begin().await.unwrap();
+        assert!(scope.first(b"M").await.unwrap().is_none());
+        assert!(
+            scope
+                .get(&native_collection_totals_key(&GLOBAL_KEY, 0).unwrap())
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn native_array_counts_zero_byte_members_and_accepts_typed_struct_rows() {
+        let store = native_test_store();
+        let operator = native_array_operator(false, false, false);
+        let scope = store.begin().await.unwrap();
+        assert!(
+            operator
+                .native_collection_budget(
+                    &scope,
+                    std::iter::once((
+                        0,
+                        CollectionStats {
+                            members: 1_000,
+                            encoded_args_bytes: 0,
+                            scalar_bytes: 0,
+                        }
+                    )),
+                )
+                .is_err()
+        );
+
+        let fields = vec![Arc::new(Field::new("label", DataType::Utf8, true))].into();
+        let value = Arc::new(
+            StructArray::try_new(
+                fields,
+                vec![Arc::new(StringArray::from(vec![Some("typed"); 1_024]))],
+                None,
+            )
+            .unwrap(),
+        ) as ArrayRef;
+        let value = value.slice(0, 1);
+        let converter = RowConverter::new(vec![SortField::new(value.data_type().clone())]).unwrap();
+        let rows = converter
+            .convert_columns(std::slice::from_ref(&value))
+            .unwrap();
+        let stored_args = rows.row(0);
+        let scalar_bytes =
+            native_collection_scalar_bytes(&converter, stored_args.as_ref()).unwrap();
+        assert!(scalar_bytes < 4_096);
+        assert!(
+            operator
+                .native_collection_budget(
+                    &scope,
+                    std::iter::once((
+                        0,
+                        CollectionStats {
+                            members: 12,
+                            encoded_args_bytes: u64::try_from(stored_args.as_ref().len() * 12)
+                                .unwrap(),
+                            scalar_bytes: u64::try_from(scalar_bytes * 12).unwrap(),
+                        }
+                    )),
+                )
+                .is_ok()
+        );
+        let decoded = converter.convert_rows(rows.iter()).unwrap();
+        assert_eq!(decoded[0].data_type(), value.data_type());
+        assert_eq!(
+            ScalarValue::try_from_array(&decoded[0], 0).unwrap(),
+            ScalarValue::try_from_array(&value, 0).unwrap()
+        );
+
+        let null_parent = Arc::new(
+            StructArray::try_new(
+                vec![Arc::new(Field::new("label", DataType::Utf8, true))].into(),
+                vec![Arc::new(StringArray::from(vec![Some("typed"); 1_024]))],
+                Some(arrow::buffer::NullBuffer::new_null(1_024)),
+            )
+            .unwrap(),
+        ) as ArrayRef;
+        let null_parent = null_parent.slice(0, 1);
+        let null_rows = converter
+            .convert_columns(std::slice::from_ref(&null_parent))
+            .unwrap();
+        assert!(
+            native_collection_scalar_bytes(&converter, null_rows.row(0).as_ref()).unwrap() < 4_096
+        );
+    }
+
+    #[test]
+    fn native_array_shape_preflight_admits_flat_struct_and_rejects_wide_or_nested_values() {
+        let selected_fields = vec![
+            Arc::new(Field::new("row_id", DataType::Int64, false)),
+            Arc::new(Field::new("sort_pos", DataType::Int64, false)),
+            Arc::new(Field::new("label", DataType::Utf8, true)),
+        ];
+        let selected = DataType::Struct(selected_fields.into());
+        assert!(native_collection_decode_bound(&[selected], 128).unwrap() < 3 * 32 * 1024);
+
+        let wide_fields = (0..512)
+            .map(|index| Arc::new(Field::new(format!("f{index}"), DataType::Null, true)))
+            .collect::<Vec<_>>();
+        let wide = DataType::Struct(wide_fields.into());
+        assert!(native_collection_decode_bound(&[wide], 0).unwrap() > 3 * 32 * 1024);
+        assert!(
+            native_collection_decode_bound(&[DataType::FixedSizeBinary(128 * 1024)], 0).unwrap()
+                > 3 * 32 * 1024
+        );
+        let null_parent_with_wide_child = DataType::Struct(
+            vec![Arc::new(Field::new(
+                "child",
+                DataType::FixedSizeBinary(128 * 1024),
+                true,
+            ))]
+            .into(),
+        );
+        assert!(
+            native_collection_decode_bound(&[null_parent_with_wide_child], 0).unwrap()
+                > 3 * 32 * 1024
+        );
+        assert!(
+            native_collection_decode_bound(
+                &[DataType::List(Arc::new(Field::new(
+                    "item",
+                    DataType::Utf8,
+                    true,
+                )))],
+                0
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("unsupported nested type")
+        );
     }
 
     #[tokio::test]
@@ -2892,7 +4271,7 @@ mod tests {
         for row in 0..input.num_rows() {
             let mut scope = store.begin().await.unwrap();
             operator
-                .native_process_event(&mut scope, &GLOBAL_KEY, &inputs, row, false)
+                .native_process_event(&mut scope, &GLOBAL_KEY, &inputs, row, false, None)
                 .await
                 .unwrap();
             scope.commit().await.unwrap();
@@ -2965,7 +4344,7 @@ mod tests {
         for row in 0..rows.num_rows() {
             let mut scope = store.begin().await.unwrap();
             operator
-                .native_process_event(&mut scope, &GLOBAL_KEY, &inputs, row, false)
+                .native_process_event(&mut scope, &GLOBAL_KEY, &inputs, row, false, None)
                 .await
                 .unwrap();
             scope.commit().await.unwrap();
@@ -3027,7 +4406,7 @@ mod tests {
         for row in 0..first_chunk.num_rows() {
             let mut scope = store.begin().await.unwrap();
             operator
-                .native_process_event(&mut scope, &GLOBAL_KEY, &inputs, row, false)
+                .native_process_event(&mut scope, &GLOBAL_KEY, &inputs, row, false, None)
                 .await
                 .unwrap();
             scope.commit().await.unwrap();
@@ -3087,7 +4466,7 @@ mod tests {
         for row in 0..second_chunk.num_rows() {
             let mut scope = store.begin().await.unwrap();
             fresh
-                .native_process_event(&mut scope, &GLOBAL_KEY, &inputs, row, false)
+                .native_process_event(&mut scope, &GLOBAL_KEY, &inputs, row, false, None)
                 .await
                 .unwrap();
             scope.commit().await.unwrap();
@@ -3180,7 +4559,7 @@ mod tests {
         let inputs = operator.compute_inputs(&input).unwrap();
         let mut scope = store.begin().await.unwrap();
         let error = operator
-            .native_process_event(&mut scope, &GLOBAL_KEY, &inputs, 0, true)
+            .native_process_event(&mut scope, &GLOBAL_KEY, &inputs, 0, true, None)
             .await
             .unwrap_err();
         assert!(
@@ -3210,7 +4589,14 @@ mod tests {
         let mut scope = store.begin().await.unwrap();
         for row in 0..initial.num_rows() {
             operator
-                .native_process_event(&mut scope, &GLOBAL_KEY, &inputs, row, false)
+                .native_process_event(
+                    &mut scope,
+                    &GLOBAL_KEY,
+                    &inputs,
+                    row,
+                    false,
+                    Some(&test_row_id(&initial, row)),
+                )
                 .await
                 .unwrap();
         }
@@ -3273,7 +4659,14 @@ mod tests {
         let inputs = fresh.compute_inputs(&removed).unwrap();
         let mut scope = store.begin().await.unwrap();
         fresh
-            .native_process_event(&mut scope, &GLOBAL_KEY, &inputs, 0, true)
+            .native_process_event(
+                &mut scope,
+                &GLOBAL_KEY,
+                &inputs,
+                0,
+                true,
+                Some(&test_row_id(&removed, 0)),
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -3294,6 +4687,177 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn injected_event_time_max_retracts_original_member_by_row_id_after_reload() {
+        let store = native_test_store();
+        let operator = native_operator();
+        assert!(operator.aggregates[8].injected_timestamp);
+        assert!(!operator.aggregates[7].injected_timestamp);
+        let input = batch_at(
+            &[Some("a"), Some("b"), Some("c")],
+            &[1, 3, 2],
+            &[10, 30, 20],
+        );
+        let inputs = operator.compute_inputs(&input).unwrap();
+        let ids = [[1_u8; 16], [2_u8; 16], [3_u8; 16]];
+        let mut scope = store.begin().await.unwrap();
+        for (row, id) in ids.iter().enumerate() {
+            operator
+                .native_process_event(&mut scope, &GLOBAL_KEY, &inputs, row, false, Some(id))
+                .await
+                .unwrap();
+        }
+        scope.commit().await.unwrap();
+
+        let fresh = native_operator();
+        let before = batch_at(&[Some("b")], &[3], &[99]);
+        let inputs = fresh.compute_inputs(&before).unwrap();
+        let mut scope = store.begin().await.unwrap();
+        fresh
+            .native_process_event(&mut scope, &GLOBAL_KEY, &inputs, 0, true, Some(&ids[1]))
+            .await
+            .unwrap();
+        assert_eq!(
+            fresh
+                .native_fallback_value(&scope, &GLOBAL_KEY, 0, 8)
+                .await
+                .unwrap(),
+            ScalarValue::TimestampNanosecond(Some(20), None)
+        );
+        assert_eq!(
+            fresh
+                .native_fallback_value(&scope, &GLOBAL_KEY, 0, 7)
+                .await
+                .unwrap(),
+            ScalarValue::Utf8(Some("c".into()))
+        );
+        scope.commit().await.unwrap();
+
+        let replacement = batch_at(&[Some("b")], &[3], &[99]);
+        let inputs = fresh.compute_inputs(&replacement).unwrap();
+        let mut scope = store.begin().await.unwrap();
+        fresh
+            .native_process_event(&mut scope, &GLOBAL_KEY, &inputs, 0, false, Some(&ids[1]))
+            .await
+            .unwrap();
+        assert_eq!(
+            fresh
+                .native_fallback_value(&scope, &GLOBAL_KEY, 0, 8)
+                .await
+                .unwrap(),
+            ScalarValue::TimestampNanosecond(Some(99), None)
+        );
+        assert!(
+            fresh
+                .native_process_event(&mut scope, &GLOBAL_KEY, &inputs, 0, false, Some(&ids[1]))
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("duplicate live row ID")
+        );
+        drop(scope);
+    }
+
+    #[tokio::test]
+    async fn injected_event_time_max_keeps_duplicate_times_with_distinct_ids() {
+        let store = native_test_store();
+        let operator = native_operator();
+        let input = batch_at(&[Some("a"), Some("b")], &[1, 2], &[10, 10]);
+        let inputs = operator.compute_inputs(&input).unwrap();
+        let ids = [[1_u8; 16], [2_u8; 16]];
+        let mut scope = store.begin().await.unwrap();
+        for (row, id) in ids.iter().enumerate() {
+            operator
+                .native_process_event(&mut scope, &GLOBAL_KEY, &inputs, row, false, Some(id))
+                .await
+                .unwrap();
+        }
+        scope.commit().await.unwrap();
+
+        let fresh = native_operator();
+        let before_a = batch_at(&[Some("a")], &[1], &[90]);
+        let inputs = fresh.compute_inputs(&before_a).unwrap();
+        let mut scope = store.begin().await.unwrap();
+        fresh
+            .native_process_event(&mut scope, &GLOBAL_KEY, &inputs, 0, true, Some(&ids[0]))
+            .await
+            .unwrap();
+        assert_eq!(
+            fresh
+                .native_fallback_value(&scope, &GLOBAL_KEY, 0, 8)
+                .await
+                .unwrap(),
+            ScalarValue::TimestampNanosecond(Some(10), None)
+        );
+        scope.commit().await.unwrap();
+
+        let before_b = batch_at(&[Some("b")], &[2], &[100]);
+        let inputs = fresh.compute_inputs(&before_b).unwrap();
+        let mut scope = store.begin().await.unwrap();
+        fresh
+            .native_process_event(&mut scope, &GLOBAL_KEY, &inputs, 0, true, Some(&ids[1]))
+            .await
+            .unwrap();
+        assert_eq!(
+            fresh
+                .native_fallback_value(&scope, &GLOBAL_KEY, 0, 8)
+                .await
+                .unwrap(),
+            ScalarValue::TimestampNanosecond(None, None)
+        );
+        scope.commit().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn injected_event_time_id_moves_between_groups_in_one_scope() {
+        let store = native_test_store();
+        let mut operator = native_operator();
+        let mut fields = operator.schema_without_metadata.fields().to_vec();
+        fields.insert(0, Arc::new(Field::new("group_key", DataType::Utf8, false)));
+        operator.schema_without_metadata = Arc::new(Schema::new(fields));
+        operator.key_converter = RowConverter::new(vec![SortField::new(DataType::Utf8)]).unwrap();
+        let group_columns: Vec<ArrayRef> = vec![Arc::new(StringArray::from(vec!["left", "right"]))];
+        let groups = operator
+            .key_converter
+            .convert_columns(&group_columns)
+            .unwrap();
+        let left = groups.row(0).as_ref().to_vec();
+        let right = groups.row(1).as_ref().to_vec();
+        let id = [9_u8; 16];
+        let first = batch_at(&[Some("v")], &[1], &[10]);
+        let inputs = operator.compute_inputs(&first).unwrap();
+        let mut scope = store.begin().await.unwrap();
+        operator
+            .native_process_event(&mut scope, &left, &inputs, 0, false, Some(&id))
+            .await
+            .unwrap();
+        scope.commit().await.unwrap();
+
+        let before = batch_at(&[Some("v")], &[1], &[100]);
+        let after = batch_at(&[Some("v")], &[1], &[110]);
+        let before_inputs = operator.compute_inputs(&before).unwrap();
+        let after_inputs = operator.compute_inputs(&after).unwrap();
+        let mut scope = store.begin().await.unwrap();
+        operator
+            .native_process_event(&mut scope, &left, &before_inputs, 0, true, Some(&id))
+            .await
+            .unwrap();
+        operator
+            .native_process_event(&mut scope, &right, &after_inputs, 0, false, Some(&id))
+            .await
+            .unwrap();
+        assert!(!operator.native_group_is_live(&scope, &left).await.unwrap());
+        assert!(operator.native_group_is_live(&scope, &right).await.unwrap());
+        assert_eq!(
+            operator
+                .native_fallback_value(&scope, &right, 0, 8)
+                .await
+                .unwrap(),
+            ScalarValue::TimestampNanosecond(Some(110), None)
+        );
+        scope.commit().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn native_ordered_tie_survives_reload_and_exact_retraction() {
         let store = native_test_store();
         let operator = native_operator();
@@ -3307,6 +4871,7 @@ mod tests {
                 &operator.compute_inputs(&first).unwrap(),
                 0,
                 false,
+                Some(&test_row_id(&first, 0)),
             )
             .await
             .unwrap();
@@ -3317,6 +4882,7 @@ mod tests {
                 &operator.compute_inputs(&tied).unwrap(),
                 0,
                 false,
+                Some(&test_row_id(&tied, 0)),
             )
             .await
             .unwrap();
@@ -3350,6 +4916,7 @@ mod tests {
                 &fresh.compute_inputs(&first).unwrap(),
                 0,
                 true,
+                Some(&test_row_id(&first, 0)),
             )
             .await
             .unwrap();
@@ -3377,7 +4944,14 @@ mod tests {
         let mut scope = store.begin().await.unwrap();
         for row in 0..rows.num_rows() {
             operator
-                .native_process_event(&mut scope, &GLOBAL_KEY, &inputs, row, false)
+                .native_process_event(
+                    &mut scope,
+                    &GLOBAL_KEY,
+                    &inputs,
+                    row,
+                    false,
+                    Some(&test_row_id(&rows, row)),
+                )
                 .await
                 .unwrap();
         }
@@ -3420,7 +4994,14 @@ mod tests {
         let mut scope = store.begin().await.unwrap();
         for row in 0..rows.num_rows() {
             operator
-                .native_process_event(&mut scope, &GLOBAL_KEY, &inputs, row, false)
+                .native_process_event(
+                    &mut scope,
+                    &GLOBAL_KEY,
+                    &inputs,
+                    row,
+                    false,
+                    Some(&test_row_id(&rows, row)),
+                )
                 .await
                 .unwrap();
         }
@@ -3510,6 +5091,87 @@ mod tests {
             ],
         )
         .unwrap()
+    }
+
+    fn batch_at(values: &[Option<&str>], sequence: &[i64], event_time: &[i64]) -> RecordBatch {
+        RecordBatch::try_new(
+            input_schema(),
+            vec![
+                Arc::new(StringArray::from(values.to_vec())),
+                Arc::new(Int64Array::from(sequence.to_vec())),
+                Arc::new(BooleanArray::from(vec![Some(true); values.len()])),
+                Arc::new(TimestampNanosecondArray::from(event_time.to_vec())),
+            ],
+        )
+        .unwrap()
+    }
+
+    // Direct operator tests provide a stable row identity explicitly. Runtime
+    // never derives one from aggregate values: it reads `_updating_meta.id`.
+    fn test_row_id(batch: &RecordBatch, row: usize) -> [u8; 16] {
+        let mut digest = Sha256::new();
+        digest.update(
+            batch
+                .column(1)
+                .as_primitive::<arrow_array::types::Int64Type>()
+                .value(row)
+                .to_be_bytes(),
+        );
+        let value = batch.column(0).as_string::<i32>();
+        if value.is_null(row) {
+            digest.update([0]);
+        } else {
+            digest.update([1]);
+            digest.update(value.value(row).as_bytes());
+        }
+        digest.finalize()[..16].try_into().unwrap()
+    }
+
+    #[test]
+    fn native_changelog_rejects_missing_or_null_row_identity() {
+        let base = batch(&[Some("value")], &[1], &[Some(true)]);
+        assert!(
+            native_changelog_columns(&base)
+                .unwrap_err()
+                .to_string()
+                .contains("no updating metadata")
+        );
+        for id in [
+            ScalarValue::FixedSizeBinary(16, None),
+            ScalarValue::FixedSizeBinary(16, Some(vec![7; 16])),
+        ] {
+            let metadata = StructArray::try_new(
+                updating_meta_fields(),
+                vec![
+                    Arc::new(BooleanArray::from(vec![false])),
+                    id.to_array().unwrap(),
+                ],
+                None,
+            )
+            .unwrap();
+            let mut fields = base.schema().fields().to_vec();
+            fields.push(Arc::new(Field::new(
+                UPDATING_META_FIELD,
+                DataType::Struct(updating_meta_fields()),
+                false,
+            )));
+            let mut columns = base.columns().to_vec();
+            columns.push(Arc::new(metadata));
+            let input = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap();
+            if id.is_null() {
+                assert!(
+                    native_changelog_columns(&input)
+                        .unwrap_err()
+                        .to_string()
+                        .contains("non-null")
+                );
+            } else {
+                assert_eq!(
+                    native_changelog_columns(&input).unwrap().1.value(0),
+                    &[7; 16]
+                );
+            }
+        }
     }
 
     fn assert_values(

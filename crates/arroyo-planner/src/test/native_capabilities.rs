@@ -2,12 +2,15 @@
 //! not aggregate values, operator recovery, resource bounds or RocksDB admission.
 
 use super::get_test_schema_provider;
+use crate::physical::{ArroyoMemExec, ArroyoPhysicalExtensionCodec, DecodingContext};
 use crate::{SqlConfig, parse_and_get_program};
 use arroyo_datastream::logical::OperatorName;
 use arroyo_rpc::grpc::api::{
     SessionWindowAggregateOperator, SlidingWindowAggregateOperator,
     TumblingWindowAggregateOperator, UpdatingAggregateOperator, ValuePlanOperator,
 };
+use datafusion::execution::runtime_env::RuntimeEnvBuilder;
+use datafusion_proto::physical_plan::AsExecutionPlan;
 use datafusion_proto::protobuf::PhysicalPlanNode;
 use petgraph::Direction;
 use prost::Message;
@@ -53,6 +56,43 @@ async fn rejects_with(sql: &str, diagnostic: &str) {
     );
 }
 
+fn assert_union_consolidation_is_one_identity_reader(
+    graph: &arroyo_datastream::logical::LogicalGraph,
+    expected_nodes: usize,
+) {
+    let provider = get_test_schema_provider();
+    let runtime = RuntimeEnvBuilder::new().build().unwrap();
+    let codec = ArroyoPhysicalExtensionCodec {
+        context: DecodingContext::Planning,
+    };
+    let mut nodes = 0;
+    for node in graph.node_weights() {
+        for (operator, _) in node.operator_chain.iter() {
+            if operator.operator_name != OperatorName::ArrowValue {
+                continue;
+            }
+            let config = ValuePlanOperator::decode(operator.operator_config.as_slice()).unwrap();
+            if config.name != "value_calculation(union_output)" {
+                continue;
+            }
+            nodes += 1;
+            let proto = PhysicalPlanNode::decode(config.physical_plan.as_slice()).unwrap();
+            let physical = proto
+                .try_into_physical_plan(&provider, &runtime, &codec)
+                .expect("UNION consolidation must decode as a physical plan");
+            assert!(
+                physical.as_any().is::<ArroyoMemExec>(),
+                "UNION consolidation must read each incoming batch once"
+            );
+            assert!(physical.children().is_empty());
+        }
+    }
+    assert_eq!(
+        nodes, expected_nodes,
+        "expected one boundary per logical UNION"
+    );
+}
+
 #[test(tokio::test)]
 async fn union_materialization_widens_nullability_from_either_branch() {
     for nullable_first in [false, true] {
@@ -70,6 +110,7 @@ async fn union_materialization_widens_nullability_from_either_branch() {
                 .await
                 .unwrap_or_else(|error| panic!("UNION failed to plan: {error}\n{sql}"));
         let graph = &compiled.program.graph;
+        assert_union_consolidation_is_one_identity_reader(graph, 1);
         let mut branches = 0;
         for node_index in graph.node_indices() {
             let node = &graph[node_index];
@@ -100,6 +141,95 @@ async fn union_materialization_widens_nullability_from_either_branch() {
         }
         assert_eq!(branches, 2, "each UNION input must use the widened schema");
     }
+}
+
+#[test(tokio::test)]
+async fn updating_union_group_aggregate_plans_with_one_input() {
+    let setup = "CREATE TABLE timestamp_input (
+                   row_id BIGINT PRIMARY KEY, k TEXT NOT NULL, position BIGINT NOT NULL
+                 ) WITH (connector='single_file', path='/tmp/union-timestamp-input.jsonl',
+                         format='debezium_json', type='source');";
+    let branch = "SELECT k, position FROM timestamp_input";
+    let queries = [
+        format!(
+            "SELECT k, COUNT(*) AS active, MAX(position) AS max_position \
+             FROM ({branch} UNION ALL {branch}) AS combined GROUP BY k"
+        ),
+        format!(
+            "WITH pair AS ({branch} UNION ALL {branch}) \
+             SELECT k, COUNT(*) AS active, MAX(position) AS max_position \
+             FROM (SELECT * FROM pair UNION ALL SELECT * FROM pair) AS combined GROUP BY k"
+        ),
+    ];
+    // DataFusion inlines each reference to `pair`: two inner UNIONs feed the
+    // outer UNION, so all three need a separate one-batch consolidation.
+    for (query, expected_boundaries) in queries.into_iter().zip([1, 3]) {
+        let sql = format!("{setup} {query}");
+        let compiled =
+            parse_and_get_program(&sql, get_test_schema_provider(), SqlConfig::default())
+                .await
+                .unwrap_or_else(|error| {
+                    panic!("updating UNION aggregate failed to plan: {error}\n{sql}")
+                });
+        assert_union_consolidation_is_one_identity_reader(
+            &compiled.program.graph,
+            expected_boundaries,
+        );
+        let aggregates = compiled
+            .program
+            .graph
+            .node_weights()
+            .flat_map(|node| node.operator_chain.iter())
+            .filter(|(operator, _)| operator.operator_name == OperatorName::UpdatingAggregate)
+            .count();
+        assert_eq!(aggregates, 1, "UNION must feed one updating aggregate");
+    }
+}
+
+#[test(tokio::test)]
+async fn updating_union_scopes_equal_primary_keys_at_each_materialized_edge() {
+    let sql = "CREATE TABLE left_changes (row_id BIGINT PRIMARY KEY, k TEXT) WITH (
+                   connector = 'single_file', path = '/tmp/left-changes.jsonl',
+                   format = 'debezium_json', type = 'source');
+               CREATE TABLE right_changes (row_id BIGINT PRIMARY KEY, k TEXT) WITH (
+                   connector = 'single_file', path = '/tmp/right-changes.jsonl',
+                   format = 'debezium_json', type = 'source');
+               CREATE VIEW combined AS
+                   SELECT row_id, k FROM left_changes
+                   UNION ALL
+                   SELECT row_id, k FROM right_changes;
+               SELECT k, COUNT(*) AS n FROM combined GROUP BY k";
+    let branch_plans = || async {
+        let compiled = parse_and_get_program(sql, get_test_schema_provider(), SqlConfig::default())
+            .await
+            .unwrap_or_else(|error| panic!("updating UNION failed to plan: {error}"));
+        compiled
+            .program
+            .graph
+            .node_weights()
+            .flat_map(|node| node.operator_chain.iter())
+            .filter(|(operator, _)| operator.operator_name == OperatorName::ArrowValue)
+            .filter_map(|(operator, _)| {
+                let config = ValuePlanOperator::decode(operator.operator_config.as_slice()).ok()?;
+                (config.name == "value_calculation(union_input)").then_some(config.physical_plan)
+            })
+            .collect::<Vec<_>>()
+    };
+    let first = branch_plans().await;
+    let second = branch_plans().await;
+    assert_eq!(
+        first.len(),
+        2,
+        "each updating UNION edge needs its own projection"
+    );
+    assert_ne!(
+        first[0], first[1],
+        "branch scopes must differ for equal row IDs"
+    );
+    assert_eq!(
+        first, second,
+        "branch scopes must be stable across replanning"
+    );
 }
 
 #[test(tokio::test)]

@@ -1,5 +1,5 @@
 use arroyo_datastream::WindowType;
-use arroyo_rpc::{TIMESTAMP_FIELD, UPDATING_META_FIELD};
+use arroyo_rpc::{TIMESTAMP_FIELD, UPDATING_META_FIELD, updating_meta_field};
 use datafusion::common::tree_node::{Transformed, TreeNodeRecursion};
 use datafusion::common::{
     Column, DFSchema, DataFusionError, Result, Spans, TableReference, plan_err,
@@ -8,12 +8,17 @@ use datafusion::common::{
 use std::{collections::HashSet, sync::Arc};
 
 use aggregate::AggregateRewriter;
+use datafusion::functions::core::expr_fn::get_field;
 use datafusion::logical_expr::{
-    Aggregate, Expr, Extension, Filter, LogicalPlan, SubqueryAlias, expr::Alias,
+    Aggregate, Expr, Extension, Filter, LogicalPlan, Projection, SubqueryAlias, expr::Alias, lit,
+    when,
 };
+use datafusion::prelude::named_struct;
+use datafusion::scalar::ScalarValue;
 use join::JoinRewriter;
 
 use self::window_fn::WindowFunctionRewriter;
+use crate::functions::multi_hash;
 use crate::rewriters::TimeWindowNullCheckRemover;
 use crate::{
     ArroyoSchemaProvider, DFField, WindowBehavior,
@@ -59,6 +64,56 @@ fn extract_column(expr: &Expr) -> Option<&Column> {
         Expr::Alias(Alias { expr, .. }) => extract_column(expr),
         _ => None,
     }
+}
+
+// An updating row ID identifies a row within its producer, not across UNION
+// inputs. Scope it at the edge so two identical inputs (including a shared CTE)
+// still contribute two distinct bag members. The domain and ordinal are stable
+// for a given logical UNION plan, and a nested UNION adds another scope.
+fn scope_union_updating_id(input: Arc<LogicalPlan>, branch: usize) -> Result<Arc<LogicalPlan>> {
+    let schema = input.schema().clone();
+    let metadata_index = schema.index_of_column(&Column::from_name(UPDATING_META_FIELD))?;
+    let metadata = schema.field(metadata_index);
+    if metadata.data_type() != updating_meta_field().data_type() || metadata.is_nullable() {
+        return plan_err!("UNION input has incompatible updating metadata");
+    }
+    let metadata_column =
+        Expr::Column(fields_with_qualifiers(&schema)[metadata_index].qualified_column());
+    let old_id = get_field(metadata_column.clone(), "id");
+    let scoped_id = multi_hash().call(vec![
+        lit("streamr.union.updating-id.v1"),
+        lit(i64::try_from(branch).map_err(|_| {
+            DataFusionError::Plan("UNION has too many updating branches".to_string())
+        })?),
+        old_id.clone(),
+    ]);
+    let scoped_id = when(
+        old_id.is_null(),
+        lit(ScalarValue::FixedSizeBinary(16, None)),
+    )
+    .otherwise(scoped_id)?;
+    let scoped_fields = named_struct(vec![
+        lit("is_retract"),
+        get_field(metadata_column.clone(), "is_retract"),
+        lit("id"),
+        scoped_id,
+    ]);
+    let scoped_metadata =
+        when(metadata_column.clone().is_null(), metadata_column).otherwise(scoped_fields)?;
+    let expressions = fields_with_qualifiers(&schema)
+        .into_iter()
+        .enumerate()
+        .map(|(index, field)| {
+            if index == metadata_index {
+                scoped_metadata.clone().alias(UPDATING_META_FIELD)
+            } else {
+                Expr::Column(field.qualified_column())
+            }
+        })
+        .collect();
+    Ok(Arc::new(LogicalPlan::Projection(
+        Projection::try_new_with_schema(expressions, input, schema)?,
+    )))
 }
 
 impl TreeNodeVisitor<'_> for WindowDetectingVisitor {
@@ -461,6 +516,34 @@ impl TreeNodeRewriter for ArroyoRewriter<'_> {
                 );
             }
             LogicalPlan::Union(mut union) => {
+                let metadata_positions = union
+                    .inputs
+                    .iter()
+                    .map(|input| {
+                        input
+                            .schema()
+                            .has_column_with_unqualified_name(UPDATING_META_FIELD)
+                            .then(|| {
+                                input
+                                    .schema()
+                                    .index_of_column(&Column::from_name(UPDATING_META_FIELD))
+                            })
+                            .transpose()
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                if let Some(position) = metadata_positions.iter().copied().flatten().next() {
+                    if metadata_positions
+                        .iter()
+                        .any(|candidate| *candidate != Some(position))
+                    {
+                        return plan_err!(
+                            "UNION updating metadata must be present at the same column in every input"
+                        );
+                    }
+                    for (branch, input) in union.inputs.iter_mut().enumerate() {
+                        *input = scope_union_updating_id(input.clone(), branch)?;
+                    }
+                }
                 // Input rewrites can add the event timestamp and changelog
                 // metadata after DataFusion first derived the UNION schema.
                 // Keep the first rewritten input's names, qualifiers, types,
@@ -515,7 +598,21 @@ impl TreeNodeRewriter for ArroyoRewriter<'_> {
                     }));
                 }
 
-                return Ok(Transformed::yes(LogicalPlan::Union(union)));
+                // A logical UNION has no graph node of its own. Without this
+                // boundary its branch nodes become separate inputs to the next
+                // operator, which may require exactly one input. The remote
+                // table's UNION case forwards each incoming batch once; the
+                // per-branch projections above still scope updating row IDs.
+                let union = LogicalPlan::Union(union);
+                let schema = union.schema().clone();
+                return Ok(Transformed::yes(LogicalPlan::Extension(Extension {
+                    node: Arc::new(RemoteTableExtension {
+                        input: union,
+                        name: TableReference::bare("union_output"),
+                        schema,
+                        materialize: false,
+                    }),
+                })));
             }
             LogicalPlan::EmptyRelation(_) => {}
             LogicalPlan::Subquery(_) => {}
@@ -554,5 +651,154 @@ impl TreeNodeRewriter for ArroyoRewriter<'_> {
             }
         }
         Ok(Transformed::no(node))
+    }
+}
+
+#[cfg(test)]
+mod union_id_tests {
+    use super::*;
+    use arrow_schema::{DataType, Field, Schema, TimeUnit};
+    use datafusion::logical_expr::ColumnarValue;
+    use datafusion::logical_expr::{EmptyRelation, Union};
+
+    #[test]
+    fn branch_hash_distinguishes_equal_source_ids_and_is_stable() {
+        let old_id = ScalarValue::FixedSizeBinary(16, Some(vec![7; 16]));
+        let hash = crate::functions::MultiHashFunction::default();
+        let scoped = |branch| {
+            let value = hash
+                .invoke(&[
+                    ColumnarValue::Scalar(ScalarValue::Utf8(Some(
+                        "streamr.union.updating-id.v1".to_string(),
+                    ))),
+                    ColumnarValue::Scalar(ScalarValue::Int64(Some(branch))),
+                    ColumnarValue::Scalar(old_id.clone()),
+                ])
+                .unwrap();
+            let ColumnarValue::Scalar(value) = value else {
+                panic!("constant branch hash must be a scalar");
+            };
+            value
+        };
+        assert_ne!(scoped(0), scoped(1));
+        assert_eq!(scoped(0), scoped(0));
+    }
+
+    fn updating_input() -> Arc<LogicalPlan> {
+        let schema = Schema::new(vec![
+            Field::new("k", DataType::Utf8, false),
+            updating_meta_field().as_ref().clone(),
+            Field::new(
+                TIMESTAMP_FIELD,
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                false,
+            ),
+        ]);
+        let schema = Arc::new(
+            DFSchema::try_from_qualified_schema(TableReference::bare("shared"), &schema).unwrap(),
+        );
+        Arc::new(LogicalPlan::EmptyRelation(EmptyRelation {
+            produce_one_row: false,
+            schema,
+        }))
+    }
+
+    fn union_branches(plan: LogicalPlan) -> Vec<Arc<LogicalPlan>> {
+        let LogicalPlan::Extension(extension) = plan else {
+            panic!("expected consolidated UNION");
+        };
+        let remote = extension
+            .node
+            .as_any()
+            .downcast_ref::<RemoteTableExtension>()
+            .expect("UNION must have a graph consolidation boundary");
+        assert_eq!(remote.name, TableReference::bare("union_output"));
+        assert!(!remote.materialize);
+        let LogicalPlan::Union(union) = &remote.input else {
+            panic!("consolidation boundary must contain the UNION");
+        };
+        union.inputs.clone()
+    }
+
+    fn scoped_projection(branch: &LogicalPlan) -> &Projection {
+        let LogicalPlan::Extension(extension) = branch else {
+            panic!("each updating UNION edge must be materialized");
+        };
+        let remote = extension
+            .node
+            .as_any()
+            .downcast_ref::<RemoteTableExtension>()
+            .expect("each UNION edge uses a distinct remote-table materialization");
+        assert!(!remote.materialize);
+        let LogicalPlan::Projection(projection) = &remote.input else {
+            panic!("branch identity must be projected at the UNION edge");
+        };
+        projection
+    }
+
+    #[test]
+    fn identical_updating_inputs_get_stable_distinct_branch_ids() {
+        let provider = ArroyoSchemaProvider::new();
+        let input = updating_input();
+        let union = LogicalPlan::Union(Union {
+            inputs: vec![input.clone(), input.clone()],
+            schema: input.schema().clone(),
+        });
+        let rewrite = || {
+            ArroyoRewriter::new(&provider)
+                .f_up(union.clone())
+                .unwrap()
+                .data
+        };
+        let first = union_branches(rewrite());
+        let second = union_branches(rewrite());
+        let left = scoped_projection(&first[0]);
+        let right = scoped_projection(&first[1]);
+        assert_eq!(left.schema.as_ref(), input.schema().as_ref());
+        assert_eq!(right.schema.as_ref(), input.schema().as_ref());
+        assert_eq!(left.expr[0], right.expr[0]);
+        assert_eq!(left.expr[2], right.expr[2]);
+        assert_ne!(left.expr[1], right.expr[1]);
+        assert_eq!(left.expr[1], scoped_projection(&second[0]).expr[1]);
+        assert_eq!(right.expr[1], scoped_projection(&second[1]).expr[1]);
+        for projection in [left, right] {
+            let metadata = projection.expr[1].to_string();
+            assert!(metadata.contains("multi_hash"));
+            assert!(metadata.contains("streamr.union.updating-id.v1"));
+            assert!(metadata.contains("is_retract"));
+            assert!(metadata.contains("IS NULL"));
+        }
+    }
+
+    #[test]
+    fn nested_union_adds_a_second_branch_scope() {
+        let provider = ArroyoSchemaProvider::new();
+        let input = updating_input();
+        let inner = ArroyoRewriter::new(&provider)
+            .f_up(LogicalPlan::Union(Union {
+                inputs: vec![input.clone(), input.clone()],
+                schema: input.schema().clone(),
+            }))
+            .unwrap()
+            .data;
+        let outer = ArroyoRewriter::new(&provider)
+            .f_up(LogicalPlan::Union(Union {
+                inputs: vec![Arc::new(inner.clone()), Arc::new(inner)],
+                schema: input.schema().clone(),
+            }))
+            .unwrap()
+            .data;
+        let branches = union_branches(outer);
+        assert_ne!(
+            scoped_projection(&branches[0]).expr[1],
+            scoped_projection(&branches[1]).expr[1]
+        );
+        for branch in branches {
+            let projection = scoped_projection(&branch);
+            assert!(matches!(
+                projection.input.as_ref(),
+                LogicalPlan::Extension(_)
+            ));
+        }
     }
 }

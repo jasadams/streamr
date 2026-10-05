@@ -14,7 +14,7 @@ use prost::Message;
 use crate::{
     builder::{NamedNode, Planner},
     multifield_partial_ord,
-    physical::ArroyoPhysicalExtensionCodec,
+    physical::{ArroyoMemExec, ArroyoPhysicalExtensionCodec},
 };
 
 use super::{ArroyoExtension, NodeWithIncomingEdges};
@@ -64,7 +64,26 @@ impl ArroyoExtension for RemoteTableExtension {
                 }
             }
         }
-        let physical_plan = planner.sync_plan(&self.input)?;
+        // A UNION has one graph edge per materialized branch. Its inputs are
+        // already evaluated before reaching this node, so evaluating a
+        // physical UnionExec over the incoming batch would emit that batch
+        // once per branch. Decode one memory reader instead: the worker calls
+        // this value operator once for each arriving branch batch.
+        let physical_plan = if let LogicalPlan::Union(union) = &self.input {
+            if input_schemas.len() != union.inputs.len() {
+                return plan_err!("UNION consolidation must have one input per branch");
+            }
+            let output_schema = self.output_schema();
+            if input_schemas[0].schema.as_ref() != output_schema.schema.as_ref() {
+                return plan_err!("UNION consolidation input/output Arrow schemas differ");
+            }
+            Arc::new(ArroyoMemExec::new(
+                "union_output".to_string(),
+                output_schema.schema,
+            )) as Arc<dyn datafusion::physical_plan::ExecutionPlan>
+        } else {
+            planner.sync_plan(&self.input)?
+        };
         let physical_plan_node = PhysicalPlanNode::try_from_physical_plan(
             physical_plan,
             &ArroyoPhysicalExtensionCodec::default(),
