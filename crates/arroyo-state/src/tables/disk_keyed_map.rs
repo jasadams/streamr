@@ -41,6 +41,7 @@ impl DiskKeyedTable {
                 return Err(error("disk-map subtask ownership mismatch"));
             }
             validate_subtask(&config, &metadata).map_err(error)?;
+            result.format_version = metadata.format_version;
             result.subtasks.insert(index, metadata);
         }
         validate_table(&config, &result).map_err(error)?;

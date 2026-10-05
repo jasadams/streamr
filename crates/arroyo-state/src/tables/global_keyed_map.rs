@@ -35,7 +35,7 @@ use super::{
     table_checkpoint_path,
 };
 use tracing::info;
-static GLOBAL_KEY_VALUE_SCHEMA: Lazy<Arc<Schema>> = Lazy::new(|| {
+pub(crate) static GLOBAL_KEY_VALUE_SCHEMA: Lazy<Arc<Schema>> = Lazy::new(|| {
     let fields = vec![
         Field::new("key", DataType::Binary, false), // non-nullable BinaryArray for 'key'
         Field::new("value", DataType::Binary, false), // non-nullable BinaryArray for 'value'

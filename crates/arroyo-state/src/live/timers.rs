@@ -940,7 +940,15 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(metadata.files.len() > 1);
+        assert!(!metadata.empty && !metadata.files.is_empty());
+        assert!(
+            metadata
+                .files
+                .iter()
+                .map(|file| file.row_count)
+                .sum::<u64>()
+                > 1
+        );
         let (restored, restored_resources) = rocks(root.path(), 1).await;
         checkpoint::restore(
             restored.as_ref(),

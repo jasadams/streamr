@@ -9,7 +9,7 @@ use prost::Message;
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 
-pub const TYPED_CHECKPOINT_VERSION: u32 = 1;
+pub const TYPED_CHECKPOINT_VERSION: u32 = 2;
 
 pub fn validate_config(config: &TypedStateTableConfig) -> Result<(), String> {
     validate_transport_table_name(&config.table_identity, &config.transport_name)
@@ -43,7 +43,7 @@ pub fn validate_subtask(
     metadata: &TypedStateTableSubtaskCheckpointMetadata,
 ) -> Result<(), String> {
     validate_config(config)?;
-    if metadata.format_version != TYPED_CHECKPOINT_VERSION
+    if crate::disk::checkpoint_file_extension(metadata.format_version).is_err()
         || metadata.encoding_version != config.encoding_version
         || metadata.schema_identity != config.schema_identity
         || metadata.subtask_index != 0
@@ -56,6 +56,7 @@ pub fn validate_subtask(
     }
     validate_singleton_namespace(&config.table_identity, &metadata.namespace)
         .map_err(|error| error.to_string())?;
+    let extension = crate::disk::checkpoint_file_extension(metadata.format_version)?;
     let mut seen = HashSet::new();
     for file in &metadata.files {
         crate::types::CheckpointRef::new(file.path.clone()).map_err(|e| e.to_string())?;
@@ -65,6 +66,13 @@ pub fn validate_subtask(
             || !seen.insert(&file.path)
         {
             return Err("invalid or duplicate typed checkpoint file".into());
+        }
+        let basename = file.path.rsplit('/').next().unwrap_or_default();
+        if !basename.starts_with("disk-")
+            || !basename.ends_with(extension)
+            || basename.contains('\\')
+        {
+            return Err("typed checkpoint file format differs from metadata".into());
         }
         if !file
             .path
@@ -93,14 +101,14 @@ pub fn validate_table(
     config: &TypedStateTableConfig,
     metadata: &TypedStateTableTaskCheckpointMetadata,
 ) -> Result<(), String> {
-    if metadata.format_version != TYPED_CHECKPOINT_VERSION
+    if crate::disk::checkpoint_file_extension(metadata.format_version).is_err()
         || metadata.subtasks.len() != 1
         || !metadata.subtasks.contains_key(&0)
     {
         return Err("typed state table requires one singleton checkpoint".into());
     }
     for (&index, subtask) in &metadata.subtasks {
-        if index != subtask.subtask_index {
+        if index != subtask.subtask_index || subtask.format_version != metadata.format_version {
             return Err("typed state-table subtask ownership mismatch".into());
         }
         validate_subtask(config, subtask)?;
@@ -212,7 +220,7 @@ mod tests {
             empty: false,
             files: vec![DiskCheckpointFile {
                 path: format!(
-                    "P/J/generations/2/checkpoints/checkpoint-0000003/operator-o/table-{transport_name}-000/disk-0.bin"
+                    "P/J/generations/2/checkpoints/checkpoint-0000003/operator-o/table-{transport_name}-000/disk-0.parquet"
                 ),
                 size_bytes: 10,
                 row_count: 1,
@@ -220,6 +228,23 @@ mod tests {
             }],
         };
         (config, metadata)
+    }
+
+    #[test]
+    fn legacy_and_parquet_checkpoints_keep_distinct_file_formats() {
+        let (config, mut subtask) = fixture();
+        validate_subtask(&config, &subtask).unwrap();
+        subtask.format_version = 1;
+        assert!(validate_subtask(&config, &subtask).is_err());
+        subtask.files[0].path = subtask.files[0].path.replace(".parquet", ".bin");
+        validate_subtask(&config, &subtask).unwrap();
+        let mut table = TypedStateTableTaskCheckpointMetadata {
+            format_version: 1,
+            subtasks: [(0, subtask)].into_iter().collect(),
+        };
+        validate_table(&config, &table).unwrap();
+        table.format_version = TYPED_CHECKPOINT_VERSION;
+        assert!(validate_table(&config, &table).is_err());
     }
 
     #[test]

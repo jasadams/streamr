@@ -26,6 +26,15 @@ Arcstream is an external consumer, not part of this engine.
   invariants, or required application checkouts. Application-specific preparation
   and oracle comparison belong in the application repository.
 
+## Scope of engine changes
+
+Work is limited to configurable live-state backends (including state larger than
+RAM), state tables for in-stream lookups, and demonstrated deficiencies in the
+existing Arroyo engine. A backend addition does not by itself justify replacing
+checkpoint formats, writers, coordination or recovery protocols. Reuse existing
+Arroyo machinery through bounded backend adapters; establish a concrete missing
+capability before proposing a replacement.
+
 ## Native SQL and backend design
 
 - Start with existing native relational operators, updating aggregates and

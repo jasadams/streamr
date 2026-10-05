@@ -47,6 +47,7 @@ fn merge_typed_checkpoint_metadata(
         }
         arroyo_state_protocol::typed_checkpoint::validate_subtask(&config, &subtask)
             .map_err(|e| anyhow!(e))?;
+        result.format_version = subtask.format_version;
         result.subtasks.insert(index, subtask);
     }
     arroyo_state_protocol::typed_checkpoint::validate_table(&config, &result)

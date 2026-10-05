@@ -485,6 +485,18 @@ fn validate_disk_subtask_metadata_size(
     Ok(())
 }
 
+fn validate_selected_checkpoint_file(path: &str, prefix: &str, format_version: u32) -> Result<()> {
+    let suffix = path.strip_prefix(prefix).ok_or_else(|| {
+        anyhow!("checkpoint file belongs to another job/operator/table/epoch/generation")
+    })?;
+    let extension = arroyo_state_protocol::disk::checkpoint_file_extension(format_version)
+        .map_err(|error| anyhow!(error))?;
+    if suffix.is_empty() || suffix.contains(['/', '\\']) || !suffix.ends_with(extension) {
+        bail!("checkpoint file is not an exclusive file of the declared format");
+    }
+    Ok(())
+}
+
 fn validate_selected_disk_checkpoint(
     config: &DiskKeyedTableConfig,
     metadata: &DiskKeyedTableTaskCheckpointMetadata,
@@ -517,14 +529,7 @@ fn validate_selected_disk_checkpoint(
             )
         );
         for file in &subtask.files {
-            let suffix = file.path.strip_prefix(&prefix).ok_or_else(|| {
-                anyhow!(
-                    "disk checkpoint file belongs to another job/operator/table/epoch/generation"
-                )
-            })?;
-            if suffix.is_empty() || suffix.contains(['/', '\\']) || !suffix.ends_with(".bin") {
-                bail!("disk checkpoint file is not an exclusive logical page");
-            }
+            validate_selected_checkpoint_file(&file.path, &prefix, subtask.format_version)?;
         }
     }
     Ok(())
@@ -1006,16 +1011,7 @@ impl TableManager {
                     )
                 );
                 for file in &subtask.files {
-                    let suffix = file
-                        .path
-                        .strip_prefix(&prefix)
-                        .ok_or_else(|| anyhow!("typed checkpoint file belongs to another owner"))?;
-                    if suffix.is_empty()
-                        || suffix.contains(['/', '\\'])
-                        || !suffix.ends_with(".bin")
-                    {
-                        bail!("typed checkpoint file is not an exclusive logical page");
-                    }
+                    validate_selected_checkpoint_file(&file.path, &prefix, subtask.format_version)?;
                 }
                 crate::live::checkpoint::restore_typed(
                     backend.as_ref(),
@@ -1476,6 +1472,36 @@ mod tests {
         );
     }
     #[test]
+    fn disk_and_typed_selected_files_bind_owner_and_format() {
+        for table in ["map", "st_0123456789"] {
+            let prefix = format!(
+                "pipeline/job/generations/7/checkpoints/checkpoint-0000002/operator-o/table-{table}-000/disk-"
+            );
+            for (version, extension) in [(1, ".bin"), (2, ".parquet")] {
+                let path = format!("{prefix}snapshot{extension}");
+                validate_selected_checkpoint_file(&path, &prefix, version).unwrap();
+                assert!(validate_selected_checkpoint_file(&path, &prefix, 3 - version).is_err());
+                assert!(
+                    validate_selected_checkpoint_file(
+                        &path.replace("operator-o", "operator-foreign"),
+                        &prefix,
+                        version
+                    )
+                    .is_err()
+                );
+                assert!(
+                    validate_selected_checkpoint_file(
+                        &format!("{prefix}subdir/file{extension}"),
+                        &prefix,
+                        version
+                    )
+                    .is_err()
+                );
+            }
+        }
+    }
+
+    #[test]
     fn selected_checkpoint_rejects_foreign_pages_and_wrong_generation() {
         let task = TaskInfo {
             job_id: "job".into(),
@@ -1530,6 +1556,17 @@ mod tests {
             format_version: 1,
             subtasks: HashMap::from([(0, subtask)]),
         };
+        let legacy = metadata.clone();
+        metadata.format_version = 2;
+        let parquet_subtask = metadata.subtasks.get_mut(&0).unwrap();
+        parquet_subtask.format_version = 2;
+        assert!(
+            validate_selected_disk_checkpoint(&config, &metadata, &task, &selected, 2).is_err()
+        );
+        let parquet_subtask = metadata.subtasks.get_mut(&0).unwrap();
+        parquet_subtask.files[0].path = parquet_subtask.files[0].path.replace(".bin", ".parquet");
+        validate_selected_disk_checkpoint(&config, &metadata, &task, &selected, 2).unwrap();
+        metadata = legacy;
         // Current attempt generation nine can recover selected generation seven.
         validate_selected_disk_checkpoint(&config, &metadata, &task, &selected, 2).unwrap();
         assert!(
