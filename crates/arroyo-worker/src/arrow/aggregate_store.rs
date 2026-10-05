@@ -416,7 +416,7 @@ mod tests {
         drop(scope);
         drop(store);
         drop(manager);
-        drop(backend);
+        backend.close().await.unwrap();
         std::fs::remove_dir_all(root).unwrap();
     }
 
