@@ -689,7 +689,7 @@ mod tests {
     fn test_dirty_tracking_get_does_not_mark_dirty() {
         let mut map = new_state();
         map.insert("k1".to_string(), Some("v1".to_string()));
-        let mut dirty: HashSet<String> = HashSet::new();
+        let dirty: HashSet<String> = HashSet::new();
 
         // Get does NOT mark dirty
         let _ = map.get("k1");
