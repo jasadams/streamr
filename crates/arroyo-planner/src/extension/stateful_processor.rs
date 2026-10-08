@@ -183,37 +183,33 @@ impl ArroyoExtension for StatefulProcessorExtension {
                 .collect()
         };
 
-        // Serialize state operation expressions against the input schema
-        let operations: Vec<StateOperation> = self
-            .ops
-            .iter()
-            .map(|op| {
-                let key_bytes =
-                    planner.serialize_as_physical_expr(&op.key_expr, &input_dfschema)?;
-
-                let value_bytes = match &op.value_expr {
-                    Some(expr) => planner.serialize_as_physical_expr(expr, &input_dfschema)?,
-                    None => vec![],
-                };
-
-                let condition_bytes = match &op.condition_expr {
-                    Some(expr) => planner.serialize_as_physical_expr(expr, &input_dfschema)?,
-                    None => vec![],
-                };
-
-                Ok(StateOperation {
-                    map_name: format!("__sp_{}", op.map_name),
-                    op_type: op.op_type,
-                    key_expr: key_bytes,
-                    value_expr: value_bytes,
-                    condition_expr: condition_bytes,
-                    output_field: op.output_field.clone(),
-                })
-            })
-            .collect::<Result<_>>()?;
-
+        // Each operation can reference earlier results. Serialize against the
+        // exact growing schema used by the row-ordered worker executor.
         let mut intermediate_fields = fields_with_qualifiers(&input_dfschema);
+        let mut operations = Vec::with_capacity(self.ops.len());
         for op in &self.ops {
+            let schema = schema_from_df_fields(&intermediate_fields)?;
+            let key_expr = planner.serialize_as_physical_expr(&op.key_expr, &schema)?;
+            let value_expr = op
+                .value_expr
+                .as_ref()
+                .map(|e| planner.serialize_as_physical_expr(e, &schema))
+                .transpose()?
+                .unwrap_or_default();
+            let condition_expr = op
+                .condition_expr
+                .as_ref()
+                .map(|e| planner.serialize_as_physical_expr(e, &schema))
+                .transpose()?
+                .unwrap_or_default();
+            operations.push(StateOperation {
+                map_name: format!("__sp_{}", op.map_name),
+                op_type: op.op_type,
+                key_expr,
+                value_expr,
+                condition_expr,
+                output_field: op.output_field.clone(),
+            });
             let dt = match StateOpType::try_from(op.op_type).map_err(|_| {
                 datafusion::common::DataFusionError::Plan(format!(
                     "unknown StateOpType: {}",

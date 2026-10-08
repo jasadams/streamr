@@ -6,6 +6,7 @@ edition = "2024"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+arroyo-state-protocol = { path = "../arroyo-state-protocol" }
 arroyo-types = { path = "../arroyo-types" }
 arroyo-rpc = { path = "../arroyo-rpc" }
 arroyo-storage = { path = "../arroyo-storage" }
@@ -32,6 +33,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 rocksdb = { version = "=0.24.0", default-features = false, features = ["bindgen-runtime", "lz4"] }
 libc = "0.2"
+sha2 = "0.10"
 
 [dev-dependencies]
 tempfile = "3"

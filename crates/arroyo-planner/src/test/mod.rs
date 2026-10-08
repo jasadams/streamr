@@ -76,6 +76,9 @@ async fn stateful_processor_runtime_fixture_plans() {
         include_str!(
             "../../../arroyo-sql-testing/src/test/queries/stateful_processor_sequential_ctes.sql"
         ),
+        include_str!(
+            "../../../arroyo-sql-testing/src/test/queries/stateful_processor_operations.sql"
+        ),
     ] {
         let compiled =
             parse_and_get_program(query, ArroyoSchemaProvider::new(), SqlConfig::default())
@@ -97,6 +100,52 @@ async fn stateful_processor_runtime_fixture_plans() {
                 }
             }
         }
-        assert!(stateful_nodes > 0);
+        assert_eq!(
+            stateful_nodes, 1,
+            "linear CTE state stages must have one ordered checkpoint owner"
+        );
+    }
+}
+
+#[test(tokio::test)]
+async fn stateful_lazy_expressions_have_precise_errors() {
+    for (expression, message) in [
+        (
+            "coalesce(state_get('m', CAST(bid.auction AS TEXT)), 'fallback')",
+            "COALESCE",
+        ),
+        (
+            "CASE WHEN state_delete('m', CAST(bid.auction AS TEXT)) THEN 'yes' ELSE 'no' END",
+            "CASE conditions",
+        ),
+        (
+            "CASE WHEN random() > 0.5 THEN state_put('m', CAST(bid.auction AS TEXT), 'selected') ELSE CAST(NULL AS TEXT) END",
+            "volatile CASE",
+        ),
+    ] {
+        let sql = format!("SELECT {expression} FROM nexmark");
+        let error = parse_and_get_program(&sql, get_test_schema_provider(), SqlConfig::default())
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains(message), "{error}");
+    }
+}
+
+#[test(tokio::test)]
+async fn state_map_names_cannot_be_checkpoint_paths() {
+    for name in [
+        "",
+        "../unsafe",
+        "nested/map",
+        "nested\\map",
+        ".",
+        "..",
+        "非ASCII",
+    ] {
+        let sql = format!("SELECT state_get('{name}', CAST(bid.auction AS TEXT)) FROM nexmark");
+        let error = parse_and_get_program(&sql, get_test_schema_provider(), SqlConfig::default())
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("state map name"), "{error}");
     }
 }

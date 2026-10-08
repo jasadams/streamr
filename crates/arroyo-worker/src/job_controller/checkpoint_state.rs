@@ -3,17 +3,20 @@ use anyhow::{anyhow, bail};
 use arroyo_datastream::logical::LogicalProgram;
 use arroyo_rpc::grpc::api::OperatorCheckpointDetail;
 use arroyo_rpc::grpc::rpc::{
-    CheckpointMetadata, OperatorCheckpointMetadata, OperatorMetadata, SubtaskCheckpointMetadata,
+    CheckpointMetadata, DiskKeyedTableConfig, DiskKeyedTableSubtaskCheckpointMetadata,
+    OperatorCheckpointMetadata, OperatorMetadata, SubtaskCheckpointMetadata,
     TableCheckpointMetadata, TableConfig, TableEnum, TableSubtaskCheckpointMetadata,
     TaskCheckpointCompletedReq, TaskCheckpointEventReq,
 };
 use arroyo_rpc::grpc::{api, rpc};
 use arroyo_rpc::{TaskEventSpans, get_event_spans, grpc, log_trace_event};
 use arroyo_state::tables::ErasedTable;
+use arroyo_state::tables::disk_keyed_map::DiskKeyedTable;
 use arroyo_state::tables::expiring_time_key_map::ExpiringTimeKeyTable;
 use arroyo_state::tables::global_keyed_map::GlobalKeyedTable;
 use arroyo_state_protocol::types::Epoch;
 use arroyo_types::{from_micros, to_micros};
+use prost::Message;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -69,10 +72,12 @@ impl OperatorState {
     fn finish_subtask(
         &mut self,
         c: SubtaskCheckpointMetadata,
-    ) -> Option<(
-        HashMap<String, TableConfig>,
-        HashMap<String, TableCheckpointMetadata>,
-    )> {
+    ) -> anyhow::Result<
+        Option<(
+            HashMap<String, TableConfig>,
+            HashMap<String, TableCheckpointMetadata>,
+        )>,
+    > {
         self.subtasks_checkpointed += 1;
         self.watermarks.push(c.watermark.map(from_micros));
         self.start_time = match self.start_time {
@@ -102,20 +107,17 @@ impl OperatorState {
         }
 
         if self.subtasks == self.subtasks_checkpointed {
-            let (table_configs, table_metadatas) = self
-                .table_state
-                .drain()
-                .filter_map(|(table_name, table_state)| {
-                    table_state
-                        .into_table_metadata()
-                        .map(|(table_config, metadata)| {
-                            ((table_name.clone(), table_config), (table_name, metadata))
-                        })
-                })
-                .unzip();
-            Some((table_configs, table_metadatas))
+            let mut table_configs = HashMap::new();
+            let mut table_metadatas = HashMap::new();
+            for (table_name, table_state) in self.table_state.drain() {
+                if let Some((config, metadata)) = table_state.into_table_metadata()? {
+                    table_configs.insert(table_name.clone(), config);
+                    table_metadatas.insert(table_name, metadata);
+                }
+            }
+            Ok(Some((table_configs, table_metadatas)))
         } else {
-            None
+            Ok(None)
         }
     }
 }
@@ -127,21 +129,23 @@ pub struct TableState {
 }
 
 impl TableState {
-    fn into_table_metadata(self) -> Option<(TableConfig, TableCheckpointMetadata)> {
-        match self.table_config.table_type() {
-            TableEnum::MissingTableType => unreachable!(),
+    fn into_table_metadata(self) -> anyhow::Result<Option<(TableConfig, TableCheckpointMetadata)>> {
+        let metadata = match self.table_config.table_type() {
+            TableEnum::MissingTableType => bail!("missing checkpoint table type"),
+            TableEnum::DiskKeyedMap => DiskKeyedTable::merge_checkpoint_metadata(
+                self.table_config.clone(),
+                self.subtask_tables,
+            )?,
             TableEnum::GlobalKeyValue => GlobalKeyedTable::merge_checkpoint_metadata(
                 self.table_config.clone(),
                 self.subtask_tables,
-            )
-            .expect("should be able to merge checkpoints"),
+            )?,
             TableEnum::ExpiringKeyedTimeTable => ExpiringTimeKeyTable::merge_checkpoint_metadata(
                 self.table_config.clone(),
                 self.subtask_tables,
-            )
-            .expect("should be able to merge checkpoint metadatas"),
-        }
-        .map(|metadata| (self.table_config, metadata))
+            )?,
+        };
+        Ok(metadata.map(|metadata| (self.table_config, metadata)))
     }
 }
 
@@ -277,6 +281,56 @@ impl CheckpointState {
             .as_ref()
             .ok_or_else(|| anyhow!("missing metadata for operator {}", c.operator_id))?;
 
+        if c.epoch != *self.epoch {
+            bail!("checkpoint completion epoch mismatch");
+        }
+        for (name, wrapped) in &metadata.table_metadata {
+            if wrapped.table_type() != TableEnum::DiskKeyedMap {
+                continue;
+            }
+            let config = metadata
+                .table_configs
+                .get(name)
+                .ok_or_else(|| anyhow!("missing disk-map checkpoint configuration"))?;
+            if config.table_type() != TableEnum::DiskKeyedMap {
+                bail!("disk-map checkpoint configuration type mismatch");
+            }
+            let config = DiskKeyedTableConfig::decode(config.config.as_slice())?;
+            let disk = DiskKeyedTableSubtaskCheckpointMetadata::decode(wrapped.data.as_slice())?;
+            arroyo_state_protocol::disk::validate_subtask(&config, &disk)
+                .map_err(|error| anyhow!(error))?;
+            if config.table_name != *name
+                || u64::from(disk.epoch) != c.epoch
+                || disk.subtask_index != metadata.subtask_index
+                || wrapped.subtask_index != metadata.subtask_index
+            {
+                bail!("disk-map checkpoint table, epoch or subtask ownership mismatch");
+            }
+            let context = c
+                .worker_context
+                .as_ref()
+                .ok_or_else(|| anyhow!("disk-map checkpoint missing worker ownership"))?;
+            if context.job_id != *self.job_id {
+                bail!("disk-map checkpoint job ownership mismatch");
+            }
+            let legacy_prefix = format!(
+                "{}/checkpoints/checkpoint-{:07}/operator-{}/table-{}-000/",
+                self.job_id, c.epoch, c.operator_id, name
+            );
+            let protocol_prefix = format!(
+                "{}/{}/generations/{}/checkpoints/checkpoint-{:07}/operator-{}/table-{}-000/",
+                context.pipeline_id, self.job_id, disk.generation, c.epoch, c.operator_id, name
+            );
+            for file in &disk.files {
+                if !(disk.generation == 0 && file.path.starts_with(&legacy_prefix)
+                    || disk.generation == context.generation
+                        && file.path.starts_with(&protocol_prefix))
+                {
+                    bail!("disk-map checkpoint file is outside its exclusive worker table owner");
+                }
+            }
+        }
+
         debug!(
             message = "Checkpoint finished",
             checkpoint_id = self.checkpoint_id,
@@ -327,7 +381,7 @@ impl CheckpointState {
         if let Some((table_configs, table_checkpoint_metadata)) = operator_state.finish_subtask(
             c.metadata
                 .ok_or_else(|| anyhow!("missing metadata for operator {}", c.operator_id))?,
-        ) {
+        )? {
             self.operators_checkpointed += 1;
 
             Self::log_checkpoint_event(
@@ -368,6 +422,7 @@ impl CheckpointState {
                     .expect("should have a config for the table");
                 if let Some(committing_data) = match config.table_type() {
                     TableEnum::MissingTableType => bail!("missing table type"),
+                    TableEnum::DiskKeyedMap => None,
                     TableEnum::GlobalKeyValue => {
                         GlobalKeyedTable::committing_data(config.clone(), checkpoint_metadata)
                     }

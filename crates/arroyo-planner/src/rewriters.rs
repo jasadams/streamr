@@ -810,13 +810,148 @@ pub(crate) fn contains_state_function(expr: &Expr) -> bool {
     .unwrap_or(false)
 }
 
-/// Walks an expression tree, replacing state function calls with column references
-/// to the operator's result columns, and accumulating `StatefulOpDesc` entries.
+fn contains_volatile_scalar(expr: &Expr) -> bool {
+    expr.exists(|expr| {
+        Ok(matches!(expr, Expr::ScalarFunction(function)
+        if !StatefulProcessorRewriter::is_state_function(function.func.name())
+        && function.func.signature().volatility == datafusion::logical_expr::Volatility::Volatile))
+    })
+    .unwrap_or(false)
+}
+
+type FusedStateInput = (LogicalPlan, Vec<StatefulOpDesc>, Vec<Expr>);
+
+/// Inline linear SQL stages into one ordered map owner. Columns from a CTE are
+/// substituted with their defining expressions; state-result columns remain
+/// references to earlier operations in the same owner.
+fn flatten_state_input(plan: &LogicalPlan) -> DFResult<Option<FusedStateInput>> {
+    let (input, projection) = match plan {
+        LogicalPlan::Projection(p) => (p.input.as_ref(), Some(p.expr.clone())),
+        LogicalPlan::SubqueryAlias(a) => (a.input.as_ref(), None),
+        LogicalPlan::Extension(e) => {
+            if let Some(s) = e.node.as_any().downcast_ref::<StatefulProcessorExtension>() {
+                if s.final_exprs.iter().any(contains_volatile_scalar) {
+                    return plan_err!(
+                        "volatile expressions after a stateful stage cannot be fused without changing evaluation count; compute them before the first stateful SELECT"
+                    );
+                }
+                return Ok(Some((
+                    s.input.clone(),
+                    s.ops.clone(),
+                    s.final_exprs.clone(),
+                )));
+            }
+            if let Some(r) = e.node.as_any().downcast_ref::<RemoteTableExtension>() {
+                (&r.input, None)
+            } else {
+                return Ok(None);
+            }
+        }
+        _ => return Ok(None),
+    };
+    let Some((base, ops, mapping)) = flatten_state_input(input)? else {
+        return Ok(None);
+    };
+    if projection
+        .as_ref()
+        .is_some_and(|exprs| exprs.iter().any(contains_volatile_scalar))
+    {
+        return plan_err!(
+            "volatile expressions between stateful stages are unsupported; compute them before the first stateful SELECT"
+        );
+    }
+    let mapping = match projection {
+        Some(exprs) => exprs
+            .into_iter()
+            .map(|e| substitute_state_columns(e, input.schema(), &mapping))
+            .collect::<DFResult<Vec<_>>>()?,
+        None => mapping,
+    };
+    Ok(Some((base, ops, mapping)))
+}
+
+fn substitute_state_columns(
+    expr: Expr,
+    schema: &datafusion::common::DFSchema,
+    mapping: &[Expr],
+) -> DFResult<Expr> {
+    Ok(expr
+        .transform_up(&mut |e| {
+            if let Expr::Column(c) = &e {
+                let index = schema.index_of_column(c)?;
+                // Strip projection aliases before embedding their expressions.
+                let mut replacement = mapping[index].clone();
+                while let Expr::Alias(a) = replacement {
+                    replacement = *a.expr;
+                }
+                Ok(Transformed::yes(replacement))
+            } else {
+                Ok(Transformed::no(e))
+            }
+        })?
+        .data)
+}
+
 fn rewrite_state_calls(
     expr: Expr,
     ops: &mut Vec<StatefulOpDesc>,
     counter: &mut usize,
 ) -> DFResult<Expr> {
+    rewrite_guarded_state_calls(expr, ops, counter, None)
+}
+
+fn rewrite_guarded_state_calls(
+    expr: Expr,
+    ops: &mut Vec<StatefulOpDesc>,
+    counter: &mut usize,
+    guard: Option<Expr>,
+) -> DFResult<Expr> {
+    if !contains_state_function(&expr) {
+        return Ok(expr);
+    }
+    let expr = expr.transform_down(&mut |e| {
+        if let Expr::Case(mut case) = e {
+            if case.expr.as_ref().is_some_and(|e| contains_state_function(e)) || case.when_then_expr.iter().any(|(w, _)| contains_state_function(w)) {
+                return plan_err!("state functions in CASE conditions are unsupported; compute the condition in an earlier SELECT stage");
+            }
+            if case.expr.as_ref().is_some_and(|expr| contains_volatile_scalar(expr)) || case.when_then_expr.iter().any(|(when, _)| contains_volatile_scalar(when)) {
+                return plan_err!("volatile CASE conditions with state functions are unsupported; materialize the condition before the first stateful SELECT");
+            }
+            let mut remaining = guard.clone().unwrap_or(Expr::Literal(ScalarValue::Boolean(Some(true)), None));
+            for (when, then) in &mut case.when_then_expr {
+                let condition = match &case.expr { Some(base) => (**base).clone().eq((**when).clone()), None => (**when).clone() };
+                let selected = Expr::IsTrue(Box::new(condition));
+                **then = rewrite_guarded_state_calls((**then).clone(), ops, counter, Some(remaining.clone().and(selected.clone())))?;
+                remaining = remaining.and(Expr::Not(Box::new(selected)));
+            }
+            if let Some(otherwise) = &mut case.else_expr {
+                **otherwise = rewrite_guarded_state_calls((**otherwise).clone(), ops, counter, Some(remaining))?;
+            }
+            // State calls were already replaced in each selected branch.
+            return Ok(Transformed::yes(Expr::Case(case)));
+        }
+        if let Expr::BinaryExpr(mut binary) = e {
+            if matches!(binary.op, datafusion::logical_expr::Operator::And | datafusion::logical_expr::Operator::Or) && contains_state_function(&Expr::BinaryExpr(binary.clone())) {
+                *binary.left = rewrite_guarded_state_calls((*binary.left).clone(), ops, counter, guard.clone())?;
+                if contains_volatile_scalar(&binary.left) {
+                    return plan_err!("volatile AND/OR conditions with state functions are unsupported; materialize the condition before the first stateful SELECT");
+                }
+                let needed = match binary.op {
+                    datafusion::logical_expr::Operator::And => Expr::IsNotFalse(Box::new((*binary.left).clone())),
+                    _ => Expr::IsNotTrue(Box::new((*binary.left).clone())),
+                };
+                let right_guard = match &guard { Some(outer) => outer.clone().and(needed), None => needed };
+                *binary.right = rewrite_guarded_state_calls((*binary.right).clone(), ops, counter, Some(right_guard))?;
+                return Ok(Transformed::yes(Expr::BinaryExpr(binary)));
+            }
+            return Ok(Transformed::no(Expr::BinaryExpr(binary)));
+        }
+        if let Expr::ScalarFunction(f) = &e
+            && matches!(f.func.name().to_ascii_lowercase().as_str(), "coalesce" | "nvl" | "ifnull" | "if" | "iif" | "nvl2") && f.args.iter().any(contains_state_function) {
+            return plan_err!("state functions inside {} are unsupported; use CASE with a state-free condition", f.func.name().to_ascii_uppercase());
+        }
+        Ok(Transformed::no(e))
+    })?.data;
     let result = expr.transform_up(&mut |e| {
         let Expr::ScalarFunction(ScalarFunction { ref func, ref args }) = e else {
             return Ok(Transformed::no(e));
@@ -841,8 +976,19 @@ fn rewrite_state_calls(
             }
         };
 
+        if map_name.is_empty() || map_name.len() > 249 || !map_name.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-')) {
+            return plan_err!("state map name must be 1-249 ASCII letters, digits, underscores, or hyphens; path separators and relative paths are unsupported");
+        }
+
         // Second argument: the key expression
-        let key_expr = args[1].clone();
+        let key_expr = match &guard {
+            Some(guard) => Expr::Case(datafusion::logical_expr::expr::Case {
+                expr: None,
+                when_then_expr: vec![(Box::new(guard.clone()), Box::new(args[1].clone()))],
+                else_expr: Some(Box::new(Expr::Literal(ScalarValue::Utf8(None), None))),
+            }),
+            None => args[1].clone(),
+        };
 
         // Third argument (for put/upsert/update): the value expression
         let value_expr = if args.len() > 2 {
@@ -893,13 +1039,41 @@ impl TreeNodeRewriter for StatefulProcessorRewriter {
             return Ok(Transformed::no(node));
         };
 
-        let mut ops: Vec<StatefulOpDesc> = vec![];
+        let flattened = flatten_state_input(&projection.input)?;
+        let (state_input, mut ops, exprs) = if let Some((base, ops, mapping)) = flattened {
+            let exprs = projection
+                .expr
+                .iter()
+                .cloned()
+                .map(|e| substitute_state_columns(e, projection.input.schema(), &mapping))
+                .collect::<DFResult<Vec<_>>>()?;
+            (base, ops, exprs)
+        } else {
+            ((*projection.input).clone(), vec![], projection.expr.clone())
+        };
+        if ops.is_empty() && projection.expr.iter().any(contains_state_function) {
+            let mut found = false;
+            projection.input.apply(|plan| {
+                if let LogicalPlan::Extension(e) = plan
+                    && e.node.as_any().is::<StatefulProcessorExtension>()
+                {
+                    found = true;
+                }
+                Ok(TreeNodeRecursion::Continue)
+            })?;
+            if found {
+                return plan_err!(
+                    "stateful stages separated by filters, joins, unions, or other non-projection operators cannot share ordered maps; use a linear CTE projection chain"
+                );
+            }
+        }
+        let original_ops = ops.len();
 
         // Rewrite each projection expression, extracting state function calls.
         // Uses self.counter (shared across all projections in the plan) so that
         // __state_result_N names are unique when multiple CTEs each contain state calls.
         let mut new_exprs = Vec::with_capacity(projection.expr.len());
-        for expr in projection.expr.into_iter() {
+        for expr in exprs {
             new_exprs.push(rewrite_state_calls(expr, &mut ops, &mut self.counter)?);
         }
 
@@ -916,14 +1090,18 @@ impl TreeNodeRewriter for StatefulProcessorRewriter {
                 // Graph traversal only creates operators for extensions; without this
                 // boundary filters and computed CTE columns would be skipped and the
                 // worker would receive the upstream extension's different schema.
-                input: LogicalPlan::Extension(Extension {
-                    node: Arc::new(RemoteTableExtension {
-                        input: (*projection.input).clone(),
-                        name: TableReference::bare(format!("__state_input_{}", self.counter)),
-                        schema: projection.input.schema().clone(),
-                        materialize: false,
-                    }),
-                }),
+                input: if original_ops > 0 {
+                    state_input
+                } else {
+                    LogicalPlan::Extension(Extension {
+                        node: Arc::new(RemoteTableExtension {
+                            input: state_input,
+                            name: TableReference::bare(format!("__state_input_{}", self.counter)),
+                            schema: projection.input.schema().clone(),
+                            materialize: false,
+                        }),
+                    })
+                },
                 ops,
                 final_exprs: new_exprs,
                 final_schema: projection.schema,

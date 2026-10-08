@@ -397,6 +397,37 @@ message GlobalKeyedTableSubtaskCheckpointMetadata {
   optional bytes commit_data = 3;
 }
 
+// Full logical snapshots. Every file belongs exclusively to one checkpoint.
+message DiskKeyedTableConfig {
+  string table_name = 1;
+  uint32 encoding_version = 2;
+  bytes schema_identity = 3;
+}
+
+message DiskCheckpointFile {
+  string path = 1;
+  uint64 size_bytes = 2;
+  bytes checksum = 3; // SHA-256 of the complete stored object
+  uint64 row_count = 4;
+}
+
+message DiskKeyedTableSubtaskCheckpointMetadata {
+  uint32 subtask_index = 1;
+  uint32 format_version = 2;
+  uint32 encoding_version = 3;
+  bytes schema_identity = 4;
+  bytes namespace = 5;
+  uint64 generation = 6;
+  uint32 epoch = 7;
+  bool empty = 8;
+  repeated DiskCheckpointFile files = 9;
+}
+
+message DiskKeyedTableTaskCheckpointMetadata {
+  uint32 format_version = 1;
+  map<uint32, DiskKeyedTableSubtaskCheckpointMetadata> subtasks = 2;
+}
+
 message ExpiringKeyedTimeTableConfig {
   string table_name = 1;
   string description = 2;
@@ -465,6 +496,7 @@ enum TableEnum {
   MissingTableType = 0;
   GlobalKeyValue = 1;
   ExpiringKeyedTimeTable = 2;
+  DiskKeyedMap = 3;
 }
 
 // Worker

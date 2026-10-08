@@ -211,7 +211,8 @@ impl KafkaSourceWithReads {
                 .await
                 .expect("timed out waiting for Kafka source output")
                 .expect("Kafka source output closed before the expected message");
-            // A source without an assigned partition can announce idleness before data arrives.
+            // An unassigned source may announce idleness before Kafka finishes
+            // assigning partitions. This is valid alongside data and barriers.
             if matches!(
                 item,
                 ArrowMessage::Signal(SignalMessage::Watermark(Watermark::Idle))

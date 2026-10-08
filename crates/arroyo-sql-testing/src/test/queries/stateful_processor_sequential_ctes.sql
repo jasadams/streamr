@@ -13,9 +13,8 @@ CREATE TABLE output (
   format = 'json', type = 'sink'
 );
 
--- Separate maps deliberately avoid relying on cross-operator map sharing.
--- Each stateful CTE must append distinct result fields and correctly pass
--- qualified values through the next operator.
+-- The chain fuses into one ordered checkpoint owner, retaining qualified
+-- values and unique result fields across the materialized CTE projections.
 INSERT INTO output
 WITH first_step AS (
   SELECT id, key,

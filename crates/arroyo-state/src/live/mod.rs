@@ -6,6 +6,7 @@ use async_trait::async_trait;
 use std::fmt;
 use std::sync::Arc;
 
+pub mod checkpoint;
 pub mod encoding;
 pub mod lifecycle;
 pub mod memory;

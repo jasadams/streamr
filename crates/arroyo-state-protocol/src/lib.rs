@@ -4,7 +4,10 @@
 //! passes the observed facts into pure decision functions, and then executes the
 //! returned decision.
 
+pub mod disk;
 pub mod gc;
+pub mod publication;
+mod ready;
 pub mod resolve;
 pub mod state;
 pub mod store;
@@ -72,6 +75,13 @@ impl ProtocolPaths {
     pub fn committed_marker(&self, generation: Generation, epoch: Epoch) -> CheckpointRef {
         self.path(format!(
             "generations/{generation}/checkpoints/checkpoint-{epoch:07}/committed.json"
+        ))
+    }
+
+    /// Immutable publication/closure slot for one generation.
+    pub fn publication_record(&self, generation: Generation, sequence: u64) -> CheckpointRef {
+        self.path(format!(
+            "generations/{generation}/publications/record-{sequence:020}.json"
         ))
     }
 
@@ -357,8 +367,8 @@ mod tests {
             .unwrap();
 
         assert!(!exists(&store, &file1).await);
-        assert!(!exists(&store, &paths.epoch_record(Epoch(1))).await);
-        assert!(!exists(&store, &paths.committed_marker(Generation(1), Epoch(1))).await);
+        assert!(exists(&store, &paths.epoch_record(Epoch(1))).await);
+        assert!(exists(&store, &paths.committed_marker(Generation(1), Epoch(1))).await);
         assert!(
             read_protobuf::<_, CheckpointManifest>(&store, &checkpoint1_ref)
                 .await
@@ -448,6 +458,19 @@ mod tests {
         assert!(store.deleted_objects().is_empty());
     }
 
+    fn logged_generation_manifest(
+        pipeline_id: PipelineId,
+        job_id: JobId,
+        generation: Generation,
+        base: Option<CheckpointRef>,
+        updated_at_micros: u64,
+    ) -> GenerationManifest {
+        let mut manifest =
+            GenerationManifest::new(pipeline_id, job_id, generation, base, updated_at_micros);
+        manifest.publication_log_version = crate::publication::PUBLICATION_LOG_VERSION;
+        manifest
+    }
+
     #[tokio::test]
     async fn initialize_generation_without_prior_checkpoint_writes_empty_manifest() {
         let store = MemoryProtocolStore::default();
@@ -467,7 +490,7 @@ mod tests {
         .await
         .unwrap();
 
-        let expected_manifest = GenerationManifest::new(
+        let expected_manifest = logged_generation_manifest(
             PipelineId::new("P"),
             JobId::new("J"),
             Generation(1),
@@ -522,7 +545,7 @@ mod tests {
         .await
         .unwrap();
 
-        let expected_manifest = GenerationManifest::new(
+        let expected_manifest = logged_generation_manifest(
             PipelineId::new("P"),
             JobId::new("J"),
             Generation(2),
@@ -582,7 +605,7 @@ mod tests {
         assert_eq!(
             initialization,
             GenerationInitialization::Initialized {
-                generation_manifest: GenerationManifest::new(
+                generation_manifest: logged_generation_manifest(
                     PipelineId::new("P"),
                     JobId::new("J"),
                     Generation(2),
@@ -733,7 +756,7 @@ mod tests {
         assert_eq!(
             initialization,
             GenerationInitialization::Initialized {
-                generation_manifest: GenerationManifest::new(
+                generation_manifest: logged_generation_manifest(
                     PipelineId::new("P"),
                     JobId::new("J"),
                     Generation(3),
@@ -798,7 +821,7 @@ mod tests {
         assert_eq!(
             initialization,
             GenerationInitialization::Initialized {
-                generation_manifest: GenerationManifest::new(
+                generation_manifest: logged_generation_manifest(
                     PipelineId::new("P"),
                     JobId::new("J"),
                     Generation(3),

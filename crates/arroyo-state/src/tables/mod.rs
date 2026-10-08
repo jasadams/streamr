@@ -15,6 +15,7 @@ use std::sync::Arc;
 use std::time::SystemTime;
 use tracing::debug;
 
+pub mod disk_keyed_map;
 pub mod expiring_time_key_map;
 pub mod global_keyed_map;
 pub mod table_manager;
