@@ -32,6 +32,11 @@ impl LiveTableManager {
     }
     pub fn register(&mut self, name: impl Into<String>) -> Result<LiveTable> {
         let name = name.into();
+        if name.as_bytes().starts_with(super::HISTORY_NAMESPACE_PREFIX) {
+            return Err(LiveStateError::InvalidEncoding(
+                "live table name uses reserved internal history prefix streamr.history.v1".into(),
+            ));
+        }
         if name.is_empty() || self.tables.contains_key(&name) {
             return Err(LiveStateError::InvalidEncoding(
                 "empty or duplicate live table name".into(),
@@ -187,6 +192,37 @@ impl LiveTable {
 mod tests {
     use super::*;
     use crate::live::{WriteOperation, memory::MemoryLiveState};
+
+    #[test]
+    fn internal_history_names_cannot_be_registered_as_ordinary_tables() {
+        let mut manager = LiveTableManager::new(
+            Arc::new(MemoryLiveState::new()),
+            Ownership::PartitionLocal {
+                subtask: 0,
+                parallelism: 1,
+            },
+        )
+        .unwrap();
+        manager.register("history").unwrap();
+        manager.register("customer.streamr.history.v1").unwrap();
+        assert!(manager.register("streamr.history.v1").is_err());
+
+        // This is the valid UTF-8 name that previously aliased history's
+        // primary table for the ordinary logical name "history".
+        let mut internal = super::super::HISTORY_NAMESPACE_PREFIX.to_vec();
+        internal.extend(7u64.to_be_bytes());
+        internal.extend(b"history");
+        internal.push(0);
+        let internal = String::from_utf8(internal).unwrap();
+        let error = match manager.register(internal) {
+            Ok(_) => panic!("internal history namespace was registered"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, LiveStateError::InvalidEncoding(message)
+            if message.contains("reserved internal history prefix")));
+        assert!(manager.table("history").is_ok());
+    }
+
     #[tokio::test]
     async fn handles_validate_namespaces_and_share_a_snapshot_boundary() {
         let mut manager = LiveTableManager::new(

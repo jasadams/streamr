@@ -1,0 +1,47 @@
+name: Lint
+
+on: [push, pull_request]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: lint-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust-format:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+      - name: Install Rust formatter
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: '1.95'
+          components: rustfmt
+      - name: Check Rust formatting
+        run: cargo fmt --all -- --check
+
+  webui-lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: webui
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9.0.6
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install lint dependencies
+        run: pnpm install --frozen-lockfile --strict-peer-dependencies --ignore-scripts
+      - name: Check Web UI formatting and lint
+        run: pnpm check

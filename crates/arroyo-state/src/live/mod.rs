@@ -20,6 +20,10 @@ pub mod typed_table;
 pub mod worker;
 pub mod write;
 
+// Internal history tables share the backend namespace domain with ordinary
+// tables. Keep this prefix reserved at the logical-table registration boundary.
+pub(crate) const HISTORY_NAMESPACE_PREFIX: &[u8] = b"streamr.history.v1";
+
 pub type Result<T> = std::result::Result<T, LiveStateError>;
 
 #[derive(Debug)]

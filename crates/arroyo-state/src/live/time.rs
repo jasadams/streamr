@@ -132,6 +132,27 @@ impl ArrowHistory {
         let mut next_sequence = sequence;
         while offset < batch.num_rows() {
             let mut rows = (batch.num_rows() - offset).min(self.limits.chunk_rows);
+            let (logical_bytes, logical_zeros) = history_key_size(key, timestamp, next_sequence)?;
+            // History keys are escaped once here and again by the backend. Size
+            // both index keys and the primary-key index value before copying.
+            let index_bytes =
+                encoded_history_key_size(&self.primary, logical_bytes, logical_zeros)?
+                    .checked_add(encoded_history_key_size(
+                        &self.expiry,
+                        logical_bytes,
+                        logical_zeros,
+                    )?)
+                    .and_then(|bytes| bytes.checked_add(logical_bytes))
+                    .and_then(|bytes| bytes.checked_add(2))
+                    .ok_or(LiveStateError::InvalidLimit)?;
+            check_batch_size(index_bytes, self.limits.batch_bytes)?;
+            let namespace_copies = super::encoding::encoded_namespace_size(&self.primary)?
+                .checked_add(super::encoding::encoded_namespace_size(&self.expiry)?)
+                .ok_or(LiveStateError::InvalidLimit)?;
+            let key_copies = logical_bytes
+                .checked_mul(3)
+                .and_then(|bytes| bytes.checked_add(namespace_copies))
+                .ok_or(LiveStateError::InvalidLimit)?;
             let reservation = if let Some(resources) = &self.resources {
                 Some(
                     resources
@@ -139,6 +160,7 @@ impl ArrowHistory {
                             self.limits
                                 .chunk_bytes
                                 .checked_mul(3)
+                                .and_then(|bytes| bytes.checked_add(key_copies))
                                 .ok_or(LiveStateError::InvalidLimit)?,
                         )
                         .await?,
@@ -156,9 +178,14 @@ impl ArrowHistory {
             let following = next_sequence.checked_add(1).ok_or_else(|| {
                 LiveStateError::InvalidEncoding("history sequence overflow".into())
             })?;
-            let primary_key = primary_key(key, timestamp, next_sequence);
-            let expiry_key = expiry_key(key, timestamp, next_sequence);
-            drop(reservation);
+            check_batch_size(
+                index_bytes
+                    .checked_add(encoded.len())
+                    .ok_or(LiveStateError::InvalidLimit)?,
+                self.limits.batch_bytes,
+            )?;
+            let primary_key = primary_key(key, timestamp, next_sequence)?;
+            let expiry_key = expiry_key(key, timestamp, next_sequence)?;
             self.backend
                 .write_batch(WriteBatch {
                     operations: vec![
@@ -174,6 +201,7 @@ impl ArrowHistory {
                     max_bytes: self.limits.batch_bytes,
                 })
                 .await?;
+            drop(reservation);
             offset += rows;
             next_sequence = following;
         }
@@ -210,20 +238,41 @@ impl ArrowHistory {
                 cursor: None,
             })
             .await?;
-        let count = page.entries.len();
-        let mut operations = Vec::with_capacity(count * 2);
+        let mut count = 0;
+        let mut bytes = 0usize;
+        let mut operations = Vec::new();
         for entry in page.entries {
             // Never accept an index pointing outside its paired primary table.
             let (key, timestamp, sequence) = parse_primary(&entry.value)?;
-            if expiry_key(&key, timestamp, sequence) != entry.key.key {
+            if expiry_key(&key, timestamp, sequence)? != entry.key.key {
                 return Err(LiveStateError::InvalidEncoding(
                     "inconsistent history expiry index".into(),
                 ));
             }
+            let primary_bytes = encoded_history_key_size(
+                &self.primary,
+                entry.value.len(),
+                entry.value.iter().filter(|byte| **byte == 0).count(),
+            )?;
+            let expiry_bytes = super::encoding::encoded_key_size(&entry.key)?;
+            let required = bytes
+                .checked_add(primary_bytes)
+                .and_then(|bytes| bytes.checked_add(expiry_bytes))
+                .ok_or(LiveStateError::InvalidLimit)?;
+            if required > self.limits.batch_bytes {
+                if count == 0 {
+                    check_batch_size(required, self.limits.batch_bytes)?;
+                }
+                break;
+            }
+            // Commit only complete primary/expiry pairs. A later call starts a
+            // fresh scan at the first pair that did not fit this write batch.
             operations.push(WriteOperation::Delete {
                 key: state_key(&self.primary, entry.value),
             });
             operations.push(WriteOperation::Delete { key: entry.key });
+            bytes = required;
+            count += 1;
         }
         self.backend
             .write_batch(WriteBatch {
@@ -244,6 +293,39 @@ impl HistorySnapshot {
         end: Option<i64>,
         cursor: Option<ScanCursor>,
     ) -> Result<HistoryPage> {
+        let prefix_bytes = escaped_prefix_size(key)?;
+        // Any matching record contains the full escaped key, both fixed-width
+        // suffixes, the backend key terminator and at least a value version.
+        // Suffix bytes can all be nonzero, so this is a lower bound regardless
+        // of the requested timestamp range or the stored sequence number.
+        let minimum_logical_bytes = prefix_bytes
+            .checked_add(16)
+            .ok_or(LiveStateError::InvalidLimit)?;
+        let minimum_logical_zeros = key
+            .iter()
+            .filter(|byte| **byte == 0)
+            .count()
+            .checked_add(2)
+            .ok_or(LiveStateError::InvalidLimit)?;
+        let minimum_record_bytes =
+            encoded_history_key_size(&self.primary, minimum_logical_bytes, minimum_logical_zeros)?
+                .checked_add(1)
+                .ok_or(LiveStateError::InvalidLimit)?;
+        if minimum_record_bytes > self.limits.page_bytes {
+            return Err(LiveStateError::ReadLimitExceeded {
+                required: minimum_record_bytes,
+                limit: self.limits.page_bytes,
+            });
+        }
+        let bound_bytes = prefix_bytes
+            .checked_add(8)
+            .ok_or(LiveStateError::InvalidLimit)?;
+        let namespace_bytes = super::encoding::encoded_namespace_size(&self.primary)?;
+        let request_bytes = prefix_bytes
+            .checked_add(if start.is_some() { bound_bytes } else { 0 })
+            .and_then(|bytes| bytes.checked_add(if end.is_some() { bound_bytes } else { 0 }))
+            .and_then(|bytes| bytes.checked_add(namespace_bytes))
+            .ok_or(LiveStateError::InvalidLimit)?;
         let decoded = if let Some(resources) = &self.resources {
             Some(
                 resources
@@ -251,6 +333,7 @@ impl HistorySnapshot {
                         self.limits
                             .page_bytes
                             .checked_mul(3)
+                            .and_then(|bytes| bytes.checked_add(request_bytes))
                             .ok_or(LiveStateError::InvalidLimit)?,
                     )
                     .await?,
@@ -258,9 +341,10 @@ impl HistorySnapshot {
         } else {
             None
         };
-        let prefix = key_prefix(key);
+        let prefix = key_prefix(key)?;
         let bound = |timestamp| {
-            let mut value = prefix.clone();
+            let mut value = Vec::with_capacity(bound_bytes);
+            value.extend_from_slice(&prefix);
             value.extend(sortable_time(timestamp));
             value
         };
@@ -322,7 +406,7 @@ impl HistorySnapshot {
 }
 
 fn index_namespace(namespace: &StateNamespace, index: u8) -> StateNamespace {
-    let mut table = b"streamr.history.v1".to_vec();
+    let mut table = super::HISTORY_NAMESPACE_PREFIX.to_vec();
     table.extend((namespace.table.len() as u64).to_be_bytes());
     table.extend(&namespace.table);
     table.push(index);
@@ -341,8 +425,59 @@ fn state_key(namespace: &StateNamespace, key: Vec<u8>) -> StateKey {
 fn sortable_time(time: i64) -> [u8; 8] {
     ((time as u64) ^ (1 << 63)).to_be_bytes()
 }
-fn key_prefix(key: &[u8]) -> Vec<u8> {
-    let mut encoded = Vec::with_capacity(key.len() + 2);
+fn escaped_prefix_size(key: &[u8]) -> Result<usize> {
+    key.len()
+        .checked_add(key.iter().filter(|byte| **byte == 0).count())
+        .and_then(|bytes| bytes.checked_add(2))
+        .ok_or(LiveStateError::InvalidLimit)
+}
+fn history_key_size(key: &[u8], timestamp: i64, sequence: u64) -> Result<(usize, usize)> {
+    let bytes = escaped_prefix_size(key)?
+        .checked_add(16)
+        .ok_or(LiveStateError::InvalidLimit)?;
+    let zeros = key
+        .iter()
+        .filter(|byte| **byte == 0)
+        .count()
+        .checked_add(2)
+        .and_then(|zeros| {
+            zeros.checked_add(
+                sortable_time(timestamp)
+                    .iter()
+                    .filter(|byte| **byte == 0)
+                    .count(),
+            )
+        })
+        .and_then(|zeros| {
+            zeros.checked_add(
+                sequence
+                    .to_be_bytes()
+                    .iter()
+                    .filter(|byte| **byte == 0)
+                    .count(),
+            )
+        })
+        .ok_or(LiveStateError::InvalidLimit)?;
+    Ok((bytes, zeros))
+}
+fn encoded_history_key_size(
+    namespace: &StateNamespace,
+    logical_bytes: usize,
+    logical_zeros: usize,
+) -> Result<usize> {
+    super::encoding::encoded_namespace_size(namespace)?
+        .checked_add(logical_bytes)
+        .and_then(|bytes| bytes.checked_add(logical_zeros))
+        .and_then(|bytes| bytes.checked_add(2))
+        .ok_or(LiveStateError::InvalidLimit)
+}
+fn check_batch_size(required: usize, limit: usize) -> Result<()> {
+    if required > limit {
+        return Err(LiveStateError::BatchLimitExceeded { required, limit });
+    }
+    Ok(())
+}
+fn push_key_prefix(encoded: &mut Vec<u8>, key: &[u8]) {
     for byte in key {
         if *byte == 0 {
             encoded.extend([0, 255]);
@@ -351,19 +486,25 @@ fn key_prefix(key: &[u8]) -> Vec<u8> {
         }
     }
     encoded.extend([0, 0]);
-    encoded
 }
-fn primary_key(key: &[u8], timestamp: i64, sequence: u64) -> Vec<u8> {
-    let mut value = key_prefix(key);
+fn key_prefix(key: &[u8]) -> Result<Vec<u8>> {
+    let mut encoded = Vec::with_capacity(escaped_prefix_size(key)?);
+    push_key_prefix(&mut encoded, key);
+    Ok(encoded)
+}
+fn primary_key(key: &[u8], timestamp: i64, sequence: u64) -> Result<Vec<u8>> {
+    let mut value = Vec::with_capacity(history_key_size(key, timestamp, sequence)?.0);
+    push_key_prefix(&mut value, key);
     value.extend(sortable_time(timestamp));
     value.extend(sequence.to_be_bytes());
-    value
+    Ok(value)
 }
-fn expiry_key(key: &[u8], timestamp: i64, sequence: u64) -> Vec<u8> {
-    let mut value = sortable_time(timestamp).to_vec();
-    value.extend(key_prefix(key));
+fn expiry_key(key: &[u8], timestamp: i64, sequence: u64) -> Result<Vec<u8>> {
+    let mut value = Vec::with_capacity(history_key_size(key, timestamp, sequence)?.0);
+    value.extend(sortable_time(timestamp));
+    push_key_prefix(&mut value, key);
     value.extend(sequence.to_be_bytes());
-    value
+    Ok(value)
 }
 fn parse_primary(bytes: &[u8]) -> Result<(Vec<u8>, i64, u64)> {
     let invalid = || LiveStateError::InvalidEncoding("invalid history primary key".into());
