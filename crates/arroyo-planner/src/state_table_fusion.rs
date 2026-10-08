@@ -24,6 +24,32 @@ use petgraph::graph::NodeIndex;
 use petgraph::visit::EdgeRef;
 use prost::Message;
 
+// Physical expressions may prove an outer field non-null while the logical
+// graph conservatively declares it nullable. Only that widening is admissible;
+// nested types/fields, names, order and metadata retain the existing Arrow
+// equality contract (including its treatment of dictionary attributes).
+fn scalar_schema_compatible(physical: &Schema, declared: &Schema) -> bool {
+    physical.metadata() == declared.metadata()
+        && physical.fields().len() == declared.fields().len()
+        && physical
+            .fields()
+            .iter()
+            .zip(declared.fields())
+            .all(|(actual, expected)| {
+                if actual.is_nullable() == expected.is_nullable() {
+                    return actual == expected;
+                }
+                if actual.is_nullable() {
+                    return false;
+                }
+                let normalized = actual
+                    .as_ref()
+                    .clone()
+                    .with_nullable(expected.is_nullable());
+                normalized == **expected
+            })
+}
+
 fn reject(message: impl Into<String>) -> DataFusionError {
     DataFusionError::Plan(format!("state-table fusion: {}", message.into()))
 }
@@ -70,7 +96,14 @@ fn admit_expression(expr: &dyn PhysicalExpr, uuid_value_root: bool) -> Result<()
                 .is::<datafusion_functions::string::uuid::UuidFunc>()
             && function.args().is_empty()
             && function.return_type() == &DataType::Utf8;
+        // Stock UTF8 CONCAT is guarded before invocation by the fused owner's
+        // private cumulative expansion allowance, including nested calls.
+        let bounded_concat = implementation
+            .as_any()
+            .is::<datafusion_functions::string::concat::ConcatFunc>()
+            && function.return_type() == &DataType::Utf8;
         if !bounded_uuid
+            && !bounded_concat
             && !implementation
                 .as_any()
                 .is::<datafusion_functions::core::getfield::GetFieldFunc>()
@@ -110,6 +143,35 @@ mod uuid_admission_tests {
     use datafusion::physical_expr::ScalarFunctionExpr;
     use datafusion_functions::string::uuid::UuidFunc;
     use std::sync::Arc;
+
+    #[test]
+    fn only_stock_utf8_concat_is_admitted() {
+        let field = Arc::new(Field::new("candidate", DataType::Utf8, false));
+        let stock = ScalarFunctionExpr::new(
+            "concat",
+            Arc::new(datafusion_functions::string::concat::ConcatFunc::new().into()),
+            vec![],
+            field.clone(),
+        );
+        admit_expression(&stock, true).unwrap();
+        admit_expression(&stock, false).unwrap();
+        let spoof = create_udf(
+            "concat",
+            vec![],
+            DataType::Utf8,
+            Volatility::Immutable,
+            Arc::new(|_| panic!("admission must never evaluate a named spoof")),
+        );
+        let spoof = ScalarFunctionExpr::new("concat", Arc::new(spoof), vec![], field);
+        assert!(admit_expression(&spoof, true).is_err());
+        let wide = ScalarFunctionExpr::new(
+            "concat",
+            Arc::new(datafusion_functions::string::concat::ConcatFunc::new().into()),
+            vec![],
+            Arc::new(Field::new("candidate", DataType::LargeUtf8, false)),
+        );
+        assert!(admit_expression(&wide, true).is_err());
+    }
 
     #[test]
     fn only_concrete_uuid_values_are_admitted() {
@@ -224,10 +286,12 @@ impl ScalarPlanAdmission for BoundedScalarAdmission<'_> {
             },
         )?;
         let mut inputs = 0;
-        if physical.schema().as_ref() != output.schema.as_ref() {
-            return Err(reject(
-                "scalar physical output schema differs from graph edge",
-            ));
+        if !scalar_schema_compatible(physical.schema().as_ref(), output.schema.as_ref()) {
+            return Err(reject(format!(
+                "scalar physical output schema differs from graph edge: physical={:?}; declared={:?}",
+                physical.schema(),
+                output.schema,
+            )));
         }
         admit_plan(physical.as_ref(), &mut inputs, &input.schema)?;
         if inputs != 1 {
@@ -1042,10 +1106,135 @@ pub(crate) fn rebuild(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn scalar_schema_allows_only_outer_nullability_widening() {
+        let child = Arc::new(Field::new("field", DataType::Utf8, true));
+        let physical = Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("changed_fields", DataType::List(child.clone()), false),
+        ]);
+        let declared = Schema::new(vec![
+            physical.field(0).clone(),
+            physical.field(1).clone().with_nullable(true),
+        ]);
+        assert!(scalar_schema_compatible(&physical, &physical));
+        assert!(scalar_schema_compatible(&physical, &declared));
+        assert!(!scalar_schema_compatible(&declared, &physical));
+        let invalid_fields = [
+            Field::new("changed_fields", DataType::Utf8, true),
+            Field::new("renamed", DataType::List(child.clone()), true),
+            Field::new(
+                "changed_fields",
+                DataType::List(Arc::new(Field::new("field", DataType::Utf8, false))),
+                true,
+            ),
+            Field::new(
+                "changed_fields",
+                DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+                true,
+            ),
+            declared
+                .field(1)
+                .clone()
+                .with_metadata(HashMap::from([("origin".into(), "different".into())])),
+        ];
+        for field in invalid_fields {
+            let other = Schema::new(vec![physical.field(0).clone(), field]);
+            assert!(!scalar_schema_compatible(&physical, &other), "{other:?}");
+        }
+        assert!(!scalar_schema_compatible(
+            &physical,
+            &Schema::new(vec![declared.field(1).clone(), declared.field(0).clone()])
+        ));
+        assert!(!scalar_schema_compatible(
+            &physical,
+            &Schema::new(vec![declared.field(0).clone()])
+        ));
+        assert!(!scalar_schema_compatible(
+            &physical,
+            &declared
+                .clone()
+                .with_metadata(HashMap::from([("origin".into(), "different".into())]))
+        ));
+        let dictionary = Field::new(
+            "dictionary",
+            DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+            false,
+        );
+        let ordered_dictionary = dictionary.clone().with_dict_is_ordered(true);
+        let physical_dictionary = Schema::new(vec![dictionary]);
+        let declared_dictionary = Schema::new(vec![ordered_dictionary]);
+        assert_eq!(physical_dictionary, declared_dictionary);
+        // Field equality deliberately ignores dictionary ordering attributes.
+        // Preserve that established acceptance while widening outer nullability.
+        assert!(scalar_schema_compatible(
+            &physical_dictionary,
+            &declared_dictionary
+        ));
+    }
+
     use super::*;
     use std::sync::Arc;
 
     use arrow_schema::{Field, TimeUnit};
+
+    const SELECTED_SNAPSHOT_CASE_SQL: &str = r#"CREATE TABLE snapshot_events (event_id BIGINT NOT NULL, k TEXT NOT NULL,
+ n BIGINT, value TEXT, selected_for_output BOOLEAN NOT NULL)
+WITH (connector='single_file',path='/tmp/generic-snapshot-input.jsonl',format='json',type='source',wait_for_control='true');
+CREATE STATE TABLE prior_snapshot (k TEXT PRIMARY KEY,n BIGINT,value TEXT,last_event_id BIGINT) PARTITION BY k;
+CREATE VIEW applied AS MERGE INTO prior_snapshot AS target USING snapshot_events AS source
+ON target.k=source.k
+WHEN MATCHED AND source.selected_for_output THEN UPDATE SET n=source.n,value=source.value,last_event_id=source.event_id
+WHEN NOT MATCHED AND source.selected_for_output THEN INSERT (k,n,value,last_event_id) VALUES (source.k,source.n,source.value,source.event_id)
+RETURNING source AS source,old AS old,new AS new,action AS action;
+CREATE TABLE result (event_id BIGINT,k TEXT,n BIGINT,value TEXT,old_n BIGINT,old_value TEXT,
+ old_event_id BIGINT,new_event_id BIGINT,action TEXT,changed_fields TEXT[])
+WITH (connector='single_file',path='/tmp/generic-snapshot-output.jsonl',format='json',type='sink');
+INSERT INTO result SELECT r.source.event_id AS event_id,r.source.k AS k,r.new.n AS n,r.new.value AS value,
+ r.old.n AS old_n,r.old.value AS old_value,r.old.last_event_id AS old_event_id,
+ r.new.last_event_id AS new_event_id,r.action AS action,
+ CASE WHEN r.old.k IS NULL THEN ARRAY['n','value']
+ WHEN (r.old.n IS DISTINCT FROM r.new.n) AND (r.old.value IS DISTINCT FROM r.new.value) THEN ARRAY['n','value']
+ WHEN r.old.n IS DISTINCT FROM r.new.n THEN ARRAY['n']
+ WHEN r.old.value IS DISTINCT FROM r.new.value THEN ARRAY['value']
+ ELSE CAST(ARRAY[] AS TEXT[]) END AS changed_fields
+FROM applied r WHERE r.source.selected_for_output;
+"#;
+
+    async fn assert_case_array_fuses(sql: &str) {
+        let compiled = crate::parse_and_get_program(
+            sql,
+            crate::ArroyoSchemaProvider::new(),
+            crate::SqlConfig {
+                default_parallelism: 1,
+            },
+        )
+        .await
+        .unwrap_or_else(|error| panic!("CASE array planning failed: {error}"));
+        assert!(compiled.program.graph.node_weights().any(|node| {
+            node.operator_chain
+                .iter()
+                .any(|(operator, _)| operator.operator_name == OperatorName::FusedStateTable)
+        }));
+    }
+
+    #[tokio::test]
+    async fn selected_snapshot_cast_case_array_preserves_declared_schema() {
+        let sql = SELECTED_SNAPSHOT_CASE_SQL
+            .replace(
+                " CASE WHEN r.old.k IS NULL",
+                " CAST(CASE WHEN r.old.k IS NULL",
+            )
+            .replace("END AS changed_fields", "END AS TEXT[]) AS changed_fields");
+        assert_case_array_fuses(&sql).await;
+    }
+
+    #[tokio::test]
+    async fn selected_snapshot_original_case_array_preserves_declared_schema() {
+        // Preserve the original uncast SQL as a separate regression attempt:
+        // a genuine nested type mismatch must still fail the unchanged guard.
+        assert_case_array_fuses(SELECTED_SNAPSHOT_CASE_SQL).await;
+    }
 
     struct AdmitTestScalar;
     impl ScalarPlanAdmission for AdmitTestScalar {

@@ -15,7 +15,147 @@ This revision does not qualify those paths or change the historical evidence
 below. Application query proposals and oracles remain in the application repo;
 they are not embedded engine implementations.
 
-## Current `d19c30e3` evidence and open gates
+## Current handoff — 2026-10-08
+
+Milestone 3 remains incomplete. This section supersedes older statements about
+queued v14b runs; the historical evidence below retains its original revision
+and scope. The current candidate is an uncommitted batch atop
+`b6b2aa7a3e0fd479f7ea5693ffd9b4d94cc2d95b`; published PR checks do not verify it.
+
+### Review repairs after the frozen v14b run
+
+Fresh independent review found two defects in the unpublished batch:
+
+- Public SESSION and unordered packaged-capture comparators retained full
+  datasets in supervisor memory. They now use incremental parsing and an exact
+  SQLite-backed multiset through `scripts/bounded_row_oracle.py`. Eight pure
+  Python tests passed and passed again under independent review; receipts and
+  reviews are in `target/milestone-3-pr6-publication/`. Memory scales with the
+  largest working row plus fixed parser/cache storage, not dataset cardinality.
+  This is not a fixed process-RSS guarantee or a new SQL/recovery qualification.
+- Startup network failures awaited a bounded control channel whose consumer
+  starts after link setup completes. Saturation could prevent startup from ever
+  finishing. The repair registers deferred awaited reporting with the existing
+  network-task owner. New tests cover full-channel delivery and cancellation;
+  runtime reporting remains unchanged. Both startup regressions passed in the
+  fresh v15 library gate:
+  `network_setup_failure_does_not_wait_for_startup_control_consumer` and
+  `network_setup_failure_report_is_cancelled_with_engine_network_tasks`.
+
+Only `network_manager.rs` differs from the frozen v14b compiled-source inventory;
+**the v14b gates do not verify this repaired Rust source**. The original run
+artifacts remain unchanged. Fresh v15 validation uses the required Bookworm
+container and shared target. All five gates exited zero: formatting, workspace
+all-target check, strict Clippy, library tests and workspace all-target build.
+Library logs record 25 suites, 708 passed, zero failed and six ignored; the library
+gate took 1308.74 seconds. Exact commands, exits and logs are retained in
+`target/native-m3-reviewed-repairs-v15-build-evidence/results.json`, with frozen
+source in the adjacent `source.json`. Root session `4624` is terminal with exit
+zero; the all-target build took 229.81 seconds.
+
+The 12 small public-helper integration cases passed: hot8 SESSION, many4
+SESSION and packaged unordered operations, each across memory/RocksDB and
+controller/leader. Evidence is retained in
+`target/native-m3-reviewed-repairs-v15-runtime-smokes/integration-evidence.json`
+(SHA-256 `46a00cb7a53c8d954017eed2a27b7810915ade2a3bafeabb307425fb1a4cc3b1`)
+and the adjacent `results.json`, capture logs, outputs and measurements.
+Independent retained-output comparison verified all complete initial/recovered
+typed rows and exact multiset multiplicities: one hot session, four many-key
+sessions and 161 operations rows per case. SESSION checkpoint input prefixes
+are seven rows with zero committed outputs; operations prefixes contain 80
+exact committed rows. All eight SESSION measurements verify checkpoint-prefix
+values. Peak SQL-child RSS across the 12 cases was 184,414,208–195,432,448 bytes,
+below each 512 MiB bound. SESSION retained-payload floors are only 448 bytes;
+these small cases do not establish capacity, full lifecycle parity, production
+process loss or the 24-hour gate. Large SESSION fixtures remain prepared only;
+actual large SESSION retained-payload qualification has not run.
+
+Two workflow interruptions preceded these results, without starting any smoke
+case: scheduled `cargo-sweep-all` removed the SQL-test executable between queue
+reservations, then the successful 1190.44-second rebuild's driver assumed the
+old Cargo artifact filename. The coordinator pinned the actual fresh all-target
+SQL artifact `arroyo_sql_testing-4c0060e4a785ebe5`, and continuation session
+`66569` exited zero after all 12 cases. Original five-gate receipts remain
+unchanged. The rebuilt SQL test fingerprint declares `default` plus
+`integration-tests`; its retained listing has 60 tests. This is distinct from
+the original library-gate ELF, whose SHA-256 is
+`a769438d85f91253fb96745f5e958f360f75f998e39baa7b9f904ef864a1f7f0`.
+The smoke SQL executable is pinned as `bin/sql-test`, SHA-256
+`ee64553b221e2caefa7a132ef9323f56de82347740fcd61126b2b3bc913b0244`;
+the rebuilt production executable is pinned as `bin/arroyo`, SHA-256
+`f619e8d6c300364f7667fa48311d80b14f90a7a2a7eba2346257a2627a060bf2`.
+Rebuild receipts, fingerprint/depfile metadata, helper/source hashes and packaged
+helper/binary inventory links were independently verified against retained files.
+Startup regressions belong to the original library gate; these rebuilt SQL
+captures do not replace that gate. No source or helper bytes changed.
+
+Container access and Git index writes work. The repaired batch remains
+uncommitted and unpublished atop `b6b2aa7a`; PR #6 remains draft and current
+candidate CI is pending publication. Preserve the patch and source/hash receipts;
+verify remote head and CI against the eventual published commit separately.
+
+The frozen v14b build evidence lives in
+`target/native-m3-admission-v14b-build-evidence/`. Formatting, workspace
+all-target check, strict Clippy, library tests and full all-target build passed.
+The library logs record 25 suites, 706 passed, zero failed and six ignored.
+`build-evidence.json` binds the compiled sources and executable hashes; preserve
+these files and use their copies of logs rather than relying on temporary paths.
+
+| Completed run | Saved evidence | Scope and limitation |
+| --- | --- | --- |
+| State-table parity: 40 cases passed | `target/native-str43-parity-admission-v14b/` | Five generic fixtures, batches 1/8, memory/RocksDB and controller/leader; finite typed values and fresh-worker recovery, not legacy checkpoint migration or full application parity. |
+| MERGE export faults: four cases passed | `target/native-str43-merge-fault-admission-v14b/` | Failed export nonpublication, selected epochs, retention and exact recovery; not production process loss. |
+| Production process recovery: six cases passed | `target/native-process-recovery-admission-v14b/matrix-results.json` | Isolated packaged binary, memory/RocksDB, worker/controller loss, 6,000 rows; not large-state, full application or 24-hour qualification. |
+| Producer/consumer deltas: four pairs passed | `target/native-produced-envelope-delta-admission-v14b/` | Eight SQL captures, actual transported JSON, typed deltas and checkpoint recovery; independently audited values, frozen files and checkpoint hashes. Not full-profile parity or atomic checkpoints across jobs. |
+| Quiet-key witness: failed validation | `target/native-quiet-key-window-witness-admission-v14b/` | SQL child passed; witness validator incorrectly expected a timestamp string instead of Debezium Unix milliseconds. Offline capture analysis confirms peer closure at 17:13:28 during both holds, while target count remains 1 rather than required zero. This query still fails. |
+| Dynamic latest-window JOIN: planner rejection | `target/native-dynamic-latest-window-join-admission-v14b/` | Exact error: `can't handle updating left side of join`. See the [SQL proposal](native-dynamic-window-composition-proposal.md); no guard bypass or new contract is approved. |
+| Large SESSION fixtures: prepared only | `target/native-session-large-fixtures-admission-v14b/preparation.json` | Hot-key and many-key inputs exceed 10× the declared 50 MiB pool. No large SESSION runtime has run on this candidate. |
+
+The quiet-window encoding diagnosis is saved in
+`target/native-quiet-key-window-witness-encoding-audit-v14b/analysis.json`, with
+hashes of the original snapshots and checked CDC continuity. Debezium's default
+is explicitly `UnixMillis` in `crates/arroyo-rpc/src/formats.rs`; ordinary JSON
+uses its separate default. Original failed run artifacts and validator are
+unchanged. Both live-hold snapshots have lifetime count 3, recent count 1 and
+peer window end 17:13:28; EOF advances the peer to 17:13:34 without producing
+the required target zero. This closes the timestamp-encoding investigation,
+not the rolling-zero gate. Re-running this unchanged query cannot qualify it.
+
+### Remaining acceptance gates
+
+| Ticket | Remaining work; passing slices do not close the ticket |
+| --- | --- |
+| STR-16 | Complete retained-state, output, checkpoint, cancellation and slow-consumer accounting coverage. |
+| STR-17 | Current-source high-cardinality/hot-key recovery and bounded ranking; slicing an already materialized full array is insufficient. |
+| STR-20 | Large SESSION runtime and full lifecycle/schema parity, including out-of-order input and restored open sessions. |
+| STR-26 | Configuration, metrics, operational recovery/rollback and measured defaults. Private instrumentation proposals have not been applied or tested. |
+| STR-28 | Complete external field/lifecycle coverage and explicit distinctions between native support, defects and policy differences. |
+| STR-29 | Complete typed profile/session composition, rolling zero/expiry behavior and bounded rankings. Standard updating-input JOIN support is a demonstrated limitation. |
+| STR-32 | Full external identity/profile/session parity; combined fixed-parallelism ≥10× capacity, hot keys, backfill, slow consumers and actual 24-hour live/fault qualification. |
+
+STR-44 tracks optional immediate-first/per-group delayed aggregate emission
+post-MVP. Existing periodic Arroyo flushing remains accepted for this milestone;
+that deferral does not defer the other gates. Legacy state functions and their
+runtime remain pending STR-43 prerequisites and checkpoint compatibility work.
+
+### Resume without repeating completed work
+
+1. Audit and publish the existing verified candidate as a reviewable PR update;
+   preserve its frozen source/build evidence and obtain CI for the published
+   candidate. Do not claim existing PR CI covers dirty worktree changes.
+2. Resume the prepared large SESSION qualification through the shared serialized
+   build/run queue after checking disk, container state and source hashes. Do not
+   recreate fixtures or restart completed waves just because old handles vanished.
+3. Use the retained quiet-window diagnosis: encoding is understood and the
+   required zero is still absent. Investigate native expiry/result composition
+   without repeating the unchanged query. Discuss any required updating-result
+   contract and RocksDB read-view lifetime
+   change before implementing observable semantics or architectural changes.
+4. Finish the remaining ticket gates before starting the full 24-hour run.
+   Broker uptime, finite captures and older-revision capacity results cannot
+   substitute for that run or establish milestone completion.
+
+## Historical `d19c30e3` evidence and open gates
 
 PR #6 at `d19c30e3` has seven successful CI checks. The generic native UUID,
 closed-HOP reaggregation and lifetime/latest-result composition fixtures each
@@ -981,6 +1121,258 @@ would need state registration, clock/watermark/recovery ordering, admitted typed
 outputs and source/sink checkpoint integration. Storage tests establish none of
 those execution guarantees.
 
+## Subsequent production completion and MAP diagnostics
+
+The v9 memory/controller worker-loss case also passed, with exactly 6,000 raw
+rows, complete aggregate CDC recovery, terminal `Finished`, 77.88 seconds of
+runtime and peak combined sampled RSS of 408,879,104 bytes. Its immutable
+evidence is `target/native-process-recovery-admission-v9/memory-controller/`;
+owned-process cleanup completed without errors.
+
+The v9 memory/worker case restored and completed its operator tasks, but the
+worker leader cancelled its RPC server before the controller could observe
+terminal status. The controller repeatedly entered recovery. The diagnosed
+run was deliberately interrupted after 541.16 seconds; it did not pass, and its
+last API state was `Running`. Peak combined sampled RSS was 409,522,176 bytes;
+owned-process cleanup completed. Logs, checkpoint objects and interruption
+evidence remain in `target/native-process-recovery-admission-v9/memory-worker/`.
+The corresponding RocksDB/worker case was skipped before execution. Earlier
+`leader` CLI invocations were rejected before engine startup: production uses
+`worker`, whereas the SQL capture harness calls that protocol `leader`.
+
+The independently reviewed completion repair now preserves the existing
+parent/leader terminal handshake by returning before cancellation and phase
+teardown on the leader path. Nonleader cancellation remains unchanged. Two
+regressions exercise actual terminal-status RPC and accounted queue/listener
+release. The v10 source is frozen for new integrated gates; actual production
+reruns remain required. The optional
+controller/catalog restart supervisor in `scripts/test-native-process-recovery.py`
+has passed independent source review and syntax checks, but has not yet been
+qualified by an actual controller-loss run.
+
+The v9 plain JSON MAP-array diagnostic passed exact initial and recovered
+values with peak child RSS of 179,003,392 bytes. The first SESSION/scalar-MAP
+attempt produced the expected map and window values but failed its caller oracle
+because unaliased projections were named `window[start]` and `window[end]`.
+That attempt is preserved at `target/native-map-admission-v9/`; an explicitly
+aliased query then passed exact initial and recovered values at
+`target/native-map-admission-v9-aliased/`, with peak child RSS of 185,139,200
+bytes. These small probes do not establish
+application histogram or full profile parity.
+
+STR-44 tracks optional per-group aggregate emission as a deferred, post-MVP
+feature outside milestone 3. Existing Arroyo periodic flushing remains the MVP
+behavior; the compatibility timing difference remains explicit.
+
+## Integrated v10 completion repair checks
+
+The frozen v10 source passed Bookworm formatting, workspace all-target checking,
+strict Clippy, all 25 library suites (680 passed, zero failed, six ignored) and
+the full workspace all-target build. Both new completion-lifetime regressions
+passed. Exact logs, source inventory and gate results are retained in
+`target/native-m3-admission-v10-build-evidence/`. The compiled diff from HEAD
+`b6b2aa7a` has SHA-256
+`c7c32a50ac3eb4c87e4ad84f2af8ec58de87e8cf5884dceafd4cc661273f5847`.
+The SQL test binary is
+`0a8c8f52ff5344e2639a26f820cfd5e32501129490d0a5cfb1baf96a84a594c1`;
+the production binary is
+`5c93653884a1601163a786ed0c4b1e33aa4ab31329c3a9bf898f2f91fce76abf`.
+
+The source-free v10 memory/worker worker-loss case passed actual production
+recovery: the same job moved from worker generation 1 to 2, emitted exactly
+6,000 raw rows and valid aggregate CDC ending at count 6,000 and sum 17,997,000,
+and reached terminal `Finished`. Runtime was 112.05 seconds; peak combined
+sampled RSS was 408,834,048 bytes. Both helper and outer supervisor cleanup
+completed without errors. Evidence is retained at
+`target/native-process-recovery-admission-v10/memory-worker-worker-loss/`.
+This verifies the previously failing completion path on the memory backend.
+
+All six source-free v10 production cases now passed. Every case restored the
+same job at generation 2, reached `Finished`, compared exactly 6,000 raw rows
+and valid CDC ending at count 6,000/sum 17,997,000/min 0/max 5,999, and completed
+both helper and outer supervisor cleanup without errors.
+
+| Backend | Coordination | Injected loss | Seconds | Peak combined sampled RSS, bytes |
+|---|---|---|---:|---:|
+| Memory | Worker leader | Worker | 112.05 | 408,834,048 |
+| RocksDB | Worker leader | Worker | 112.97 | 422,490,112 |
+| Memory | Controller | Worker | 77.90 | 409,600,000 |
+| RocksDB | Controller | Worker | 78.25 | 418,721,792 |
+| Memory | Controller | Controller and owned workers | 77.65 | 408,088,576 |
+| RocksDB | Controller | Controller and owned workers | 77.88 | 419,373,056 |
+
+Controller-loss cases preserve catalog identity, query and program bytes, and
+restore the authoritative persisted epoch with exact source counter/start time
+and committed sink prefixes. Both selected epoch 1 in ready state; this does not
+qualify the committing-state replay branch. Evidence, catalogs, actual objects,
+logs, source-free bundle provenance and exact results remain in
+`target/native-process-recovery-admission-v10/`. No owned matrix containers
+remained after the terminal result.
+
+Capacity, full application parity, write/export/publication-specific faults,
+backfill and 24-hour live qualification remain open. Earlier v9 runtime results
+remain evidence for their own source; this production matrix does not establish
+milestone completion.
+
+## Additional v10 SQL diagnostics
+
+The v10 fixed-reference calendar query passed all eight memory/RocksDB ×
+controller/leader × source batch 1/8 captures at
+`target/native-calendar-boundary-admission-v10/`. Each checks exact committed
+prefix and final endpoints, CDC continuity, and complete correlated before/after
+rows. At source prefix 7 the counts `(total, c1, c7, c30, c90)` are
+`(7, 0, 2, 4, 6)`; final counts are `(10, 2, 4, 6, 8)`. Date-boundary membership
+and future-date exclusion use a caller-supplied fixed reference date. Peak SQL
+child RSS ranged from 187,146,240 to 194,158,592 bytes. This is calendar
+arithmetic and fresh-worker recovery evidence, not moving-clock expiry or an
+autonomous idle-key zero.
+
+The separate selected-append-snapshot MERGE/CASE-array wave stopped at its first
+memory/controller/batch-1 attempt. Planning failed with
+`state-table fusion: scalar physical output schema differs from graph edge`
+before any input processing; unchanged-source failure artifacts are retained at
+`target/native-existing-sql-parity-admission-v10/`. The strict schema guard stays
+in place. Existing-SQL cast diagnostics are prepared but unrun; the exact schema
+difference remains unobserved. No selected-snapshot or aggregate-emission parity
+pass follows from that attempt.
+
+The v10 RocksDB aggregate capacity wave passed the 8-member sanity and
+10,000-member hot-key cases under controller and leader checkpoint modes.
+Every pass compares full payload values, CDC before images and recovered
+committed prefixes. The 10,000-member cases retained a logical payload floor of
+2,559,744 bytes at the checkpoint; peak SQL child RSS was 214,138,880 bytes
+(controller) and 212,725,760 bytes (leader). These cases do not reach ten times
+the declared 78 MiB pool budget.
+
+The subsequent 100,000-key, 8,192-byte-payload controller case failed before its
+checkpoint: graph queue admission at `value_1` requested 258.2 KB while only
+43.5 KB remained in the 16 MiB execution pool. The SQL capture failed in 0.91
+seconds; the enclosing driver exited 1 with complete owned-process cleanup.
+No recovery or ten-times-capacity pass follows from that case, and the matching
+leader case was not run. All artifacts and unchanged-source provenance remain
+in `target/native-m3-aggregate-capacity-admission-v10/`. Resource limits were
+not increased to turn this refusal into a pass. Queue/backpressure diagnosis
+is pending.
+
+The v10 state-table all-key wave similarly passed the eight-key sanity under
+both checkpoint modes. Its 65,000-key controller capture failed at source queue
+admission after 2.28 seconds: a 257.8 KB message requested allocation with only
+90.2 KB free in the shared execution pool. Its driver exited 1 with complete
+owned-process cleanup, and the large leader case was not run. Artifacts remain
+in `target/native-m3-state-table-capacity-admission-v10-v2/`. The intended
+532,471,808-byte checkpoint floor was not reached or recovered; this is a
+preserved configured admission failure, not ten-times state-table qualification.
+
+The separate state-table queue-size-32 diagnostic subsequently passed the
+unchanged 65,000-key × 8,192-byte fixture under **both controller and leader**
+checkpoint modes. Artifacts are retained in
+`target/native-m3-state-table-queue32-diagnostic-v10/`. Each case inserted
+65,000 independent values, checkpointed the proper 64,999-row prefix, then
+probed every key. Exact initial and recovered comparisons each cover 130,000
+rows, including event order, action, OLD/NEW quantities and full-payload SQL
+equality in OLD, NEW and same-event lookup. Recovered committed output was
+exactly 64,999 rows; all 64,999 restored prefix keys were probed. The full and
+checkpoint retained-payload floors were 532,480,000 and 532,471,808 bytes,
+respectively, each greater than ten times the unchanged 48 MiB pool sum.
+
+Controller peak SQL-child RSS was 216,408,064 bytes (206.38 MiB); leader was
+218,284,032 bytes (208.17 MiB), both below the unchanged 512 MiB ceiling.
+Enclosing drivers exited 0 in 528.67 and 537.48 seconds, within their
+1,800-second SQL deadlines, with complete owned-process cleanup and stable
+final provenance. The supplied existing configuration was
+`ARROYO__WORKER__QUEUE_SIZE=32`, replacing the default 8,192-row queue;
+no execution/state budget, cardinality or oracle was relaxed. Invocation and
+pinned config-loader/test-configuration evidence establish that binding; no
+separate numeric effective-queue scrape was taken. The earlier default-queue
+admission failure remains preserved and is not a pass.
+
+Independent evidence inspection rechecked every initial/recovered row and the
+retained checkpoint inventories: controller 1,455 objects / 283,159,385 bytes;
+leader 1,454 objects / 283,195,508 bytes. Each contains 1,445 Parquet objects
+summing to 282,758,172 bytes. Every inventory path, size and SHA-256 matched.
+These compressed physical sizes are not the logical retained-payload floor;
+no separate raw-IPC checkpoint-content decode was performed. Recovery plus
+all-key full-payload equality is the value oracle. Frozen v10 source/build
+proof hashes are `4d1782df…` / `481a00ed…`, SQL ELF `0a8c8f52…`, driver
+`24580ca9…` and launcher `c258d45a…`; all five v10 gates passed. Input, expected
+rows, query, capture log and outputs are independently hash-pinned per case.
+This qualifies that frozen binary and configuration, not later source repairs.
+It is singleton same-process fresh-worker epoch-1 recovery, not an OS-process
+loss, greater-than-host-RAM, multiple-epoch or full M3 readiness claim. See
+[state-table capacity evidence](state-table-all-key-capacity.md).
+
+The separate v10 aggregate queue-size-32 diagnostic kept all 100,000 keys,
+8,192-byte values, 300,000 inputs, checkpoint prefix 199,999, the 78 MiB pool
+budget and the 512 MiB SQL-child ceiling. The actual SQL child supplied
+`ARROYO__WORKER__QUEUE_SIZE=32`; a process identity/environment witness is
+retained beside the case. Effective configuration follows the pinned config
+loader; no separate numeric configuration scrape was taken. The initial phase
+reported 100,000 rows after approximately 27 minutes, then the SQL capture
+exceeded its declared 1,800-second deadline during checkpoint/recovery. The
+driver exited 1 with complete owned-process cleanup and unchanged final
+provenance; the leader case did not run. Exact-value comparison and ten-times
+recovery qualification did not complete. Artifacts remain in
+`target/native-m3-aggregate-many-queue32-diagnostic-v10/`.
+
+The existing-SQL whole-CASE `CAST(... AS TEXT[])` selected-snapshot diagnostic
+also failed at the same strict planner schema guard before input processing.
+The nine input records, six final rows and three checkpoint rows were unchanged.
+The SQL child exited 101 after 0.20 seconds, with 148,058,112-byte peak RSS and
+complete cleanup. Post-run pins remained unchanged. The original failure is
+retained separately under the fresh
+`target/native-selected-cast-result-admission-v10/` evidence. Actual physical
+and declared schemas still need observation before a repair; no guard bypass or
+new SQL syntax was introduced.
+
+Repeated physical read-view setup during aggregate result draining is a
+source-demonstrated integration cost. The proposed lifecycle decision is in
+[the RocksDB read-view proposal](rocksdb-read-view-proposal.md), awaiting user
+agreement. No native-view ownership dependency or contract change has been
+implemented.
+
+## Integrated v11b bounded-scope repairs
+
+After the frozen-v10 state-table capacity wave completed, two reviewed
+contract-preserving optimizations were integrated: memory scans stop at an
+exhausted logical prefix/exclusive end, and indexed aggregate chunks containing
+only physical appends use the existing point-read scope. Indexed retractions
+retain stable snapshot scopes. SQL results, admission limits and durable
+checkpoint machinery are unchanged. The planner's strict scalar schema check
+also now prints both schemas when rejecting a mismatch; the check remains intact.
+
+Fresh Bookworm formatting, workspace all-target checking, strict Clippy,
+workspace library tests and all-target build passed serially in the existing
+build target. The library run contains 25 suites, 683 passed tests, zero failures
+and six explicitly ignored dedicated-runtime tests. The new real-backend scan
+visit bound, indexed append snapshot avoidance, keyed expiry/filter/null
+assertions and existing retraction cancellation checks all passed.
+
+Evidence is at `target/native-m3-admission-v11b-build-evidence/`. Frozen source
+SHA-256 is `44c5106faf34339730b9417d1f8efc5702c24b751066b1525c90375f1750a2a2`;
+completed build-evidence SHA-256 is
+`b2aabc80c859e60a2831c2e4100a4925deb6c5845d9f39c787ad0c484e9164e5`.
+SQL ELF SHA-256 is
+`3adf4ee594227af25b44d4ab82ba55bd25dda947e010aa2fa780ea68446225c7`;
+production ELF is
+`d6b3e70644714176c7d05521f0dd1bf9bf4be9f025b06f25f72d0dbc2648a099`.
+The initial v11 formatting-only failure is preserved separately; its argument
+line wrapping was corrected before freezing v11b. These combined checks do not
+requalify the earlier-source capacity/recovery runs or establish a measured
+speedup. RocksDB read-view lifecycle changes remain proposed, unimplemented and
+subject to explicit agreement.
+
+The unchanged-guard selected-snapshot cast diagnostic then ran against that
+qualified v11b ELF and failed before processing input. Evidence is at
+`target/native-selected-cast-result-admission-v11b/`: SQL exit 101, measured
+peak RSS 147,075,072 bytes, child duration 0.206 seconds, cleanup complete and
+post-run provenance unchanged. The detailed rejection establishes that the only
+schema difference is the outer `changed_fields` field's nullability: physical
+`false`, declared `true`. Both are the same List of nullable Utf8 elements named
+`field`; all other fields, names, types and nullability match. This is evidence
+for investigating safe nullability widening in the fusion adapter, not proof of
+native selected-snapshot parity. The strict guard remains enabled, and no type
+coercion or unsafe nullability tightening is authorized by this result.
+
 ## Reproduction
 
 Use the prescribed Bookworm image and migrated build database from
@@ -1140,7 +1532,360 @@ leader capacity failure. Broader window/quiet-key behavior, profile/session
 parity, timers/emission, backpressure, backfill and live/fault gates remain open.
 Milestone 3 is incomplete.
 
+## Shared execution admission qualification in progress (2026-10-05)
+
+The current staged candidate shares execution admission across graph queues,
+network transfers and updating-aggregate expression/output lifetimes. Independent
+source review has approved these changes; runtime qualification is pending.
+The fresh full-workspace attempts are recorded separately and must not be
+combined into an overall pass:
+
+- Attempt v1 passed formatting and failed compilation on private module
+  visibility. A one-line crate-local visibility repair was independently reviewed.
+- Attempt v2 passed formatting, checking and strict Clippy. Library tests found
+  an incorrect escaped-key test budget (29 encoded bytes required, 28 allowed).
+  The test now computes the maximum actual row cost; production scan code and
+  exact row/snapshot assertions were preserved.
+- Attempt v3 passed formatting, checking and strict Clippy. Library tests exposed
+  a real receiver-drop race: Tokio can admit a message before receiver teardown
+  and publish it after the receiver drains, retaining Arrow data while a sender
+  remains alive. A private synchronous publication/close-and-drain lock repairs
+  both queue modes. Independent review approved the fix, its metadata accounting
+  and deterministic ownership assertions. No asynchronous wait holds the lock.
+
+- Attempt v4 passed formatting, checking and strict Clippy. Across 24 completed
+  library suites, 669 tests passed, one failed and four were ignored. The receiver
+  ownership tests passed. The new aggregate cancellation fixture failed before
+  its intended wait: two held state scopes exceed its four-MiB write pool because
+  each scope reserves five times its configured write bytes plus operation
+  overhead. The reviewed test-only repair preserves the real snapshot suspension and
+  cleanup assertions; production admission limits remain unchanged.
+
+Attempt v5 passed all five required Bookworm gates against frozen reviewed
+source: formatting, whole-workspace checking, strict Clippy, 670 library tests
+with four explicitly ignored, and the full all-target build. It reused the same
+container/cache and machine build queue. Logs and source
+hash inventories are preserved under `/tmp/streamr-m3-admission-v{1,2,3,4,5}-*`.
+The first four attempts failed; none establishes acceptance for this candidate.
+Fresh native runtime, resource and recovery qualification is pending after this
+successful combined build. Frozen source, gate logs and executable hashes are
+retained in target/native-m3-admission-v5-build-evidence/. Prior baseline captures remain evidence for their recorded revisions.
+
+The fresh v5 small runtime wave has now finished. Its 31 qualification steps
+passed, including preparation, eight typed-result composition captures, ordered,
+closed, many-key and hot-key SESSION captures across both backends and both
+checkpoint protocols, two state-table captures, and four continuous SESSION
+captures. The continuous fixture crosses 24 hours of event time; it does not
+establish a 24-hour live run or larger-than-memory acceptance. Scheduled CDC
+endpoint assertions and the existing NOW query-start clock diagnostic also passed.
+All results and executable/source hashes are retained in
+`target/native-m3-admission-v5-small-runtime-v2/`.
+
+The wave exited nonzero because two capability diagnostics failed: plain JSON
+MAP output and a scalar MAP assembled after SESSION aggregation panic while
+constructing a serialization schema. These failures remain open; neither is
+full session histogram or application parity evidence. The scheduled timing
+observations establish periodic aggregate flushing, not immediate per-key
+creation or first-pending-change debounce.
+
+Source-free production process-loss attempts are recorded separately in
+`target/native-process-recovery-admission-v5/`. The first attempt could not start
+a worker with non-loopback defaults in a network-isolated container; its owned
+process was stopped and cleanup recorded. The second uses the existing loopback
+address configuration but exited before qualification completed. Neither attempt
+establishes production recovery; their failure evidence is preserved.
+
+The third production attempt accepted the fixture configuration but timed out
+after 90.47 seconds in Scheduling, with empty outputs and completed cleanup.
+Tracing showed an introduced lifetime regression: worker initialization dropped
+its returned RunningEngine after extracting controls. Its new destructor aborted
+the network listener; dropping the listener's shutdown guard cancelled the
+worker, including its control receiver. A reviewed repair retains RunningEngine
+inside the existing waiting/running phase state, with a real listener/control
+lifetime regression test. This repair is integrated but not yet build- or
+runtime-qualified. The failure remains under
+`target/native-process-recovery-admission-v5/rocks-controller-v3/`.
+
+Four small many-key aggregate captures also passed on the frozen v5 candidate,
+with exact retained MAX payloads, COUNT updates for every key, changelog
+before-images and committed-prefix recovery assertions. Results are at
+`target/native-aggregate-admission-v5-many-small/comparisons.json`; eight keys
+and 64-byte payloads do not qualify larger-than-RAM capacity. The separate
+1024-member ARRAY_AGG-then-slice probe reproduced the expected precise collection
+budget rejection at peak child RSS 192,860,160 bytes. Its test exited 101 and its
+diagnostic supervisor exited 2; this is a validated limit refusal, not successful
+ranking qualification. Artifacts are at
+`target/native-top5-admission-v5-negative/`.
+
+The new candidate also integrates the reviewed unused-schema serialization
+repair, shared execution-pool metrics and checkpoint-byte HELP correction. The
+metrics observe the latest configured pool through weak references and do not
+replace its admission mechanism. Existing checkpoint byte counter values are
+preserved: they measure successfully transferred immutable object bytes, not
+logical payload bytes. All these changes require a fresh combined build and
+runtime qualification; v5 gate success applies to the preceding frozen source.
+
+The next combined attempts are recorded independently: v6 passed formatting but
+failed compilation on two new fault-harness loops; using the existing
+OperatorChain iterator repairs those loops without changing their assertions.
+V7 passed formatting and compilation but failed strict Clippy on a redundant
+return binding in the same test helper. The independently reviewed direct-return
+repair passed v8 formatting, checking and strict Clippy. V8 library tests then
+found an incorrect assumption in the newly added Avro initialization test:
+the existing container writer appends without flushing a small pending block.
+The original serializer has the same behavior; lazy schema construction did not
+introduce it. The reviewed test-only correction uses existing raw datums and
+checks exact decoding, full byte consumption and repeated schema initialization.
+No production Avro writer behavior changed, and container correctness is not
+qualified. V9 passed all five combined Bookworm gates: formatting, checking,
+strict Clippy, 678 library tests across 25 suites (six opt-in tests ignored),
+and the full all-target build. Frozen source, logs and executable hashes are
+retained in `target/native-m3-admission-v9-build-evidence/`. The SQL test binary
+SHA-256 is `83f2a024a20d40ee01aa9a79ceca47e816c372089c47ce5fe8c9522fd5660e53`;
+the production binary is
+`95b3ca9006e5eb18b207aa2bd45936d60e3c3934f96d33611b1eda7e6786285b`.
+Both belong to the frozen working-tree changes on base `b6b2aa7a`, not the
+unmodified committed base.
+
+The fresh source-free v9 production RocksDB/controller worker-loss case passed
+in 78.99 seconds. It reached Running, retained and independently decoded epoch
+1 with source counter 795 and exact committed sink prefixes, then killed the
+actual generation-1 worker while its controller remained alive. A different
+worker recovered the same job in generation 2. All 6,000 ordered raw rows and
+69 aggregate CDC transitions passed, ending at COUNT 6,000, SUM 17,997,000,
+MIN 0 and MAX 5,999. Combined sampled controller/worker peak RSS was
+424,820,736 bytes; owned process cleanup completed. The top-level process was
+forcibly terminated during bounded cleanup after Finished, not restarted as
+part of this worker-loss proof. Evidence is retained in
+`target/native-process-recovery-admission-v9/rocks-controller/`, with the
+immutable source-free bundle and source/build hashes alongside it. Other
+backend/protocol combinations, whole-controller restart and larger/live fault
+qualification remain pending.
+
+All eight fresh v9 native checkpoint-fault cases passed: updating aggregate and
+SESSION owners, controller and leader protocols, failed epoch-2 export followed
+by selected epoch-1 recovery, and retained epoch-2 recovery after cleanup. Each
+uses independent exact typed output and committed-prefix assertions, real
+native checkpoint objects and preserved owned runtime artifacts. Child peak
+RSS ranged from 195,510,272 to 196,902,912 bytes, below the declared 512-MiB
+envelope. Evidence is retained in
+`target/native-m3-admission-v9-native-fault-wave/`, including frozen source,
+binary, caller fixture and launcher hashes. These are small local export and
+retention faults, not remote publication, production controller loss, capacity
+or 24-hour qualification.
+Failed attempts do not
+establish build acceptance; logs and complete source hash inventories are
+preserved in `target/native-m3-admission-failed-build-evidence/` and under
+`/tmp/streamr-m3-admission-v{6,7,8}-*`.
+
+A read-only retained-checkpoint measurement passed for both v5 RocksDB SESSION
+checkpoint protocols. It decodes the actual Parquet transport and raw Arrow IPC,
+then compares seven caller-projected rows with an independent oracle derived
+from the original synthetic input prefix. Both contain exactly seven rows and
+448 attribute UTF8 bytes, excluding keys, schemas, indices and copies. Deliberate
+wrong payload, missing row, duplicate identity, wrong type and one-nanosecond
+timestamp changes were all rejected. Evidence and pinned helpers are retained
+in `target/native-m3-retained-ipc-small-v1/`. This small measurement validates
+the measurement path; it does not qualify large state, live RSS or production
+recovery.
+
+The user deferred the optional immediate-first/per-group first-pending aggregate
+emission policy until after MVP, tracked in STR-44. Milestone 3 uses Arroyo's
+existing periodic flushing and records the observed timing difference in
+compatibility evidence. STR-44 is related post-MVP work, not a milestone 3 or
+MVP blocker; no new emission policy has been implemented.
+
 ## Validation status
+
+Frozen v12b passed all five combined Bookworm gates: formatting, workspace
+all-target checking, strict Clippy, 694 library tests across 25 suites (six
+opt-in tests ignored), and workspace all-target build. Evidence is retained in
+`target/native-m3-admission-v12b-build-evidence/`. Its source inventory SHA-256 is
+`bcb48d234ce81955b0ed287f7bfb571716ffe2a86da58ac525e6d360fff4a7ac`;
+build evidence SHA-256 is
+`114b55d62cb0eb97e35e9d10fccd2b22c60ef3feba80e5b90b3e3bfe953b7f70`.
+The SQL test executable SHA-256 is
+`b97b63e775ee6c4be290d7e003f7bced6890000eaf5a9ab69365a523a1114317`;
+the production executable is
+`75ea281ac6ad53174920bf097f88ef881240f19c5505aca1077f1d3459e65869`.
+Both original and explicitly cast selected-snapshot CASE planner regressions
+passed. This qualifies the narrow outer-nullability schema repair and native
+MERGE fault-harness support at the unit/build level. The preceding v12
+strict-Clippy failure was test-only and is retained separately.
+
+All sixteen v12b selected-snapshot captures passed: original uncast SQL and its
+CASE-result cast variant, each under memory/RocksDB, controller/leader, and
+source batch sizes 1/8. Every case compared all six initial and recovered rows
+and the three-row committed prefix with the independent typed oracle, retaining
+actual owner/configuration, epoch-1 metadata and checkpoint objects. Child peak
+RSS ranged from 185,303,040 to 190,922,752 bytes, below 512 MiB; all child cleanup
+completed and final source/build/binary/helper inventories remained unchanged.
+Artifacts are in `target/native-selected-snapshot-parity-admission-v12b/`.
+This establishes selected append-snapshot SQL and prior-snapshot values, not
+the timing or contents of actual aggregate emissions, full profile parity or
+production process-loss recovery. Native MERGE fault checks subsequently passed
+on v13 as recorded below.
+
+The integrated source review found two delivery regressions still present in
+v12b: unconditional flushing on Immediate source completion, and an ignored
+buffered delivery error allowing a later small checkpoint barrier after lost
+rows. Those repairs were independently reviewed and applied in v13, below.
+Consequently these passing
+build gates do not establish milestone readiness or source/checkpoint delivery
+acceptance. The repair must preserve the original conditional completion and
+checkpoint coordination contracts and retain the first typed failure.
+
+The independently reviewed three-file repair was subsequently applied as v13.
+Immediate completion now checks the first delivery failure without flushing;
+Graceful/Final retain their existing flush-and-signal path. A failed buffered
+delivery reports and retains its original typed failure before returning, so
+ignored errors cannot forward a later barrier or report successful completion.
+Borrowed/owned failure conversion shares the existing classification logic.
+Real operator/deserializer/admission/checkpoint regression tests accompany the
+repair. V13 source inventory SHA-256 is
+`13abe6bd5c054d2db0d5491644215608a9ddac700abb2d94f0ed0195514e3dee`;
+all five fresh combined Bookworm gates passed, including 698 library tests
+across 25 suites (six ignored) and all four new source-delivery/error-conversion
+regressions. Build evidence is retained in
+`target/native-m3-admission-v13-build-evidence/`, SHA-256
+`abf4a10fac2ced4e354dcf7299580615e1bcdcfb09cc243223cb43eea7784fb3`.
+SQL executable SHA-256 is
+`2ba930686719a43798db1e0e90d8a063e7e50c2a58795f884638d73bb30d4ebf`;
+production executable is
+`cd1d8e150315e278097e55571a3f13e04c8a6d2690df20f96db127aa42765889`.
+No checkpoint format, writer or coordination protocol was replaced.
+
+All four fresh v13 RocksDB native MERGE fault cases passed under controller and
+leader checkpoints: failed epoch-2 export without publication followed by
+selected epoch-1 restore, and selected epoch-2 restore after epoch-1 cleanup and
+two recovery attempts. Every case checks all eleven ordered typed output rows,
+including mutation OLD/NEW and same-event lookup values, against independent
+oracles. Checkpoint source prefixes 3/6 match the persisted sink offsets 254/507
+bytes and exact committed outputs. Retained native typed checkpoint objects,
+rendered SQL, input/oracle files and complete artifact hashes are preserved in
+`target/native-str43-merge-fault-admission-v13/`. Child peak RSS ranged from
+187,502,592 to 188,985,344 bytes; every child cleanup completed and final
+provenance remained unchanged. These small same-process export/retention tests
+do not qualify OS process loss, large-state capacity, legacy-state migration,
+the forty-case legacy output comparison or full application readiness.
+
+The v13 forty-case legacy-equivalent native SQL wave stopped after eight passing
+operation-fixture captures (memory/RocksDB, controller/leader, batch targets
+1/8). Those eight checked all 161 initial/recovered rows and the 80-row committed
+prefix against the unchanged legacy golden. The first shared-CTE case failed
+planning with `state-table fusion: scalar function concat has unqualified purity
+or allocation bounds`; SQL exited 101 after 0.20 seconds, with child peak RSS
+144,109,568 bytes and complete cleanup. Final frozen inventories remained
+unchanged. Evidence is retained in `target/native-str43-parity-admission-v13/`.
+This is a demonstrated limitation of Streamr's fusion admission for an existing
+SQL function, not justification for new syntax or relaxed memory checks. That
+revision did not complete the five-fixture comparison; fresh v14b results are
+recorded below. Legacy function retirement and its compatibility policy remain
+open.
+
+The source-free v13 production matrix subsequently passed all six process-loss
+cases: memory/RocksDB worker loss under the worker and controller checkpoint
+protocols, and memory/RocksDB whole-controller loss under the controller
+protocol. Each case compared the complete raw sequence 0..5999, the committed
+source/sink prefixes and typed aggregate changelog, finishing with count 6000,
+sum 17,997,000, minimum 0 and maximum 5999. The selected checkpoint was epoch 1;
+replacement workers used generation 2, and whole-controller recovery retained
+the same catalog/job and advanced its run. Sampled combined controller/worker
+RSS ranged from 406,224,896 to 428,040,192 bytes under the declared 1 GiB limit.
+Every inner and outer cleanup completed. Evidence is retained in
+`target/native-process-recovery-admission-v13/matrix-results.json`, SHA-256
+`64ba2d45724d9961120bc2f309efc6f4aac864cedff7be4d9ccc8b55934efb8e`;
+immutable bundle provenance SHA-256 is
+`5aa0a5ecd61a67efb850da7f451dde6e4b50026133dd537c6f812cd27276ca9f`.
+These finite impulse/single-file checks establish the recorded restart paths,
+not broker delivery, export/publication-phase process loss, large-state capacity,
+complete external profile/session parity or a 24-hour live qualification.
+
+A separate quiet-target/active-peer standard-SQL diagnostic remains a failure.
+Its HOP output followed by ordered LAST_VALUE restores the selected source-4
+prefix exactly to lifetime 3/recent 2, but both eight-second live holds finish
+at lifetime 3/recent 1, rather than the required recent 0. Real peer-key events
+advance the declared source clock; no fake target event was supplied. The
+source-position hold and peer-clock projection do not directly measure the
+runtime watermark, and this does not qualify an all-source-idle clock.
+The original launcher reported 882,495,488-byte child peak RSS after hashing
+the entire executable with read_bytes. A reviewed hash-only retry using
+streaming file_digest reports 192,520,192 bytes with the same SQL, oracle and
+512 MiB limit; it still fails the zero-value assertion. Both failures are
+preserved in `target/native-quiet-target-active-peer-admission-v13/` and
+`target/native-quiet-target-active-peer-streaming-admission-v13/`; SQL children
+exit 0, cleanup completes and final pinned inventories remain unchanged.
+This confirms the selected latest-nonempty-window query does not satisfy the
+expiry requirement; it does not by itself justify changing window semantics.
+
+All four v13 small RocksDB SESSION raw-checkpoint captures passed under
+controller/leader protocols. The hot fixture retains seven open input rows
+and 448 UTF8 payload bytes, then emits exactly one initial/recovered session;
+the many fixture retains fifteen rows and 960 bytes, then emits exactly eight
+sessions. Both selected checkpoint outputs are empty. Independent raw Arrow
+row comparison verifies projected fields, identities, NULLs, exact timestamp
+nanoseconds and full payloads, in addition to final SQL outputs. Child peak RSS
+ranged from 195,219,456 to 196,399,104 bytes, below 512 MiB. Evidence is retained
+in `target/native-m3-session-small-raw-ipc-admission-v13/wave-results.json`,
+SHA-256 `1e3a09290bf444932f906494c1678ab1c47de4b9e727f8d2d3cfa663c3286211`.
+These are small fresh-worker captures, not >=10x capacity, production process
+loss, complete external session parity or the 24-hour live gate.
+
+The independently reviewed stock UTF8 CONCAT repair guards newly admitted
+fused Projection/Value expressions before string expansion, with one cumulative
+backing-byte allowance shared by nested calls and released at the operation
+boundary. Stock NULL/value semantics, plan serialization and configured limits
+remain unchanged. Existing direct state-access expression accounting is
+unchanged; this is not a universal allocator ledger or a per-input transaction.
+
+The first v14 qualification stopped after formatting passed: all-target checking
+failed with E0507 in the new zero-row array comparison test, before Clippy,
+units or the build ran. The failure is preserved in
+`/tmp/streamr-m3-admission-v14-check.log` and the corresponding results JSON.
+The independently reviewed test-only correction compares borrowed array
+references without changing the zero-row oracle or production code.
+
+Fresh frozen v14b then passed all five combined Bookworm gates: formatting,
+workspace all-target checking, strict Clippy, 706 library tests across 25 suites
+(six opt-in tests ignored), and workspace all-target build. All eight new CONCAT
+admission, allocation, value/schema and refusal/retry regressions passed.
+Evidence is retained in `target/native-m3-admission-v14b-build-evidence/`.
+Source inventory SHA-256 is
+`d16b92b6ec3b44c741bd91bd5acc4762baaea594f94c6a3e1f372ee6b0040ca3`;
+build evidence SHA-256 is
+`8791ffe6eb08f851463ab792095ae898fbe10f71dfd8a88b79daa3389f4f79fa`.
+SQL executable SHA-256 is
+`7e1fb8034285ead7e0bae311817fc0426ea095bfb6fd198dd122b2420387992b`;
+production executable is
+`bf496d076f8db9dc518e603a4ded61eb9c18bc81c08f281342f4304781f3fe8e`.
+These gates qualify the repair at the unit/build level. The fresh v14b native
+state-table matrix subsequently passed all forty captures: five original fixture
+streams, each at source batch targets 1/8, memory/RocksDB and controller/leader.
+Every case independently compared complete initial and recovered ordered rows
+with the unchanged legacy golden, including exact JSON field sets, types, NULLs,
+Booleans and values. Operations/shared-CTE cases checked 161 rows and an 80-row
+committed prefix; sequential/computed/filter cases checked five rows and a
+two-row committed prefix after three input rows. Every capture reported epoch 1,
+one singleton FusedStateTable owner and no StatefulProcessor, its declared
+backend/protocol and the unchanged 16 MiB execution pool. Checkpoint job/lineage
+paths and all 436 retained object hashes were checked. Child peak RSS ranged
+from 182,763,520 to 191,946,752 bytes, below 512 MiB; every child cleanup completed
+and final source/build/ELF/helper/fixture inventories remained stable.
+
+Evidence is retained in `target/native-str43-parity-admission-v14b/`.
+Terminal result SHA-256 is
+`082da414721cd3ef83e01efcaabdb19d3c878e4fddae2ab7f990559a47ee5f69`;
+forty-case results SHA-256 is
+`2d8d00989be791392265871b44bbc4e7380f74677f166fbcf4661e6b2d6cdc11`;
+provenance SHA-256 is
+`9311ee954c8e06d64a46cfdfb5ddc9b51c83c240b730ae96f4e9d2ecd5604b66`.
+The v13 eight-pass/shared-CTE-failure evidence remains unchanged. This qualifies
+these five finite native SQL streams and fresh-worker native-checkpoint recovery,
+not full application parity, live/capacity acceptance, production process loss,
+legacy checkpoint migration or function-removal compatibility policy. Export/
+retention faults and production restart paths have separate source-pinned evidence;
+this value matrix does not replace those checks. No passing matrix or build
+establishes milestone readiness.
 
 Qualification of `a2d2aba7` passed 153 Bookworm units (33 RPC, 56 state, 64
 worker), 25 isolated native fixture runs, all-target checks and strict Clippy.

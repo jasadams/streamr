@@ -5,8 +5,8 @@
 use std::{collections::HashMap, sync::Arc};
 
 use anyhow::{Context, Result, ensure};
-use arrow_array::RecordBatch;
-use arrow_schema::{Field, SchemaRef};
+use arrow_array::{RecordBatch, RecordBatchOptions};
+use arrow_schema::{Field, Schema, SchemaRef};
 use arroyo_operator::operator::Registry;
 use arroyo_rpc::config::TypedSqlStateConfig;
 use arroyo_rpc::df::ArroyoSchema;
@@ -23,7 +23,55 @@ use prost::Message;
 use super::{
     StatelessPhysicalExecutor,
     state_table::{StateTableStep, capture_envelope},
+    state_table_concat::{ConcatAllowance, guard_expression, guard_plan},
 };
+
+// Physical expressions may prove an outer field non-null while the logical
+// graph conservatively declares it nullable. Only that widening is admissible;
+// nested types/fields, names, order and metadata retain the existing Arrow
+// equality contract (including its treatment of dictionary attributes).
+fn scalar_schema_compatible(physical: &Schema, declared: &Schema) -> bool {
+    physical.metadata() == declared.metadata()
+        && physical.fields().len() == declared.fields().len()
+        && physical
+            .fields()
+            .iter()
+            .zip(declared.fields())
+            .all(|(actual, expected)| {
+                if actual.is_nullable() == expected.is_nullable() {
+                    return actual == expected;
+                }
+                if actual.is_nullable() {
+                    return false;
+                }
+                let normalized = actual
+                    .as_ref()
+                    .clone()
+                    .with_nullable(expected.is_nullable());
+                normalized == **expected
+            })
+}
+
+fn normalize_scalar_batch(batch: RecordBatch, declared: SchemaRef) -> Result<RecordBatch> {
+    ensure!(
+        scalar_schema_compatible(batch.schema().as_ref(), declared.as_ref()),
+        "state-table scalar transform changed schema"
+    );
+    // Preserve the formerly accepted batch/schema (including dictionary
+    // attributes ignored by Arrow equality) without reconstructing it.
+    if batch.schema().as_ref() == declared.as_ref() {
+        return Ok(batch);
+    }
+    // Reuse the owned column references and preserve explicit row count even
+    // for zero-column batches. Do not use with_schema: its contains check
+    // would add dictionary-attribute restrictions absent from Arrow equality.
+    let (_, columns, row_count) = batch.into_parts();
+    Ok(RecordBatch::try_new_with_options(
+        declared,
+        columns,
+        &RecordBatchOptions::new().with_row_count(Some(row_count)),
+    )?)
+}
 
 pub(crate) enum EventOperation {
     Projection {
@@ -57,6 +105,7 @@ pub(crate) struct FusedEventProgram {
     pub(crate) timestamp_index: usize,
     pub(crate) max_captured_event_bytes: usize,
     pub(crate) max_working_event_bytes: usize,
+    pub(super) concat_allowance: Arc<ConcatAllowance>,
 }
 
 /// Buffers captured output while the shared working scope has pending writes.
@@ -182,6 +231,7 @@ impl FusedEventProgram {
             timestamp_field.as_ref() == input.schema.field(input.timestamp_index),
             "fused owner changed event timestamp field"
         );
+        let concat_allowance = Arc::new(ConcatAllowance::default());
         let steps = config
             .steps
             .iter()
@@ -210,12 +260,13 @@ impl FusedEventProgram {
                             .iter()
                             .map(|bytes| {
                                 let proto = PhysicalExprNode::decode(bytes.as_slice())?;
-                                Ok(parse_physical_expr(
+                                let expression = parse_physical_expr(
                                     &proto,
                                     registry,
                                     input.schema.as_ref(),
                                     &DefaultPhysicalExtensionCodec {},
-                                )?)
+                                )?;
+                                Ok(guard_expression(expression, &concat_allowance)?)
                             })
                             .collect::<Result<Vec<_>>>()?;
                         ensure!(
@@ -230,11 +281,11 @@ impl FusedEventProgram {
                     }
                     "value" => {
                         let value = ValuePlanOperator::decode(step.operator_config.as_slice())?;
+                        let mut executor =
+                            StatelessPhysicalExecutor::new(&value.physical_plan, registry)?;
+                        executor.plan = guard_plan(executor.plan, &concat_allowance)?;
                         EventOperation::Value {
-                            executor: StatelessPhysicalExecutor::new(
-                                &value.physical_plan,
-                                registry,
-                            )?,
+                            executor,
                             output_schema: output.schema,
                         }
                     }
@@ -255,6 +306,7 @@ impl FusedEventProgram {
             timestamp_index: input.timestamp_index,
             max_captured_event_bytes: limits.max_captured_event_bytes,
             max_working_event_bytes: limits.max_working_event_bytes,
+            concat_allowance,
         };
         program.validate()?;
         Ok(program)
@@ -329,6 +381,12 @@ impl FusedEventProgram {
                 Some(parent) => results[parent].as_ref(),
                 None => Some(event),
             };
+            // Nested CONCAT calls share this remaining backing-allocation
+            // allowance. Hold it until the scalar stream/output is complete;
+            // an error or cancelled future disarms it without retaining data.
+            let _concat_scope = self
+                .concat_allowance
+                .begin(self.max_working_event_bytes - working_bytes)?;
             let mut output_charged = false;
             let output = match input {
                 None => None,
@@ -364,10 +422,10 @@ impl FusedEventProgram {
                                 "state-table scalar stream exceeds configured working byte limit"
                             );
                             ensure!(
-                                batch.schema().as_ref() == output_schema.as_ref()
-                                    && batch.num_rows() <= 1,
+                                batch.num_rows() <= 1,
                                 "state-table scalar transform changed schema or expanded one event"
                             );
+                            let batch = normalize_scalar_batch(batch, output_schema.clone())?;
                             if batch.num_rows() == 1 {
                                 ensure!(
                                     one.is_none(),
@@ -432,9 +490,154 @@ impl FusedEventProgram {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn scalar_schema_allows_only_outer_nullability_widening() {
+        let child = Arc::new(Field::new("field", DataType::Utf8, true));
+        let physical = Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("changed_fields", DataType::List(child.clone()), false),
+        ]);
+        let declared = Schema::new(vec![
+            physical.field(0).clone(),
+            physical.field(1).clone().with_nullable(true),
+        ]);
+        assert!(scalar_schema_compatible(&physical, &physical));
+        assert!(scalar_schema_compatible(&physical, &declared));
+        assert!(!scalar_schema_compatible(&declared, &physical));
+        let invalid_fields = [
+            Field::new("changed_fields", DataType::Utf8, true),
+            Field::new("renamed", DataType::List(child.clone()), true),
+            Field::new(
+                "changed_fields",
+                DataType::List(Arc::new(Field::new("field", DataType::Utf8, false))),
+                true,
+            ),
+            Field::new(
+                "changed_fields",
+                DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+                true,
+            ),
+            declared
+                .field(1)
+                .clone()
+                .with_metadata(HashMap::from([("origin".into(), "different".into())])),
+        ];
+        for field in invalid_fields {
+            let other = Schema::new(vec![physical.field(0).clone(), field]);
+            assert!(!scalar_schema_compatible(&physical, &other), "{other:?}");
+        }
+        assert!(!scalar_schema_compatible(
+            &physical,
+            &Schema::new(vec![declared.field(1).clone(), declared.field(0).clone()])
+        ));
+        assert!(!scalar_schema_compatible(
+            &physical,
+            &Schema::new(vec![declared.field(0).clone()])
+        ));
+        assert!(!scalar_schema_compatible(
+            &physical,
+            &declared
+                .clone()
+                .with_metadata(HashMap::from([("origin".into(), "different".into())]))
+        ));
+        let dictionary = Field::new(
+            "dictionary",
+            DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+            false,
+        );
+        let ordered_dictionary = dictionary.clone().with_dict_is_ordered(true);
+        let physical_dictionary = Schema::new(vec![dictionary]);
+        let declared_dictionary = Schema::new(vec![ordered_dictionary]);
+        assert_eq!(physical_dictionary, declared_dictionary);
+        // Field equality deliberately ignores dictionary ordering attributes.
+        // Preserve that established acceptance while widening outer nullability.
+        assert!(scalar_schema_compatible(
+            &physical_dictionary,
+            &declared_dictionary
+        ));
+    }
+
     use super::*;
     use arrow_array::TimestampNanosecondArray;
-    use arrow_schema::{DataType, Schema, TimeUnit};
+    use arrow_schema::{DataType, TimeUnit};
+
+    #[test]
+    fn scalar_batch_relabels_populated_empty_and_zero_row_lists_without_copying() {
+        use arrow_array::builder::{ListBuilder, StringBuilder};
+        for values in [vec!["n", "value"], vec![]] {
+            let mut builder = ListBuilder::new(StringBuilder::new());
+            for value in values {
+                builder.values().append_value(value);
+            }
+            builder.append(true);
+            let array: arrow_array::ArrayRef = Arc::new(builder.finish());
+            let physical = Arc::new(Schema::new(vec![Field::new(
+                "changed_fields",
+                array.data_type().clone(),
+                false,
+            )]));
+            let declared = Arc::new(Schema::new(vec![
+                physical.field(0).clone().with_nullable(true),
+            ]));
+            let batch = RecordBatch::try_new(physical.clone(), vec![array.clone()]).unwrap();
+            let normalized = normalize_scalar_batch(batch.clone(), declared.clone()).unwrap();
+            assert_eq!(normalized.schema(), declared);
+            assert_eq!(normalized.num_rows(), 1);
+            assert!(Arc::ptr_eq(normalized.column(0), &array));
+            assert_eq!(normalized.column(0).to_data(), batch.column(0).to_data());
+            assert!(normalize_scalar_batch(normalized, physical.clone()).is_err());
+            let empty = batch.slice(0, 0);
+            let empty_column = empty.column(0).clone();
+            let normalized = normalize_scalar_batch(empty, declared).unwrap();
+            assert_eq!(normalized.num_rows(), 0);
+            assert!(Arc::ptr_eq(normalized.column(0), &empty_column));
+            let wrong_type = Arc::new(Schema::new(vec![Field::new(
+                "changed_fields",
+                DataType::Utf8,
+                true,
+            )]));
+            assert!(normalize_scalar_batch(batch, wrong_type).is_err());
+        }
+    }
+
+    #[test]
+    fn scalar_batch_relabel_preserves_existing_dictionary_attribute_equality() {
+        use arrow_array::{builder::StringDictionaryBuilder, types::Int32Type};
+        let mut builder = StringDictionaryBuilder::<Int32Type>::new();
+        builder.append("value").unwrap();
+        let array: arrow_array::ArrayRef = Arc::new(builder.finish());
+        let physical = Arc::new(Schema::new(vec![Field::new(
+            "dictionary",
+            array.data_type().clone(),
+            false,
+        )]));
+        let declared = Arc::new(Schema::new(vec![
+            physical.field(0).clone().with_dict_is_ordered(true),
+        ]));
+        assert_eq!(physical, declared);
+        let batch = RecordBatch::try_new(physical, vec![array.clone()]).unwrap();
+        let normalized = normalize_scalar_batch(batch, declared.clone()).unwrap();
+        assert_eq!(normalized.schema().field(0).dict_is_ordered(), Some(false));
+        assert!(Arc::ptr_eq(normalized.column(0), &array));
+        assert_eq!(normalized.num_rows(), 1);
+    }
+
+    #[test]
+    fn scalar_batch_relabel_preserves_zero_column_row_count() {
+        for rows in [0, 1] {
+            let schema = Arc::new(Schema::empty());
+            let batch = RecordBatch::try_new_with_options(
+                schema.clone(),
+                vec![],
+                &RecordBatchOptions::new().with_row_count(Some(rows)),
+            )
+            .unwrap();
+            let normalized = normalize_scalar_batch(batch, schema.clone()).unwrap();
+            assert_eq!(normalized.schema(), schema);
+            assert_eq!(normalized.num_rows(), rows);
+            assert_eq!(normalized.num_columns(), 0);
+        }
+    }
 
     #[test]
     fn no_action_events_still_fill_the_pending_capture_queue() {

@@ -468,7 +468,7 @@ impl WorkerStateResources {
         let checkpoint_encoded_page_bytes = IntCounterVec::new(
             Opts::new(
                 "arroyo_live_state_checkpoint_encoded_page_bytes_total",
-                "Encoded logical checkpoint page bytes successfully uploaded or applied; not live logical state size or remote physical bytes",
+                "Immutable checkpoint object bytes successfully uploaded or applied, including compressed Parquet; excludes manifests, transport overhead and failed-transfer bytes, not live logical state size",
             ),
             &["direction"],
         )

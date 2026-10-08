@@ -86,3 +86,28 @@ coverage, or review quality. Give each agent a clear scope and expected result,
 coordinate shared files, and avoid overlapping edits. Keep short or dependent
 steps local. The coordinating agent owns integration and verification and waits
 for required delegated work before ending the turn.
+
+## Continuity and delivery
+
+- Read the current task's compact status ledger before implementation or after
+  context compaction. For milestone 3, use `docs/milestone-3-status.md` and the
+  task breakdown it links; historical validation logs are supporting evidence.
+- Keep the ledger short: active task, acceptance check, exact next action,
+  decisions awaiting the user, source-bound evidence and known blockers. Update
+  it when those facts change, not with repeated status narration.
+- Delegate narrow deliverables with explicit file ownership and acceptance
+  checks. Use a separate reviewer; reuse agents for repairs. The coordinator
+  owns integration, serialized builds and the final evidence audit.
+- Do not repeat a settled investigation unless source changes, contradictory
+  evidence or user steering provides a concrete reason. Preserve and link the
+  previous conclusion rather than reconstructing it from conversation summaries.
+- Keep executable pinning and dependent validation within the same shared queue
+  reservation: scheduled cache eviction can remove binaries between commands.
+  Preserve pinned executables and source/hash receipts outside regenerable Cargo
+  caches.
+- Deliver reviewed, tested increments before expanding the unpublished batch.
+  Distinguish implementation, review, current-source validation, publication and
+  milestone qualification; none substitutes for the others.
+- A conversational question or request to discuss takes precedence over
+  automatic goal continuation. Stay with that discussion until user steering
+  supports returning to implementation.

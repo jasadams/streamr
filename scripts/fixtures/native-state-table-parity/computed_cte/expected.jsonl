@@ -1,0 +1,5 @@
+{"id":1,"normalized":"value:one","stored":"value:one","retrieved":"value:one"}
+{"id":3,"normalized":"value:three","stored":"value:three","retrieved":"value:three"}
+{"id":4,"normalized":"missing","stored":"missing","retrieved":"missing"}
+{"id":5,"normalized":"missing","stored":"missing","retrieved":"missing"}
+{"id":6,"normalized":"value:after","stored":"value:after","retrieved":"value:after"}

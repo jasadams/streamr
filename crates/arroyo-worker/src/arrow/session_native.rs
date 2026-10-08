@@ -518,4 +518,402 @@ mod tests {
             2 * limits.partial_bytes + limits.key_bytes + 6 * 4096
         );
     }
+
+    struct BlockedSessionCollector {
+        started: Option<tokio::sync::oneshot::Sender<std::sync::Weak<dyn Array>>>,
+        release: tokio::sync::oneshot::Receiver<()>,
+    }
+
+    fn assert_session_output(batch: &RecordBatch, start: i64, end: i64, sum: i64) {
+        assert_eq!(batch.num_rows(), 1);
+        assert_eq!(batch.num_columns(), 4);
+        let window = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        let times = |column: &Arc<dyn Array>| {
+            column
+                .as_any()
+                .downcast_ref::<TimestampNanosecondArray>()
+                .unwrap()
+                .value(0)
+        };
+        assert_eq!(times(window.column(0)), start);
+        assert_eq!(times(window.column(1)), end);
+        let count = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow_array::Int64Array>()
+            .unwrap();
+        let total = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<arrow_array::Int64Array>()
+            .unwrap();
+        assert!(!count.is_null(0));
+        assert!(!total.is_null(0));
+        assert_eq!(count.value(0), 2);
+        assert_eq!(total.value(0), sum);
+        assert_eq!(times(batch.column(3)), end - 1);
+    }
+
+    #[async_trait::async_trait]
+    impl Collector for BlockedSessionCollector {
+        async fn collect(&mut self, batch: RecordBatch) -> arroyo_rpc::errors::DataflowResult<()> {
+            assert_session_output(&batch, 0, 19, 8);
+            self.started
+                .take()
+                .unwrap()
+                .send(Arc::downgrade(batch.column(0)))
+                .unwrap();
+            (&mut self.release).await.unwrap();
+            drop(batch);
+            Ok(())
+        }
+        async fn broadcast_watermark(
+            &mut self,
+            _: arroyo_types::Watermark,
+        ) -> arroyo_rpc::errors::DataflowResult<()> {
+            panic!("native SESSION emits batches, not watermark signals");
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordedSessionCollector(Vec<RecordBatch>);
+
+    #[async_trait::async_trait]
+    impl Collector for RecordedSessionCollector {
+        async fn collect(&mut self, batch: RecordBatch) -> arroyo_rpc::errors::DataflowResult<()> {
+            self.0.push(batch);
+            Ok(())
+        }
+        async fn broadcast_watermark(
+            &mut self,
+            _: arroyo_types::Watermark,
+        ) -> arroyo_rpc::errors::DataflowResult<()> {
+            panic!("native SESSION emits batches, not watermark signals");
+        }
+    }
+
+    async fn assert_retained_session(
+        store: &SessionStore,
+        session: SessionMeta,
+        expected: &[(i64, i64)],
+    ) {
+        let snapshot = store.snapshot().await.unwrap();
+        let mut after = None;
+        let mut rows = Vec::new();
+        while let Some(row) = store
+            .next_row(&snapshot, &[], session, after.as_deref())
+            .await
+            .unwrap()
+        {
+            let value = row
+                .batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<arrow_array::Int64Array>()
+                .unwrap();
+            let time = row
+                .batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<TimestampNanosecondArray>()
+                .unwrap();
+            assert_eq!(row.batch.num_rows(), 1);
+            assert!(!value.is_null(0));
+            assert!(!time.is_null(0));
+            rows.push((time.value(0), value.value(0)));
+            after = Some(row.key.clone());
+        }
+        assert_eq!(rows, expected);
+    }
+
+    fn assert_snapshot_capacity(resources: &arroyo_state::live::resources::WorkerStateResources) {
+        use futures::FutureExt;
+        let first = resources
+            .snapshot()
+            .now_or_never()
+            .expect("first snapshot leaked")
+            .unwrap();
+        let second = resources
+            .snapshot()
+            .now_or_never()
+            .expect("second snapshot leaked")
+            .unwrap();
+        assert!(
+            resources.snapshot().now_or_never().is_none(),
+            "snapshot limit was bypassed"
+        );
+        drop((first, second));
+    }
+
+    #[tokio::test]
+    async fn watermark_cancellation_keeps_session_state_and_releases_emission_admission() {
+        use crate::arrow::execution::with_test_execution_resources;
+        use arroyo_planner::physical::ArroyoMemExec;
+        use arroyo_state::live::{
+            LiveStateBackend, Ownership,
+            memory::MemoryLiveState,
+            resources::{ResourceConfig, WorkerStateResources},
+            table::LiveTableManager,
+        };
+        use datafusion::functions_aggregate::{count::count_udaf, sum::sum_udaf};
+        use datafusion::physical_expr::{aggregate::AggregateExprBuilder, expressions::col};
+        use datafusion::physical_plan::aggregates::{AggregateMode, PhysicalGroupBy};
+        use std::time::{Duration, UNIX_EPOCH};
+
+        let execution = Arc::new(
+            ExecutionResources::new(ExecutionResourceConfig {
+                memory_bytes: 128 * 1024,
+                max_batch_bytes: 64 * 1024,
+            })
+            .unwrap(),
+        );
+        with_test_execution_resources(execution.clone(), async {
+            let limits = WindowStateConfig {
+                key_bytes: 128,
+                partial_bytes: 1024,
+                page_bytes: 8192,
+                page_entries: 8,
+                write_bytes: 32768,
+                write_operations: 16,
+                max_resident_bytes: 8 * 1024 * 1024,
+            };
+            let state = WorkerStateResources::new(ResourceConfig {
+                block_cache_bytes: 1024 * 1024,
+                memtable_bytes: 1024 * 1024,
+                queued_write_bytes: 1024 * 1024,
+                decoded_value_bytes: limits.partial_bytes * 9,
+                scan_page_bytes: 1024 * 1024,
+                max_blocking_operations: 2,
+                max_snapshots: 2,
+                max_open_databases: 1,
+                disk_reserve_bytes: 0,
+            })
+            .unwrap();
+            let backend: Arc<dyn LiveStateBackend> = Arc::new(
+                MemoryLiveState::bounded(state.clone(), limits.max_resident_bytes).unwrap(),
+            );
+            let mut tables = LiveTableManager::new(
+                backend.clone(),
+                Ownership::PartitionLocal {
+                    subtask: 0,
+                    parallelism: 1,
+                },
+            )
+            .unwrap();
+            let table = tables.register(TABLE).unwrap();
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("metric", DataType::Int64, false),
+                Field::new(
+                    arroyo_rpc::TIMESTAMP_FIELD,
+                    DataType::Timestamp(arrow_schema::TimeUnit::Nanosecond, None),
+                    false,
+                ),
+            ]));
+            let store = SessionStore::new(
+                backend.clone(),
+                table.clone(),
+                state.clone(),
+                schema.clone(),
+                limits,
+                10,
+            )
+            .unwrap();
+            for (time, value) in [(0, 3), (9, 5), (40, 7), (49, 11)] {
+                let row = RecordBatch::try_new(
+                    schema.clone(),
+                    vec![
+                        Arc::new(arrow_array::Int64Array::from(vec![value])),
+                        Arc::new(TimestampNanosecondArray::from(vec![time])),
+                    ],
+                )
+                .unwrap();
+                store.insert(&[], time, &row).await.unwrap();
+            }
+            let observer =
+                SessionStore::new(backend, table, state.clone(), schema.clone(), limits, 10)
+                    .unwrap();
+            let input: Arc<dyn ExecutionPlan> =
+                Arc::new(ArroyoMemExec::new("input".into(), schema.clone()));
+            let aggregates = vec![
+                Arc::new(
+                    AggregateExprBuilder::new(count_udaf(), vec![col("metric", &schema).unwrap()])
+                        .schema(schema.clone())
+                        .alias("n")
+                        .build()
+                        .unwrap(),
+                ),
+                Arc::new(
+                    AggregateExprBuilder::new(sum_udaf(), vec![col("metric", &schema).unwrap()])
+                        .schema(schema.clone())
+                        .alias("total")
+                        .build()
+                        .unwrap(),
+                ),
+            ];
+            let planning: Arc<dyn ExecutionPlan> = Arc::new(
+                AggregateExec::try_new(
+                    AggregateMode::Single,
+                    PhysicalGroupBy::new_single(vec![]),
+                    aggregates,
+                    vec![None, None],
+                    input,
+                    schema.clone(),
+                )
+                .unwrap(),
+            );
+            let receiver = Arc::new(RwLock::new(None));
+            let codec = ArroyoPhysicalExtensionCodec {
+                context: DecodingContext::Planning,
+            };
+            let serialized = PhysicalPlanNode::try_from_physical_plan(planning, &codec).unwrap();
+            let codec = ArroyoPhysicalExtensionCodec {
+                context: DecodingContext::BoundedBatchStream(receiver.clone()),
+            };
+            let finish = serialized
+                .try_into_physical_plan(
+                    &arroyo_planner::physical::new_registry(),
+                    &execution.runtime,
+                    &codec,
+                )
+                .unwrap();
+            let admitted_output = output_allowance(finish.schema().as_ref(), 4, limits).unwrap();
+            let window = Arc::new(Field::new("window", window_arrow_struct(), true));
+            let output_schema = Arc::new(Schema::new(vec![
+                window.as_ref().clone(),
+                finish.schema().field(0).clone(),
+                finish.schema().field(1).clone(),
+                Field::new(
+                    arroyo_rpc::TIMESTAMP_FIELD,
+                    DataType::Timestamp(arrow_schema::TimeUnit::Nanosecond, None),
+                    false,
+                ),
+            ]));
+            let input_schema = Arc::new(ArroyoSchema::from_schema_unkeyed(schema).unwrap());
+            let mut operator = NativeSession {
+                gap: 10,
+                input_schema: input_schema.clone(),
+                window_field: window,
+                window_index: 0,
+                finish,
+                finish_receiver: receiver,
+                limits,
+                identity: vec![],
+                store: Some(store),
+            };
+            let (control_tx, _control_rx) = channel(16);
+            let mut ctx = OperatorContext::new(
+                Arc::new(arroyo_types::get_test_task_info()),
+                None,
+                control_tx,
+                1,
+                vec![input_schema],
+                Some(Arc::new(
+                    ArroyoSchema::from_schema_unkeyed(output_schema).unwrap(),
+                )),
+                HashMap::new(),
+            )
+            .await;
+            ctx.watermarks.set(
+                0,
+                arroyo_types::Watermark::EventTime(UNIX_EPOCH + Duration::from_nanos(20)),
+            );
+            let converter = Converter::new(vec![]).unwrap();
+            let due = SessionMeta { start: 0, end: 9 };
+            let future = SessionMeta { start: 40, end: 49 };
+            assert_eq!(
+                observer.first_due(Some(20)).await.unwrap(),
+                Some((vec![], due))
+            );
+            assert_eq!(execution.runtime.memory_pool.reserved(), 0);
+            let (started_tx, mut started_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+            let mut collector = BlockedSessionCollector {
+                started: Some(started_tx),
+                release: release_rx,
+            };
+            let mut pending =
+                Box::pin(operator.handle_watermark(&mut ctx, &mut collector, &converter));
+            let weak = tokio::time::timeout(Duration::from_secs(2), async {
+                tokio::select! {
+                    result = &mut pending => panic!("collector did not block: {result:?}"),
+                    started = &mut started_rx => started.unwrap(),
+                }
+            })
+            .await
+            .unwrap();
+            assert!(futures::poll!(&mut pending).is_pending());
+            assert!(
+                weak.upgrade().is_some(),
+                "output ownership ended before collector acknowledgement"
+            );
+            // Producer/consumer have completed, releasing their snapshot. The
+            // two-slot decoded input allowance stays held through collection.
+            assert_snapshot_capacity(&state);
+            let free = state.config().decoded_value_bytes - limits.partial_bytes * 6;
+            assert!(state.try_decoded_value(free + 1).is_err());
+            drop(state.try_decoded_value(free).unwrap());
+            assert!(execution.runtime.memory_pool.reserved() >= admitted_output);
+            assert_retained_session(&observer, due, &[(0, 3), (9, 5)]).await;
+            assert_retained_session(&observer, future, &[(40, 7), (49, 11)]).await;
+            drop(pending);
+            drop(collector);
+            assert!(
+                release_tx.send(()).is_err(),
+                "cancelled collector receiver remained owned"
+            );
+            assert!(weak.upgrade().is_none(), "cancelled output remained owned");
+            assert_eq!(execution.runtime.memory_pool.reserved(), 0);
+            drop(
+                state
+                    .try_decoded_value(state.config().decoded_value_bytes)
+                    .unwrap(),
+            );
+            assert_snapshot_capacity(&state);
+            assert_eq!(
+                observer.first_due(Some(20)).await.unwrap(),
+                Some((vec![], due))
+            );
+            assert_retained_session(&observer, due, &[(0, 3), (9, 5)]).await;
+            assert_retained_session(&observer, future, &[(40, 7), (49, 11)]).await;
+            assert!(operator.finish_receiver.read().unwrap().is_none());
+            let mut emitted = RecordedSessionCollector::default();
+            operator
+                .handle_watermark(&mut ctx, &mut emitted, &converter)
+                .await
+                .unwrap();
+            assert_eq!(emitted.0.len(), 1);
+            assert_session_output(&emitted.0[0], 0, 19, 8);
+            assert!(observer.first_due(Some(20)).await.unwrap().is_none());
+            assert_retained_session(&observer, due, &[]).await;
+            assert_retained_session(&observer, future, &[(40, 7), (49, 11)]).await;
+            operator
+                .handle_watermark(&mut ctx, &mut emitted, &converter)
+                .await
+                .unwrap();
+            assert_eq!(
+                emitted.0.len(),
+                1,
+                "retry emitted the retired session twice"
+            );
+            ctx.watermarks.set(
+                0,
+                arroyo_types::Watermark::EventTime(UNIX_EPOCH + Duration::from_nanos(60)),
+            );
+            operator
+                .handle_watermark(&mut ctx, &mut emitted, &converter)
+                .await
+                .unwrap();
+            assert_eq!(emitted.0.len(), 2);
+            assert_session_output(&emitted.0[1], 40, 59, 18);
+            assert!(observer.first_due(None).await.unwrap().is_none());
+            assert_retained_session(&observer, future, &[]).await;
+            assert_eq!(execution.runtime.memory_pool.reserved(), 0);
+            assert_snapshot_capacity(&state);
+        })
+        .await;
+    }
 }

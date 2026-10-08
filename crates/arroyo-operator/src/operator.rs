@@ -12,7 +12,7 @@ use arrow::datatypes::Schema;
 use arroyo_datastream::logical::{DylibUdfConfig, PythonUdfConfig};
 use arroyo_metrics::TaskCounters;
 use arroyo_rpc::df::ArroyoSchema;
-use arroyo_rpc::errors::DataflowResult;
+use arroyo_rpc::errors::{DataflowResult, TaskError};
 use arroyo_rpc::grpc::rpc::{TableConfig, TaskCheckpointEventType};
 use arroyo_rpc::{ControlMessage, ControlResp};
 use arroyo_state::tables::table_manager::TableManager;
@@ -148,7 +148,7 @@ impl OperatorNode {
         in_qs: &mut [BatchReceiver],
         ready: Arc<Barrier>,
         mut collector: ArrowCollector,
-    ) -> DataflowResult<()> {
+    ) -> Result<(), TaskError> {
         match self {
             OperatorNode::Source(mut s) => {
                 let mut source_context =
@@ -179,14 +179,20 @@ impl OperatorNode {
                     .await
                     .unwrap();
 
-                let result = s.operator.run(&mut source_context, &mut collector).await?;
+                let result = s
+                    .operator
+                    .run(&mut source_context, &mut collector)
+                    .await
+                    .map_err(|error| collector.delivery_error(error))?;
 
                 s.operator
                     .on_close(&mut source_context, &mut collector)
-                    .await?;
+                    .await
+                    .map_err(|error| collector.delivery_error(error))?;
 
+                collector.check_delivery_error()?;
                 if let Some(final_message) = result.into() {
-                    collector.broadcast(final_message).await;
+                    collector.broadcast_checked(final_message).await?;
                 }
             }
             OperatorNode::Chained(mut o) => {
@@ -200,7 +206,7 @@ impl OperatorNode {
                 )
                 .await?;
                 if let Some(final_message) = result {
-                    collector.broadcast(final_message).await;
+                    collector.broadcast_checked(final_message).await?;
                 }
             }
         }
@@ -285,7 +291,7 @@ impl OperatorNode {
                     .send(ControlResp::TaskFailed {
                         task_id: chain_info.task_id,
                         subtask_idx: chain_info.task_index,
-                        error: e.into(),
+                        error: e,
                     })
                     .await
                     .expect("control response unwrap");
@@ -694,7 +700,9 @@ impl ChainedOperator {
                         .await
                         .map_err(|e| e.with_operator(self.context.task_info.operator_id.clone()))?;
 
-                    collector.broadcast(SignalMessage::Barrier(*t)).await;
+                    collector
+                        .broadcast_checked(SignalMessage::Barrier(*t))
+                        .await?;
 
                     if t.then_stop {
                         // if this is a committing operator, we need to wait for the commit message
@@ -782,8 +790,8 @@ impl ChainedOperator {
                     .map_err(|e| e.with_operator(self.context.task_info.operator_id.clone()))?;
                 if let Some(watermark) = watermark {
                     final_collector
-                        .broadcast(SignalMessage::Watermark(watermark))
-                        .await;
+                        .broadcast_checked(SignalMessage::Watermark(watermark))
+                        .await?;
                 }
             }
         }

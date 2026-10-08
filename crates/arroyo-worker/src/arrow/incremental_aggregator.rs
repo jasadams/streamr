@@ -1,6 +1,7 @@
 use crate::arrow::aggregate_codec::{EncodedGroup, decode_group, encode_group};
 use crate::arrow::aggregate_store::{AggregateScope, AggregateStore, AggregateStoreLimits};
 use crate::arrow::decode_aggregate;
+use crate::arrow::execution::{ExecutionResources, configured_execution_resources};
 use crate::arrow::updating_cache::{Key, UpdatingCache};
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use arrow::compute::{SortOptions, filter, max_array};
@@ -38,6 +39,7 @@ use arroyo_state::live::{
 use arroyo_state::timestamp_table_config;
 use arroyo_types::{CheckpointBarrier, SignalMessage, to_nanos};
 use datafusion::common::{Result as DFResult, ScalarValue};
+use datafusion::execution::memory_pool::MemoryConsumer;
 use datafusion::functions_aggregate::min_max::Max;
 use datafusion::physical_expr::expressions::Column;
 use datafusion::physical_plan::aggregates::{AggregateMode, aggregate_expressions};
@@ -366,7 +368,7 @@ pub struct IncrementalAggregatingFunc {
     key_converter: RowConverter,
     new_generation: u64,
     native_config: Option<AggregateStateConfig>,
-    native_max_input_batch_bytes: Option<usize>,
+    native_execution_resources: Option<Arc<ExecutionResources>>,
     native_store: Option<AggregateStore>,
     retain_indefinitely: bool,
     native_schema_identity: Vec<u8>,
@@ -1258,13 +1260,12 @@ impl IncrementalAggregatingFunc {
             .native_store
             .as_ref()
             .ok_or_else(|| anyhow!("native aggregate store was not initialized"))?;
-        let max_input_batch_bytes = self.native_max_input_batch_bytes.ok_or_else(|| {
-            anyhow!("native aggregate requires worker.execution-resources.max-batch-bytes")
-        })?;
-        ensure!(
-            batch.get_array_memory_size() <= max_input_batch_bytes,
-            "native aggregate input exceeds configured max-batch-bytes"
-        );
+        let execution = self
+            .native_execution_resources
+            .as_ref()
+            .context("native aggregate requires worker.execution-resources")?;
+        let max_input_batch_bytes = execution.limits.max_batch_bytes;
+        let _source = execution.reserve_batch("native aggregate input", batch)?;
         let input_schema = &ctx.in_schemas[0];
         let keys = if input_schema
             .routing_keys()
@@ -1305,6 +1306,12 @@ impl IncrementalAggregatingFunc {
             input_working_bytes <= max_input_batch_bytes,
             "native aggregate expressions exceed configured max-batch-bytes"
         );
+        // Expressions have the same cooperative boundary as projection: their
+        // resulting buffers can be measured once evaluated. Keep the charge
+        // through every state scope/commit, including blocked snapshot waits.
+        let mut _working = MemoryConsumer::new("native aggregate expressions and keys")
+            .register(&execution.runtime.memory_pool);
+        _working.try_grow(input_working_bytes)?;
         ensure!(
             !self.native_append_only || batch.column_by_name(UPDATING_META_FIELD).is_none(),
             "append-only native aggregate received changelog metadata",
@@ -1345,10 +1352,12 @@ impl IncrementalAggregatingFunc {
         );
         for start in (0..batch.num_rows()).step_by(rows_per_chunk) {
             let end = batch.num_rows().min(start + rows_per_chunk);
-            // Indexed/retracting accumulators scan a stable view. Scalar and
-            // ordered append-only accumulators only read their group key;
-            // the serial owner plus scope overlay supplies read-own-writes.
-            let mut scope = if fallback == 0 {
+            // Without member indexes, the existing point-read path is safe
+            // even for retractions. Indexed appends (including collections
+            // and TTL rollover) also use only keyed reads and this owner's overlay.
+            let has_retracts =
+                changelog.is_some_and(|(flags, _)| (start..end).any(|row| flags.value(row)));
+            let mut scope = if fallback == 0 || !has_retracts {
                 store.begin_point().await?
             } else {
                 store.begin().await?
@@ -3200,11 +3209,11 @@ impl IncrementalAggregatingConstructor {
             batch_state_schema,
             new_generation: 0,
             native_config,
-            native_max_input_batch_bytes: arroyo_rpc::config::config()
-                .worker
-                .execution_resources
-                .as_ref()
-                .map(|resources| resources.max_batch_bytes),
+            native_execution_resources: if native_config.is_some() {
+                configured_execution_resources()?
+            } else {
+                None
+            },
             native_store: None,
             retain_indefinitely: config.retain_indefinitely == Some(true),
             native_schema_identity,
@@ -3223,6 +3232,7 @@ mod tests {
         memory::MemoryLiveState,
         resources::{ResourceConfig, WorkerStateResources},
         table::LiveTableManager,
+        write::AdmittedWriteBatch,
     };
     use datafusion::execution::FunctionRegistry;
     use datafusion::functions_aggregate::{
@@ -3599,10 +3609,17 @@ mod tests {
     }
 
     fn native_test_store_with_limits(limits: AggregateStoreLimits) -> AggregateStore {
+        native_test_store_with_write_budget(limits, 4 * 1024 * 1024)
+    }
+
+    fn native_test_store_with_write_budget(
+        limits: AggregateStoreLimits,
+        queued_write_bytes: usize,
+    ) -> AggregateStore {
         let resources = WorkerStateResources::new(ResourceConfig {
             block_cache_bytes: 1024 * 1024,
             memtable_bytes: 1024 * 1024,
-            queued_write_bytes: 4 * 1024 * 1024,
+            queued_write_bytes,
             decoded_value_bytes: 4 * 1024 * 1024,
             scan_page_bytes: 1024 * 1024,
             max_blocking_operations: 2,
@@ -3623,6 +3640,511 @@ mod tests {
         .unwrap();
         let table = manager.register(NATIVE_AGGREGATE_TABLE).unwrap();
         AggregateStore::new(backend, table, resources, limits).unwrap()
+    }
+
+    async fn native_input_context(schema: Arc<Schema>) -> OperatorContext {
+        let (control_tx, _control_rx) = tokio::sync::mpsc::channel(16);
+        OperatorContext::new(
+            Arc::new(arroyo_types::get_test_task_info()),
+            None,
+            control_tx,
+            1,
+            vec![Arc::new(ArroyoSchema::from_schema_unkeyed(schema).unwrap())],
+            None,
+            HashMap::new(),
+        )
+        .await
+    }
+
+    fn native_test_changelog(base: &RecordBatch, retracts: &[bool]) -> RecordBatch {
+        assert_eq!(base.num_rows(), retracts.len());
+        let ids = (0..base.num_rows())
+            .map(|row| test_row_id(base, row).to_vec())
+            .collect::<Vec<_>>();
+        let metadata = StructArray::new(
+            updating_meta_fields(),
+            vec![
+                Arc::new(BooleanArray::from(retracts.to_vec())),
+                Arc::new(FixedSizeBinaryArray::try_from_iter(ids.into_iter()).unwrap()),
+            ],
+            None,
+        );
+        let mut fields = base.schema().fields().to_vec();
+        fields.push(Arc::new(Field::new(
+            UPDATING_META_FIELD,
+            metadata.data_type().clone(),
+            false,
+        )));
+        let mut columns = base.columns().to_vec();
+        columns.push(Arc::new(metadata));
+        RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap()
+    }
+
+    #[tokio::test]
+    async fn native_indexed_append_chunk_does_not_acquire_a_snapshot() {
+        for collection in [false, true] {
+            let base = batch(
+                &[Some("z"), Some("a"), None, Some("ignored")],
+                &[4, 1, 3, 2],
+                &[Some(true), Some(true), Some(true), Some(false)],
+            );
+            let input = native_test_changelog(&base, &[false; 4]);
+            let mut operator = if collection {
+                native_array_operator(false, false, true)
+            } else {
+                native_operator()
+            };
+            let limits = native_test_store().limits();
+            let write_scope_bytes =
+                AdmittedWriteBatch::reservation_bytes(limits.write_bytes, limits.write_operations)
+                    .unwrap();
+            operator.native_store = Some(native_test_store_with_write_budget(
+                limits,
+                3 * write_scope_bytes,
+            ));
+            operator.native_execution_resources = Some(Arc::new(
+                ExecutionResources::new(arroyo_rpc::config::ExecutionResourceConfig {
+                    memory_bytes: 1024 * 1024,
+                    max_batch_bytes: 128 * 1024,
+                })
+                .unwrap(),
+            ));
+            let store = operator.native_store.as_ref().unwrap();
+            let first = store.begin().await.unwrap();
+            let second = store.begin().await.unwrap();
+            let mut ctx = native_input_context(input.schema()).await;
+            let mut processing = Box::pin(operator.process_native_batch(&input, &mut ctx));
+            // Both real snapshot permits are held. A stable scope would be
+            // pending here; point processing must finish without a scan.
+            let std::task::Poll::Ready(result) = futures::poll!(&mut processing) else {
+                panic!("indexed append acquired a snapshot permit");
+            };
+            result.unwrap();
+            drop(processing);
+            drop(first);
+            drop(second);
+            let scope = store.begin().await.unwrap();
+            if collection {
+                assert_eq!(
+                    operator
+                        .native_fallback_value(&scope, &GLOBAL_KEY, 0, 0)
+                        .await
+                        .unwrap(),
+                    ScalarValue::List(ScalarValue::new_list(
+                        &[
+                            ScalarValue::Utf8(Some("a".into())),
+                            ScalarValue::Utf8(None),
+                            ScalarValue::Utf8(Some("z".into())),
+                        ],
+                        &DataType::Utf8,
+                        true,
+                    )),
+                );
+            } else {
+                assert_eq!(
+                    operator
+                        .native_fallback_value(&scope, &GLOBAL_KEY, 0, 7)
+                        .await
+                        .unwrap(),
+                    ScalarValue::Utf8(Some("z".into())),
+                );
+                assert_eq!(
+                    operator
+                        .native_fallback_value(&scope, &GLOBAL_KEY, 0, 8)
+                        .await
+                        .unwrap(),
+                    ScalarValue::TimestampNanosecond(Some(4), None),
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn native_point_append_handles_keyed_expiry_collections_filters_and_nulls() {
+        for collection in [false, true] {
+            for ignore_nulls in [false, true] {
+                let mut operator = if collection {
+                    native_array_operator(false, ignore_nulls, true)
+                } else {
+                    native_operator()
+                };
+                operator.retain_indefinitely = false;
+                let mut fields = operator.schema_without_metadata.fields().to_vec();
+                fields.insert(0, Arc::new(Field::new("group_key", DataType::Utf8, false)));
+                operator.schema_without_metadata = Arc::new(Schema::new(fields));
+                let group = b"opaque-key";
+                operator.native_store = Some(native_test_store());
+                let store = operator.native_store.as_ref().unwrap();
+                let old = batch(&[Some("old")], &[0], &[Some(true)]);
+                let mut scope = store.begin_point().await.unwrap();
+                operator
+                    .native_process_event(
+                        &mut scope,
+                        group,
+                        &operator.compute_inputs(&old).unwrap(),
+                        0,
+                        false,
+                        Some(&test_row_id(&old, 0)),
+                    )
+                    .await
+                    .unwrap();
+                scope.commit().await.unwrap();
+                let mut scope = store.begin_point().await.unwrap();
+                let key = native_group_key(b'G', group).unwrap();
+                let mut previous = decode_group(
+                    &scope.get(&key).await.unwrap().unwrap(),
+                    &operator.native_state_types(),
+                    &operator.native_output_types(),
+                    scope.limits().value_bytes,
+                )
+                .unwrap();
+                let ttl = i64::try_from(operator.ttl.as_nanos()).unwrap();
+                scope
+                    .delete(
+                        &native_expiry_key(previous.last_update_nanos.saturating_add(ttl), group)
+                            .unwrap(),
+                    )
+                    .unwrap();
+                previous.last_update_nanos = 0;
+                scope
+                    .put(
+                        &key,
+                        &encode_group(&previous, scope.limits().value_bytes).unwrap(),
+                    )
+                    .unwrap();
+                scope
+                    .put(&native_expiry_key(ttl, group).unwrap(), &[1])
+                    .unwrap();
+                scope.commit().await.unwrap();
+                let input = batch(
+                    &[
+                        Some("z"),
+                        Some("a"),
+                        None,
+                        Some("ignored"),
+                        Some("null-filter"),
+                    ],
+                    &[4, 1, 3, 2, 5],
+                    &[Some(true), Some(true), Some(true), Some(false), None],
+                );
+                let inputs = operator.compute_inputs(&input).unwrap();
+                // The actual point scope rejects first()/first_from(). This
+                // exercises rollover and read-own-writes without scan escape.
+                for start in (0..input.num_rows()).step_by(2) {
+                    let mut scope = store.begin_point().await.unwrap();
+                    for row in start..input.num_rows().min(start + 2) {
+                        operator
+                            .native_process_event(
+                                &mut scope,
+                                group,
+                                &inputs,
+                                row,
+                                false,
+                                Some(&test_row_id(&input, row)),
+                            )
+                            .await
+                            .unwrap();
+                    }
+                    scope.commit().await.unwrap();
+                }
+                let scope = store.begin().await.unwrap();
+                let current = decode_group(
+                    &scope.get(&key).await.unwrap().unwrap(),
+                    &operator.native_state_types(),
+                    &operator.native_output_types(),
+                    scope.limits().value_bytes,
+                )
+                .unwrap();
+                assert_eq!(current.generation, 1);
+                assert_eq!(current.next_ordinal, 5);
+                assert_eq!(
+                    scope
+                        .get(&native_live_rows_key(group).unwrap())
+                        .await
+                        .unwrap()
+                        .unwrap(),
+                    5_u64.to_be_bytes()
+                );
+                assert_eq!(
+                    scope
+                        .get(&native_cleanup_key(group, 0).unwrap())
+                        .await
+                        .unwrap(),
+                    Some(b"M".to_vec())
+                );
+                assert!(
+                    scope
+                        .first(&native_member_prefix(group, 0, 0).unwrap())
+                        .await
+                        .unwrap()
+                        .is_some()
+                );
+                if collection {
+                    let value = operator
+                        .native_fallback_value(&scope, group, 1, 0)
+                        .await
+                        .unwrap();
+                    let mut wanted = vec![ScalarValue::Utf8(Some("a".into()))];
+                    if !ignore_nulls {
+                        wanted.push(ScalarValue::Utf8(None));
+                    }
+                    wanted.push(ScalarValue::Utf8(Some("z".into())));
+                    assert_eq!(
+                        value,
+                        ScalarValue::List(ScalarValue::new_list(&wanted, &DataType::Utf8, true))
+                    );
+                } else {
+                    assert_eq!(
+                        operator
+                            .native_fallback_value(&scope, group, 1, 4)
+                            .await
+                            .unwrap(),
+                        ScalarValue::Utf8(Some("z".into()))
+                    );
+                    assert_eq!(
+                        operator
+                            .native_fallback_value(&scope, group, 1, 8)
+                            .await
+                            .unwrap(),
+                        ScalarValue::TimestampNanosecond(Some(5), None)
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn native_input_and_expressions_share_execution_budget_before_state_mutation() {
+        let input = batch(&[Some("value")], &[1], &[Some(true)]);
+        let source_bytes = input.get_array_memory_size();
+        let resources = Arc::new(
+            ExecutionResources::new(arroyo_rpc::config::ExecutionResourceConfig {
+                memory_bytes: 128 * 1024,
+                max_batch_bytes: 128 * 1024,
+            })
+            .unwrap(),
+        );
+        let mut operator = native_append_only_operator();
+        operator.native_store = Some(native_test_store());
+        operator.native_execution_resources = Some(resources.clone());
+        let mut ctx = native_input_context(input.schema()).await;
+        let mut occupied = MemoryConsumer::new("other concurrent operator")
+            .register(&resources.runtime.memory_pool);
+        occupied
+            .try_grow(resources.limits.memory_bytes - source_bytes)
+            .unwrap();
+        let error = operator
+            .process_native_batch(&input, &mut ctx)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<datafusion::common::DataFusionError>(),
+            Some(datafusion::common::DataFusionError::ResourcesExhausted(_))
+        ));
+        assert_eq!(
+            resources.runtime.memory_pool.reserved(),
+            resources.limits.memory_bytes - source_bytes
+        );
+        let store = operator.native_store.as_ref().unwrap();
+        let scope = store.begin().await.unwrap();
+        let group_key = native_group_key(b'G', &GLOBAL_KEY).unwrap();
+        assert!(scope.get(&group_key).await.unwrap().is_none());
+        drop(scope);
+        drop(occupied);
+        operator
+            .process_native_batch(&input, &mut ctx)
+            .await
+            .unwrap();
+        assert_eq!(resources.runtime.memory_pool.reserved(), 0);
+        assert!(
+            store
+                .begin()
+                .await
+                .unwrap()
+                .get(&group_key)
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn native_input_cancellation_releases_execution_and_pending_state_scope() {
+        let base = batch(&[Some("value")], &[1], &[Some(true)]);
+        let input = native_test_changelog(&base, &[true]);
+        let seed = native_test_changelog(&base, &[false]);
+        let resources = Arc::new(
+            ExecutionResources::new(arroyo_rpc::config::ExecutionResourceConfig {
+                memory_bytes: 1024 * 1024,
+                max_batch_bytes: 128 * 1024,
+            })
+            .unwrap(),
+        );
+        let mut operator = native_operator();
+        let limits = AggregateStoreLimits {
+            key_bytes: 256,
+            value_bytes: 16 * 1024,
+            page_bytes: 64 * 1024,
+            page_entries: 4,
+            write_bytes: 512 * 1024,
+            write_operations: 64,
+            overlay_bytes: 512 * 1024,
+        };
+        // Two scopes hold the snapshot permits; processing must admit its
+        // third write scope before it can suspend on snapshot acquisition.
+        let write_scope_bytes =
+            AdmittedWriteBatch::reservation_bytes(limits.write_bytes, limits.write_operations)
+                .unwrap();
+        operator.native_store = Some(native_test_store_with_write_budget(
+            limits,
+            3 * write_scope_bytes,
+        ));
+        operator.native_execution_resources = Some(resources.clone());
+        let store = operator.native_store.as_ref().unwrap();
+        let mut ctx = native_input_context(input.schema()).await;
+        // A real matching retraction still needs a stable scan. Seed its
+        // member before exhausting permits; cancellation must leave it intact.
+        operator
+            .process_native_batch(&seed, &mut ctx)
+            .await
+            .unwrap();
+        // Exhaust the real backend's snapshot permits so processing suspends
+        // after admitting input/expressions and acquiring its state scope.
+        let first = store.begin().await.unwrap();
+        let second = store.begin().await.unwrap();
+        let scope_bytes = store.limits().overlay_bytes + 3 * store.limits().value_bytes;
+        let otherwise_free = store.resources().config().decoded_value_bytes - 2 * scope_bytes;
+        assert!(store.resources().try_decoded_value(otherwise_free).is_ok());
+        assert!(
+            store
+                .resources()
+                .try_queued_write(write_scope_bytes)
+                .is_ok()
+        );
+        let mut processing = Box::pin(operator.process_native_batch(&input, &mut ctx));
+        assert!(futures::poll!(&mut processing).is_pending());
+        assert!(resources.runtime.memory_pool.reserved() > input.get_array_memory_size());
+        assert!(store.resources().try_decoded_value(otherwise_free).is_err());
+        assert!(store.resources().try_queued_write(1).is_err());
+        drop(processing);
+        assert_eq!(resources.runtime.memory_pool.reserved(), 0);
+        assert!(store.resources().try_decoded_value(otherwise_free).is_ok());
+        assert!(
+            store
+                .resources()
+                .try_queued_write(write_scope_bytes)
+                .is_ok()
+        );
+        drop(first);
+        drop(second);
+        operator
+            .process_native_batch(&input, &mut ctx)
+            .await
+            .unwrap();
+        assert_eq!(resources.runtime.memory_pool.reserved(), 0);
+        assert!(
+            store
+                .resources()
+                .try_decoded_value(store.resources().config().decoded_value_bytes)
+                .is_ok()
+        );
+        assert!(
+            store
+                .resources()
+                .try_queued_write(3 * write_scope_bytes)
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn native_slow_collector_holds_output_budget_until_completion_or_cancellation() {
+        struct SlowCollector {
+            started: Option<tokio::sync::oneshot::Sender<()>>,
+            release: tokio::sync::oneshot::Receiver<()>,
+        }
+
+        #[async_trait::async_trait]
+        impl Collector for SlowCollector {
+            async fn collect(&mut self, output: RecordBatch) -> DataflowResult<()> {
+                assert_eq!(output.num_rows(), 1);
+                self.started.take().unwrap().send(()).unwrap();
+                (&mut self.release).await.unwrap();
+                drop(output);
+                Ok(())
+            }
+
+            async fn broadcast_watermark(
+                &mut self,
+                _: arroyo_types::Watermark,
+            ) -> DataflowResult<()> {
+                Ok(())
+            }
+        }
+
+        for cancel in [false, true] {
+            let input = batch(&[Some("value")], &[1], &[Some(true)]);
+            let resources = Arc::new(
+                ExecutionResources::new(arroyo_rpc::config::ExecutionResourceConfig {
+                    memory_bytes: 1024 * 1024,
+                    max_batch_bytes: 128 * 1024,
+                })
+                .unwrap(),
+            );
+            let mut operator = native_append_only_operator();
+            operator.native_store = Some(native_test_store());
+            operator.native_execution_resources = Some(resources.clone());
+            let metadata = StructArray::new(
+                updating_meta_fields(),
+                vec![
+                    Arc::new(BooleanArray::from(vec![false])),
+                    ScalarValue::FixedSizeBinary(16, None).to_array().unwrap(),
+                ],
+                None,
+            );
+            operator.metadata_expr =
+                Arc::new(Literal::new(ScalarValue::Struct(Arc::new(metadata))));
+            let mut ctx = native_input_context(input.schema()).await;
+            ctx.out_schema = Some(Arc::new(
+                native_config().0.final_schema.unwrap().try_into().unwrap(),
+            ));
+            operator
+                .process_native_batch(&input, &mut ctx)
+                .await
+                .unwrap();
+            assert_eq!(resources.runtime.memory_pool.reserved(), 0);
+            let (started_tx, mut started_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+            let mut collector = SlowCollector {
+                started: Some(started_tx),
+                release: release_rx,
+            };
+            let mut flushing = Box::pin(operator.drain_native_dirty(&mut ctx, &mut collector));
+            assert!(futures::poll!(&mut flushing).is_pending());
+            started_rx.try_recv().unwrap();
+            let state_resources = operator.native_store.as_ref().unwrap().resources();
+            let output_bytes = 3 * native_test_config().max_pending_output_bytes;
+            let otherwise_free = state_resources.config().decoded_value_bytes - output_bytes;
+            assert!(state_resources.try_decoded_value(otherwise_free).is_ok());
+            assert!(
+                state_resources
+                    .try_decoded_value(otherwise_free + 1)
+                    .is_err()
+            );
+            if cancel {
+                drop(flushing);
+                drop(collector);
+                assert!(release_tx.send(()).is_err());
+            } else {
+                release_tx.send(()).unwrap();
+                flushing.await.unwrap();
+            }
+            assert!(
+                state_resources
+                    .try_decoded_value(state_resources.config().decoded_value_bytes)
+                    .is_ok()
+            );
+            assert_eq!(resources.runtime.memory_pool.reserved(), 0);
+        }
     }
 
     async fn array_members(

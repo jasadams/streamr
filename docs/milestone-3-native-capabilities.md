@@ -51,6 +51,12 @@ not establish this combined schedule or its recovery. Durable timer storage APIs
 alone provide neither dispatch nor output/clear atomicity. No public callback or
 timer API is selected by this audit.
 
+The user subsequently deferred the optional immediate-first and per-group
+coalescing policy to post-MVP STR-44. Milestone 3 retains Arroyo's periodic
+aggregate flushing and records that compatibility difference. Quiet expiry,
+profile/session values, last-emitted deltas and recovery remain required;
+this deferral does not approve another clock or lifecycle policy.
+
 The session table covers all 12 external fields:
 
 | External session fields | Native candidate or remaining decision |

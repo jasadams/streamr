@@ -210,8 +210,8 @@ fn classify_datafusion_error(err: &DataFusionError) -> (ErrorDomain, RetryHint) 
     }
 }
 
-impl From<DataflowError> for TaskError {
-    fn from(value: DataflowError) -> Self {
+impl From<&DataflowError> for TaskError {
+    fn from(value: &DataflowError) -> Self {
         let message = value.to_string();
         let (domain, retry_hint, details) = match value {
             DataflowError::ConnectorError {
@@ -219,10 +219,10 @@ impl From<DataflowError> for TaskError {
                 retry,
                 source,
                 ..
-            } => (domain, retry, source.as_ref().map(|s| format!("{s:?}"))),
+            } => (*domain, *retry, source.as_ref().map(|s| format!("{s:?}"))),
             DataflowError::ArrowError(_) => (ErrorDomain::Internal, RetryHint::NoRetry, None),
             DataflowError::DataFusionError(df_err) => {
-                let (domain, retry) = classify_datafusion_error(&df_err);
+                let (domain, retry) = classify_datafusion_error(df_err);
                 (domain, retry, None)
             }
             DataflowError::InternalOperatorError { .. } => {
@@ -240,8 +240,8 @@ impl From<DataflowError> for TaskError {
             ),
             DataflowError::UnknownError(_) => (ErrorDomain::Internal, RetryHint::WithBackoff, None),
             DataflowError::WithOperator { error, operator_id } => {
-                let mut inner: TaskError = (*error).into();
-                inner.operator_id = Some(operator_id);
+                let mut inner: TaskError = error.as_ref().into();
+                inner.operator_id = Some(operator_id.clone());
                 return inner;
             }
         };
@@ -253,6 +253,12 @@ impl From<DataflowError> for TaskError {
             operator_id: None,
             details,
         }
+    }
+}
+
+impl From<DataflowError> for TaskError {
+    fn from(value: DataflowError) -> Self {
+        Self::from(&value)
     }
 }
 
@@ -348,6 +354,154 @@ impl SourceError {
         DataflowError::DataError {
             details: details.into(),
             count,
+        }
+    }
+}
+
+#[cfg(test)]
+mod task_error_tests {
+    use super::*;
+
+    #[test]
+    fn borrowed_and_owned_task_errors_preserve_existing_fields() {
+        // Independent expected classifications cover every DataflowError arm;
+        // borrowed conversion must also leave the original available to return.
+        let connector_source = anyhow::anyhow!("source");
+        let connector_details = format!("{connector_source:?}");
+        let cases = [
+            (
+                DataflowError::ArrowError(ArrowError::SchemaError("schema".into())),
+                ErrorDomain::Internal,
+                RetryHint::NoRetry,
+                None,
+            ),
+            (
+                DataflowError::DataFusionError(DataFusionError::ResourcesExhausted("pool".into())),
+                ErrorDomain::External,
+                RetryHint::WithBackoff,
+                None,
+            ),
+            (
+                DataflowError::DataFusionError(DataFusionError::Plan("plan".into())),
+                ErrorDomain::User,
+                RetryHint::NoRetry,
+                None,
+            ),
+            (
+                DataflowError::DataFusionError(DataFusionError::Context(
+                    "context".into(),
+                    Box::new(DataFusionError::ResourcesExhausted("pool".into())),
+                )),
+                ErrorDomain::External,
+                RetryHint::WithBackoff,
+                None,
+            ),
+            (
+                DataflowError::InternalOperatorError {
+                    error: "operator",
+                    message: "failed".into(),
+                },
+                ErrorDomain::Internal,
+                RetryHint::WithBackoff,
+                None,
+            ),
+            (
+                DataflowError::StateError(StateError::Other {
+                    table: "table".into(),
+                    error: "state".into(),
+                }),
+                ErrorDomain::Internal,
+                RetryHint::WithBackoff,
+                None,
+            ),
+            (
+                DataflowError::ArgumentError("arg".into()),
+                ErrorDomain::User,
+                RetryHint::NoRetry,
+                None,
+            ),
+            (
+                DataflowError::ExternalError("external".into()),
+                ErrorDomain::External,
+                RetryHint::WithBackoff,
+                None,
+            ),
+            (
+                DataflowError::DataError {
+                    details: "bad row".into(),
+                    count: 3,
+                },
+                ErrorDomain::External,
+                RetryHint::WithBackoff,
+                Some("count: 3, details: bad row".into()),
+            ),
+            (
+                DataflowError::ConnectorError {
+                    domain: ErrorDomain::User,
+                    retry: RetryHint::NoRetry,
+                    error: "connector".into(),
+                    source: None,
+                },
+                ErrorDomain::User,
+                RetryHint::NoRetry,
+                None,
+            ),
+            (
+                DataflowError::ConnectorError {
+                    domain: ErrorDomain::External,
+                    retry: RetryHint::WithBackoff,
+                    error: "connector".into(),
+                    source: Some(connector_source),
+                },
+                ErrorDomain::External,
+                RetryHint::WithBackoff,
+                Some(connector_details),
+            ),
+            (
+                DataflowError::UnknownError(anyhow::anyhow!("unknown")),
+                ErrorDomain::Internal,
+                RetryHint::WithBackoff,
+                None,
+            ),
+        ];
+        for (error, domain, retry_hint, details) in cases {
+            let original_message = error.to_string();
+            let borrowed = TaskError::from(&error);
+            let owned = TaskError::from(error);
+            for result in [borrowed, owned] {
+                assert_eq!(result.message, original_message);
+                assert_eq!(result.domain, domain);
+                assert_eq!(result.retry_hint, retry_hint);
+                assert_eq!(result.operator_id, None);
+                assert_eq!(result.details, details);
+            }
+        }
+        // WithOperator retains the inner message/details and outermost owner,
+        // rather than incorporating display-only operator suffixes.
+        let error = DataflowError::WithOperator {
+            operator_id: "outer".into(),
+            error: Box::new(DataflowError::WithOperator {
+                operator_id: "inner".into(),
+                error: Box::new(DataflowError::DataError {
+                    details: "bad row".into(),
+                    count: 3,
+                }),
+            }),
+        };
+        let borrowed = TaskError::from(&error);
+        let owned = TaskError::from(error);
+        for result in [borrowed, owned] {
+            assert_eq!(
+                result.message,
+                "error deserializing data: bad row (3 times)"
+            );
+            assert_eq!(result.domain, ErrorDomain::External);
+            assert_eq!(result.retry_hint, RetryHint::WithBackoff);
+            assert_eq!(result.operator_id.as_deref(), Some("outer"));
+            assert_eq!(
+                result.details.as_deref(),
+                Some("count: 3, details: bad row")
+            );
         }
     }
 }

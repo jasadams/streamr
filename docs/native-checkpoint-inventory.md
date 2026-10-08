@@ -1,5 +1,11 @@
 # Read-only native aggregate checkpoint inventory
 
+The inspector and captures below describe the historical `STRDS001` snapshot
+format. The current bounded adapter reuses Arroyo's format-2 Parquet checkpoints;
+use [native retained-checkpoint measurement](native-retained-checkpoint-measurement.md)
+for those artifacts. Historical results remain evidence for their recorded
+source revisions, not qualification of the current checkpoint format.
+
 `checkpoint_inventory.py` reads **one explicitly selected** local checkpoint. It parses the
 controller checkpoint metadata or leader manifest, each native aggregate owner's
 `native-aggregate-v1` table descriptor, the `STRDS001` full logical snapshot

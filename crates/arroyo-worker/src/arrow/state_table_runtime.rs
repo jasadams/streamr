@@ -566,6 +566,7 @@ mod tests {
             timestamp_index: 2,
             max_captured_event_bytes: limits.max_captured_event_bytes,
             max_working_event_bytes: limits.max_working_event_bytes,
+            concat_allowance: Arc::new(super::super::state_table_concat::ConcatAllowance::default()),
         };
         program.validate().unwrap();
         let mut operator = FusedStateTable {
@@ -709,6 +710,112 @@ mod tests {
                 .value(0),
             3
         );
+    }
+
+    #[tokio::test]
+    async fn concat_refusal_prevents_later_state_access_and_releases_permits_for_retry() {
+        use super::super::state_table_concat::guard_expression;
+        use super::super::state_table_owner::EventOperation;
+        use datafusion::{
+            common::ScalarValue,
+            physical_expr::{ScalarFunctionExpr, expressions::Literal},
+        };
+        let (mut owner, mut context, input_schema, capture_schema, resources) = test_owner(1).await;
+        let literal = Arc::new(Literal::new(ScalarValue::Utf8(Some("x".repeat(64 * 1024)))));
+        let stock = Arc::new(ScalarFunctionExpr::new(
+            "concat",
+            Arc::new(datafusion::functions::string::concat::ConcatFunc::new().into()),
+            vec![literal],
+            Arc::new(Field::new("candidate", DataType::Utf8, false)),
+        ));
+        let expression = guard_expression(stock, &owner.program.concat_allowance).unwrap();
+        owner.program.steps.insert(
+            0,
+            EventStep {
+                parent: None,
+                operation: EventOperation::Projection {
+                    expressions: vec![expression],
+                    input_schema: input_schema.clone(),
+                    output_schema: Arc::new(Schema::new(vec![Field::new(
+                        "candidate",
+                        DataType::Utf8,
+                        false,
+                    )])),
+                },
+                captures: vec![],
+            },
+        );
+        owner.program.max_working_event_bytes = 32 * 1024;
+        let batches = Arc::new(Mutex::new(Vec::new()));
+        let mut collector = RecordingCollector {
+            batches: batches.clone(),
+            entered: None,
+            release: None,
+        };
+        let error = owner
+            .process_batch(
+                test_input(input_schema.clone(), &[(Some("a"), 1)]),
+                &mut context,
+                &mut collector,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("CONCAT exceeds remaining working-event")
+        );
+        assert!(batches.lock().await.is_empty());
+        let key = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("item", DataType::Utf8, false)])),
+            vec![Arc::new(StringArray::from(vec!["a"]))],
+        )
+        .unwrap();
+        assert!(
+            owner.tables["inventory"].get(&key).await.unwrap().is_none(),
+            "the refused operation precedes the state access; no rollback contract is added"
+        );
+        resources
+            .try_decoded_value(resources.config().decoded_value_bytes)
+            .unwrap();
+        // Keep the same program/allowance, replacing only the caller value.
+        let small = Arc::new(ScalarFunctionExpr::new(
+            "concat",
+            Arc::new(datafusion::functions::string::concat::ConcatFunc::new().into()),
+            vec![Arc::new(Literal::new(ScalarValue::Utf8(Some("ok".into()))))],
+            Arc::new(Field::new("candidate", DataType::Utf8, false)),
+        ));
+        let small = guard_expression(small, &owner.program.concat_allowance).unwrap();
+        let EventOperation::Projection { expressions, .. } = &mut owner.program.steps[0].operation
+        else {
+            unreachable!()
+        };
+        *expressions = vec![small];
+        owner
+            .process_batch(
+                test_input(input_schema, &[(Some("a"), 1)]),
+                &mut context,
+                &mut collector,
+            )
+            .await
+            .unwrap();
+        let outputs = batches.lock().await;
+        assert_eq!(outputs.len(), 1);
+        let captured = extract_capture(&outputs[0], 0, capture_schema).unwrap();
+        assert_eq!(
+            captured
+                .column(3)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .value(0),
+            "insert"
+        );
+        drop(outputs);
+        assert!(owner.tables["inventory"].get(&key).await.unwrap().is_some());
+        resources
+            .try_decoded_value(resources.config().decoded_value_bytes)
+            .unwrap();
     }
 
     #[tokio::test]

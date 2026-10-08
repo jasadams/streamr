@@ -1799,9 +1799,18 @@ async fn external_sql_checkpoint_capture() {
     .expect("external SQL capture planning, startup, or recovery timed out");
 }
 
+#[path = "smoke_schedule_tests.rs"]
+mod smoke_schedule_tests;
+
 async fn external_sql_checkpoint_capture_inner() {
     let capture = CaptureCounts::from_env().expect("invalid external SQL capture configuration");
     let idle = CaptureIdle::from_env(&capture).expect("invalid external SQL idle configuration");
+    let schedule = smoke_schedule_tests::CaptureSchedule::from_env()
+        .expect("invalid external SQL initial schedule");
+    assert!(
+        idle.is_none() || schedule.is_none(),
+        "idle and initial schedule captures are mutually exclusive"
+    );
     configure_test_worker();
     let selected_backend = env::var("STREAMR_TEST_BACKEND").unwrap_or_else(|_| "memory".into());
     let selected_checkpoint =
@@ -1873,6 +1882,18 @@ async fn external_sql_checkpoint_capture_inner() {
             .is_none_or(|value| value.is_null() || value.as_bool() == Some(true)),
         "capture source must wait for control after each input row"
     );
+    if let Some(schedule) = &schedule {
+        schedule
+            .validate_input(
+                source_config
+                    .table
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .expect("scheduled single-file source must have a path"),
+            )
+            .await
+            .expect("invalid scheduled source input");
+    }
     let job_id = format!(
         "external-sql-capture-{}-{}",
         std::process::id(),
@@ -1900,11 +1921,16 @@ async fn external_sql_checkpoint_capture_inner() {
     }
     let (control_tx, mut control_rx) = channel(128);
     let program = local_program(&job_id, &logical.graph, &udfs, None, control_tx).await;
-    let running = Engine::for_local(program, "pipe-test".into(), job_id.clone())
+    let initial_engine = Engine::for_local(program, "pipe-test".into(), job_id.clone())
         .await
-        .unwrap()
-        .start()
-        .await;
+        .unwrap();
+    let initial_started = tokio::time::Instant::now();
+    let running = initial_engine.start().await;
+    if let Some(schedule) = &schedule {
+        schedule
+            .run(&running, &mut control_rx, &output_path, initial_started)
+            .await;
+    }
     if let Some(idle) = &idle {
         advance_idle_target(&running, idle.additional_noops(1)).await;
         let (before_rows, before_bytes) = capture_idle_output(

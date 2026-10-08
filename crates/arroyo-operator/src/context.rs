@@ -6,7 +6,7 @@ use arroyo_formats::de::{ArrowDeserializer, FieldValueType};
 use arroyo_metrics::{QueueGauges, TaskCounters, register_queue_gauge};
 use arroyo_rpc::config::config;
 use arroyo_rpc::df::ArroyoSchema;
-use arroyo_rpc::errors::{DataflowError, DataflowResult};
+use arroyo_rpc::errors::{DataflowError, DataflowResult, TaskError};
 use arroyo_rpc::formats::{BadData, Format, Framing};
 use arroyo_rpc::grpc::rpc::{TableConfig, TaskCheckpointEventType};
 use arroyo_rpc::schema_resolver::SchemaResolver;
@@ -18,12 +18,15 @@ use arroyo_types::{
     ArrowMessage, ChainInfo, CheckpointBarrier, SignalMessage, TaskInfo, Watermark,
 };
 use async_trait::async_trait;
+use datafusion::common::DataFusionError;
 use datafusion::common::hash_utils;
+use datafusion::execution::memory_pool::{MemoryConsumer, MemoryReservation};
+use datafusion::execution::runtime_env::RuntimeEnv;
 use rand::Rng;
 use std::collections::HashMap;
 use std::mem::size_of_val;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 use tokio::sync::Notify;
 use tokio::sync::mpsc::error::SendError;
@@ -90,10 +93,95 @@ impl WatermarkHolder {
 #[derive(Clone)]
 pub struct BatchSender {
     size: u32,
-    tx: UnboundedSender<QueueItem>,
+    tx: UnboundedSender<QueuedItem>,
     queued_messages: Arc<AtomicU32>,
     queued_bytes: Arc<AtomicU64>,
     notify: Arc<Notify>,
+    enqueue: Arc<Mutex<()>>,
+    budget: Option<Arc<QueueBudget>>,
+    #[cfg(test)]
+    enqueue_pause: Option<Arc<EnqueuePause>>,
+}
+
+#[cfg(test)]
+struct EnqueuePause {
+    entered: std::sync::mpsc::Sender<()>,
+    resume: Mutex<std::sync::mpsc::Receiver<()>>,
+}
+
+struct QueueBudget {
+    runtime: Arc<RuntimeEnv>,
+    max_batch_bytes: usize,
+    messages: AtomicUsize,
+    metadata: Mutex<MemoryReservation>,
+}
+
+// Tokio 1.47.1's mpsc list uses 32-slot blocks on 64-bit targets (16 on
+// 32-bit), with a four-word header. Six spare blocks cover partial head/tail,
+// its three recycled blocks, and one transient grow allocation. Accounted
+// enqueue is serialized below so producer tail publication cannot delay
+// reclamation while other producers extend the list indefinitely.
+fn queue_metadata_bytes(messages: usize) -> DataflowResult<usize> {
+    let slots = if usize::BITS == 64 { 32 } else { 16 };
+    let block = std::mem::size_of::<QueuedItem>()
+        .checked_mul(slots)
+        .and_then(|bytes| bytes.checked_add(4 * std::mem::size_of::<usize>()));
+    // Chan's two cache-padded fields, Notify, counters and receiver state fit
+    // within 1024 bytes in the pinned Tokio version. Include our own controls.
+    let controls = 1024
+        + std::mem::size_of::<QueueBudget>()
+        + 3 * std::mem::size_of::<Notify>()
+        + std::mem::size_of::<Mutex<()>>()
+        + 2 * std::mem::size_of::<usize>()
+        + 16 * std::mem::size_of::<usize>();
+    messages
+        .div_ceil(slots)
+        .checked_add(6)
+        .and_then(|blocks| block.and_then(|bytes| bytes.checked_mul(blocks)))
+        .and_then(|bytes| bytes.checked_add(controls))
+        .ok_or_else(|| {
+            DataFusionError::ResourcesExhausted("graph queue metadata size overflow".into()).into()
+        })
+}
+
+struct QueueAdmission {
+    _reservation: MemoryReservation,
+    budget: Arc<QueueBudget>,
+}
+
+fn queue_message_charge(bytes: usize) -> Option<usize> {
+    // DF48 SharedRegistration owns MemoryConsumer, its name, a fat pool Arc
+    // and its own Arc counters. FairSpillPool adds no per-consumer map entry.
+    bytes.checked_add(
+        std::mem::size_of::<QueuedItem>()
+            + std::mem::size_of::<MemoryConsumer>()
+            + "Streamr graph queue message".len()
+            + 4 * std::mem::size_of::<usize>(),
+    )
+}
+
+/// Own the queue charge for exactly as long as the channel owns the message.
+/// This also releases charges for a failed send or receiver teardown racing
+/// with a send, without depending on the receiver draining each item.
+struct QueuedItem {
+    item: Option<QueueItem>,
+    count: u32,
+    bytes: u64,
+    queued_messages: Arc<AtomicU32>,
+    queued_bytes: Arc<AtomicU64>,
+    notify: Arc<Notify>,
+    admission: Option<QueueAdmission>,
+}
+
+impl Drop for QueuedItem {
+    fn drop(&mut self) {
+        self.queued_messages.fetch_sub(self.count, Ordering::SeqCst);
+        self.queued_bytes.fetch_sub(self.bytes, Ordering::AcqRel);
+        if let Some(admission) = &self.admission {
+            admission.budget.messages.fetch_sub(1, Ordering::AcqRel);
+        }
+        self.notify.notify_waiters();
+    }
 }
 
 #[inline]
@@ -114,11 +202,64 @@ fn message_bytes(item: &QueueItem) -> u64 {
 
 impl BatchSender {
     pub async fn send(&self, item: QueueItem) -> Result<(), SendError<QueueItem>> {
+        self.send_inner(item)
+            .await
+            .map_err(|(item, _)| SendError(item))
+    }
+
+    /// Engine delivery preserving precise configured-resource failures.
+    pub async fn send_checked(&self, item: QueueItem) -> DataflowResult<()> {
+        self.send_inner(item).await.map_err(|(_, error)| error)
+    }
+
+    async fn send_inner(&self, item: QueueItem) -> Result<(), (QueueItem, DataflowError)> {
+        let admission = if let Some(budget) = &self.budget {
+            let bytes = message_bytes(&item) as usize;
+            if matches!(&item, QueueItem::Data(_)) && bytes > budget.max_batch_bytes {
+                return Err((
+                    item,
+                    DataFusionError::ResourcesExhausted(format!(
+                        "graph queue batch requires {bytes} bytes; max-batch-bytes is {}",
+                        budget.max_batch_bytes,
+                    ))
+                    .into(),
+                ));
+            }
+            let mut reservation = MemoryConsumer::new("Streamr graph queue message")
+                .register(&budget.runtime.memory_pool);
+            // Include the pending-send envelope before awaiting row capacity.
+            let Some(bytes) = queue_message_charge(bytes) else {
+                return Err((
+                    item,
+                    DataFusionError::ResourcesExhausted("graph queue message size overflow".into())
+                        .into(),
+                ));
+            };
+            if let Err(error) = reservation.try_grow(bytes) {
+                return Err((item, error.into()));
+            }
+            Some(QueueAdmission {
+                _reservation: reservation,
+                budget: budget.clone(),
+            })
+        } else {
+            None
+        };
         // Ensure that every message is sendable, even if it's bigger than our max size
-        let count = message_count(&item, self.size);
+        let count = if self.budget.is_some() {
+            match &item {
+                QueueItem::Data(batch) => u32::try_from(batch.num_rows())
+                    .unwrap_or(u32::MAX)
+                    .max(1)
+                    .min(self.size),
+                QueueItem::Signal(_) => 1,
+            }
+        } else {
+            message_count(&item, self.size)
+        };
         loop {
             if self.tx.is_closed() {
-                return Err(SendError(item));
+                return Err((item, queue_closed_error()));
             }
 
             let cur = self.queued_messages.load(Ordering::Acquire);
@@ -130,9 +271,72 @@ impl BatchSender {
                     Ordering::SeqCst,
                 ) {
                     Ok(_) => {
-                        self.queued_bytes
-                            .fetch_add(message_bytes(&item), Ordering::AcqRel);
-                        return self.tx.send(item);
+                        let bytes = message_bytes(&item);
+                        self.queued_bytes.fetch_add(bytes, Ordering::AcqRel);
+                        if let Some(admission) = &admission {
+                            admission.budget.messages.fetch_add(1, Ordering::AcqRel);
+                        }
+                        let mut queued = QueuedItem {
+                            item: Some(item),
+                            count,
+                            bytes,
+                            queued_messages: self.queued_messages.clone(),
+                            queued_bytes: self.queued_bytes.clone(),
+                            notify: self.notify.clone(),
+                            admission,
+                        };
+                        // Tokio 1.47.1 increments its unbounded message count
+                        // before publishing into the list. Receiver drop can
+                        // otherwise finish draining before that publication,
+                        // retaining the item until the last sender drops.
+                        // Serialize publication with our receiver close/drain.
+                        let _enqueue = match self.enqueue.lock() {
+                            Ok(guard) => guard,
+                            Err(_) => {
+                                return Err((
+                                    queued.item.take().unwrap(),
+                                    DataflowError::InternalOperatorError {
+                                        error: "graph queue enqueue mutex poisoned",
+                                        message: "message was not delivered".into(),
+                                    },
+                                ));
+                            }
+                        };
+                        #[cfg(test)]
+                        if let Some(pause) = &self.enqueue_pause {
+                            pause.entered.send(()).unwrap();
+                            // Dropping the test's release sender also resumes
+                            // this thread if an assertion unwinds the test.
+                            let _ = pause.resume.lock().unwrap().recv();
+                        }
+                        if let Some(budget) = &self.budget {
+                            let result = (|| {
+                                let mut metadata = budget.metadata.lock().map_err(|_| {
+                                    DataflowError::InternalOperatorError {
+                                        error: "graph queue budget mutex poisoned",
+                                        message: "cannot admit another message".into(),
+                                    }
+                                })?;
+                                let bytes =
+                                    queue_metadata_bytes(budget.messages.load(Ordering::Acquire))?;
+                                // Tokio may retain recycled blocks. Keep the
+                                // high-water charge until this queue is dropped.
+                                if bytes > metadata.size() {
+                                    metadata.try_resize(bytes)?;
+                                }
+                                Ok::<_, DataflowError>(metadata)
+                            })();
+                            let _metadata = match result {
+                                Ok(metadata) => metadata,
+                                Err(error) => return Err((queued.item.take().unwrap(), error)),
+                            };
+                            return self.tx.send(queued).map_err(|mut error| {
+                                (error.0.item.take().unwrap(), queue_closed_error())
+                            });
+                        }
+                        return self.tx.send(queued).map_err(|mut error| {
+                            (error.0.item.take().unwrap(), queue_closed_error())
+                        });
                     }
                     Err(_) => {
                         // try again
@@ -152,7 +356,10 @@ impl BatchSender {
 
                 // if not, we're now guaranteed to receive the notification if space is made
                 // available
-                notified.await;
+                tokio::select! {
+                    _ = notified => {},
+                    _ = self.tx.closed() => return Err((item, queue_closed_error())),
+                }
             }
         }
     }
@@ -172,32 +379,89 @@ impl BatchSender {
 }
 
 pub struct BatchReceiver {
-    size: u32,
-    rx: UnboundedReceiver<QueueItem>,
-    queued_messages: Arc<AtomicU32>,
-    queued_bytes: Arc<AtomicU64>,
-    notify: Arc<Notify>,
+    rx: UnboundedReceiver<QueuedItem>,
+    enqueue: Arc<Mutex<()>>,
+    // Retain both the metadata charge and runtime even after all senders exit.
+    _budget: Option<Arc<QueueBudget>>,
+    #[cfg(test)]
+    close_contended: Option<std::sync::mpsc::Sender<bool>>,
+}
+
+impl Drop for BatchReceiver {
+    fn drop(&mut self) {
+        // No publisher can be between Tokio's admission and list push while
+        // this guard is held. Closing prevents all later sends; every earlier
+        // publication is now available to try_recv, without a Busy list slot.
+        // QueuedItem::drop only updates atomics/notifies and takes neither this
+        // mutex nor the metadata mutex. Recover poison to finish teardown too.
+        #[cfg(test)]
+        if let Some(observation) = &self.close_contended {
+            let contended = matches!(
+                self.enqueue.try_lock(),
+                Err(std::sync::TryLockError::WouldBlock)
+            );
+            let _ = observation.send(contended);
+        }
+        let _enqueue = self
+            .enqueue
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        self.rx.close();
+        while let Ok(item) = self.rx.try_recv() {
+            drop(item);
+        }
+    }
 }
 
 impl BatchReceiver {
     pub async fn recv(&mut self) -> Option<QueueItem> {
-        let item = self.rx.recv().await;
-        if let Some(item) = &item {
-            let count = message_count(item, self.size);
-            self.queued_messages.fetch_sub(count, Ordering::SeqCst);
-            self.queued_bytes
-                .fetch_sub(message_bytes(item), Ordering::AcqRel);
-            self.notify.notify_waiters();
-        }
-        item
+        self.rx.recv().await?.item.take()
     }
 }
 
 pub fn batch_bounded(size: u32) -> (BatchSender, BatchReceiver) {
+    batch_bounded_inner(size, None)
+}
+
+/// Construct engine graph channels using an existing shared execution runtime.
+pub fn batch_bounded_accounted(
+    size: u32,
+    runtime: Arc<RuntimeEnv>,
+    max_batch_bytes: usize,
+) -> DataflowResult<(BatchSender, BatchReceiver)> {
+    if size == 0 || max_batch_bytes == 0 {
+        return Err(DataflowError::ArgumentError(
+            "accounted graph queues require positive row and batch limits".into(),
+        ));
+    }
+    let mut metadata =
+        MemoryConsumer::new("Streamr graph queue metadata").register(&runtime.memory_pool);
+    metadata.try_grow(queue_metadata_bytes(0)?)?;
+    let budget = Arc::new(QueueBudget {
+        runtime,
+        max_batch_bytes,
+        messages: AtomicUsize::new(0),
+        metadata: Mutex::new(metadata),
+    });
+    Ok(batch_bounded_inner(size, Some(budget)))
+}
+
+fn queue_closed_error() -> DataflowError {
+    DataflowError::InternalOperatorError {
+        error: "downstream graph queue closed",
+        message: "message was not delivered".into(),
+    }
+}
+
+fn batch_bounded_inner(
+    size: u32,
+    budget: Option<Arc<QueueBudget>>,
+) -> (BatchSender, BatchReceiver) {
     let (tx, rx) = unbounded_channel();
     let notify = Arc::new(Notify::new());
     let queued_messages = Arc::new(AtomicU32::new(0));
     let queued_bytes = Arc::new(AtomicU64::new(0));
+    let enqueue = Arc::new(Mutex::new(()));
     (
         BatchSender {
             size,
@@ -205,13 +469,17 @@ pub fn batch_bounded(size: u32) -> (BatchSender, BatchReceiver) {
             queued_messages: queued_messages.clone(),
             queued_bytes: queued_bytes.clone(),
             notify: notify.clone(),
+            enqueue: enqueue.clone(),
+            budget: budget.clone(),
+            #[cfg(test)]
+            enqueue_pause: None,
         },
         BatchReceiver {
-            size,
             rx,
-            notify,
-            queued_bytes,
-            queued_messages,
+            enqueue,
+            _budget: budget,
+            #[cfg(test)]
+            close_contended: None,
         },
     )
 }
@@ -264,7 +532,7 @@ impl SourceContext {
 
 pub struct SourceCollector {
     deserializer: Option<ArrowDeserializer>,
-    buffered_error: Option<DataflowError>,
+    buffered_error: Option<TaskError>,
     error_rate_limiter: RateLimiter,
     pub out_schema: Arc<ArroyoSchema>,
     pub(crate) collector: ArrowCollector,
@@ -409,30 +677,73 @@ impl SourceCollector {
         Ok(())
     }
 
+    // Completion must inspect a sticky failure without flushing buffered rows:
+    // Immediate shutdown deliberately does not deliver or wait on downstreams.
+    pub(crate) fn check_delivery_error(&self) -> Result<(), TaskError> {
+        match &self.buffered_error {
+            Some(error) => Err(error.clone()),
+            None => Ok(()),
+        }
+    }
+
+    pub(crate) fn delivery_error(&self, error: DataflowError) -> TaskError {
+        self.buffered_error.clone().unwrap_or_else(|| error.into())
+    }
+
+    async fn report_delivery_error(&mut self, error: &DataflowError) {
+        if self.buffered_error.is_none() {
+            let error = TaskError::from(error);
+            self.buffered_error = Some(error.clone());
+            // Report before returning: some connectors ignore a flush error
+            // and advance their local source checkpoint immediately afterward.
+            self.control_tx
+                .send(ControlResp::TaskFailed {
+                    task_id: self.task_info.operator_idx,
+                    subtask_idx: self.task_info.task_index,
+                    error,
+                })
+                .await
+                .ok();
+        }
+    }
+
     pub async fn flush_buffer(&mut self) -> DataflowResult<()> {
+        self.check_delivery_error()
+            .map_err(|error| DataflowError::InternalOperatorError {
+                error: "source delivery previously failed",
+                message: error.message,
+            })?;
         if let Some(deserializer) = self.deserializer.as_mut() {
             let (batch, errors) = deserializer.flush_buffer();
             if !errors.is_empty() {
                 self.collect_source_errors(errors).await?;
             }
 
-            if let Some(batch) = batch {
-                self.collector.collect(batch).await?;
+            if let Some(batch) = batch
+                && let Err(error) = self.collector.collect(batch).await
+            {
+                // The deserializer has consumed this batch. Remember the
+                // first failure even if a connector ignores the returned Err,
+                // so a later barrier/completion cannot certify lost rows.
+                self.report_delivery_error(&error).await;
+                return Err(error);
             }
-        }
-
-        if let Some(error) = self.buffered_error.take() {
-            return Err(error);
         }
 
         Ok(())
     }
 
+    pub(crate) async fn broadcast_checked(&mut self, message: SignalMessage) -> DataflowResult<()> {
+        self.flush_buffer().await?;
+        self.collector.broadcast_checked(message).await
+    }
+
     pub async fn broadcast(&mut self, message: SignalMessage) {
-        if let Err(e) = self.flush_buffer().await {
-            self.buffered_error.replace(e);
+        if let Err(error) = self.broadcast_checked(message).await {
+            // This compatibility API cannot return an error. Preserve/report
+            // the first typed failure and make completion/next flush fail too.
+            self.report_delivery_error(&error).await;
         }
-        self.collector.broadcast(message).await;
     }
 }
 
@@ -587,9 +898,8 @@ impl Collector for ArrowCollector {
 
             for (partition, batch) in partitions {
                 out_q[partition]
-                    .send(ArrowMessage::Data(batch))
-                    .await
-                    .unwrap();
+                    .send_checked(ArrowMessage::Data(batch))
+                    .await?;
 
                 self.tx_queue_rem_gauges[i][partition]
                     .iter()
@@ -609,9 +919,8 @@ impl Collector for ArrowCollector {
     }
 
     async fn broadcast_watermark(&mut self, watermark: Watermark) -> DataflowResult<()> {
-        self.broadcast(SignalMessage::Watermark(watermark)).await;
-
-        Ok(())
+        self.broadcast_checked(SignalMessage::Watermark(watermark))
+            .await
     }
 }
 
@@ -660,20 +969,26 @@ impl ArrowCollector {
         }
     }
 
-    pub async fn broadcast(&mut self, message: SignalMessage) {
+    pub(crate) async fn broadcast_checked(&mut self, message: SignalMessage) -> DataflowResult<()> {
         trace!("[{}] Broadcast {:?}", self.chain_info, message);
         for out_node in &self.out_qs {
             for q in out_node {
-                q.send(ArrowMessage::Signal(message.clone()))
-                    .await
-                    .unwrap_or_else(|e| {
-                        panic!(
-                            "failed to broadcast message <{:?}> for operator {}: {}",
-                            message, self.chain_info, e
-                        )
-                    });
+                q.send_checked(ArrowMessage::Signal(message.clone()))
+                    .await?;
             }
         }
+        Ok(())
+    }
+
+    pub async fn broadcast(&mut self, message: SignalMessage) {
+        self.broadcast_checked(message)
+            .await
+            .unwrap_or_else(|error| {
+                panic!(
+                    "failed to broadcast message for operator {}: {}",
+                    self.chain_info, error
+                )
+            });
     }
 }
 
@@ -879,6 +1194,743 @@ mod tests {
         rx.recv().await.unwrap();
 
         assert_eq!(tx.capacity(), 8);
+    }
+
+    fn queue_batch() -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, false)])),
+            vec![Arc::new(Int64Array::from(vec![1, 2, 3, 4]))],
+        )
+        .unwrap()
+    }
+
+    fn queue_runtime(bytes: usize) -> Arc<RuntimeEnv> {
+        use datafusion::execution::disk_manager::{DiskManagerBuilder, DiskManagerMode};
+        use datafusion::execution::memory_pool::FairSpillPool;
+        use datafusion::execution::runtime_env::RuntimeEnvBuilder;
+        RuntimeEnvBuilder::new()
+            .with_memory_pool(Arc::new(FairSpillPool::new(bytes)))
+            .with_disk_manager_builder(
+                DiskManagerBuilder::default().with_mode(DiskManagerMode::Disabled),
+            )
+            .build_arc()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn accounted_queues_share_memory_and_failed_admission_rolls_back() {
+        let bytes = queue_batch().get_array_memory_size();
+        let charge = queue_message_charge(bytes).unwrap();
+        let empty_metadata = queue_metadata_bytes(0).unwrap();
+        let used_metadata = queue_metadata_bytes(1).unwrap();
+        let runtime = queue_runtime(2 * used_metadata + charge);
+        let pool = runtime.memory_pool.clone();
+        let (first, mut first_rx) = batch_bounded_accounted(4, runtime.clone(), bytes).unwrap();
+        let (second, mut second_rx) = batch_bounded_accounted(4, runtime.clone(), bytes).unwrap();
+        first
+            .send_checked(ArrowMessage::Data(queue_batch()))
+            .await
+            .unwrap();
+        let error = second
+            .send_checked(ArrowMessage::Data(queue_batch()))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            DataflowError::DataFusionError(DataFusionError::ResourcesExhausted(_))
+        ));
+        assert_eq!(second.capacity(), 4);
+        assert_eq!(second.queued_bytes(), 0);
+        assert_eq!(pool.reserved(), used_metadata + empty_metadata + charge);
+        drop(first_rx.recv().await.unwrap());
+        assert_eq!(pool.reserved(), used_metadata + empty_metadata);
+        second
+            .send_checked(ArrowMessage::Data(queue_batch()))
+            .await
+            .unwrap();
+        assert_eq!(pool.reserved(), 2 * used_metadata + charge);
+        drop(second_rx.recv().await.unwrap());
+        drop((first, first_rx, second, second_rx, runtime));
+        assert_eq!(pool.reserved(), 0);
+    }
+
+    #[tokio::test]
+    async fn accounted_empty_batches_backpressure_and_pending_send_remains_charged() {
+        let empty = queue_batch().slice(0, 0);
+        let bytes = empty.get_array_memory_size();
+        let charge = queue_message_charge(bytes).unwrap();
+        let runtime = queue_runtime(queue_metadata_bytes(1).unwrap() + 2 * charge);
+        let pool = runtime.memory_pool.clone();
+        let (tx, mut rx) = batch_bounded_accounted(1, runtime, bytes).unwrap();
+        tx.send_checked(ArrowMessage::Data(empty.clone()))
+            .await
+            .unwrap();
+        let mut blocked = Box::pin(tx.send_checked(ArrowMessage::Data(empty)));
+        assert!(futures::poll!(&mut blocked).is_pending());
+        assert_eq!(tx.capacity(), 0);
+        assert_eq!(
+            pool.reserved(),
+            queue_metadata_bytes(1).unwrap() + 2 * charge
+        );
+        drop(rx.recv().await.unwrap());
+        blocked.await.unwrap();
+        assert_eq!(pool.reserved(), queue_metadata_bytes(1).unwrap() + charge);
+        drop(rx);
+        assert_eq!(tx.queued_bytes(), 0);
+        assert_eq!(tx.capacity(), 1);
+        assert_eq!(pool.reserved(), queue_metadata_bytes(1).unwrap());
+        drop(tx);
+        assert_eq!(pool.reserved(), 0);
+    }
+
+    #[tokio::test]
+    async fn accounted_metadata_tracks_actual_peak_and_pins_runtime_until_receiver_drop() {
+        let runtime = queue_runtime(1024 * 1024);
+        let pool = runtime.memory_pool.clone();
+        let weak_runtime = Arc::downgrade(&runtime);
+        // A large row capacity does not prepay a million message envelopes.
+        let (tx, mut rx) = batch_bounded_accounted(1_000_000, runtime, 1024).unwrap();
+        assert_eq!(pool.reserved(), queue_metadata_bytes(0).unwrap());
+        for _ in 0..3 {
+            for _ in 0..70 {
+                tx.send_checked(ArrowMessage::Signal(SignalMessage::Watermark(
+                    Watermark::Idle,
+                )))
+                .await
+                .unwrap();
+            }
+            for _ in 0..70 {
+                drop(rx.recv().await.unwrap());
+            }
+            assert_eq!(pool.reserved(), queue_metadata_bytes(70).unwrap());
+        }
+        drop(tx);
+        assert!(weak_runtime.upgrade().is_some());
+        assert_eq!(pool.reserved(), queue_metadata_bytes(70).unwrap());
+        drop(rx);
+        assert!(weak_runtime.upgrade().is_none());
+        assert_eq!(pool.reserved(), 0);
+    }
+
+    #[test]
+    fn accounted_queue_construction_failure_releases_metadata_reservation() {
+        let runtime = queue_runtime(queue_metadata_bytes(0).unwrap() - 1);
+        assert!(matches!(
+            batch_bounded_accounted(4, runtime.clone(), 1024),
+            Err(DataflowError::DataFusionError(
+                DataFusionError::ResourcesExhausted(_)
+            ))
+        ));
+        assert_eq!(runtime.memory_pool.reserved(), 0);
+    }
+
+    #[tokio::test]
+    async fn collector_preserves_accounted_queue_limit_error() {
+        let input = queue_batch();
+        let bytes = input.get_array_memory_size();
+        let runtime = queue_runtime(1024 * 1024);
+        let (tx, rx) = batch_bounded_accounted(8, runtime.clone(), bytes - 1).unwrap();
+        let mut collector = ArrowCollector::new(
+            Arc::new(ChainInfo {
+                job_id: "accounted-queue-limit".into(),
+                task_id: 1,
+                description: "accounted queue limit".into(),
+                task_index: 0,
+            }),
+            Some(Arc::new(ArroyoSchema::new_unkeyed(input.schema(), 0))),
+            vec![vec![tx.clone()]],
+        );
+        let error = collector.collect(input).await.unwrap_err();
+        assert!(matches!(
+            &error,
+            DataflowError::DataFusionError(DataFusionError::ResourcesExhausted(_))
+        ));
+        assert!(error.to_string().contains("graph queue batch requires"));
+        assert_eq!(tx.queued_bytes(), 0);
+        drop((collector, tx, rx));
+        assert_eq!(runtime.memory_pool.reserved(), 0);
+    }
+
+    #[tokio::test]
+    async fn collector_signal_metadata_exhaustion_preserves_error_and_no_barrier_delivery() {
+        let message = SignalMessage::Watermark(Watermark::Idle);
+        let charge = queue_message_charge(size_of_val(&message)).unwrap();
+        // The payload fits exactly, but the first live block growth does not.
+        let runtime = queue_runtime(queue_metadata_bytes(0).unwrap() + charge);
+        let (tx, mut rx) = batch_bounded_accounted(8, runtime.clone(), 1024).unwrap();
+        let mut collector = ArrowCollector::new(
+            Arc::new(ChainInfo {
+                job_id: "signal-admission".into(),
+                task_id: 92,
+                description: "signal admission".into(),
+                task_index: 3,
+            }),
+            None,
+            vec![vec![tx.clone()]],
+        );
+        let error = collector
+            .broadcast_watermark(Watermark::Idle)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            DataflowError::DataFusionError(DataFusionError::ResourcesExhausted(_))
+        ));
+        assert_eq!(tx.capacity(), 8);
+        assert_eq!(tx.queued_bytes(), 0);
+        assert_eq!(
+            runtime.memory_pool.reserved(),
+            queue_metadata_bytes(0).unwrap()
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), rx.recv())
+                .await
+                .is_err()
+        );
+        drop((collector, tx, rx));
+        assert_eq!(runtime.memory_pool.reserved(), 0);
+    }
+
+    #[tokio::test]
+    async fn source_barrier_admission_reports_typed_failure_and_completion_stays_failed() {
+        let signal = SignalMessage::Barrier(arroyo_types::CheckpointBarrier {
+            epoch: 4,
+            min_epoch: 1,
+            timestamp: SystemTime::UNIX_EPOCH,
+            then_stop: true,
+        });
+        let runtime = queue_runtime(
+            queue_metadata_bytes(0).unwrap() + queue_message_charge(size_of_val(&signal)).unwrap(),
+        );
+        let (tx, mut rx) = batch_bounded_accounted(8, runtime.clone(), 1024).unwrap();
+        let collector = ArrowCollector::new(
+            Arc::new(ChainInfo {
+                job_id: "source-signal-admission".into(),
+                task_id: 93,
+                description: "source signal admission".into(),
+                task_index: 2,
+            }),
+            None,
+            vec![vec![tx.clone()]],
+        );
+        let task = Arc::new(TaskInfo {
+            job_id: "source-signal-admission".into(),
+            operator_idx: 93,
+            operator_name: "test".into(),
+            operator_id: "test-source".into(),
+            task_index: 2,
+            parallelism: 1,
+            key_range: 0..=u64::MAX,
+            checkpoint_file_path_layout: Default::default(),
+        });
+        let schema = Arc::new(ArroyoSchema::new_unkeyed(queue_batch().schema(), 0));
+        let (control, mut events) = tokio::sync::mpsc::channel(4);
+        let mut source = SourceCollector::new(schema, collector, control, &task);
+        source.broadcast(signal).await;
+        let ControlResp::TaskFailed {
+            task_id,
+            subtask_idx,
+            error,
+        } = events.recv().await.unwrap()
+        else {
+            panic!("expected task failure");
+        };
+        assert_eq!((task_id, subtask_idx), (93, 2));
+        assert!(
+            error.message.contains("Streamr graph queue metadata"),
+            "{}",
+            error.message
+        );
+        assert_eq!(error.domain, arroyo_rpc::errors::ErrorDomain::External);
+        // A connector that observes/ignores one flush failure still cannot make
+        // the operator's completion flush pass and report TaskFinished.
+        assert!(source.flush_buffer().await.is_err());
+        assert!(source.flush_buffer().await.is_err());
+        assert!(events.try_recv().is_err());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), rx.recv())
+                .await
+                .is_err()
+        );
+        drop((source, tx, rx));
+        assert_eq!(runtime.memory_pool.reserved(), 0);
+    }
+
+    struct BufferedFinishSource {
+        finish: Option<crate::SourceFinishType>,
+        failure: Option<tokio::sync::oneshot::Sender<TaskError>>,
+        checkpoint_after_failure: bool,
+        propagate_second_failure: bool,
+    }
+
+    #[async_trait]
+    impl crate::operator::SourceOperator for BufferedFinishSource {
+        fn name(&self) -> String {
+            "buffered-finish-test".into()
+        }
+
+        async fn run(
+            &mut self,
+            ctx: &mut SourceContext,
+            collector: &mut SourceCollector,
+        ) -> DataflowResult<crate::SourceFinishType> {
+            collector.initialize_deserializer(Format::Json(Default::default()), None, None, &[]);
+            let input =
+                serde_json::to_vec(&serde_json::json!({"value": "x".repeat(8192)})).unwrap();
+            collector
+                .deserialize_slice(&input, SystemTime::UNIX_EPOCH, None)
+                .await?;
+            if let Some(first_error) = self.failure.take() {
+                let error = collector.flush_buffer().await.unwrap_err();
+                assert!(matches!(
+                    &error,
+                    DataflowError::DataFusionError(DataFusionError::ResourcesExhausted(_))
+                ));
+                first_error.send(TaskError::from(&error)).unwrap();
+                // Match existing connectors that ignore this first failure and
+                // attempt their normal checkpoint/then-stop path afterward.
+                if self.checkpoint_after_failure {
+                    assert!(
+                        self.start_checkpoint(source_test_barrier(), ctx, collector)
+                            .await
+                    );
+                }
+                if self.propagate_second_failure {
+                    collector.flush_buffer().await?;
+                }
+            }
+            Ok(self.finish.take().unwrap())
+        }
+    }
+
+    fn source_test_barrier() -> CheckpointBarrier {
+        CheckpointBarrier {
+            epoch: 4,
+            min_epoch: 1,
+            timestamp: SystemTime::UNIX_EPOCH,
+            then_stop: true,
+        }
+    }
+
+    fn source_test_schema() -> Arc<ArroyoSchema> {
+        Arc::new(ArroyoSchema::new_unkeyed(
+            Arc::new(Schema::new(vec![
+                Field::new("value", DataType::Utf8, false),
+                Field::new(
+                    "_timestamp",
+                    DataType::Timestamp(TimeUnit::Nanosecond, None),
+                    false,
+                ),
+            ])),
+            1,
+        ))
+    }
+
+    async fn start_buffered_test_source(
+        source: BufferedFinishSource,
+        tx: BatchSender,
+    ) -> Vec<ControlResp> {
+        use crate::operator::{OperatorNode, SourceNode};
+        static NEXT_JOB: AtomicUsize = AtomicUsize::new(0);
+        let task = Arc::new(TaskInfo {
+            job_id: format!(
+                "source-finish-{}-{}",
+                std::process::id(),
+                NEXT_JOB.fetch_add(1, Ordering::Relaxed)
+            ),
+            operator_idx: 94,
+            operator_name: "buffered-finish-test".into(),
+            operator_id: "source".into(),
+            task_index: 0,
+            parallelism: 1,
+            key_range: 0..=u64::MAX,
+            checkpoint_file_path_layout: Default::default(),
+        });
+        let schema = source_test_schema();
+        let (control, mut events) = tokio::sync::mpsc::channel(32);
+        let context = OperatorContext::new(
+            task,
+            None,
+            control.clone(),
+            0,
+            vec![],
+            Some(schema.clone()),
+            HashMap::new(),
+        )
+        .await;
+        let node = Box::new(OperatorNode::Source(SourceNode {
+            operator: Box::new(source),
+            context,
+        }));
+        let (_commands, command_rx) = tokio::sync::mpsc::channel(1);
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            node.start(
+                control,
+                command_rx,
+                vec![],
+                vec![vec![tx]],
+                Some(schema),
+                Arc::new(tokio::sync::Barrier::new(1)),
+            ),
+        )
+        .await
+        .expect("source completion must not wait for a full downstream on Immediate");
+        let mut observed = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            observed.push(event);
+        }
+        observed
+    }
+
+    #[tokio::test]
+    async fn immediate_source_completion_does_not_flush_buffered_rows_or_wait_for_downstream() {
+        for full in [false, true] {
+            let (tx, mut rx) = batch_bounded(1);
+            let sentinel = ArrowMessage::Signal(SignalMessage::Watermark(Watermark::Idle));
+            if full {
+                tx.send(sentinel.clone()).await.unwrap();
+            }
+            let bytes_before = tx.queued_bytes();
+            let events = start_buffered_test_source(
+                BufferedFinishSource {
+                    finish: Some(crate::SourceFinishType::Immediate),
+                    failure: None,
+                    checkpoint_after_failure: false,
+                    propagate_second_failure: false,
+                },
+                tx.clone(),
+            )
+            .await;
+            assert_eq!(tx.queued_bytes(), bytes_before);
+            assert!(matches!(
+                events.first(),
+                Some(ControlResp::TaskStarted { .. })
+            ));
+            assert!(matches!(
+                events.last(),
+                Some(ControlResp::TaskFinished { .. })
+            ));
+            assert!(
+                !events
+                    .iter()
+                    .any(|e| matches!(e, ControlResp::TaskFailed { .. }))
+            );
+            if full {
+                assert_eq!(rx.recv().await, Some(sentinel));
+            }
+            assert!(futures::poll!(Box::pin(rx.recv())).is_pending());
+        }
+    }
+
+    #[tokio::test]
+    async fn graceful_and_final_source_completion_flush_rows_before_terminal_signal() {
+        for (finish, expected_signal) in [
+            (crate::SourceFinishType::Graceful, SignalMessage::Stop),
+            (crate::SourceFinishType::Final, SignalMessage::EndOfData),
+        ] {
+            let (tx, mut rx) = batch_bounded(8);
+            let events = start_buffered_test_source(
+                BufferedFinishSource {
+                    finish: Some(finish),
+                    failure: None,
+                    checkpoint_after_failure: false,
+                    propagate_second_failure: false,
+                },
+                tx.clone(),
+            )
+            .await;
+            assert!(matches!(
+                events.last(),
+                Some(ControlResp::TaskFinished { .. })
+            ));
+            assert!(
+                !events
+                    .iter()
+                    .any(|e| matches!(e, ControlResp::TaskFailed { .. }))
+            );
+            let Some(ArrowMessage::Data(batch)) = rx.recv().await else {
+                panic!("buffered rows must precede the terminal signal");
+            };
+            assert_eq!(batch.num_rows(), 1);
+            assert_eq!(batch.schema(), source_test_schema().schema);
+            assert_eq!(
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<arrow::array::StringArray>()
+                    .unwrap()
+                    .value(0),
+                "x".repeat(8192)
+            );
+            assert_eq!(
+                batch
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<TimestampNanosecondArray>()
+                    .unwrap()
+                    .value(0),
+                0
+            );
+            assert_eq!(rx.recv().await, Some(ArrowMessage::Signal(expected_signal)));
+            assert!(futures::poll!(Box::pin(rx.recv())).is_pending());
+        }
+    }
+
+    #[tokio::test]
+    async fn ignored_buffered_delivery_failure_blocks_checkpoint_and_immediate_success() {
+        for (checkpoint, propagate_second_failure) in [(false, false), (true, false), (false, true)]
+        {
+            let signal = SignalMessage::Barrier(source_test_barrier());
+            // This pool can admit a barrier, including the first channel block,
+            // but not the actual buffered 8192-byte string batch. The batch cap
+            // itself remains permissive so this exercises shared-pool failure.
+            let runtime = queue_runtime(
+                queue_metadata_bytes(1).unwrap()
+                    + queue_message_charge(size_of_val(&signal)).unwrap(),
+            );
+            let (tx, mut rx) = batch_bounded_accounted(8, runtime.clone(), 1024 * 1024).unwrap();
+            tx.send_checked(ArrowMessage::Signal(signal.clone()))
+                .await
+                .unwrap();
+            assert_eq!(rx.recv().await, Some(ArrowMessage::Signal(signal)));
+            let (first_error, expected_error) = tokio::sync::oneshot::channel();
+            let events = start_buffered_test_source(
+                BufferedFinishSource {
+                    finish: Some(crate::SourceFinishType::Immediate),
+                    failure: Some(first_error),
+                    checkpoint_after_failure: checkpoint,
+                    propagate_second_failure,
+                },
+                tx.clone(),
+            )
+            .await;
+            let expected = expected_error.await.unwrap();
+            assert_eq!(expected.domain, arroyo_rpc::errors::ErrorDomain::External);
+            assert_eq!(
+                expected.retry_hint,
+                arroyo_rpc::errors::RetryHint::WithBackoff
+            );
+            assert!(expected.message.contains("Streamr graph queue message"));
+            assert!(matches!(
+                events.first(),
+                Some(ControlResp::TaskStarted { .. })
+            ));
+            assert!(matches!(
+                events.get(1),
+                Some(ControlResp::TaskFailed { .. })
+            ));
+            assert!(matches!(
+                events.last(),
+                Some(ControlResp::TaskFailed { .. })
+            ));
+            let failures: Vec<_> = events
+                .iter()
+                .filter_map(|event| match event {
+                    ControlResp::TaskFailed { error, .. } => Some(error),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                failures.len(),
+                2,
+                "first admission failure and terminal failure only"
+            );
+            for error in failures {
+                assert_eq!(error.message, expected.message);
+                assert_eq!(error.domain, expected.domain);
+                assert_eq!(error.retry_hint, expected.retry_hint);
+                assert_eq!(error.operator_id, expected.operator_id);
+                assert_eq!(error.details, expected.details);
+            }
+            assert!(
+                !events
+                    .iter()
+                    .any(|e| matches!(e, ControlResp::TaskFinished { .. }))
+            );
+            if checkpoint {
+                assert!(events.iter().skip(2).any(|event| matches!(
+                    event,
+                    ControlResp::CheckpointEvent(event)
+                        if event.event_type == TaskCheckpointEventType::FinishedSync
+                )));
+            }
+            assert_eq!(tx.queued_bytes(), 0);
+            assert!(futures::poll!(Box::pin(rx.recv())).is_pending());
+            drop((tx, rx));
+            assert_eq!(runtime.memory_pool.reserved(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn receiver_cancellation_wakes_blocked_senders_and_releases_queued_arrays() {
+        let (tx, rx) = batch_bounded(4);
+        let queued = queue_batch();
+        let held_array = Arc::downgrade(queued.column(0));
+        let bytes = queued.get_array_memory_size() as u64;
+        tx.send(ArrowMessage::Data(queued)).await.unwrap();
+        let other = tx.clone();
+        let mut first = Box::pin(tx.send(ArrowMessage::Data(queue_batch())));
+        let mut second = Box::pin(other.send(ArrowMessage::Data(queue_batch())));
+        assert!(futures::poll!(&mut first).is_pending());
+        assert!(futures::poll!(&mut second).is_pending());
+        assert_eq!(tx.queued_bytes(), bytes);
+        assert_eq!(tx.capacity(), 0);
+        assert!(held_array.upgrade().is_some());
+
+        drop(rx);
+        let (first, second) =
+            tokio::time::timeout(Duration::from_secs(1), futures::future::join(first, second))
+                .await
+                .expect("receiver cancellation must wake every blocked sender");
+        assert!(first.is_err());
+        assert!(second.is_err());
+        assert!(held_array.upgrade().is_none());
+        assert_eq!(tx.queued_bytes(), 0);
+        assert_eq!(tx.capacity(), 4);
+    }
+
+    #[tokio::test]
+    async fn cancelling_blocked_send_preserves_queued_owner_and_releases_unsent_array() {
+        let (tx, mut rx) = batch_bounded(4);
+        let queued = queue_batch();
+        let queued_array = Arc::downgrade(queued.column(0));
+        let bytes = queued.get_array_memory_size() as u64;
+        tx.send(ArrowMessage::Data(queued)).await.unwrap();
+        let unsent = queue_batch();
+        let unsent_array = Arc::downgrade(unsent.column(0));
+        let mut blocked = Box::pin(tx.send(ArrowMessage::Data(unsent)));
+        assert!(futures::poll!(&mut blocked).is_pending());
+        drop(blocked);
+        assert!(unsent_array.upgrade().is_none());
+        assert!(queued_array.upgrade().is_some());
+        assert_eq!(tx.queued_bytes(), bytes);
+        assert_eq!(tx.capacity(), 0);
+
+        let received = rx.recv().await.unwrap();
+        assert_eq!(tx.queued_bytes(), 0);
+        assert_eq!(tx.capacity(), 4);
+        assert!(queued_array.upgrade().is_some());
+        drop(received);
+        assert!(queued_array.upgrade().is_none());
+        tx.send(ArrowMessage::Data(queue_batch())).await.unwrap();
+        drop(rx);
+        assert_eq!(tx.queued_bytes(), 0);
+        assert_eq!(tx.capacity(), 4);
+    }
+
+    #[test]
+    fn receiver_teardown_waits_for_paused_publication_then_releases_queued_array() {
+        for accounted in [false, true] {
+            let runtime = queue_runtime(1024 * 1024);
+            let (mut tx, mut rx) = if accounted {
+                batch_bounded_accounted(4, runtime.clone(), 1024 * 1024).unwrap()
+            } else {
+                batch_bounded(4)
+            };
+            let queued = queue_batch();
+            let held_array = Arc::downgrade(queued.column(0));
+            let bytes = queued.get_array_memory_size() as u64;
+            let (entered, entered_rx) = std::sync::mpsc::channel();
+            let (resume, resume_rx) = std::sync::mpsc::channel();
+            let (contended, contended_rx) = std::sync::mpsc::channel();
+            tx.enqueue_pause = Some(Arc::new(EnqueuePause {
+                entered,
+                resume: Mutex::new(resume_rx),
+            }));
+            rx.close_contended = Some(contended);
+            let sender = tx.clone();
+            let publication = std::thread::spawn(move || {
+                drop(futures::executor::block_on(
+                    sender.send(ArrowMessage::Data(queued)),
+                ));
+            });
+            entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            let teardown = std::thread::spawn(move || drop(rx));
+            // Receiver teardown has reached the publication gate while the
+            // actual production send holds it, before calling Tokio send.
+            let observed_contention = contended_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            let remained_open = !tx.tx.is_closed();
+            let retained = held_array.upgrade().is_some();
+            let queued_bytes = tx.queued_bytes();
+            resume.send(()).unwrap();
+            publication.join().unwrap();
+            teardown.join().unwrap();
+            assert!(observed_contention);
+            assert!(remained_open);
+            assert!(retained);
+            assert_eq!(queued_bytes, bytes);
+            // Both threads have finished, but the original sender is still
+            // alive. Cleanup must not depend on dropping its Tokio channel.
+            assert!(held_array.upgrade().is_none());
+            assert_eq!(tx.queued_bytes(), 0);
+            assert_eq!(tx.capacity(), 4);
+            if let Some(budget) = &tx.budget {
+                assert_eq!(budget.messages.load(Ordering::Acquire), 0);
+                assert_eq!(
+                    runtime.memory_pool.reserved(),
+                    budget.metadata.lock().unwrap().size()
+                );
+            } else {
+                assert_eq!(runtime.memory_pool.reserved(), 0);
+            }
+            drop(tx);
+            assert_eq!(runtime.memory_pool.reserved(), 0);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn receiver_close_racing_with_delivery_does_not_leak_queue_charges() {
+        for accounted in [false, true] {
+            for iteration in 0..64 {
+                let runtime = queue_runtime(1024 * 1024);
+                let (tx, rx) = if accounted {
+                    batch_bounded_accounted(4, runtime.clone(), 1024 * 1024).unwrap()
+                } else {
+                    batch_bounded(4)
+                };
+                let queued = queue_batch();
+                let held_array = Arc::downgrade(queued.column(0));
+                let barrier = Arc::new(tokio::sync::Barrier::new(2));
+                let sender_barrier = barrier.clone();
+                let sender = tx.clone();
+                let delivery = tokio::spawn(async move {
+                    sender_barrier.wait().await;
+                    // Either delivery before closure or rejection is valid.
+                    // Consume SendError's original message before task return.
+                    drop(sender.send(ArrowMessage::Data(queued)).await);
+                });
+                barrier.wait().await;
+                drop(rx);
+                tokio::time::timeout(Duration::from_secs(1), delivery)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                // Keep the original sender alive: Tokio's last-sender cleanup
+                // must not conceal a message published after receiver teardown.
+                assert!(
+                    held_array.upgrade().is_none(),
+                    "accounted={accounted} iteration={iteration} retained={} queued_bytes={} capacity={}",
+                    held_array.strong_count(),
+                    tx.queued_bytes(),
+                    tx.capacity()
+                );
+                assert_eq!(tx.queued_bytes(), 0);
+                assert_eq!(tx.capacity(), 4);
+                if let Some(budget) = &tx.budget {
+                    assert_eq!(budget.messages.load(Ordering::Acquire), 0);
+                    // Only channel metadata may remain with the live sender.
+                    assert_eq!(
+                        runtime.memory_pool.reserved(),
+                        budget.metadata.lock().unwrap().size()
+                    );
+                } else {
+                    assert_eq!(runtime.memory_pool.reserved(), 0);
+                }
+                drop(tx);
+                assert_eq!(runtime.memory_pool.reserved(), 0);
+            }
+        }
     }
 
     #[tokio::test]

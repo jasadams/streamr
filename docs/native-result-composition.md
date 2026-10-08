@@ -444,10 +444,11 @@ prerequisite for repairing that engine support.
 
 Closed HOP windows emit nonempty results; an absent empty window is not an
 explicit zero, update or delete. Composition must define how expiry changes a
-current rolling result without a new input event. First creation emitted
-immediately, subsequent first-pending coalescing, and comparison with the last
-emitted snapshot also require precise generic output contracts. An aligned
-TUMBLE or an aggregate flush interval does not establish those behaviors.
+current rolling result without a new input event. Comparison with the last
+emitted snapshot remains required. The original application's immediate-first
+and first-pending coalescing policy is deferred post-MVP in STR-44; milestone 3
+retains Arroyo's periodic flushing and records the timing difference. An aligned
+TUMBLE or an aggregate flush interval does not establish the deferred policy.
 
 These findings remain STR-29 work. They do not authorize application-specific
 operators, callbacks or output policies in Streamr. See the

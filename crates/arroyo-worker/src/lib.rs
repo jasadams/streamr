@@ -1,7 +1,7 @@
 // TODO: factor out complex types
 #![allow(clippy::type_complexity)]
 
-use crate::engine::{Engine, Program, SubtaskNode};
+use crate::engine::{Engine, Program, RunningEngine, SubtaskNode};
 use crate::job_controller::{
     CheckpointHistory, RetireWorkerLeader, RunningMessage, TaskFailedEvent, WorkerContext,
 };
@@ -151,6 +151,8 @@ impl Display for WorkerExecutionPhase {
 }
 
 struct EngineState {
+    // Keep the network task owner alive through both waiting and running phases.
+    _running_engine: RunningEngine,
     sources: Vec<Sender<ControlMessage>>,
     sinks: Vec<Sender<ControlMessage>>,
     operator_to_node: HashMap<String, u32>,
@@ -440,6 +442,7 @@ impl WorkerState {
         let operator_to_node = engine.operator_to_node();
 
         let engine_state = EngineState {
+            _running_engine: engine,
             sources,
             sinks,
             operator_to_node,
@@ -1045,7 +1048,22 @@ impl WorkerGrpc for WorkerServer {
         &self,
         _request: Request<JobFinishedReq>,
     ) -> Result<Response<JobFinishedResp>, Status> {
-        let is_worker_leader = self.state.job_controller_tx.get().is_some();
+        if self.state.job_controller_tx.get().is_some() {
+            // The engine-state guard shares the worker cancellation token, and
+            // dropping RunningEngine aborts its guarded network listener. Keep
+            // both alive until the controller observes the terminal job status
+            // and explicitly stops this worker. Operator tasks release their
+            // state on completion; bounded graph/network metadata stays owned
+            // by the running phase during this terminal handshake.
+            info!(
+                message =
+                    "job finished on worker leader; waiting for controller to stop worker process",
+                worker_id = self.state.worker_context.worker_id.0,
+                job_id = *self.state.worker_context.job_id,
+                generation = self.state.worker_context.generation,
+            );
+            return Ok(Response::new(JobFinishedResp {}));
+        }
 
         let mut phase = self.state.phase.lock().unwrap();
         if let WorkerExecutionPhase::Running(engine_state) = &*phase {
@@ -1054,23 +1072,11 @@ impl WorkerGrpc for WorkerServer {
         *phase = WorkerExecutionPhase::Idle;
         drop(phase);
 
-        if is_worker_leader {
-            // Keep the worker leader reachable so the controller can observe the
-            // terminal job status before explicitly stopping the worker process.
-            info!(
-                message =
-                    "job finished on worker leader; waiting for controller to stop worker process",
-                worker_id = self.state.worker_context.worker_id.0,
-                job_id = *self.state.worker_context.job_id,
-                generation = self.state.worker_context.generation,
-            );
-        } else {
-            let token = self.shutdown_guard.token();
-            tokio::task::spawn(async move {
-                tokio::time::sleep(Duration::from_secs(1)).await;
-                token.cancel();
-            });
-        }
+        let token = self.shutdown_guard.token();
+        tokio::task::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            token.cancel();
+        });
 
         Ok(Response::new(JobFinishedResp {}))
     }
@@ -1443,5 +1449,394 @@ impl JobStatusGrpc for LeaderServer {
             .await?;
 
         Ok(Response::new(StopJobResp {}))
+    }
+}
+
+#[cfg(test)]
+mod engine_lifetime_tests {
+    use super::*;
+    use arroyo_operator::context::batch_bounded_accounted;
+    use arroyo_server_common::shutdown::{Shutdown, SignalBehavior};
+    use datafusion::execution::memory_pool::FairSpillPool;
+    use datafusion::execution::runtime_env::RuntimeEnvBuilder;
+    use petgraph::graph::DiGraph;
+    use std::sync::RwLock;
+    use tokio::net::TcpStream;
+    use tokio::sync::oneshot;
+    use tokio::time::timeout;
+
+    #[tokio::test]
+    async fn initialized_worker_retains_network_and_control_until_phase_teardown() {
+        let shutdown = Shutdown::new("engine-lifetime-test", SignalBehavior::None);
+        let token = shutdown.token();
+        let (control_tx, control_rx) = channel(4);
+        let mut network = NetworkManager::new(0).await.unwrap();
+        let port = network
+            .open_listener(shutdown.guard("network-manager"))
+            .await;
+        let program = Program {
+            graph: Arc::new(RwLock::new(DiGraph::new())),
+            control_tx: Some(control_tx.clone()),
+        };
+        let context = WorkerContext {
+            machine_id: MachineId(Arc::new("test-machine".into())),
+            worker_id: WorkerId(100),
+            pipeline_id: PipelineId(Arc::new("test-pipeline".into())),
+            job_id: JobId(Arc::new("test-job".into())),
+            generation: 1,
+        };
+
+        // Exercise the actual engine/listener ownership transfer at the end of
+        // initialization. An empty graph isolates this lifecycle from SQL and
+        // connector setup; the listener and control receiver are real tasks.
+        let mut phase = {
+            let engine = Engine::new(program, context, network, Vec::new())
+                .start()
+                .await;
+            let state = EngineState {
+                sources: engine.source_controls(),
+                sinks: engine.sink_controls(),
+                operator_to_node: engine.operator_to_node(),
+                operator_controls: engine.operator_controls(),
+                _running_engine: engine,
+                shutdown_guard: shutdown.guard("engine-state"),
+            };
+            WorkerExecutionPhase::WaitingOnLeader {
+                control_rx,
+                engine_state: state,
+                job_controller_addr: "http://127.0.0.1:1".into(),
+            }
+        };
+        tokio::task::yield_now().await;
+        assert!(!token.is_cancelled(), "initialization cancelled the worker");
+        let first_connection = timeout(
+            Duration::from_secs(1),
+            TcpStream::connect(("127.0.0.1", port)),
+        )
+        .await
+        .unwrap()
+        .expect("listener must survive initialization");
+        drop(first_connection);
+
+        // Use the same owning phase move as job_controller_init, then the same
+        // guarded control-task lifetime used by production initialization.
+        let previous = mem::replace(&mut phase, WorkerExecutionPhase::Idle);
+        let WorkerExecutionPhase::WaitingOnLeader {
+            mut control_rx,
+            engine_state,
+            ..
+        } = previous
+        else {
+            panic!("expected waiting phase");
+        };
+        phase = WorkerExecutionPhase::Running(engine_state);
+        let (started_tx, started_rx) = oneshot::channel();
+        let control_task = shutdown
+            .guard("control-thread")
+            .into_spawn_task(async move {
+                let message = control_rx.recv().await.expect("control receiver is live");
+                assert!(matches!(
+                    message,
+                    ControlResp::TaskStarted {
+                        task_id: 7,
+                        subtask_idx: 0,
+                        ..
+                    }
+                ));
+                started_tx.send(()).unwrap();
+                // Keep the real receiver owned until shutdown cancellation.
+                while control_rx.recv().await.is_some() {}
+                Ok(())
+            });
+        control_tx
+            .send(ControlResp::TaskStarted {
+                task_id: 7,
+                subtask_idx: 0,
+                start_time: SystemTime::now(),
+            })
+            .await
+            .expect("startup notification must reach the live receiver");
+        timeout(Duration::from_secs(1), started_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!token.is_cancelled(), "running phase cancelled the worker");
+        let second_connection = timeout(
+            Duration::from_secs(1),
+            TcpStream::connect(("127.0.0.1", port)),
+        )
+        .await
+        .unwrap()
+        .expect("listener must survive the waiting-to-running move");
+        drop(second_connection);
+
+        // Exercise job_finished's existing cancellation followed by phase
+        // replacement. Both the socket and receiver must be released even
+        // though the original control sender remains alive.
+        if let WorkerExecutionPhase::Running(state) = &phase {
+            state.shutdown_guard.cancel();
+        } else {
+            panic!("expected running phase");
+        }
+        drop(mem::replace(&mut phase, WorkerExecutionPhase::Idle));
+        timeout(Duration::from_secs(1), token.cancelled())
+            .await
+            .unwrap();
+        assert!(
+            timeout(Duration::from_secs(1), control_task)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_none(),
+            "guarded control task must exit through cancellation"
+        );
+        assert!(control_tx.is_closed(), "teardown retained the receiver");
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if TcpStream::connect(("127.0.0.1", port)).await.is_err() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("teardown retained the listening socket");
+    }
+
+    async fn exercise_job_finished_lifetime(is_leader: bool) {
+        let shutdown = Shutdown::new("job-finished-lifetime-test", SignalBehavior::None);
+        let token = shutdown.token();
+        let worker = WorkerServer::new(
+            MachineId(Arc::new("test-machine".into())),
+            WorkerId(100),
+            PipelineId(Arc::new("test-pipeline".into())),
+            JobId(Arc::new("test-job".into())),
+            1,
+            shutdown.guard("worker"),
+        );
+        let state = worker.state.clone();
+        let (leader_tx, _leader_rx) = channel(1);
+        if is_leader {
+            state.job_controller_tx.set(leader_tx).unwrap();
+        }
+
+        let runtime = RuntimeEnvBuilder::new()
+            .with_memory_pool(Arc::new(FairSpillPool::new(1024 * 1024)))
+            .build_arc()
+            .unwrap();
+        let (queue_tx, queue_rx) = batch_bounded_accounted(4, runtime.clone(), 64 * 1024).unwrap();
+        let queue_allowance = runtime.memory_pool.reserved();
+        assert!(queue_allowance > 0);
+        let peer_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut network = NetworkManager::new(0).await.unwrap();
+        let data_port = network
+            .open_listener(shutdown.guard("network-manager"))
+            .await;
+        network
+            .connect(
+                &peer_listener.local_addr().unwrap().to_string(),
+                crate::network_manager::Quad {
+                    src_id: 0,
+                    src_idx: 0,
+                    dst_id: 1,
+                    dst_idx: 0,
+                },
+                queue_rx,
+            )
+            .await;
+        let (_peer, _) = timeout(Duration::from_secs(1), peer_listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        let (control_tx, mut control_rx) = channel(4);
+        let engine = Engine::new(
+            Program {
+                graph: Arc::new(RwLock::new(DiGraph::new())),
+                control_tx: Some(control_tx.clone()),
+            },
+            state.worker_context.clone(),
+            network,
+            Vec::new(),
+        )
+        .start()
+        .await;
+        *state.phase.lock().unwrap() = WorkerExecutionPhase::Running(EngineState {
+            sources: engine.source_controls(),
+            sinks: engine.sink_controls(),
+            operator_to_node: engine.operator_to_node(),
+            operator_controls: engine.operator_controls(),
+            _running_engine: engine,
+            shutdown_guard: worker
+                .shutdown_guard
+                .clone_temporary()
+                .child("engine-state"),
+        });
+        let control_task = shutdown
+            .guard("control-thread")
+            .into_spawn_task(async move {
+                while control_rx.recv().await.is_some() {}
+                Ok(())
+            });
+
+        let rpc_task = if is_leader {
+            let status = crate::job_controller::JobControllerStatus {
+                job_status: state.job_status.clone(),
+                checkpoint_history: state.checkpoint_history.clone(),
+            };
+            status.transition(rpc::JobState::JobRunning).unwrap();
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!("http://{}", listener.local_addr().unwrap());
+            let leader = LeaderServer {
+                state: state.clone(),
+            };
+            let task = shutdown.guard("grpc").into_spawn_task(async move {
+                tonic::transport::Server::builder()
+                    .add_service(WorkerGrpcServer::new(worker))
+                    .add_service(JobStatusGrpcServer::new(leader))
+                    .serve_with_incoming(TcpListenerStream::new(listener))
+                    .await?;
+                Ok(())
+            });
+            let mut worker_client =
+                rpc::worker_grpc_client::WorkerGrpcClient::connect(endpoint.clone())
+                    .await
+                    .unwrap();
+            let mut status_client =
+                rpc::job_status_grpc_client::JobStatusGrpcClient::connect(endpoint)
+                    .await
+                    .unwrap();
+            // Exercise the actual RPC handler twice: completion is idempotent
+            // while the controller has not yet observed the terminal status.
+            for _ in 0..2 {
+                timeout(
+                    Duration::from_secs(1),
+                    worker_client.job_finished(JobFinishedReq {}),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                assert!(!token.is_cancelled());
+                assert!(matches!(
+                    *state.phase.lock().unwrap(),
+                    WorkerExecutionPhase::Running(_)
+                ));
+            }
+            status.transition(rpc::JobState::JobFinishing).unwrap();
+            status.transition(rpc::JobState::JobFinished).unwrap();
+            let observed = timeout(
+                Duration::from_secs(1),
+                status_client.get_job_status(JobStatusReq {
+                    job_id: "test-job".into(),
+                    generation: 1,
+                }),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .into_inner();
+            assert_eq!(observed.job_id, "test-job");
+            assert_eq!(observed.generation, 1);
+            assert_eq!(
+                observed.job_status.unwrap().job_state,
+                rpc::JobState::JobFinished as i32
+            );
+            assert!(!control_tx.is_closed());
+            assert_eq!(runtime.memory_pool.reserved(), queue_allowance);
+            drop(
+                timeout(
+                    Duration::from_secs(1),
+                    TcpStream::connect(("127.0.0.1", data_port)),
+                )
+                .await
+                .unwrap()
+                .unwrap(),
+            );
+            Some(task)
+        } else {
+            // Controller-coordinated workers retain their existing immediate
+            // engine cancellation and phase teardown behavior.
+            WorkerGrpc::job_finished(&worker, Request::new(JobFinishedReq {}))
+                .await
+                .unwrap();
+            assert!(token.is_cancelled());
+            assert!(matches!(
+                *state.phase.lock().unwrap(),
+                WorkerExecutionPhase::Idle
+            ));
+            None
+        };
+
+        // The parent stops the leader only after observing JOB_FINISHED. Model
+        // process teardown by cancelling its root and dropping its owned phase;
+        // no change to ShutdownGuard or listener error semantics is needed.
+        token.cancel();
+        *state.phase.lock().unwrap() = WorkerExecutionPhase::Idle;
+        if let Some(task) = rpc_task {
+            assert!(
+                timeout(Duration::from_secs(1), task)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        assert!(
+            timeout(Duration::from_secs(1), control_task)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_none()
+        );
+        assert!(control_tx.is_closed());
+        // Prove the real outgoing task released its receiver while the original
+        // sender and peer socket are still alive. Dropping the sender first
+        // could otherwise make an unaborted network task exit naturally.
+        let closed = timeout(Duration::from_secs(1), async {
+            loop {
+                if let Err(error) = queue_tx
+                    .send_checked(arroyo_types::ArrowMessage::Signal(
+                        arroyo_types::SignalMessage::Stop,
+                    ))
+                    .await
+                {
+                    break error;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("network teardown retained its queue receiver");
+        assert!(matches!(
+            closed,
+            arroyo_rpc::errors::DataflowError::InternalOperatorError {
+                error: "downstream graph queue closed",
+                ..
+            }
+        ));
+        drop(queue_tx);
+        timeout(Duration::from_secs(1), async {
+            while runtime.memory_pool.reserved() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("network teardown retained queue reservations");
+        timeout(Duration::from_secs(1), async {
+            while TcpStream::connect(("127.0.0.1", data_port)).await.is_ok() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("network teardown retained the listener");
+    }
+
+    #[tokio::test]
+    async fn worker_leader_finished_remains_reachable_until_parent_stop() {
+        exercise_job_finished_lifetime(true).await;
+    }
+
+    #[tokio::test]
+    async fn nonleader_finished_cancels_and_releases_engine() {
+        exercise_job_finished_lifetime(false).await;
     }
 }

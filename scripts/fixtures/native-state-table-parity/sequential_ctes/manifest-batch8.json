@@ -1,0 +1,12 @@
+{
+  "query": "query.sql",
+  "input": "input.jsonl",
+  "expected": "expected.jsonl",
+  "expected_checkpoint": "expected.checkpoint.jsonl",
+  "checkpoint_input_rows": 3,
+  "checkpoint_output_rows": 2,
+  "batch_rows": 8,
+  "ordered": true,
+  "timeout_seconds": 120,
+  "rss_limit_mib": 512
+}

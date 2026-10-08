@@ -964,6 +964,7 @@ mod tests {
             timestamp_index: 2,
             max_captured_event_bytes: 64 * 1024,
             max_working_event_bytes: 128 * 1024,
+            concat_allowance: Arc::new(super::super::state_table_concat::ConcatAllowance::default()),
         };
         program.validate().unwrap();
         for values in [
