@@ -1,8 +1,8 @@
 [profile.default]
 slow-timeout = { period = "60s", terminate-after = 2 }
 
-# UDF validation and pipeline creation each compile dependencies on a cold runner.
-# Other integration tests retain the default two-minute bound.
 [[profile.default.overrides]]
-filter = 'package(integ) & test(udfs)'
-slow-timeout = { period = "60s", terminate-after = 10 }
+filter = 'package(=integ) & test(=udfs)'
+# Cold UDF validation and compilation use a separate Cargo project. Leave room
+# for the bounded 600s compile request plus validation and pipeline assertions.
+slow-timeout = { period = "60s", terminate-after = 12 }

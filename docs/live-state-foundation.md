@@ -50,6 +50,14 @@ the legacy manager. Live snapshots have no remote checkpoint publication API yet
 Do not attach these handles to a pipeline that expects legacy checkpoints to
 include their content.
 
+Ordinary table names beginning with `streamr.history.v1` are reserved and rejected
+by `LiveTableManager::register`. That prefix identifies the internal primary and
+expiry tables used by Arrow histories; allowing an ordinary table to claim it
+would break logical-table isolation. The restriction preserves the existing
+stored-data format. Previously accepted caller names with this prefix must be
+renamed before registration; other table names and existing history encodings
+are unchanged.
+
 ## Admission and lifecycle
 
 Requests exceeding byte budgets fail; capacity saturation awaits admission.
@@ -106,9 +114,16 @@ single rows fail explicitly. Appends commit a chunk at a time, so cancellation
 may leave a committed prefix. Repeating the same identifiers replaces that chunk.
 
 Snapshot scans paginate a single hot key over a half-open timestamp range.
-Cursors bind to the snapshot and exact namespace/prefix/range. Expiry removes one
-page at a time and retains records exactly at the cutoff, matching legacy table
-retention. IPC frame/body/row bounds are checked before decoding and compressed
+Before copying a lookup key, histories reject it if the minimum encoded matching
+record exceeds the configured page-byte limit. This applies on both backends,
+with or without attached resource accounting; an oversized missing-key lookup
+returns a limit error rather than an empty page. Other lookups retain their
+existing bounds and result semantics.
+Cursors bind to the snapshot and exact namespace/prefix/range. Expiry removes at
+most one page at a time, committing a prefix of complete primary/expiry delete
+pairs that fits the write-batch limit. Repeated calls make progress without
+breaking either index. Records exactly at the cutoff are retained, matching
+legacy table retention. IPC frame/body/row bounds are checked before decoding and compressed
 IPC is rejected. With shared resources attached via `with_resources`, decoded
 page reservations last until the page is dropped; copying or retaining extracted
 batches still requires caller accounting. Routed histories require a future
@@ -163,11 +178,12 @@ The tests include native backend conformance, identity-checked reopen, independe
 operators, snapshot lifetime, corruption and cleanup failures, cancellation and
 admission, Arrow fidelity, hot-key pagination and atomic expiry indexes.
 
-Workspace-wide `cargo fmt --all -- --check` reports existing formatting differences
-in planner `extension/stateful_processor.rs` and `rewriters.rs`, and worker
-`arrow/mod.rs` and `arrow/stateful_processor.rs`. Those files are outside this
-change. Supported Linux arm64/macOS distribution builds and complete packaging
-remain CI qualification; no local result implies they have passed.
+The original qualification found workspace formatting differences in planner
+`extension/stateful_processor.rs` and `rewriters.rs`, and worker `arrow/mod.rs`
+and `arrow/stateful_processor.rs`. The 2026-10-08 review applies formatting-only
+repairs to those four files so the unchanged workspace formatting gate can run.
+Supported Linux arm64/macOS distribution builds and complete packaging remain
+qualification gates; no local state/RPC test result implies they have passed.
 
 The final native probe (`-- 256 192`) wrote and reopened four operator databases,
 then checked every key and all 4096 payload bytes for 65,536 records. Logical
