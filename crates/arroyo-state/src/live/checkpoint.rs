@@ -43,6 +43,62 @@ const CHECKSUM_BUFFER_BYTES: usize = 64 * 1024;
 const PARQUET_FOOTER_ALLOWANCE: usize = 256 * 1024;
 static UPLOAD_ID: AtomicU64 = AtomicU64::new(0);
 
+// Export and restore must admit the same bounded file and decoded pages. A
+// per-database share is a target, not a ceiling: a valid page can require more
+// than that share while still fitting the worker-wide decoded-value pool.
+struct ParquetCheckpointBudget {
+    page_bytes: usize,
+    file_limit: usize,
+    decoded_bytes: usize,
+}
+
+impl ParquetCheckpointBudget {
+    fn new(resources: Option<&WorkerStateResources>) -> Result<Self> {
+        let per_owner_writer_budget = resources.map_or(6 * PAGE_BYTES, |r| {
+            (r.config().decoded_value_bytes / r.config().max_open_databases.saturating_add(1))
+                .min(6 * PAGE_BYTES)
+        });
+        let page_bytes = resources.map_or(PAGE_BYTES, |r| {
+            PAGE_BYTES
+                .min(
+                    r.config().scan_page_bytes
+                        / (8 * r.config().max_open_databases.saturating_add(1)),
+                )
+                .min(r.config().queued_write_bytes / 8)
+                .saturating_sub(32768)
+        });
+        ensure!(page_bytes > 0, "checkpoint resource budgets are too small");
+        // Keep the scan-page limit independent of the writer's per-owner target:
+        // a single value that fitted the former exporter must still fit a page.
+        // If that page needs more than the target share, acquire only its actual
+        // bounded allowance from the full decoded pool, fail-fast before scanning.
+        let minimum_file_limit = page_bytes + PARQUET_FOOTER_ALLOWANCE + PARQUET_BUFFER_BYTES;
+        let file_limit = PARQUET_MAX_BYTES.min(
+            per_owner_writer_budget
+                .saturating_sub(page_bytes * 3 + PARQUET_FOOTER_ALLOWANCE + PAGE_ROWS * 128)
+                .max(minimum_file_limit),
+        );
+        ensure!(
+            file_limit >= page_bytes + PARQUET_FOOTER_ALLOWANCE + PARQUET_BUFFER_BYTES,
+            "checkpoint Parquet writer cannot fit configured decoded-value budget"
+        );
+        // A page can coexist as an Arrow batch, unencoded Parquet values and
+        // encoded Parquet bytes while `write`/`flush` runs. Flush after each scan
+        // page so those three page-sized copies never accumulate across pages.
+        let writer_reservation =
+            file_limit + page_bytes * 3 + PARQUET_FOOTER_ALLOWANCE + PAGE_ROWS * 128;
+        ensure!(
+            resources.is_none_or(|r| writer_reservation <= r.config().decoded_value_bytes),
+            "checkpoint Parquet writer cannot fit configured decoded-value budget"
+        );
+        Ok(Self {
+            page_bytes,
+            file_limit,
+            decoded_bytes: writer_reservation,
+        })
+    }
+}
+
 struct OpenParquetFile {
     path: String,
     writer: ArrowWriter<Vec<u8>>,
@@ -262,43 +318,11 @@ async fn export_snapshot_inner(
             .as_nanos(),
         UPLOAD_ID.fetch_add(1, Ordering::Relaxed)
     );
-    let per_owner_writer_budget = resources.as_ref().map_or(6 * PAGE_BYTES, |r| {
-        (r.config().decoded_value_bytes / r.config().max_open_databases.saturating_add(1))
-            .min(6 * PAGE_BYTES)
-    });
-    let page_bytes = resources.as_ref().map_or(PAGE_BYTES, |r| {
-        PAGE_BYTES
-            .min(r.config().scan_page_bytes / (8 * r.config().max_open_databases.saturating_add(1)))
-            .min(r.config().queued_write_bytes / 8)
-            .saturating_sub(32768)
-    });
-    ensure!(page_bytes > 0, "checkpoint resource budgets are too small");
-    // Keep the scan-page limit independent of the writer's per-owner target:
-    // a single value that fitted the former exporter must still fit a page.
-    // If that page needs more than the target share, acquire only its actual
-    // bounded allowance from the full decoded pool, fail-fast before scanning.
-    let minimum_file_limit = page_bytes + PARQUET_FOOTER_ALLOWANCE + PARQUET_BUFFER_BYTES;
-    let file_limit = PARQUET_MAX_BYTES.min(
-        per_owner_writer_budget
-            .saturating_sub(page_bytes * 3 + PARQUET_FOOTER_ALLOWANCE + PAGE_ROWS * 128)
-            .max(minimum_file_limit),
-    );
-    ensure!(
-        file_limit >= page_bytes + PARQUET_FOOTER_ALLOWANCE + PARQUET_BUFFER_BYTES,
-        "checkpoint Parquet writer cannot fit configured decoded-value budget"
-    );
+    let budget = ParquetCheckpointBudget::new(resources.as_ref())?;
+    let page_bytes = budget.page_bytes;
+    let file_limit = budget.file_limit;
+    let writer_reservation = budget.decoded_bytes;
     let file_target = PARQUET_TARGET_BYTES.min(file_limit / 2);
-    // A page can coexist as an Arrow batch, unencoded Parquet values and
-    // encoded Parquet bytes while `write`/`flush` runs. Flush after each scan
-    // page so those three page-sized copies never accumulate across pages.
-    let writer_reservation =
-        file_limit + page_bytes * 3 + PARQUET_FOOTER_ALLOWANCE + PAGE_ROWS * 128;
-    ensure!(
-        resources
-            .as_ref()
-            .is_none_or(|r| writer_reservation <= r.config().decoded_value_bytes),
-        "checkpoint Parquet writer cannot fit configured decoded-value budget"
-    );
     // This permit is fail-fast. No exporter can hold a scan or queued-write
     // permit while waiting for another exporter to release its writer memory.
     let _writer_memory = resources
@@ -688,10 +712,10 @@ async fn restore_parquet_file(
         );
     }
 
-    let decoded_budget = resources.map_or(6 * PAGE_BYTES, |r| {
-        (r.config().decoded_value_bytes / r.config().max_open_databases.saturating_add(1))
-            .min(6 * PAGE_BYTES)
-    });
+    // Reserve the same file/page headroom as the exporter before parsing the
+    // footer. In particular, compressed file size alone cannot bound decoded
+    // row groups, and a per-database target can be smaller than the footer.
+    let decoded_budget = ParquetCheckpointBudget::new(resources)?.decoded_bytes;
     ensure!(
         decoded_budget >= PARQUET_BUFFER_BYTES + PAGE_ROWS * 128
             && file.size_bytes as usize + PARQUET_FOOTER_ALLOWANCE <= decoded_budget,
@@ -1155,6 +1179,155 @@ mod tests {
                 Some(value)
             );
         }
+    }
+
+    #[tokio::test]
+    async fn rocks_checkpoint_restores_with_decoded_share_smaller_than_footer() {
+        use crate::live::{lifecycle::RocksStateConfig, rocks::RocksLiveState};
+
+        let resources = WorkerStateResources::new(ResourceConfig {
+            block_cache_bytes: 8 * 1024 * 1024,
+            memtable_bytes: 2 * 1024 * 1024,
+            queued_write_bytes: 8 * 1024 * 1024,
+            decoded_value_bytes: 4 * 1024 * 1024,
+            scan_page_bytes: 8 * 1024 * 1024,
+            max_blocking_operations: 2,
+            max_snapshots: 2,
+            max_open_databases: 16,
+            disk_reserve_bytes: 0,
+        })
+        .unwrap();
+        assert!(
+            resources.config().decoded_value_bytes / (resources.config().max_open_databases + 1)
+                < PARQUET_FOOTER_ALLOWANCE
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let storage = storage(&directory).await;
+        let state_config = RocksStateConfig {
+            root: directory.path().join("live"),
+            job_id: "checkpoint-admission".into(),
+            operator_id: "state-owner".into(),
+            subtask: 0,
+            generation: 0,
+            attempt: 1,
+        };
+        let source = RocksLiveState::open(state_config.clone(), resources.clone())
+            .await
+            .unwrap();
+        let mut expected = Vec::new();
+        for number in 0..160 {
+            // Exercise both compressed and incompressible row groups, with
+            // each row fitting the reported 1 KiB caller write limit.
+            let value = if number % 2 == 0 {
+                vec![number as u8; 896]
+            } else {
+                incompressible_payload(number)[..896].to_vec()
+            };
+            source.put(key(number), value.clone(), 1024).await.unwrap();
+            expected.push(value);
+        }
+        let snapshot = source.snapshot().await.unwrap();
+        let observation = CheckpointObservation::new(None, CheckpointDirection::Export);
+        let metadata = export_snapshot_inner(
+            &snapshot,
+            &namespace(),
+            &config().table_name,
+            config().table_name.as_bytes(),
+            &config().schema_identity,
+            1,
+            &storage,
+            "J/checkpoints/checkpoint-0000001/operator-o/table-map-000",
+            1,
+            0,
+            0,
+            MAX_FILES,
+            Some(resources.clone()),
+            &observation,
+        )
+        .await
+        .unwrap();
+        assert!(metadata.files.len() > 1);
+        assert_eq!(
+            metadata
+                .files
+                .iter()
+                .map(|file| file.row_count)
+                .sum::<u64>(),
+            160
+        );
+        arroyo_state_protocol::disk::validate_subtask(&config(), &metadata).unwrap();
+        drop(snapshot);
+        source.close_and_remove().await.unwrap();
+
+        let destination = RocksLiveState::open(
+            RocksStateConfig {
+                attempt: 2,
+                ..state_config.clone()
+            },
+            resources.clone(),
+        )
+        .await
+        .unwrap();
+        let observation = CheckpointObservation::new(None, CheckpointDirection::Restore);
+        // Admission remains worker-wide and fail-fast. Recovery retries use a
+        // fresh attempt after releasing contention, with unchanged budgets.
+        let held = resources
+            .try_decoded_value(resources.config().decoded_value_bytes)
+            .unwrap();
+        let error = restore_snapshot_inner(
+            &destination,
+            &namespace(),
+            1,
+            &config().schema_identity,
+            &metadata,
+            &storage,
+            Some(resources.clone()),
+            &observation,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("decoded_value_bytes budget exhausted")
+        );
+        drop(held);
+        destination.close_and_remove().await.unwrap();
+        let destination = RocksLiveState::open(
+            RocksStateConfig {
+                attempt: 3,
+                ..state_config
+            },
+            resources.clone(),
+        )
+        .await
+        .unwrap();
+        restore_snapshot_inner(
+            &destination,
+            &namespace(),
+            1,
+            &config().schema_identity,
+            &metadata,
+            &storage,
+            Some(resources.clone()),
+            &observation,
+        )
+        .await
+        .unwrap();
+        for (number, value) in expected.into_iter().enumerate() {
+            assert_eq!(
+                destination
+                    .get(&key(number as u32), ReadOptions { max_bytes: 1024 })
+                    .await
+                    .unwrap(),
+                Some(value)
+            );
+        }
+        destination.close_and_remove().await.unwrap();
+        // All decoded permits, including failed admission, were released.
+        let _all_decoded = resources
+            .try_decoded_value(resources.config().decoded_value_bytes)
+            .unwrap();
     }
 
     #[tokio::test]
