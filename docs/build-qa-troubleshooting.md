@@ -131,10 +131,10 @@ changing engine emission scheduling would be a separate semantic change.
 
 ## Evidence and process cleanup for this incident
 
-On this SELinux host, the independent image smoke test could not read its
-host-mounted evidence script with a plain `:ro` bind mount (`Permission denied`).
-Using `:ro,z` for the run-owned evidence directory allowed the same script to
-run and all assertions passed. Read-only access does not by itself supply the
+On this SELinux host, the independent image/source comparison could not read its
+host-mounted source files with a plain `:ro` bind mount (`Permission denied`).
+Using `:ro,z` allowed the same file comparisons to run and pass.
+Read-only access does not by itself supply the
 container SELinux label. Follow repository mount conventions and label only
 the intended workspace/evidence paths; do not disable host SELinux or relabel
 unrelated directories to work around this error.
