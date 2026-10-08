@@ -14,6 +14,7 @@ permissions:
 
 jobs:
   build:
+    if: github.repository == 'ArroyoSystems/arroyo'
     strategy:
       matrix:
         platform:

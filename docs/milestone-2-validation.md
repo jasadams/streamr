@@ -155,9 +155,15 @@ with Rust 1.96 and GCC 12.2. The host was an Intel i5-8259U (4 cores, 8 threads)
 isolated runtime modes. [CI on this revision](https://github.com/jasadams/streamr/actions/runs/37107133887)
 passed the full Rust 1.95 build, workspace Clippy and console checks, then failed an
 existing Kafka source test that rejected a valid idle watermark before partition
-assignment. The follow-up changes only that test helper, CI cache handling, the
-verification script and this evidence; the qualified runtime is unchanged. A full
-CI rerun is required before merge; these local results do not establish CI acceptance.
+assignment. The [follow-up CI run](https://github.com/jasadams/streamr/actions/runs/37110042700)
+passed the full build, workspace Clippy and all 434 library tests, including the
+Kafka regression. Integration then exceeded the existing 60-second HTTP deadline
+during cold UDF compilation after a successful 44.7-second validation build.
+UDF compilation requests now have a bounded 600-second deadline, with a 720-second
+Nextest limit for that test; ordinary API requests retain 60 seconds. These follow-ups
+change only test helpers/configuration, CI cache handling, the verification script
+and this evidence; the qualified runtime is unchanged. A full CI rerun is required
+before merge; these local results do not establish CI acceptance.
 
 All 258 unit tests passed against the pinned revision: state 40, protocol 57,
 planner 82, worker 47 and RPC 32. Logs are
