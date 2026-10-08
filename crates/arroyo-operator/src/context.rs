@@ -3,7 +3,7 @@ use arrow::array::{Array, PrimitiveArray, RecordBatch};
 use arrow::compute::{partition, sort_to_indices, take};
 use arrow::datatypes::UInt64Type;
 use arroyo_formats::de::{ArrowDeserializer, FieldValueType};
-use arroyo_metrics::{QueueGauges, TaskCounters, register_queue_gauge};
+use arroyo_metrics::{QueueGauge, TaskCounters, register_queue_gauge};
 use arroyo_rpc::config::config;
 use arroyo_rpc::df::ArroyoSchema;
 use arroyo_rpc::errors::{DataflowError, DataflowResult, TaskError};
@@ -99,8 +99,33 @@ pub struct BatchSender {
     notify: Arc<Notify>,
     enqueue: Arc<Mutex<()>>,
     budget: Option<Arc<QueueBudget>>,
+    telemetry: Arc<Mutex<QueueTelemetry>>,
     #[cfg(test)]
     enqueue_pause: Option<Arc<EnqueuePause>>,
+}
+
+/// Gauge sampling and publication share one short critical section. A sender
+/// cannot publish an old occupancy sample after the final envelope is dropped.
+/// This lock never acquires the enqueue/budget locks or spans an await.
+#[derive(Default)]
+struct QueueTelemetry {
+    remaining: QueueGauge,
+    size: QueueGauge,
+    bytes: QueueGauge,
+}
+
+impl QueueTelemetry {
+    fn refresh(&self, size: u32, messages: &AtomicU32, bytes: &AtomicU64) {
+        if let Some(gauge) = &self.remaining {
+            gauge.set(size.saturating_sub(messages.load(Ordering::Acquire)) as i64);
+        }
+        if let Some(gauge) = &self.size {
+            gauge.set(size as i64);
+        }
+        if let Some(gauge) = &self.bytes {
+            gauge.set(bytes.load(Ordering::Acquire) as i64);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -132,7 +157,8 @@ fn queue_metadata_bytes(messages: usize) -> DataflowResult<usize> {
         + std::mem::size_of::<QueueBudget>()
         + 3 * std::mem::size_of::<Notify>()
         + std::mem::size_of::<Mutex<()>>()
-        + 2 * std::mem::size_of::<usize>()
+        + std::mem::size_of::<Mutex<QueueTelemetry>>()
+        + 4 * std::mem::size_of::<usize>()
         + 16 * std::mem::size_of::<usize>();
     messages
         .div_ceil(slots)
@@ -171,6 +197,8 @@ struct QueuedItem {
     queued_bytes: Arc<AtomicU64>,
     notify: Arc<Notify>,
     admission: Option<QueueAdmission>,
+    size: u32,
+    telemetry: Arc<Mutex<QueueTelemetry>>,
 }
 
 impl Drop for QueuedItem {
@@ -180,6 +208,10 @@ impl Drop for QueuedItem {
         if let Some(admission) = &self.admission {
             admission.budget.messages.fetch_sub(1, Ordering::AcqRel);
         }
+        self.telemetry
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .refresh(self.size, &self.queued_messages, &self.queued_bytes);
         self.notify.notify_waiters();
     }
 }
@@ -284,7 +316,13 @@ impl BatchSender {
                             queued_bytes: self.queued_bytes.clone(),
                             notify: self.notify.clone(),
                             admission,
+                            size: self.size,
+                            telemetry: self.telemetry.clone(),
                         };
+                        self.telemetry
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner())
+                            .refresh(self.size, &self.queued_messages, &self.queued_bytes);
                         // Tokio 1.47.1 increments its unbounded message count
                         // before publishing into the list. Receiver drop can
                         // otherwise finish draining before that publication,
@@ -392,8 +430,8 @@ impl Drop for BatchReceiver {
         // No publisher can be between Tokio's admission and list push while
         // this guard is held. Closing prevents all later sends; every earlier
         // publication is now available to try_recv, without a Busy list slot.
-        // QueuedItem::drop only updates atomics/notifies and takes neither this
-        // mutex nor the metadata mutex. Recover poison to finish teardown too.
+        // QueuedItem::drop refreshes telemetry but never takes this mutex or
+        // the metadata mutex. Recover poison to finish teardown too.
         #[cfg(test)]
         if let Some(observation) = &self.close_contended {
             let contended = matches!(
@@ -471,6 +509,7 @@ fn batch_bounded_inner(
             notify: notify.clone(),
             enqueue: enqueue.clone(),
             budget: budget.clone(),
+            telemetry: Arc::new(Mutex::new(QueueTelemetry::default())),
             #[cfg(test)]
             enqueue_pause: None,
         },
@@ -809,9 +848,6 @@ pub struct ArrowCollector {
     pub chain_info: Arc<ChainInfo>,
     out_schema: Option<Arc<ArroyoSchema>>,
     out_qs: Vec<Vec<BatchSender>>,
-    tx_queue_rem_gauges: QueueGauges,
-    tx_queue_size_gauges: QueueGauges,
-    tx_queue_bytes_gauges: QueueGauges,
 }
 
 fn repartition<'a>(
@@ -893,25 +929,13 @@ impl Collector for ArrowCollector {
                 );
             });
 
-        for (i, out_q) in self.out_qs.iter_mut().enumerate() {
+        for out_q in &mut self.out_qs {
             let partitions = repartition(&record, out_schema.routing_keys(), out_q.len());
 
             for (partition, batch) in partitions {
                 out_q[partition]
                     .send_checked(ArrowMessage::Data(batch))
                     .await?;
-
-                self.tx_queue_rem_gauges[i][partition]
-                    .iter()
-                    .for_each(|g| g.set(out_q[partition].capacity() as i64));
-
-                self.tx_queue_size_gauges[i][partition]
-                    .iter()
-                    .for_each(|g| g.set(out_q[partition].size() as i64));
-
-                self.tx_queue_bytes_gauges[i][partition]
-                    .iter()
-                    .for_each(|g| g.set(out_q[partition].queued_bytes() as i64));
             }
         }
 
@@ -954,6 +978,23 @@ impl ArrowCollector {
             0,
         );
 
+        for (i, queues) in out_qs.iter().enumerate() {
+            for (partition, queue) in queues.iter().enumerate() {
+                let mut telemetry = queue
+                    .telemetry
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                *telemetry = QueueTelemetry {
+                    remaining: tx_queue_rem_gauges[i][partition].clone(),
+                    size: tx_queue_size_gauges[i][partition].clone(),
+                    bytes: tx_queue_bytes_gauges[i][partition].clone(),
+                };
+                // Registration may follow enqueue or race with a drain. Share
+                // the publication lock and sample the current queue state.
+                telemetry.refresh(queue.size, &queue.queued_messages, &queue.queued_bytes);
+            }
+        }
+
         // initialize counters so that tasks that never produce data still report 0
         for m in TaskCounters::variants() {
             m.for_task(&chain_info, |_| {});
@@ -963,9 +1004,6 @@ impl ArrowCollector {
             chain_info,
             out_schema,
             out_qs,
-            tx_queue_rem_gauges,
-            tx_queue_size_gauges,
-            tx_queue_bytes_gauges,
         }
     }
 
@@ -1117,38 +1155,11 @@ mod tests {
 
         let out_qs = vec![vec![tx1, tx2]];
 
-        let tx_queue_size_gauges = register_queue_gauge(
-            "arroyo_worker_tx_queue_size",
-            "Size of a tx queue",
-            &chain_info,
-            &out_qs,
-            0,
-        );
-
-        let tx_queue_rem_gauges = register_queue_gauge(
-            "arroyo_worker_tx_queue_rem",
-            "Remaining space in a tx queue",
-            &chain_info,
-            &out_qs,
-            0,
-        );
-
-        let tx_queue_bytes_gauges = register_queue_gauge(
-            "arroyo_worker_tx_bytes",
-            "Number of bytes queued in a tx queue",
-            &chain_info,
-            &out_qs,
-            0,
-        );
-
-        let mut collector = ArrowCollector {
+        let mut collector = ArrowCollector::new(
             chain_info,
-            out_schema: Some(Arc::new(ArroyoSchema::new_keyed(schema, 1, vec![0]))),
+            Some(Arc::new(ArroyoSchema::new_keyed(schema, 1, vec![0]))),
             out_qs,
-            tx_queue_rem_gauges,
-            tx_queue_size_gauges,
-            tx_queue_bytes_gauges,
-        };
+        );
 
         collector.collect(record).await.unwrap();
 
@@ -1202,6 +1213,107 @@ mod tests {
             vec![Arc::new(Int64Array::from(vec![1, 2, 3, 4]))],
         )
         .unwrap()
+    }
+
+    fn queue_collector(tx: &BatchSender) -> ArrowCollector {
+        static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
+        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        ArrowCollector::new(
+            Arc::new(ChainInfo {
+                job_id: "queue-telemetry".into(),
+                task_id: 1,
+                description: format!("queue telemetry {id}"),
+                task_index: 0,
+            }),
+            Some(Arc::new(ArroyoSchema::new_unkeyed(
+                queue_batch().schema(),
+                0,
+            ))),
+            vec![vec![tx.clone()]],
+        )
+    }
+
+    fn assert_queue_metrics(tx: &BatchSender, remaining: u32, bytes: u64) {
+        let telemetry = tx.telemetry.lock().unwrap();
+        assert_eq!(
+            telemetry.remaining.as_ref().unwrap().get(),
+            remaining as i64
+        );
+        assert_eq!(telemetry.size.as_ref().unwrap().get(), tx.size() as i64);
+        assert_eq!(telemetry.bytes.as_ref().unwrap().get(), bytes as i64);
+    }
+
+    #[tokio::test]
+    async fn queue_metrics_follow_drain_without_another_send_and_collector_drop() {
+        for accounted in [false, true] {
+            let (tx, mut rx) = if accounted {
+                batch_bounded_accounted(4, queue_runtime(1024 * 1024), 1024).unwrap()
+            } else {
+                batch_bounded(4)
+            };
+            // The envelope must find handles registered after it was enqueued.
+            let batch = queue_batch();
+            let bytes = batch.get_array_memory_size() as u64;
+            tx.send_checked(ArrowMessage::Data(batch)).await.unwrap();
+            let mut collector = queue_collector(&tx);
+            assert_queue_metrics(&tx, 0, bytes);
+            drop(rx.recv().await.unwrap());
+            assert_queue_metrics(&tx, 4, 0);
+
+            collector.collect(queue_batch()).await.unwrap();
+            assert_queue_metrics(&tx, 0, bytes);
+            drop(rx.recv().await.unwrap());
+            assert_queue_metrics(&tx, 4, 0);
+
+            collector
+                .broadcast_watermark(Watermark::Idle)
+                .await
+                .unwrap();
+            assert_queue_metrics(
+                &tx,
+                3,
+                message_bytes(&ArrowMessage::Signal(SignalMessage::Watermark(
+                    Watermark::Idle,
+                ))),
+            );
+            drop(collector);
+            drop(rx.recv().await.unwrap());
+            assert_queue_metrics(&tx, 4, 0);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_queue_metrics_finish_empty_after_last_drain() {
+        for accounted in [false, true] {
+            let (tx, mut rx) = if accounted {
+                batch_bounded_accounted(8, queue_runtime(1024 * 1024), 1024).unwrap()
+            } else {
+                batch_bounded(8)
+            };
+            let collector = queue_collector(&tx);
+            let mut producers = Vec::new();
+            for _ in 0..4 {
+                let sender = tx.clone();
+                producers.push(tokio::spawn(async move {
+                    for _ in 0..64 {
+                        sender
+                            .send_checked(ArrowMessage::Data(queue_batch()))
+                            .await
+                            .unwrap();
+                    }
+                }));
+            }
+            for _ in 0..256 {
+                drop(rx.recv().await.unwrap());
+            }
+            for producer in producers {
+                producer.await.unwrap();
+            }
+            // Joining every producer ensures a delayed enqueue refresh cannot
+            // overwrite the last drain's empty state.
+            assert_queue_metrics(&tx, 8, 0);
+            drop(collector);
+        }
     }
 
     fn queue_runtime(bytes: usize) -> Arc<RuntimeEnv> {
@@ -1347,6 +1459,7 @@ mod tests {
         ));
         assert!(error.to_string().contains("graph queue batch requires"));
         assert_eq!(tx.queued_bytes(), 0);
+        assert_queue_metrics(&tx, 8, 0);
         drop((collector, tx, rx));
         assert_eq!(runtime.memory_pool.reserved(), 0);
     }
@@ -1378,6 +1491,7 @@ mod tests {
         ));
         assert_eq!(tx.capacity(), 8);
         assert_eq!(tx.queued_bytes(), 0);
+        assert_queue_metrics(&tx, 8, 0);
         assert_eq!(
             runtime.memory_pool.reserved(),
             queue_metadata_bytes(0).unwrap()
@@ -1765,6 +1879,7 @@ mod tests {
     #[tokio::test]
     async fn receiver_cancellation_wakes_blocked_senders_and_releases_queued_arrays() {
         let (tx, rx) = batch_bounded(4);
+        let _collector = queue_collector(&tx);
         let queued = queue_batch();
         let held_array = Arc::downgrade(queued.column(0));
         let bytes = queued.get_array_memory_size() as u64;
@@ -1775,6 +1890,7 @@ mod tests {
         assert!(futures::poll!(&mut first).is_pending());
         assert!(futures::poll!(&mut second).is_pending());
         assert_eq!(tx.queued_bytes(), bytes);
+        assert_queue_metrics(&tx, 0, bytes);
         assert_eq!(tx.capacity(), 0);
         assert!(held_array.upgrade().is_some());
 
@@ -1788,11 +1904,13 @@ mod tests {
         assert!(held_array.upgrade().is_none());
         assert_eq!(tx.queued_bytes(), 0);
         assert_eq!(tx.capacity(), 4);
+        assert_queue_metrics(&tx, 4, 0);
     }
 
     #[tokio::test]
     async fn cancelling_blocked_send_preserves_queued_owner_and_releases_unsent_array() {
         let (tx, mut rx) = batch_bounded(4);
+        let _collector = queue_collector(&tx);
         let queued = queue_batch();
         let queued_array = Arc::downgrade(queued.column(0));
         let bytes = queued.get_array_memory_size() as u64;
@@ -1805,11 +1923,13 @@ mod tests {
         assert!(unsent_array.upgrade().is_none());
         assert!(queued_array.upgrade().is_some());
         assert_eq!(tx.queued_bytes(), bytes);
+        assert_queue_metrics(&tx, 0, bytes);
         assert_eq!(tx.capacity(), 0);
 
         let received = rx.recv().await.unwrap();
         assert_eq!(tx.queued_bytes(), 0);
         assert_eq!(tx.capacity(), 4);
+        assert_queue_metrics(&tx, 4, 0);
         assert!(queued_array.upgrade().is_some());
         drop(received);
         assert!(queued_array.upgrade().is_none());
@@ -1817,6 +1937,7 @@ mod tests {
         drop(rx);
         assert_eq!(tx.queued_bytes(), 0);
         assert_eq!(tx.capacity(), 4);
+        assert_queue_metrics(&tx, 4, 0);
     }
 
     #[test]
@@ -1828,6 +1949,7 @@ mod tests {
             } else {
                 batch_bounded(4)
             };
+            let collector = queue_collector(&tx);
             let queued = queue_batch();
             let held_array = Arc::downgrade(queued.column(0));
             let bytes = queued.get_array_memory_size() as u64;
@@ -1865,6 +1987,7 @@ mod tests {
             assert!(held_array.upgrade().is_none());
             assert_eq!(tx.queued_bytes(), 0);
             assert_eq!(tx.capacity(), 4);
+            assert_queue_metrics(&tx, 4, 0);
             if let Some(budget) = &tx.budget {
                 assert_eq!(budget.messages.load(Ordering::Acquire), 0);
                 assert_eq!(
@@ -1874,6 +1997,7 @@ mod tests {
             } else {
                 assert_eq!(runtime.memory_pool.reserved(), 0);
             }
+            drop(collector);
             drop(tx);
             assert_eq!(runtime.memory_pool.reserved(), 0);
         }
@@ -1889,6 +2013,7 @@ mod tests {
                 } else {
                     batch_bounded(4)
                 };
+                let collector = queue_collector(&tx);
                 let queued = queue_batch();
                 let held_array = Arc::downgrade(queued.column(0));
                 let barrier = Arc::new(tokio::sync::Barrier::new(2));
@@ -1917,6 +2042,7 @@ mod tests {
                 );
                 assert_eq!(tx.queued_bytes(), 0);
                 assert_eq!(tx.capacity(), 4);
+                assert_queue_metrics(&tx, 4, 0);
                 if let Some(budget) = &tx.budget {
                     assert_eq!(budget.messages.load(Ordering::Acquire), 0);
                     // Only channel metadata may remain with the live sender.
@@ -1927,6 +2053,7 @@ mod tests {
                 } else {
                     assert_eq!(runtime.memory_pool.reserved(), 0);
                 }
+                drop(collector);
                 drop(tx);
                 assert_eq!(runtime.memory_pool.reserved(), 0);
             }

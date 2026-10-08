@@ -179,7 +179,8 @@ impl TaskCounters {
     }
 }
 
-pub type QueueGauges = Vec<Vec<Option<IntGauge>>>;
+pub type QueueGauge = Option<IntGauge>;
+pub type QueueGauges = Vec<Vec<QueueGauge>>;
 
 pub fn register_queue_gauge<T>(
     name: &'static str,
