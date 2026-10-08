@@ -330,6 +330,249 @@ async fn history_cursors_bind_snapshot_key_and_time_range_and_replacements_are_i
         .unwrap();
 }
 
+async fn expiry_respects_delete_batch_cap(backend: Arc<dyn LiveStateBackend>) {
+    let mut bounded = limits();
+    bounded.page_bytes = 64 << 10;
+    bounded.batch_bytes = 64 << 10;
+    bounded.page_entries = 4096;
+    let history = ArrowHistory::new(backend.clone(), namespace(), schema(), bounded).unwrap();
+    let row = batch().slice(0, 1);
+    for sequence in 0..600 {
+        history.append(b"k", 0, sequence, &row).await.unwrap();
+    }
+    history.append(b"k", 1, 0, &row).await.unwrap();
+    let mut removed = 0;
+    let mut pages = 0;
+    loop {
+        let count = history.expire_page(1).await.unwrap();
+        if count == 0 {
+            break;
+        }
+        assert!(count < 600, "delete batches must split the scan page");
+        removed += count;
+        pages += 1;
+        assert!(removed <= 600);
+        let snapshot = history.snapshot().await.unwrap();
+        let mut cursor = None;
+        let mut remaining = 0;
+        loop {
+            let page = snapshot.scan_key(b"k", None, None, cursor).await.unwrap();
+            for chunk in &page.chunks {
+                assert_eq!(chunk.batch, row);
+                assert!(chunk.timestamp == 0 || chunk.timestamp == 1);
+            }
+            remaining += page.chunks.len();
+            cursor = page.next_cursor;
+            if cursor.is_none() {
+                break;
+            }
+        }
+        assert_eq!(remaining, 601 - removed);
+        // Both indexes must reflect exactly the committed prefix after each page.
+        let raw = backend.snapshot().await.unwrap();
+        let index = raw
+            .scan(ScanRequest {
+                range: ScanRange {
+                    namespace: index_namespace(&namespace(), 1),
+                    prefix: None,
+                    start: None,
+                    end: None,
+                },
+                max_entries: bounded.page_entries,
+                max_bytes: bounded.page_bytes,
+                cursor: None,
+            })
+            .await
+            .unwrap();
+        assert!(index.next_cursor.is_none());
+        assert_eq!(index.entries.len(), remaining);
+    }
+    assert_eq!(removed, 600);
+    assert!(pages > 1);
+    let snapshot = history.snapshot().await.unwrap();
+    let page = snapshot.scan_key(b"k", None, None, None).await.unwrap();
+    assert_eq!(page.chunks.len(), 1);
+    assert_eq!(page.chunks[0].timestamp, 1);
+    assert_eq!(page.chunks[0].batch, row);
+    assert!(page.next_cursor.is_none());
+}
+
+#[tokio::test]
+async fn memory_expiry_splits_expanded_delete_batches() {
+    expiry_respects_delete_batch_cap(Arc::new(crate::live::memory::MemoryLiveState::new())).await;
+}
+
+#[tokio::test]
+async fn rocks_expiry_splits_expanded_delete_batches() {
+    let root = tempfile::tempdir().unwrap();
+    let backend = Arc::new(
+        RocksLiveState::open(config(root.path()), resources())
+            .await
+            .unwrap(),
+    );
+    expiry_respects_delete_batch_cap(backend.clone()).await;
+    Arc::try_unwrap(backend)
+        .ok()
+        .unwrap()
+        .close_and_remove()
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn oversized_borrowed_history_keys_reject_before_owned_key_assembly() {
+    let backend = Arc::new(crate::live::memory::MemoryLiveState::new());
+    let pool = resources();
+    let history = ArrowHistory::new(backend, namespace(), schema(), limits())
+        .unwrap()
+        .with_resources(pool.clone());
+    // The Arrow source is small and valid; only the borrowed key is oversized.
+    let key = vec![0; 1 << 20];
+    let row = batch().slice(0, 1);
+    let occupied = pool
+        .decoded_value(pool.config().decoded_value_bytes)
+        .await
+        .unwrap();
+    {
+        // Rejection must precede both admission and internal key assembly.
+        let append = history.append(&key, 0, 0, &row);
+        tokio::pin!(append);
+        assert!(matches!(
+            futures::poll!(&mut append),
+            std::task::Poll::Ready(Err(LiveStateError::BatchLimitExceeded { .. }))
+        ));
+    }
+    let snapshot = history.snapshot().await.unwrap();
+    assert!(matches!(
+        snapshot.scan_key(&key, Some(0), Some(1), None).await,
+        Err(LiveStateError::ReadLimitExceeded { .. })
+    ));
+    drop(occupied);
+    assert!(
+        snapshot
+            .scan_key(b"k", None, None, None)
+            .await
+            .unwrap()
+            .chunks
+            .is_empty()
+    );
+}
+
+async fn scan_key_checks_page_bound_before_copies(
+    backend: Arc<dyn LiveStateBackend>,
+    pool: WorkerStateResources,
+) {
+    for attached in [false, true] {
+        let mut bounded = limits();
+        bounded.page_bytes = 512;
+        let history = ArrowHistory::new(backend.clone(), namespace(), schema(), bounded).unwrap();
+        let history = if attached {
+            history.with_resources(pool.clone())
+        } else {
+            history
+        };
+        let snapshot = history.snapshot().await.unwrap();
+        let oversized_key = vec![0; 2048];
+        assert!(matches!(
+            snapshot.scan_key(&oversized_key, Some(-1), Some(1), None).await,
+            Err(LiveStateError::ReadLimitExceeded { required, limit: 512 }) if required > 512
+        ));
+        drop(snapshot);
+
+        // A page that fits a real encoded record exactly must still work,
+        // including nested zero escaping and half-open signed time bounds.
+        let key = b"k\0x";
+        let row = batch().slice(0, 1);
+        let primary = primary_key(key, -1, 255).unwrap();
+        bounded.page_bytes = crate::live::encoding::encoded_key_size(&state_key(
+            &index_namespace(&namespace(), 0),
+            primary,
+        ))
+        .unwrap()
+            + encode_chunk(&row, bounded.chunk_bytes).unwrap().len()
+            + 1;
+        let history = ArrowHistory::new(backend.clone(), namespace(), schema(), bounded).unwrap();
+        let history = if attached {
+            history.with_resources(pool.clone())
+        } else {
+            history
+        };
+        history.append(key, -1, 255, &row).await.unwrap();
+        let snapshot = history.snapshot().await.unwrap();
+        let page = snapshot
+            .scan_key(key, Some(-1), Some(0), None)
+            .await
+            .unwrap();
+        assert_eq!(page.chunks.len(), 1);
+        assert_eq!(page.chunks[0].timestamp, -1);
+        assert_eq!(page.chunks[0].sequence, 255);
+        assert_eq!(page.chunks[0].batch, row);
+        assert!(page.next_cursor.is_none());
+        assert!(
+            snapshot
+                .scan_key(key, Some(0), Some(1), None)
+                .await
+                .unwrap()
+                .chunks
+                .is_empty()
+        );
+    }
+}
+
+#[tokio::test]
+async fn memory_history_scan_bounds_keys_without_optional_resources() {
+    scan_key_checks_page_bound_before_copies(
+        Arc::new(crate::live::memory::MemoryLiveState::new()),
+        resources(),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn rocks_history_scan_bounds_keys_without_optional_resources() {
+    let root = tempfile::tempdir().unwrap();
+    let pool = resources();
+    let backend = Arc::new(
+        RocksLiveState::open(config(root.path()), pool.clone())
+            .await
+            .unwrap(),
+    );
+    scan_key_checks_page_bound_before_copies(backend.clone(), pool).await;
+    Arc::try_unwrap(backend)
+        .ok()
+        .unwrap()
+        .close_and_remove()
+        .await
+        .unwrap();
+}
+
+#[test]
+fn history_key_measurements_match_nested_encoding_and_check_overflow() {
+    let ns = namespace();
+    for key in [b"".as_slice(), b"k", b"\0\0", b"a\0b"] {
+        for timestamp in [i64::MIN, -1, 0, i64::MAX] {
+            for sequence in [0, 255, u64::MAX] {
+                let (bytes, zeros) = history_key_size(key, timestamp, sequence).unwrap();
+                for logical in [
+                    primary_key(key, timestamp, sequence).unwrap(),
+                    expiry_key(key, timestamp, sequence).unwrap(),
+                ] {
+                    assert_eq!(logical.len(), bytes);
+                    assert_eq!(logical.iter().filter(|byte| **byte == 0).count(), zeros);
+                    assert_eq!(
+                        encoded_history_key_size(&ns, bytes, zeros).unwrap(),
+                        crate::live::encoding::encode_key(&state_key(&ns, logical))
+                            .unwrap()
+                            .len()
+                    );
+                }
+            }
+        }
+    }
+    assert!(encoded_history_key_size(&ns, usize::MAX, 0).is_err());
+    assert!(encoded_history_key_size(&ns, 0, usize::MAX).is_err());
+}
+
 #[test]
 fn bounded_ipc_preflight_rejects_truncated_frames_and_excessive_rows() {
     let bytes = encode_chunk(&batch(), limits().chunk_bytes).unwrap();
