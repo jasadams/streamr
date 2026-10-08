@@ -23,6 +23,7 @@ use std::{
 use futures::stream::FuturesUnordered;
 
 use super::sync::streams::KeyedCloneableStreamFuture;
+use super::window_native::NativeWindow;
 use arroyo_operator::context::Collector;
 use arroyo_operator::operator::{AsDisplayable, DisplayableOperator, Registry};
 use arroyo_planner::physical::{ArroyoPhysicalExtensionCodec, DecodingContext};
@@ -58,6 +59,7 @@ pub struct SlidingAggregatingWindowFunc<K: Copy> {
     projection_input_schema: SchemaRef,
     final_projection: Arc<dyn ExecutionPlan>,
     state: SlidingWindowState,
+    native: Option<NativeWindow>,
 }
 
 #[allow(clippy::enum_variant_names)]
@@ -487,6 +489,26 @@ impl OperatorConstructor for SlidingAggregatingWindowConstructor {
             .ok_or_else(|| anyhow!("missing partial schema"))?
             .try_into()?;
 
+        let native = arroyo_rpc::config::config()
+            .worker
+            .window_state
+            .map(|limits| {
+                NativeWindow::new(
+                    width,
+                    slide,
+                    true,
+                    binning_function.clone(),
+                    &config.binning_function,
+                    &config.partial_aggregation_plan,
+                    &config.final_aggregation_plan,
+                    Some(&config.final_projection),
+                    &partial_schema,
+                    registry.clone(),
+                    limits,
+                )
+            })
+            .transpose()?;
+
         let finish_plan = PhysicalPlanNode::decode(&mut config.final_aggregation_plan.as_slice())?;
         let final_codec = ArroyoPhysicalExtensionCodec {
             context: DecodingContext::LockedBatchVec(final_batches_passer.clone()),
@@ -522,6 +544,7 @@ impl OperatorConstructor for SlidingAggregatingWindowConstructor {
                 projection_input_schema: final_projection.children()[0].schema().clone(),
                 final_projection,
                 state: SlidingWindowState::NoData,
+                native,
             },
         )))
     }
@@ -554,6 +577,9 @@ impl ArrowOperator for SlidingAggregatingWindowFunc<SystemTime> {
     }
 
     async fn on_start(&mut self, ctx: &mut OperatorContext) -> DataflowResult<()> {
+        if let Some(native) = self.native.as_mut() {
+            return Ok(native.on_start(ctx).await?);
+        }
         let watermark = ctx.last_present_watermark();
         let table = ctx
             .table_manager
@@ -601,6 +627,9 @@ impl ArrowOperator for SlidingAggregatingWindowFunc<SystemTime> {
         ctx: &mut OperatorContext,
         _: &mut dyn Collector,
     ) -> DataflowResult<()> {
+        if let Some(native) = self.native.as_mut() {
+            return Ok(native.process_batch(batch, ctx).await?);
+        }
         let bin = self
             .binning_function
             .evaluate(&batch)
@@ -679,6 +708,13 @@ impl ArrowOperator for SlidingAggregatingWindowFunc<SystemTime> {
         ctx: &mut OperatorContext,
         collector: &mut dyn Collector,
     ) -> DataflowResult<Option<Watermark>> {
+        if let Some(native) = self.native.as_mut() {
+            if ctx.last_present_watermark().is_none() {
+                return Ok(None);
+            }
+            native.handle_watermark(ctx, collector).await?;
+            return Ok(Some(watermark));
+        }
         let Some(last_watermark) = ctx.last_present_watermark() else {
             return Ok(None);
         };
@@ -696,6 +732,9 @@ impl ArrowOperator for SlidingAggregatingWindowFunc<SystemTime> {
         ctx: &mut OperatorContext,
         _: &mut dyn Collector,
     ) -> DataflowResult<()> {
+        if self.native.is_some() {
+            return Ok(());
+        }
         let watermark = ctx
             .watermark()
             .and_then(|watermark: Watermark| match watermark {
@@ -737,6 +776,9 @@ impl ArrowOperator for SlidingAggregatingWindowFunc<SystemTime> {
     }
 
     fn tables(&self) -> HashMap<String, TableConfig> {
+        if let Some(native) = &self.native {
+            return native.tables();
+        }
         vec![(
             "t".to_string(),
             timestamp_table_config(

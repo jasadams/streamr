@@ -1,3 +1,6 @@
+mod aggregate_retention;
+mod continuous_merge;
+mod native_capabilities;
 mod plan_tests;
 
 use arrow_schema::DataType;

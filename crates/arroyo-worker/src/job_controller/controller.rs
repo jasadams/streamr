@@ -872,6 +872,7 @@ fn manifest_into_commit_req(manifest: CheckpointManifest) -> anyhow::Result<Comm
             let commit_data = match config.table_type() {
                 TableEnum::MissingTableType => bail!("missing table type"),
                 TableEnum::DiskKeyedMap => None,
+                TableEnum::TypedStateTable => None,
                 TableEnum::GlobalKeyValue => {
                     GlobalKeyedTable::committing_data(config, &table_metadata)
                 }

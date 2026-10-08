@@ -1,0 +1,224 @@
+{
+  "format_version": 1,
+  "scope": "Independent original input/golden references; not generated native results or a legacy checkpoint migration mapping",
+  "cases": [
+    {
+      "name": "operations",
+      "input_rows": 161,
+      "output_rows": 161,
+      "checkpoint_source_rows": 80,
+      "checkpoint_output_rows": 80,
+      "checkpoint_epoch": 1,
+      "output_fields": [
+        {
+          "name": "id",
+          "sql_type": "BIGINT",
+          "nullable": true
+        },
+        {
+          "name": "before",
+          "sql_type": "TEXT",
+          "nullable": true
+        },
+        {
+          "name": "put_value",
+          "sql_type": "TEXT",
+          "nullable": true
+        },
+        {
+          "name": "upsert_value",
+          "sql_type": "TEXT",
+          "nullable": true
+        },
+        {
+          "name": "updated",
+          "sql_type": "BOOLEAN",
+          "nullable": true
+        },
+        {
+          "name": "deleted",
+          "sql_type": "BOOLEAN",
+          "nullable": true
+        },
+        {
+          "name": "after",
+          "sql_type": "TEXT",
+          "nullable": true
+        }
+      ],
+      "exact_json_value_types": {
+        "id": "integer_or_null",
+        "before": "string_or_null",
+        "put_value": "string_or_null",
+        "upsert_value": "string_or_null",
+        "updated": "boolean_never_null",
+        "deleted": "boolean_never_null",
+        "after": "string_or_null"
+      },
+      "reference_input": "crates/arroyo-sql-testing/inputs/stateful_processor_operations.json",
+      "reference_input_sha256": "eea30cec744a53c9098fb7e7cf978f61e5d7392c5b23ff1bf37137036480215d",
+      "reference_golden": "crates/arroyo-sql-testing/golden_outputs/stateful_processor_operations.json",
+      "reference_golden_sha256": "4ea94c2c0373c05ec71c6d7a91d92bacdd3da058564dc1b93c6097b333ea5885"
+    },
+    {
+      "name": "shared_ctes",
+      "input_rows": 161,
+      "output_rows": 161,
+      "checkpoint_source_rows": 80,
+      "checkpoint_output_rows": 80,
+      "checkpoint_epoch": 1,
+      "output_fields": [
+        {
+          "name": "id",
+          "sql_type": "BIGINT",
+          "nullable": true
+        },
+        {
+          "name": "before",
+          "sql_type": "TEXT",
+          "nullable": true
+        },
+        {
+          "name": "after",
+          "sql_type": "TEXT",
+          "nullable": true
+        },
+        {
+          "name": "read_back",
+          "sql_type": "TEXT",
+          "nullable": true
+        }
+      ],
+      "exact_json_value_types": {
+        "id": "integer_or_null",
+        "before": "string_or_null",
+        "after": "string_or_null",
+        "read_back": "string_or_null"
+      },
+      "reference_input": "crates/arroyo-sql-testing/inputs/stateful_processor_operations.json",
+      "reference_input_sha256": "eea30cec744a53c9098fb7e7cf978f61e5d7392c5b23ff1bf37137036480215d",
+      "reference_golden": "crates/arroyo-sql-testing/golden_outputs/stateful_processor_shared_ctes.json",
+      "reference_golden_sha256": "af829bc9777ae1ca3de99c5482dfe44613775b12ef489615a2903d7c328d8be8"
+    },
+    {
+      "name": "sequential_ctes",
+      "input_rows": 6,
+      "output_rows": 5,
+      "checkpoint_source_rows": 3,
+      "checkpoint_output_rows": 2,
+      "checkpoint_epoch": 1,
+      "output_fields": [
+        {
+          "name": "id",
+          "sql_type": "BIGINT",
+          "nullable": true
+        },
+        {
+          "name": "first_value",
+          "sql_type": "TEXT",
+          "nullable": true
+        },
+        {
+          "name": "second_value",
+          "sql_type": "TEXT",
+          "nullable": true
+        },
+        {
+          "name": "final_value",
+          "sql_type": "TEXT",
+          "nullable": true
+        }
+      ],
+      "exact_json_value_types": {
+        "id": "integer_or_null",
+        "first_value": "string_or_null",
+        "second_value": "string_or_null",
+        "final_value": "string_or_null"
+      },
+      "reference_input": "crates/arroyo-sql-testing/inputs/stateful_processor.json",
+      "reference_input_sha256": "8c5dbf4ece38503e134983e1182da8c488d4580273389d2cd90aa5b8bb874e69",
+      "reference_golden": "crates/arroyo-sql-testing/golden_outputs/stateful_processor_sequential_ctes.json",
+      "reference_golden_sha256": "270e07d51e2f4d7882cc00c24abc643d74022a10ddd686735e32e91f022dce45"
+    },
+    {
+      "name": "computed_cte",
+      "input_rows": 6,
+      "output_rows": 5,
+      "checkpoint_source_rows": 3,
+      "checkpoint_output_rows": 2,
+      "checkpoint_epoch": 1,
+      "output_fields": [
+        {
+          "name": "id",
+          "sql_type": "BIGINT",
+          "nullable": true
+        },
+        {
+          "name": "normalized",
+          "sql_type": "TEXT",
+          "nullable": true
+        },
+        {
+          "name": "stored",
+          "sql_type": "TEXT",
+          "nullable": true
+        },
+        {
+          "name": "retrieved",
+          "sql_type": "TEXT",
+          "nullable": true
+        }
+      ],
+      "exact_json_value_types": {
+        "id": "integer_or_null",
+        "normalized": "string_or_null",
+        "stored": "string_or_null",
+        "retrieved": "string_or_null"
+      },
+      "reference_input": "crates/arroyo-sql-testing/inputs/stateful_processor.json",
+      "reference_input_sha256": "8c5dbf4ece38503e134983e1182da8c488d4580273389d2cd90aa5b8bb874e69",
+      "reference_golden": "crates/arroyo-sql-testing/golden_outputs/stateful_processor_computed_cte.json",
+      "reference_golden_sha256": "315668aee53de15169058fcaa49c4324d4339e864676fa9b110bc74ad890ce87"
+    },
+    {
+      "name": "qualified_filter",
+      "input_rows": 6,
+      "output_rows": 5,
+      "checkpoint_source_rows": 3,
+      "checkpoint_output_rows": 2,
+      "checkpoint_epoch": 1,
+      "output_fields": [
+        {
+          "name": "id",
+          "sql_type": "BIGINT",
+          "nullable": true
+        },
+        {
+          "name": "payload",
+          "sql_type": "TEXT",
+          "nullable": true
+        },
+        {
+          "name": "stored",
+          "sql_type": "TEXT",
+          "nullable": true
+        },
+        {
+          "name": "retrieved",
+          "sql_type": "TEXT",
+          "nullable": true
+        }
+      ],
+      "exact_json_value_types": {
+        "id": "integer_or_null",
+        "payload": "string_or_null",
+        "stored": "string_or_null",
+        "retrieved": "string_or_null"
+      },
+      "reference_input": "crates/arroyo-sql-testing/inputs/stateful_processor.json",
+      "reference_input_sha256": "8c5dbf4ece38503e134983e1182da8c488d4580273389d2cd90aa5b8bb874e69",
+      "reference_golden": "crates/arroyo-sql-testing/golden_outputs/stateful_processor_qualified_filter.json",
+      "reference_golden_sha256": "0fc7c9b5ee7a70398ffef3d552de48d7125f74feaa27363d0ae793ab50b539b4"
+    }
+  ]
+}

@@ -11,6 +11,7 @@ mod ready;
 pub mod resolve;
 pub mod state;
 pub mod store;
+pub mod typed_checkpoint;
 pub mod types;
 pub mod workflow;
 

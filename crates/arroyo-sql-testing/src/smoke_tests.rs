@@ -31,7 +31,8 @@ use arroyo_worker::job_controller::checkpoint_state::CheckpointState;
 use petgraph::{Direction, Graph};
 use serde_json::Value;
 use test_log::test as test_log;
-use tokio::fs::read_to_string;
+use tokio::fs::{File, read_to_string};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::sync::mpsc::error::TryRecvError;
 use tracing::info;
 
@@ -122,6 +123,19 @@ struct SmokeTestContext<'a> {
 }
 
 async fn checkpoint(ctx: &mut SmokeTestContext<'_>, epoch: u32) -> u64 {
+    let then_stop =
+        epoch == 3 && std::env::var("STREAMR_TEST_CHECKPOINT_STOP").as_deref() == Ok("1");
+    checkpoint_with_stop(ctx, epoch, then_stop, &mut HashSet::new()).await
+}
+
+/// Retain terminal events consumed while publishing a stopping checkpoint so
+/// callers can subsequently wait for the remaining tasks without losing IDs.
+async fn checkpoint_with_stop(
+    ctx: &mut SmokeTestContext<'_>,
+    epoch: u32,
+    then_stop: bool,
+    finished_tasks: &mut HashSet<(u32, u32)>,
+) -> u64 {
     let checkpoint_started = std::time::Instant::now();
     let checkpoint_id = epoch as i64;
     let leader = leader_mode();
@@ -170,8 +184,7 @@ async fn checkpoint(ctx: &mut SmokeTestContext<'_>, epoch: u32) -> u64 {
         epoch,
         min_epoch: 0,
         timestamp: SystemTime::now(),
-        then_stop: epoch == 3
-            && std::env::var("STREAMR_TEST_CHECKPOINT_STOP").as_deref() == Ok("1"),
+        then_stop,
     };
 
     for source in ctx.engine.source_controls() {
@@ -236,6 +249,12 @@ async fn checkpoint(ctx: &mut SmokeTestContext<'_>, epoch: u32) -> u64 {
                 }
             }
             ControlResp::TaskFailed { error, .. } => panic!("checkpoint worker failed: {error:?}"),
+            ControlResp::TaskFinished {
+                task_id,
+                subtask_idx,
+            } => {
+                finished_tasks.insert((task_id, subtask_idx));
+            }
             _ => {}
         }
     }
@@ -364,12 +383,29 @@ async fn run_until_finished(engine: &RunningEngine, control_rx: &mut Receiver<Co
 }
 
 fn set_internal_parallelism(graph: &mut Graph<LogicalNode, LogicalEdge>, parallelism: usize) {
-    // Stateful SQL maps currently support a singleton operator only. These
-    // fixtures still exercise checkpoint recovery, but cannot test rescaling.
+    // These live SQL owners currently require unchanged singleton ownership.
+    // The fixture still exercises checkpoint and replay; rescaling is not
+    // qualified by this run. Legacy window/aggregate fixtures still rescale.
+    let current = config::config();
+    let worker = &current.worker;
+    let native_window = worker.window_state.is_some();
+    let native_aggregate = worker.aggregate_state.is_some();
     if graph.node_weights().any(|node| {
         node.operator_chain
             .iter()
-            .any(|(config, _)| config.operator_name == OperatorName::StatefulProcessor)
+            .any(|(operator, _)| match operator.operator_name {
+                OperatorName::StatefulProcessor => true,
+                OperatorName::UpdatingAggregate => native_aggregate,
+                OperatorName::SlidingWindowAggregate => native_window,
+                OperatorName::SessionWindowAggregate => native_window,
+                OperatorName::TumblingWindowAggregate if native_window => {
+                    <arroyo_rpc::grpc::api::TumblingWindowAggregateOperator as prost::Message>::decode(
+                        operator.operator_config.as_slice(),
+                    )
+                    .is_ok_and(|window| window.width_micros > 0)
+                }
+                _ => false,
+            })
     }) {
         return;
     }
@@ -1087,21 +1123,694 @@ async fn local_program(
     .unwrap()
 }
 
-/// External Arcstream fixtures supply absolute connector paths and compare the
-/// captured JSONL against their independent oracle, preserving row multiplicity.
-/// Run alone because worker configuration and checkpoint storage are process-wide.
-#[test_log(tokio::test)]
-#[ignore = "opt-in Arcstream identity output and checkpoint/recovery capture"]
-async fn arcstream_identity_capture() {
-    tokio::time::timeout(
-        test_runtime_timeout() * 4,
-        arcstream_identity_capture_inner(),
-    )
-    .await
-    .expect("identity capture planning, startup, or recovery timed out");
+#[derive(Debug, PartialEq, Eq)]
+struct CaptureCounts {
+    input_rows_before_checkpoint: i32,
+    expected_rows: usize,
+    expected_initial_rows: usize,
+    expected_checkpoint_rows: usize,
+    checkpoint_epoch: u32,
 }
 
-async fn arcstream_identity_capture_inner() {
+impl CaptureCounts {
+    fn from_env() -> std::result::Result<Self, String> {
+        let initial_name = "STREAMR_CAPTURE_EXPECTED_INITIAL_ROWS";
+        let initial = match env::var(initial_name) {
+            Ok(value) => Some(value),
+            Err(env::VarError::NotPresent) => None,
+            Err(error) => return Err(format!("{initial_name}: {error}")),
+        };
+        Self::parse(
+            |name| env::var(name).map_err(|error| format!("{name}: {error}")),
+            initial.as_deref(),
+        )
+    }
+
+    fn parse(
+        mut read: impl FnMut(&str) -> std::result::Result<String, String>,
+        initial_rows: Option<&str>,
+    ) -> std::result::Result<Self, String> {
+        fn number<T: std::str::FromStr>(name: &str, raw: String) -> std::result::Result<T, String> {
+            if raw.is_empty() || !raw.bytes().all(|byte| byte.is_ascii_digit()) {
+                return Err(format!("{name} must be an unsigned decimal integer"));
+            }
+            raw.parse()
+                .map_err(|_| format!("{name} is outside the supported integer range"))
+        }
+        let input_name = "STREAMR_CAPTURE_INPUT_ROWS_BEFORE_CHECKPOINT";
+        let epoch_name = "STREAMR_CAPTURE_CHECKPOINT_EPOCH";
+        let input_rows_before_checkpoint = number(input_name, read(input_name)?)?;
+        let checkpoint_epoch = number(epoch_name, read(epoch_name)?)?;
+        if input_rows_before_checkpoint == 0 {
+            return Err(format!(
+                "{input_name} must be positive: the source reads its first row immediately"
+            ));
+        }
+        if checkpoint_epoch == 0 {
+            return Err(format!("{epoch_name} must be positive"));
+        }
+        let rows_name = "STREAMR_CAPTURE_EXPECTED_ROWS";
+        let checkpoint_rows_name = "STREAMR_CAPTURE_EXPECTED_CHECKPOINT_ROWS";
+        let expected_rows = number(rows_name, read(rows_name)?)?;
+        let expected_initial_rows = match initial_rows {
+            Some(value) => number("STREAMR_CAPTURE_EXPECTED_INITIAL_ROWS", value.to_owned())?,
+            None => expected_rows,
+        };
+        Ok(Self {
+            input_rows_before_checkpoint,
+            expected_rows,
+            expected_initial_rows,
+            expected_checkpoint_rows: number(checkpoint_rows_name, read(checkpoint_rows_name)?)?,
+            checkpoint_epoch,
+        })
+    }
+}
+
+/// Opt-in pause after a real input row, with the source blocked on its
+/// existing control channel. The ordinary capture path does not use this.
+#[derive(Debug, PartialEq, Eq)]
+struct CaptureIdle {
+    source_row_target: i32,
+    duration: Duration,
+    min_pre_rows: usize,
+    max_output_bytes: usize,
+    pre_match: Option<CaptureIdlePreMatch>,
+}
+
+/// Optional, caller-owned value readiness for the last complete sink row.
+#[derive(Debug, PartialEq, Eq)]
+struct CaptureIdlePreMatch {
+    pointer: String,
+    expected: Value,
+}
+
+impl CaptureIdlePreMatch {
+    fn parse(
+        pointer: Option<&str>,
+        value: Option<&str>,
+    ) -> std::result::Result<Option<Self>, String> {
+        const POINTER: &str = "STREAMR_CAPTURE_IDLE_PRE_MATCH_POINTER";
+        const VALUE: &str = "STREAMR_CAPTURE_IDLE_PRE_MATCH_VALUE";
+        let (Some(pointer), Some(value)) = (pointer, value) else {
+            if pointer.is_some() || value.is_some() {
+                return Err(format!("{POINTER} and {VALUE} must be set together"));
+            }
+            return Ok(None);
+        };
+        if pointer.len() > 1024 || value.len() > 4096 {
+            return Err(format!(
+                "{POINTER} and {VALUE} exceed configured size limits"
+            ));
+        }
+        if !pointer.is_empty() && !pointer.starts_with('/') {
+            return Err(format!("{POINTER} must be a JSON Pointer"));
+        }
+        let bytes = pointer.as_bytes();
+        let mut index = 0;
+        while index < bytes.len() {
+            if bytes[index] == b'~' {
+                if index + 1 >= bytes.len() || !matches!(bytes[index + 1], b'0' | b'1') {
+                    return Err(format!("{POINTER} has an invalid escape"));
+                }
+                index += 1;
+            }
+            index += 1;
+        }
+        let expected = serde_json::from_str(value)
+            .map_err(|error| format!("{VALUE} must be valid JSON: {error}"))?;
+        Ok(Some(Self {
+            pointer: pointer.to_owned(),
+            expected,
+        }))
+    }
+
+    fn matches(&self, row: &Value) -> bool {
+        row.pointer(&self.pointer) == Some(&self.expected)
+    }
+}
+
+impl CaptureIdle {
+    fn from_env(capture: &CaptureCounts) -> std::result::Result<Option<Self>, String> {
+        fn optional(name: &str) -> std::result::Result<Option<String>, String> {
+            match env::var(name) {
+                Ok(value) => Ok(Some(value)),
+                Err(env::VarError::NotPresent) => Ok(None),
+                Err(error) => Err(format!("{name}: {error}")),
+            }
+        }
+        let target = optional("STREAMR_CAPTURE_IDLE_SOURCE_ROW_TARGET")?;
+        let seconds = optional("STREAMR_CAPTURE_IDLE_SECONDS")?;
+        let pre_rows = optional("STREAMR_CAPTURE_IDLE_MIN_PRE_ROWS")?;
+        let max_bytes = optional("STREAMR_CAPTURE_IDLE_MAX_BYTES")?;
+        let batch = optional("STREAMR_TEST_SOURCE_BATCH_ROWS")?;
+        let pre_match = CaptureIdlePreMatch::parse(
+            optional("STREAMR_CAPTURE_IDLE_PRE_MATCH_POINTER")?.as_deref(),
+            optional("STREAMR_CAPTURE_IDLE_PRE_MATCH_VALUE")?.as_deref(),
+        )?;
+        let mut idle = Self::parse(
+            target.as_deref(),
+            seconds.as_deref(),
+            pre_rows.as_deref(),
+            max_bytes.as_deref(),
+            batch.as_deref(),
+            capture.input_rows_before_checkpoint,
+            test_runtime_timeout(),
+        )?;
+        match idle.as_mut() {
+            Some(idle) => idle.pre_match = pre_match,
+            None if pre_match.is_some() => {
+                return Err("idle pre-match requires an idle capture".into());
+            }
+            None => {}
+        }
+        Ok(idle)
+    }
+
+    fn parse(
+        target: Option<&str>,
+        seconds: Option<&str>,
+        pre_rows: Option<&str>,
+        max_bytes: Option<&str>,
+        source_batch_rows: Option<&str>,
+        checkpoint_prefix: i32,
+        runtime_timeout: Duration,
+    ) -> std::result::Result<Option<Self>, String> {
+        const TARGET: &str = "STREAMR_CAPTURE_IDLE_SOURCE_ROW_TARGET";
+        const SECONDS: &str = "STREAMR_CAPTURE_IDLE_SECONDS";
+        const PRE_ROWS: &str = "STREAMR_CAPTURE_IDLE_MIN_PRE_ROWS";
+        const MAX_BYTES: &str = "STREAMR_CAPTURE_IDLE_MAX_BYTES";
+        let (Some(target), Some(seconds)) = (target, seconds) else {
+            if target.is_some() || seconds.is_some() || pre_rows.is_some() || max_bytes.is_some() {
+                return Err(format!(
+                    "{TARGET}, {SECONDS}, {PRE_ROWS}, and {MAX_BYTES} must be set together"
+                ));
+            }
+            return Ok(None);
+        };
+        let Some(pre_rows) = pre_rows else {
+            return Err(format!("{PRE_ROWS} is required for idle capture"));
+        };
+        let Some(max_bytes) = max_bytes else {
+            return Err(format!("{MAX_BYTES} is required for idle capture"));
+        };
+        fn decimal<T: std::str::FromStr>(name: &str, raw: &str) -> std::result::Result<T, String> {
+            if raw.is_empty() || !raw.bytes().all(|byte| byte.is_ascii_digit()) {
+                return Err(format!("{name} must be an unsigned decimal integer"));
+            }
+            raw.parse()
+                .map_err(|_| format!("{name} is outside the supported integer range"))
+        }
+        let source_row_target: i32 = decimal(TARGET, target)?;
+        let idle_seconds: u64 = decimal(SECONDS, seconds)?;
+        let min_pre_rows: usize = decimal(PRE_ROWS, pre_rows)?;
+        let max_output_bytes: usize = decimal(MAX_BYTES, max_bytes)?;
+        if source_row_target <= checkpoint_prefix {
+            return Err(format!("{TARGET} must exceed the checkpoint input prefix"));
+        }
+        if idle_seconds == 0 || idle_seconds > 120 {
+            return Err(format!("{SECONDS} must be in 1..=120"));
+        }
+        if min_pre_rows == 0 {
+            return Err(format!("{PRE_ROWS} must be positive"));
+        }
+        if max_output_bytes == 0 || max_output_bytes > 64 * 1024 * 1024 {
+            return Err(format!("{MAX_BYTES} must be in 1..=67108864"));
+        }
+        let duration = Duration::from_secs(idle_seconds);
+        if duration > runtime_timeout {
+            return Err(format!("{SECONDS} must fit within the runtime timeout"));
+        }
+        if source_batch_rows != Some("1") {
+            return Err("STREAMR_TEST_SOURCE_BATCH_ROWS must be 1 for idle capture".into());
+        }
+        Ok(Some(Self {
+            source_row_target,
+            duration,
+            min_pre_rows,
+            max_output_bytes,
+            pre_match: None,
+        }))
+    }
+
+    /// Single-file sources read the first available row without a NoOp.
+    fn additional_noops(&self, already_read: i32) -> i32 {
+        assert!(already_read > 0 && already_read <= self.source_row_target);
+        self.source_row_target - already_read
+    }
+}
+
+async fn advance_idle_target(engine: &RunningEngine, noops: i32) {
+    let sources = engine.source_controls();
+    assert_eq!(sources.len(), 1, "idle capture requires one source");
+    for _ in 0..noops {
+        sources[0]
+            .send(ControlMessage::NoOp)
+            .await
+            .expect("source ended before idle row target");
+    }
+}
+
+fn check_idle_response(response: Option<ControlResp>) {
+    match response {
+        Some(ControlResp::TaskFailed { error, .. }) => {
+            panic!("worker failed during idle hold: {error:?}")
+        }
+        Some(ControlResp::Error {
+            message, details, ..
+        }) => {
+            panic!("worker error during idle hold: {message}: {details}")
+        }
+        Some(ControlResp::TaskFinished {
+            task_id,
+            subtask_idx,
+        }) => {
+            panic!("task {task_id}/{subtask_idx} finished during idle hold")
+        }
+        Some(_) => {}
+        None => panic!("control channel closed during idle hold"),
+    }
+}
+
+async fn hold_capture_idle(
+    control_rx: &mut Receiver<ControlResp>,
+    phase: &str,
+    idle: &CaptureIdle,
+) {
+    let started = tokio::time::Instant::now();
+    let deadline = started + idle.duration;
+    println!(
+        "CAPTURE_IDLE phase={phase} event=start source_position={} duration_ms={}",
+        idle.source_row_target,
+        idle.duration.as_millis()
+    );
+    loop {
+        tokio::select! {
+            response = control_rx.recv() => check_idle_response(response),
+            () = tokio::time::sleep_until(deadline) => break,
+        }
+    }
+    while let Ok(response) = control_rx.try_recv() {
+        check_idle_response(Some(response));
+    }
+    assert!(
+        !control_rx.is_closed(),
+        "control channel closed during idle hold"
+    );
+    println!(
+        "CAPTURE_IDLE phase={phase} event=end source_position={} elapsed_ms={}",
+        idle.source_row_target,
+        started.elapsed().as_millis()
+    );
+}
+
+/// Snapshot complete sink rows while the control-waiting source remains live.
+/// The single-file sink writes directly to a tokio File, without a BufWriter.
+/// The caller compares these generic before/after byte prefixes with its own
+/// value oracle; row count alone does not establish which input was processed.
+fn complete_idle_jsonl_rows(bytes: &[u8]) -> Option<(usize, Value)> {
+    if !bytes.ends_with(b"\n") {
+        return None;
+    }
+    let mut rows = 0;
+    let mut last = None;
+    for line in bytes[..bytes.len() - 1].split(|&byte| byte == b'\n') {
+        assert!(
+            !line.is_empty(),
+            "idle output contains a blank JSONL record"
+        );
+        let value: Value =
+            serde_json::from_slice(line).expect("idle output contains malformed JSONL");
+        assert!(value.is_object(), "idle output JSONL row must be an object");
+        rows += 1;
+        last = Some(value);
+    }
+    Some((rows, last.expect("complete JSONL has at least one row")))
+}
+
+async fn capture_idle_output(
+    output_path: &Path,
+    phase: &str,
+    boundary: &str,
+    minimum_rows: usize,
+    max_bytes: usize,
+    pre_match: Option<&CaptureIdlePreMatch>,
+) -> (usize, Vec<u8>) {
+    // Four snapshots across the two phases must fit inside the outer 4x
+    // runtime timeout alongside the two bounded idle holds.
+    let deadline = tokio::time::Instant::now() + test_runtime_timeout() / 4;
+    loop {
+        match File::open(output_path).await {
+            Ok(file) => {
+                let mut bytes = Vec::new();
+                file.take(u64::try_from(max_bytes).unwrap() + 1)
+                    .read_to_end(&mut bytes)
+                    .await
+                    .expect("cannot read idle output");
+                assert!(
+                    bytes.len() <= max_bytes,
+                    "idle output exceeds configured byte limit"
+                );
+                // A sink write may be between its value and newline.
+                if let Some((rows, last)) = complete_idle_jsonl_rows(&bytes)
+                    && rows >= minimum_rows
+                    && pre_match.is_none_or(|expected| expected.matches(&last))
+                {
+                    let snapshot =
+                        output_path.with_extension(format!("idle-{phase}-{boundary}.jsonl"));
+                    tokio::fs::write(&snapshot, &bytes)
+                        .await
+                        .expect("failed to write idle output snapshot");
+                    println!(
+                        "CAPTURE_IDLE_OUTPUT phase={phase} boundary={boundary} rows={rows} bytes={} path={}",
+                        bytes.len(),
+                        snapshot.display()
+                    );
+                    return (rows, bytes);
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => panic!("cannot read idle output {}: {error}", output_path.display()),
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "idle output did not reach {minimum_rows} complete rows before timeout"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[test]
+fn capture_counts_require_explicit_bounded_parameters() {
+    let parse = |input: &str, rows: &str, checkpoint_rows: &str, epoch: &str| {
+        CaptureCounts::parse(
+            |name| {
+                Ok(match name {
+                    "STREAMR_CAPTURE_INPUT_ROWS_BEFORE_CHECKPOINT" => input,
+                    "STREAMR_CAPTURE_EXPECTED_ROWS" => rows,
+                    "STREAMR_CAPTURE_EXPECTED_CHECKPOINT_ROWS" => checkpoint_rows,
+                    "STREAMR_CAPTURE_CHECKPOINT_EPOCH" => epoch,
+                    _ => unreachable!(),
+                }
+                .to_owned())
+            },
+            None,
+        )
+    };
+    assert_eq!(
+        parse("7", "3", "2", "9").unwrap(),
+        CaptureCounts {
+            input_rows_before_checkpoint: 7,
+            expected_rows: 3,
+            expected_initial_rows: 3,
+            expected_checkpoint_rows: 2,
+            checkpoint_epoch: 9
+        }
+    );
+    assert!(parse("1", "0", "0", "1").is_ok());
+    for invalid in ["", "-1", "+1", " 1", "1.5", "18446744073709551616"] {
+        assert!(parse(invalid, "3", "2", "9").is_err());
+        assert!(parse("7", invalid, "2", "9").is_err());
+        assert!(parse("7", "3", invalid, "9").is_err());
+        assert!(parse("7", "3", "2", invalid).is_err());
+    }
+    assert!(parse("0", "3", "2", "9").is_err());
+    assert!(parse("2147483648", "3", "2", "9").is_err());
+    assert!(parse("7", "3", "2", "0").is_err());
+    assert!(parse("7", "3", "2", "4294967296").is_err());
+    assert!(CaptureCounts::parse(|name| Err(format!("missing {name}")), None).is_err());
+    let with_initial = |initial| {
+        CaptureCounts::parse(
+            |name| {
+                Ok(match name {
+                    "STREAMR_CAPTURE_INPUT_ROWS_BEFORE_CHECKPOINT" => "2",
+                    "STREAMR_CAPTURE_EXPECTED_ROWS" => "3",
+                    "STREAMR_CAPTURE_EXPECTED_CHECKPOINT_ROWS" => "1",
+                    "STREAMR_CAPTURE_CHECKPOINT_EPOCH" => "1",
+                    _ => unreachable!(),
+                }
+                .to_owned())
+            },
+            Some(initial),
+        )
+    };
+    assert_eq!(with_initial("1").unwrap().expected_initial_rows, 1);
+    assert_eq!(with_initial("0").unwrap().expected_initial_rows, 0);
+    for invalid in ["", "-1", "+1", " 1", "1.5", "18446744073709551616"] {
+        assert!(with_initial(invalid).is_err());
+    }
+}
+
+#[test]
+fn idle_capture_requires_one_row_batches_and_bounded_complete_configuration() {
+    let parse = |target, seconds, pre_rows, max_bytes, batch, timeout| {
+        CaptureIdle::parse(
+            target,
+            seconds,
+            pre_rows,
+            max_bytes,
+            batch,
+            4,
+            Duration::from_secs(timeout),
+        )
+    };
+    assert_eq!(parse(None, None, None, None, None, 120).unwrap(), None);
+    assert_eq!(
+        parse(
+            Some("5"),
+            Some("120"),
+            Some("2"),
+            Some("1024"),
+            Some("1"),
+            120
+        )
+        .unwrap(),
+        Some(CaptureIdle {
+            source_row_target: 5,
+            duration: Duration::from_secs(120),
+            min_pre_rows: 2,
+            max_output_bytes: 1024,
+            pre_match: None,
+        })
+    );
+    assert!(parse(Some("5"), None, Some("2"), Some("1024"), Some("1"), 120).is_err());
+    assert!(parse(None, Some("1"), Some("2"), Some("1024"), Some("1"), 120).is_err());
+    assert!(parse(Some("5"), Some("1"), None, Some("1024"), Some("1"), 120).is_err());
+    assert!(parse(Some("5"), Some("1"), Some("2"), None, Some("1"), 120).is_err());
+    assert!(parse(None, None, Some("1"), Some("1024"), None, 120).is_err());
+    assert!(
+        parse(
+            Some("4"),
+            Some("1"),
+            Some("2"),
+            Some("1024"),
+            Some("1"),
+            120
+        )
+        .is_err()
+    );
+    assert!(
+        parse(
+            Some("5"),
+            Some("0"),
+            Some("2"),
+            Some("1024"),
+            Some("1"),
+            120
+        )
+        .is_err()
+    );
+    assert!(
+        parse(
+            Some("5"),
+            Some("121"),
+            Some("2"),
+            Some("1024"),
+            Some("1"),
+            600
+        )
+        .is_err()
+    );
+    assert!(
+        parse(
+            Some("5"),
+            Some("11"),
+            Some("2"),
+            Some("1024"),
+            Some("1"),
+            10
+        )
+        .is_err()
+    );
+    assert!(parse(Some("5"), Some("1"), Some("2"), Some("0"), Some("1"), 120).is_err());
+    assert!(
+        parse(
+            Some("5"),
+            Some("1"),
+            Some("2"),
+            Some("67108865"),
+            Some("1"),
+            120
+        )
+        .is_err()
+    );
+    assert!(
+        parse(
+            Some("5"),
+            Some("1"),
+            Some("2"),
+            Some("1024"),
+            Some("8"),
+            120
+        )
+        .is_err()
+    );
+    assert!(parse(Some("5"), Some("1"), Some("2"), Some("1024"), None, 120).is_err());
+    for invalid in ["", "-1", "+5", "5x", "2147483648"] {
+        assert!(
+            parse(
+                Some(invalid),
+                Some("1"),
+                Some("2"),
+                Some("1024"),
+                Some("1"),
+                120
+            )
+            .is_err()
+        );
+    }
+    for invalid in ["", "-1", "+1", "1.5", "18446744073709551616"] {
+        assert!(
+            parse(
+                Some("5"),
+                Some(invalid),
+                Some("2"),
+                Some("1024"),
+                Some("1"),
+                120
+            )
+            .is_err()
+        );
+        assert!(
+            parse(
+                Some("5"),
+                Some("1"),
+                Some(invalid),
+                Some("1024"),
+                Some("1"),
+                120
+            )
+            .is_err()
+        );
+        assert!(
+            parse(
+                Some("5"),
+                Some("1"),
+                Some("2"),
+                Some(invalid),
+                Some("1"),
+                120
+            )
+            .is_err()
+        );
+    }
+}
+
+#[test]
+fn idle_control_counts_account_for_automatic_first_and_restored_suffix_rows() {
+    let idle = CaptureIdle {
+        source_row_target: 9,
+        duration: Duration::from_secs(1),
+        min_pre_rows: 1,
+        max_output_bytes: 1024,
+        pre_match: None,
+    };
+    assert_eq!(idle.additional_noops(1), 8); // initial reads row 1
+    assert_eq!(idle.additional_noops(5), 4); // prefix 4, restore reads row 5
+    assert_eq!(idle.additional_noops(9), 0); // target is first suffix row
+}
+
+#[test]
+fn idle_snapshot_requires_complete_object_jsonl_rows() {
+    assert_eq!(
+        complete_idle_jsonl_rows(b"{\"x\":1}\n{\"x\":2}\n"),
+        Some((2, serde_json::json!({"x": 2})))
+    );
+    assert_eq!(complete_idle_jsonl_rows(b"{\"x\":1}"), None);
+    for invalid in [
+        b"{\"x\":1}\n\n".as_slice(),
+        b"{\"x\":1}\n[]\n".as_slice(),
+        b"{\"x\":1}\n42\n".as_slice(),
+    ] {
+        assert!(std::panic::catch_unwind(|| complete_idle_jsonl_rows(invalid)).is_err());
+    }
+}
+
+#[test]
+fn idle_pre_match_requires_paired_bounded_json_pointer_and_value() {
+    let parse = CaptureIdlePreMatch::parse;
+    assert_eq!(parse(None, None).unwrap(), None);
+    assert!(parse(Some("/after"), None).is_err());
+    assert!(parse(None, Some("null")).is_err());
+    assert!(parse(Some("after"), Some("null")).is_err());
+    assert!(parse(Some("/after/~2"), Some("null")).is_err());
+    assert!(parse(Some("/after/~"), Some("null")).is_err());
+    assert!(parse(Some("/after"), Some("not JSON")).is_err());
+    assert!(parse(Some(&format!("/{}", "x".repeat(1024))), Some("null")).is_err());
+    assert!(parse(Some("/after"), Some(&" ".repeat(4097))).is_err());
+    let escaped = parse(Some("/a~1b/~0"), Some("null")).unwrap().unwrap();
+    assert!(escaped.matches(&serde_json::json!({"a/b": {"~": null}})));
+    assert!(!escaped.matches(&serde_json::json!({"a/b": {}})));
+    let root = parse(Some(""), Some("{\"x\":1}")).unwrap().unwrap();
+    assert!(root.matches(&serde_json::json!({"x": 1})));
+}
+
+#[test]
+fn idle_pre_match_checks_latest_complete_object_row() {
+    let expected = CaptureIdlePreMatch::parse(Some("/after"), Some("{\"x\":2}"))
+        .unwrap()
+        .unwrap();
+    let (rows, latest) =
+        complete_idle_jsonl_rows(b"{\"after\":{\"x\":1}}\n{\"after\":{\"x\":2}}\n").unwrap();
+    assert_eq!(rows, 2);
+    assert!(expected.matches(&latest));
+    let (_, latest) =
+        complete_idle_jsonl_rows(b"{\"after\":{\"x\":2}}\n{\"after\":{\"x\":1}}\n").unwrap();
+    assert!(!expected.matches(&latest));
+    let null = CaptureIdlePreMatch::parse(Some("/after"), Some("null"))
+        .unwrap()
+        .unwrap();
+    assert!(null.matches(&serde_json::json!({"after": null})));
+    assert!(!null.matches(&serde_json::json!({})));
+}
+
+/// Capture externally supplied SQL as JSONL before and after checkpoint recovery.
+/// Requires a singleton graph and one control-waiting single-file source.
+/// Input advancement and expected output counts are configured independently;
+/// fixture preparation and business-output comparison belong to the caller.
+/// Run alone because worker configuration and checkpoint storage are process-wide.
+#[test_log(tokio::test)]
+#[ignore = "opt-in external SQL output and checkpoint/recovery capture"]
+async fn external_sql_checkpoint_capture() {
+    tokio::time::timeout(
+        test_runtime_timeout() * 4,
+        external_sql_checkpoint_capture_inner(),
+    )
+    .await
+    .expect("external SQL capture planning, startup, or recovery timed out");
+}
+
+#[path = "smoke_schedule_tests.rs"]
+mod smoke_schedule_tests;
+
+async fn external_sql_checkpoint_capture_inner() {
+    let capture = CaptureCounts::from_env().expect("invalid external SQL capture configuration");
+    let idle = CaptureIdle::from_env(&capture).expect("invalid external SQL idle configuration");
+    let schedule = smoke_schedule_tests::CaptureSchedule::from_env()
+        .expect("invalid external SQL initial schedule");
+    assert!(
+        idle.is_none() || schedule.is_none(),
+        "idle and initial schedule captures are mutually exclusive"
+    );
     configure_test_worker();
     let selected_backend = env::var("STREAMR_TEST_BACKEND").unwrap_or_else(|_| "memory".into());
     let selected_checkpoint =
@@ -1118,12 +1827,15 @@ async fn arcstream_identity_capture_inner() {
         ),
         selected_backend == "rocksdb"
     );
-    println!("IDENTITY_CONFIG backend={selected_backend} checkpoint_mode={selected_checkpoint}");
+    println!(
+        "CAPTURE_CONFIG backend={selected_backend} checkpoint_mode={selected_checkpoint} execution_resources={:?}",
+        config::config().worker.execution_resources
+    );
     let query_path = PathBuf::from(
-        env::var("STREAMR_IDENTITY_QUERY").expect("STREAMR_IDENTITY_QUERY is required"),
+        env::var("STREAMR_CAPTURE_QUERY").expect("STREAMR_CAPTURE_QUERY is required"),
     );
     let output_path = PathBuf::from(
-        env::var("STREAMR_IDENTITY_OUTPUT").expect("STREAMR_IDENTITY_OUTPUT is required"),
+        env::var("STREAMR_CAPTURE_OUTPUT").expect("STREAMR_CAPTURE_OUTPUT is required"),
     );
     assert!(query_path.is_absolute(), "query path must be absolute");
     assert!(output_path.is_absolute(), "output path must be absolute");
@@ -1132,33 +1844,58 @@ async fn arcstream_identity_capture_inner() {
     let logical = Arc::new(
         tokio::time::timeout(test_runtime_timeout(), get_graph(query, &udfs))
             .await
-            .expect("identity planning timed out")
-            .expect("identity SQL failed to plan"),
+            .expect("external SQL planning timed out")
+            .expect("external SQL failed to plan"),
     );
     for node in logical.graph.node_weights() {
         assert_eq!(
             node.parallelism, 1,
-            "identity capture requires singleton graph"
+            "external SQL capture requires singleton graph"
         );
         for (operator, _) in node.operator_chain.iter() {
             println!(
-                "IDENTITY_OPERATOR node={} operator={} kind={:?} parallelism={}",
+                "CAPTURE_OPERATOR node={} operator={} kind={:?} parallelism={}",
                 node.node_id, operator.operator_id, operator.operator_name, node.parallelism
             );
         }
     }
+    let sources: Vec<_> = logical
+        .graph
+        .node_weights()
+        .flat_map(|node| node.operator_chain.iter())
+        .filter(|(operator, _)| operator.operator_name == OperatorName::ConnectorSource)
+        .collect();
+    assert_eq!(sources.len(), 1, "capture requires one connector source");
+    let source: arroyo_rpc::grpc::api::ConnectorOp =
+        prost::Message::decode(sources[0].0.operator_config.as_slice())
+            .expect("capture source config must decode");
     assert_eq!(
-        logical
-            .graph
-            .node_weights()
-            .flat_map(|node| node.operator_chain.iter())
-            .filter(|(operator, _)| operator.operator_name == OperatorName::StatefulProcessor)
-            .count(),
-        1,
-        "identity CTE maps must share one ordered execution owner"
+        source.connector, "single_file",
+        "capture requires a single-file source"
     );
+    let source_config: arroyo_rpc::OperatorConfig =
+        serde_json::from_str(&source.config).expect("capture source connector config must decode");
+    assert!(
+        source_config
+            .table
+            .get("wait_for_control")
+            .is_none_or(|value| value.is_null() || value.as_bool() == Some(true)),
+        "capture source must wait for control after each input row"
+    );
+    if let Some(schedule) = &schedule {
+        schedule
+            .validate_input(
+                source_config
+                    .table
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .expect("scheduled single-file source must have a path"),
+            )
+            .await
+            .expect("invalid scheduled source input");
+    }
     let job_id = format!(
-        "arcstream-identity-{}-{}",
+        "external-sql-capture-{}-{}",
         std::process::id(),
         SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -1166,7 +1903,16 @@ async fn arcstream_identity_capture_inner() {
             .as_nanos()
     );
     let initial_path = output_path.with_extension("initial.jsonl");
-    for path in [&output_path, &initial_path] {
+    let mut stale_paths = vec![output_path.clone(), initial_path.clone()];
+    if idle.is_some() {
+        for phase in ["initial", "recovered"] {
+            for boundary in ["before", "after"] {
+                stale_paths
+                    .push(output_path.with_extension(format!("idle-{phase}-{boundary}.jsonl")));
+            }
+        }
+    }
+    for path in &stale_paths {
         match tokio::fs::remove_file(path).await {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -1175,25 +1921,58 @@ async fn arcstream_identity_capture_inner() {
     }
     let (control_tx, mut control_rx) = channel(128);
     let program = local_program(&job_id, &logical.graph, &udfs, None, control_tx).await;
-    let running = Engine::for_local(program, "pipe-test".into(), job_id.clone())
+    let initial_engine = Engine::for_local(program, "pipe-test".into(), job_id.clone())
         .await
-        .unwrap()
-        .start()
+        .unwrap();
+    let initial_started = tokio::time::Instant::now();
+    let running = initial_engine.start().await;
+    if let Some(schedule) = &schedule {
+        schedule
+            .run(&running, &mut control_rx, &output_path, initial_started)
+            .await;
+    }
+    if let Some(idle) = &idle {
+        advance_idle_target(&running, idle.additional_noops(1)).await;
+        let (before_rows, before_bytes) = capture_idle_output(
+            &output_path,
+            "initial",
+            "before",
+            idle.min_pre_rows,
+            idle.max_output_bytes,
+            idle.pre_match.as_ref(),
+        )
         .await;
+        hold_capture_idle(&mut control_rx, "initial", idle).await;
+        let (after_rows, after_bytes) = capture_idle_output(
+            &output_path,
+            "initial",
+            "after",
+            before_rows,
+            idle.max_output_bytes,
+            None,
+        )
+        .await;
+        assert!(after_bytes.starts_with(&before_bytes) && after_rows >= before_rows);
+    }
     run_until_finished(&running, &mut control_rx).await;
-    identity_capture_rows(&output_path, 13).await;
+    let initial_rows = capture_rows(
+        &output_path,
+        capture.expected_initial_rows,
+        "STREAMR_CAPTURE_MAX_INITIAL_ROWS",
+    )
+    .await;
     tokio::fs::rename(&output_path, &initial_path)
         .await
         .unwrap();
     println!(
-        "IDENTITY_CAPTURE phase=initial rows=13 path={}",
+        "CAPTURE_RESULT phase=initial rows={} path={}",
+        initial_rows,
         initial_path.display()
     );
 
-    // Epoch 41 is deliberately the first checkpoint for this second run. The
-    // shared smoke helper initializes leader generations at epoch 1, so create
-    // the generation explicitly here rather than changing ordinary smoke tests.
-    if leader_mode() {
+    // The shared helper initializes leader generations for epoch 1. Other
+    // configured first epochs require explicit generation initialization.
+    if leader_mode() && capture.checkpoint_epoch != 1 {
         use arroyo_state_protocol::workflow::{
             GenerationInitialization, InitializeGenerationRequest, initialize_generation,
         };
@@ -1225,32 +2004,45 @@ async fn arcstream_identity_capture_inner() {
         .start()
         .await;
     // A control-waiting single-file source reads its first row immediately;
-    // nine NoOps advance to row ten. The barrier flushes that partial batch.
+    // configured NoOps advance the remaining input rows. The barrier flushes
+    // a partial source batch; output cardinality need not match input cardinality.
     assert_eq!(
         running.source_controls().len(),
         1,
         "capture requires one source"
     );
-    advance(&running, 9).await;
-    let checkpoint_bytes = checkpoint(
+    advance(&running, capture.input_rows_before_checkpoint - 1).await;
+    // Stop at the barrier: a normal checkpoint resumes the source and reads
+    // another line, which could flush beyond the captured checkpoint prefix.
+    let mut finished_tasks = HashSet::new();
+    let checkpoint_bytes = checkpoint_with_stop(
         &mut SmokeTestContext {
             job_id: Arc::new(job_id.clone()),
             engine: &running,
             control_rx: &mut control_rx,
             program: logical.clone(),
         },
-        41,
+        capture.checkpoint_epoch,
+        true,
+        &mut finished_tasks,
     )
     .await;
-    identity_capture_rows(&output_path, 10).await;
+    let checkpoint_rows = capture_rows(
+        &output_path,
+        capture.expected_checkpoint_rows,
+        "STREAMR_CAPTURE_MAX_CHECKPOINT_ROWS",
+    )
+    .await;
     if leader_mode() {
         use arroyo_state_protocol::store::read_protobuf;
         let paths = arroyo_state_protocol::ProtocolPaths::new(
             arroyo_types::PipelineId::new("pipe-test"),
             arroyo_types::JobId::new(job_id.clone()),
         );
-        let checkpoint_ref =
-            paths.checkpoint_manifest(arroyo_state_protocol::types::Generation(0), Epoch(41));
+        let checkpoint_ref = paths.checkpoint_manifest(
+            arroyo_state_protocol::types::Generation(0),
+            Epoch(u64::from(capture.checkpoint_epoch)),
+        );
         let storage = arroyo_state::get_storage_provider(&StorageProviderFor::Worker)
             .await
             .unwrap();
@@ -1259,26 +2051,30 @@ async fn arcstream_identity_capture_inner() {
                 .await
                 .unwrap()
                 .unwrap();
-        assert_eq!(metadata.epoch, 41);
+        assert_eq!(metadata.epoch, u64::from(capture.checkpoint_epoch));
         assert_eq!(metadata.job_id, job_id);
         assert!(!metadata.operators.is_empty());
-        println!("IDENTITY_CHECKPOINT path={checkpoint_ref} metadata={metadata:?}");
+        println!("CAPTURE_CHECKPOINT path={checkpoint_ref} metadata={metadata:?}");
     } else {
-        let metadata =
-            StateBackend::load_checkpoint_metadata(&StorageProviderFor::Worker, &job_id, 41)
-                .await
-                .unwrap();
-        assert_eq!(metadata.epoch, 41);
+        let metadata = StateBackend::load_checkpoint_metadata(
+            &StorageProviderFor::Worker,
+            &job_id,
+            capture.checkpoint_epoch,
+        )
+        .await
+        .unwrap();
+        assert_eq!(metadata.epoch, capture.checkpoint_epoch);
         assert_eq!(metadata.job_id, job_id);
         assert!(!metadata.operator_ids.is_empty());
         println!(
-            "IDENTITY_CHECKPOINT path={job_id}/checkpoints/checkpoint-0000041/metadata metadata={metadata:?}"
+            "CAPTURE_CHECKPOINT path={job_id}/checkpoints/checkpoint-{:07}/metadata metadata={metadata:?}",
+            capture.checkpoint_epoch
         );
     }
     let task_count: usize = running.operator_controls().values().map(Vec::len).sum();
     running.abort_workers();
     tokio::time::timeout(test_runtime_timeout(), async {
-        let mut stopped = HashSet::new();
+        let mut stopped = finished_tasks;
         while stopped.len() < task_count {
             match control_rx.recv().await {
                 Some(ControlResp::TaskFailed {
@@ -1304,42 +2100,136 @@ async fn arcstream_identity_capture_inner() {
         );
     })
     .await
-    .expect("identity worker cancellation timed out");
+    .expect("external SQL worker cancellation timed out");
     drop(running);
     let (control_tx, mut control_rx) = channel(128);
-    let program = local_program(&job_id, &logical.graph, &udfs, Some(41), control_tx).await;
+    let program = local_program(
+        &job_id,
+        &logical.graph,
+        &udfs,
+        Some(u64::from(capture.checkpoint_epoch)),
+        control_tx,
+    )
+    .await;
     let restored = Engine::for_local(program, "pipe-test".into(), job_id.clone())
         .await
         .unwrap()
         .start()
         .await;
+    if let Some(idle) = &idle {
+        // Restore reads the first suffix row without a NoOp. The configured
+        // target is an absolute source row count across the checkpoint.
+        advance_idle_target(
+            &restored,
+            idle.additional_noops(capture.input_rows_before_checkpoint + 1),
+        )
+        .await;
+        let (before_rows, before_bytes) = capture_idle_output(
+            &output_path,
+            "recovered",
+            "before",
+            idle.min_pre_rows,
+            idle.max_output_bytes,
+            idle.pre_match.as_ref(),
+        )
+        .await;
+        hold_capture_idle(&mut control_rx, "recovered", idle).await;
+        let (after_rows, after_bytes) = capture_idle_output(
+            &output_path,
+            "recovered",
+            "after",
+            before_rows,
+            idle.max_output_bytes,
+            None,
+        )
+        .await;
+        assert!(after_bytes.starts_with(&before_bytes) && after_rows >= before_rows);
+    }
     run_until_finished(&restored, &mut control_rx).await;
-    identity_capture_rows(&output_path, 13).await;
+    let recovered_rows = capture_rows(
+        &output_path,
+        capture.expected_rows,
+        "STREAMR_CAPTURE_MAX_ROWS",
+    )
+    .await;
     println!(
-        "IDENTITY_CAPTURE phase=recovered checkpoint=41 committed_rows=10 rows=13 bytes={checkpoint_bytes} path={} job={job_id}",
+        "CAPTURE_RESULT phase=recovered checkpoint={} input_rows_before_checkpoint={} committed_rows={} rows={} bytes={checkpoint_bytes} path={} job={job_id}",
+        capture.checkpoint_epoch,
+        capture.input_rows_before_checkpoint,
+        checkpoint_rows,
+        recovered_rows,
         output_path.display()
     );
 }
 
-async fn identity_capture_rows(path: &Path, expected: usize) {
-    let captured = read_to_string(path)
-        .await
-        .expect("identity capture file missing");
-    let rows: Vec<_> = captured.lines().collect();
-    assert_eq!(
-        rows.len(),
-        expected,
-        "unexpected capture row count in {}",
-        path.display()
+fn capture_max_rows(expected: usize, configured: Option<&str>, name: &str) -> usize {
+    let Some(configured) = configured else {
+        return expected;
+    };
+    assert!(
+        !configured.is_empty() && configured.bytes().all(|byte| byte.is_ascii_digit()),
+        "{name} must be an unsigned decimal integer"
     );
-    for row in rows {
+    let max: usize = configured
+        .parse()
+        .expect("capture row maximum is out of range");
+    assert!(
+        max >= expected,
+        "{name} must be at least the expected row minimum"
+    );
+    max
+}
+
+#[test]
+fn capture_max_rows_defaults_to_exact_and_rejects_invalid_ranges() {
+    assert_eq!(capture_max_rows(2, None, "test"), 2);
+    assert_eq!(capture_max_rows(2, Some("4"), "test"), 4);
+    assert_eq!(capture_max_rows(0, None, "test"), 0);
+    assert_eq!(capture_max_rows(0, Some("0"), "test"), 0);
+    assert_eq!(capture_max_rows(0, Some("2"), "test"), 2);
+    assert!(std::panic::catch_unwind(|| capture_max_rows(2, Some("1"), "test")).is_err());
+    assert!(std::panic::catch_unwind(|| capture_max_rows(2, Some("1x"), "test")).is_err());
+}
+
+async fn capture_rows(path: &Path, expected: usize, max_name: &str) -> usize {
+    let configured_max = match env::var(max_name) {
+        Ok(value) => Some(value),
+        Err(env::VarError::NotPresent) => None,
+        Err(error) => panic!("{max_name}: {error}"),
+    };
+    let max = capture_max_rows(expected, configured_max.as_deref(), max_name);
+    let file = File::open(path)
+        .await
+        .expect("external SQL capture file missing");
+    let mut reader = BufReader::new(file);
+    let mut row = String::new();
+    let mut count = 0usize;
+    loop {
+        row.clear();
+        if reader
+            .read_line(&mut row)
+            .await
+            .expect("external SQL capture read failed")
+            == 0
+        {
+            break;
+        }
+        count = count
+            .checked_add(1)
+            .expect("external SQL capture row count overflow");
         let value: Value =
-            serde_json::from_str(row).expect("identity capture contains invalid JSON");
+            serde_json::from_str(&row).expect("external SQL capture contains invalid JSON");
         assert!(
             value.is_object(),
-            "identity capture must contain JSON objects"
+            "external SQL capture must contain JSON objects"
         );
     }
+    assert!(
+        (expected..=max).contains(&count),
+        "unexpected capture row count in {}: {count} outside {expected}..={max}",
+        path.display()
+    );
+    count
 }
 
 /// Run separately: resources and RSS measurements belong to one worker process.
@@ -1626,6 +2516,26 @@ fn configure_test_worker() {
     config::update(|c| {
         // reduce the batch size to increase consistency
         c.pipeline.source_batch_size = 32;
+        if let Ok(seconds) = std::env::var("STREAMR_TEST_AGGREGATE_FLUSH_SECONDS") {
+            let seconds: u64 = seconds.parse().expect("invalid aggregate flush interval");
+            assert!(seconds > 0, "aggregate flush interval must be positive");
+            c.pipeline.update_aggregate_flush_interval = Duration::from_secs(seconds).into();
+        }
+        if let Some(rows) = std::env::var_os("STREAMR_TEST_SOURCE_BATCH_ROWS") {
+            let rows: usize = rows
+                .to_str()
+                .expect("source batch rows must be Unicode")
+                .parse()
+                .expect("invalid source batch rows");
+            assert!(rows > 0, "source batch rows must be positive");
+            c.pipeline.source_batch_size = rows;
+        }
+        if let Ok(bytes) = std::env::var("STREAMR_TEST_EXECUTION_BYTES") {
+            c.worker.execution_resources = Some(arroyo_rpc::config::ExecutionResourceConfig {
+                memory_bytes: bytes.parse().expect("invalid execution memory limit"),
+                max_batch_bytes: 1024 * 1024,
+            });
+        }
         if std::env::var("STREAMR_TEST_BACKEND").as_deref() == Ok("rocksdb") {
             use arroyo_rpc::config::{
                 DiskSqlStateConfig, LiveStateResourceConfig, SqlStateBackend,
@@ -1646,6 +2556,149 @@ fn configure_test_worker() {
                 max_open_databases: 2,
                 disk_reserve_bytes: 64 * 1024 * 1024,
             });
+        }
+        if std::env::var("STREAMR_TEST_TYPED_SQL").as_deref() == Ok("1") {
+            c.worker.execution_resources.get_or_insert(
+                arroyo_rpc::config::ExecutionResourceConfig {
+                    memory_bytes: 16 * 1024 * 1024,
+                    max_batch_bytes: 1024 * 1024,
+                },
+            );
+            c.worker.typed_sql_state = Some(arroyo_rpc::config::TypedSqlStateConfig {
+                key_bytes: 4096,
+                row_bytes: 24 * 1024,
+                decoded_bytes: 64 * 1024,
+                scope_bytes: 256 * 1024,
+                scope_operations: 128,
+                page_bytes: 128 * 1024,
+                page_entries: 64,
+                max_working_event_bytes: 256 * 1024,
+                max_captured_event_bytes: 128 * 1024,
+                max_pending_output_rows: 64,
+                max_pending_output_bytes: 512 * 1024,
+                max_resident_bytes: 8 * 1024 * 1024,
+            });
+            let resources = c.worker.live_state_resources.get_or_insert(
+                arroyo_rpc::config::LiveStateResourceConfig {
+                    block_cache_bytes: 8 * 1024 * 1024,
+                    memtable_bytes: 4 * 1024 * 1024,
+                    queued_write_bytes: 1024 * 1024,
+                    decoded_value_bytes: 1024 * 1024,
+                    scan_page_bytes: 2 * 1024 * 1024,
+                    max_blocking_operations: 2,
+                    max_snapshots: 2,
+                    max_open_databases: 2,
+                    disk_reserve_bytes: 64 * 1024 * 1024,
+                },
+            );
+            // Typed paging reserves up to three decoded copies of each page,
+            // in addition to the live event scope and captured output buffers.
+            resources.decoded_value_bytes = 16 * 1024 * 1024;
+            // The typed scope also admits backend copies and operation metadata.
+            resources.queued_write_bytes = 2 * 1024 * 1024;
+        }
+        if std::env::var("STREAMR_TEST_NATIVE_AGGREGATES").as_deref() == Ok("1") {
+            c.worker.execution_resources = Some(arroyo_rpc::config::ExecutionResourceConfig {
+                memory_bytes: 16 * 1024 * 1024,
+                max_batch_bytes: 8 * 1024 * 1024,
+            });
+            c.worker.aggregate_state = Some(arroyo_rpc::config::AggregateStateConfig {
+                key_bytes: 512,
+                value_bytes: 32 * 1024,
+                page_bytes: 128 * 1024,
+                page_entries: 64,
+                write_bytes: 2 * 1024 * 1024,
+                write_operations: 128,
+                overlay_bytes: 2 * 1024 * 1024,
+                max_pending_output_rows: 64,
+                max_pending_output_bytes: 512 * 1024,
+                max_resident_bytes: 128 * 1024 * 1024,
+            });
+            let resources = c.worker.live_state_resources.get_or_insert(
+                arroyo_rpc::config::LiveStateResourceConfig {
+                    block_cache_bytes: 8 * 1024 * 1024,
+                    memtable_bytes: 4 * 1024 * 1024,
+                    queued_write_bytes: 32 * 1024 * 1024,
+                    decoded_value_bytes: 16 * 1024 * 1024,
+                    scan_page_bytes: 2 * 1024 * 1024,
+                    max_blocking_operations: 2,
+                    max_snapshots: 2,
+                    max_open_databases: 2,
+                    disk_reserve_bytes: 64 * 1024 * 1024,
+                },
+            );
+            // Two native owners can each admit a complete 2 MiB write scope.
+            resources.queued_write_bytes = 32 * 1024 * 1024;
+            resources.decoded_value_bytes = 16 * 1024 * 1024;
+        }
+        if std::env::var("STREAMR_TEST_NATIVE_WINDOWS").as_deref() == Ok("1") {
+            c.worker.execution_resources.get_or_insert(
+                arroyo_rpc::config::ExecutionResourceConfig {
+                    memory_bytes: 16 * 1024 * 1024,
+                    max_batch_bytes: 1024 * 1024,
+                },
+            );
+            c.worker.window_state = Some(arroyo_rpc::config::WindowStateConfig {
+                key_bytes: 512,
+                partial_bytes: 32 * 1024,
+                page_bytes: 128 * 1024,
+                page_entries: 64,
+                write_bytes: 512 * 1024,
+                write_operations: 64,
+                max_resident_bytes: 128 * 1024 * 1024,
+            });
+            let resources = c.worker.live_state_resources.get_or_insert(
+                arroyo_rpc::config::LiveStateResourceConfig {
+                    block_cache_bytes: 8 * 1024 * 1024,
+                    memtable_bytes: 4 * 1024 * 1024,
+                    queued_write_bytes: 4 * 1024 * 1024,
+                    decoded_value_bytes: 16 * 1024 * 1024,
+                    scan_page_bytes: 2 * 1024 * 1024,
+                    max_blocking_operations: 2,
+                    max_snapshots: 2,
+                    max_open_databases: 2,
+                    disk_reserve_bytes: 64 * 1024 * 1024,
+                },
+            );
+            resources.queued_write_bytes = resources.queued_write_bytes.max(4 * 1024 * 1024);
+            resources.decoded_value_bytes = 16 * 1024 * 1024;
+        }
+        // A composition fixture can run several independent native state
+        // owners. Keep the ordinary two-owner defaults unless the test asks
+        // for a larger shared worker admission limit explicitly.
+        let positive_limit = |name: &str| -> Option<usize> {
+            std::env::var(name).ok().map(|value| {
+                let count: usize = value.parse().unwrap_or_else(|_| panic!("invalid {name}"));
+                assert!(count > 0, "{name} must be positive");
+                count
+            })
+        };
+        let databases = positive_limit("STREAMR_TEST_MAX_OPEN_DATABASES");
+        let snapshots = positive_limit("STREAMR_TEST_MAX_SNAPSHOTS");
+        let scan_page_bytes = positive_limit("STREAMR_TEST_SCAN_PAGE_BYTES");
+        let queued_write_bytes = positive_limit("STREAMR_TEST_QUEUED_WRITE_BYTES");
+        if databases.is_some()
+            || snapshots.is_some()
+            || scan_page_bytes.is_some()
+            || queued_write_bytes.is_some()
+        {
+            let resources = c
+                .worker
+                .live_state_resources
+                .as_mut()
+                .expect("test live-state limit requires configured live-state resources");
+            if let Some(databases) = databases {
+                resources.max_open_databases = databases;
+            }
+            if let Some(snapshots) = snapshots {
+                resources.max_snapshots = snapshots;
+            }
+            if let Some(scan_page_bytes) = scan_page_bytes {
+                resources.scan_page_bytes = scan_page_bytes;
+            }
+            if let Some(queued_write_bytes) = queued_write_bytes {
+                resources.queued_write_bytes = queued_write_bytes;
+            }
         }
     });
 }

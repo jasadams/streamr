@@ -98,16 +98,95 @@ pub(crate) fn io_error(error: std::io::Error) -> LiveStateError {
 }
 
 pub(crate) fn directory_bytes(path: &Path) -> Result<u64> {
+    directory_bytes_at(path, true)
+}
+
+fn directory_bytes_at(path: &Path, root: bool) -> Result<u64> {
+    let entries = match std::fs::read_dir(path) {
+        Ok(entries) => entries,
+        // RocksDB may remove a child directory after its parent was read.
+        Err(error) if !root && error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(directory_io_error(path, error)),
+    };
     let mut bytes = 0u64;
-    for entry in std::fs::read_dir(path).map_err(io_error)? {
-        let entry = entry.map_err(io_error)?;
-        let metadata = entry.metadata().map_err(io_error)?;
-        let size = if metadata.is_dir() {
-            directory_bytes(&entry.path())?
-        } else {
-            metadata.len()
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(directory_io_error(path, error)),
         };
-        bytes = bytes.saturating_add(size);
+        bytes = bytes.saturating_add(directory_entry_bytes(&entry)?);
+    }
+    // A missing live database is not a normal disappearing-child race.
+    if root {
+        std::fs::metadata(path).map_err(|error| directory_io_error(path, error))?;
     }
     Ok(bytes)
+}
+
+fn directory_entry_bytes(entry: &std::fs::DirEntry) -> Result<u64> {
+    let child = entry.path();
+    let metadata = match entry.metadata() {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(directory_io_error(&child, error)),
+    };
+    if metadata.is_dir() {
+        directory_bytes_at(&child, false)
+    } else {
+        Ok(metadata.len())
+    }
+}
+
+fn directory_io_error(path: &Path, error: std::io::Error) -> LiveStateError {
+    LiveStateError::Backend(format!(
+        "scanning live-state directory {}: {error}",
+        path.display()
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn directory_accounting_tolerates_disappearing_children_but_not_missing_root() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("compacted.sst");
+        std::fs::write(&file, [1u8; 17]).unwrap();
+        assert_eq!(directory_bytes(root.path()).unwrap(), 17);
+
+        let entry = std::fs::read_dir(root.path())
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        std::fs::remove_file(file).unwrap();
+        assert_eq!(directory_entry_bytes(&entry).unwrap(), 0);
+        assert_eq!(directory_bytes(root.path()).unwrap(), 0);
+
+        let removed_dir = root.path().join("removed-child");
+        std::fs::create_dir(&removed_dir).unwrap();
+        std::fs::remove_dir(&removed_dir).unwrap();
+        assert_eq!(directory_bytes_at(&removed_dir, false).unwrap(), 0);
+        assert!(directory_bytes(&removed_dir).is_err());
+    }
+
+    #[test]
+    fn directory_accounting_survives_concurrent_file_churn() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().to_owned();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                for index in 0..2_000 {
+                    let file = path.join(format!("{index}.sst"));
+                    std::fs::write(&file, [0u8; 32]).unwrap();
+                    std::fs::remove_file(file).unwrap();
+                }
+            });
+            for _ in 0..2_000 {
+                directory_bytes(root.path()).unwrap();
+            }
+        });
+    }
 }

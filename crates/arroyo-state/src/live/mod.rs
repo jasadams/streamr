@@ -7,6 +7,7 @@ use std::fmt;
 use std::sync::Arc;
 
 pub mod checkpoint;
+pub mod collections;
 pub mod encoding;
 pub mod lifecycle;
 pub mod memory;
@@ -14,6 +15,8 @@ pub mod resources;
 pub mod rocks;
 pub mod table;
 pub mod time;
+pub mod timers;
+pub mod typed_table;
 pub mod worker;
 pub mod write;
 
@@ -189,6 +192,17 @@ pub struct ScanPage {
 #[async_trait]
 pub trait SnapshotReader: Send + Sync {
     async fn get(&self, key: &StateKey, options: ReadOptions) -> Result<Option<Vec<u8>>>;
+    /// Native work still awaits completion; only resource admission is fail-fast.
+    async fn try_get(&self, _key: &StateKey, _options: ReadOptions) -> Result<Option<Vec<u8>>> {
+        Err(LiveStateError::Backend(
+            "snapshot does not support fail-fast read admission".into(),
+        ))
+    }
+    async fn try_scan(&self, _request: ScanRequest) -> Result<ScanPage> {
+        Err(LiveStateError::Backend(
+            "snapshot does not support fail-fast scan admission".into(),
+        ))
+    }
     async fn multi_get(
         &self,
         keys: &[StateKey],
@@ -203,6 +217,12 @@ pub struct StateSnapshot(pub Arc<dyn SnapshotReader>);
 impl StateSnapshot {
     pub async fn get(&self, key: &StateKey, options: ReadOptions) -> Result<Option<Vec<u8>>> {
         self.0.get(key, options).await
+    }
+    pub async fn try_get(&self, key: &StateKey, options: ReadOptions) -> Result<Option<Vec<u8>>> {
+        self.0.try_get(key, options).await
+    }
+    pub async fn try_scan(&self, request: ScanRequest) -> Result<ScanPage> {
+        self.0.try_scan(request).await
     }
     pub async fn multi_get(
         &self,
@@ -219,6 +239,20 @@ impl StateSnapshot {
 #[async_trait]
 pub trait LiveStateBackend: Send + Sync {
     async fn get(&self, key: &StateKey, options: ReadOptions) -> Result<Option<Vec<u8>>>;
+    async fn try_get(&self, _key: &StateKey, _options: ReadOptions) -> Result<Option<Vec<u8>>> {
+        Err(LiveStateError::Backend(
+            "backend does not support fail-fast read admission".into(),
+        ))
+    }
+    fn try_admit_write(
+        &self,
+        _max_bytes: usize,
+        _max_operations: usize,
+    ) -> Result<write::AdmittedWriteBatch> {
+        Err(LiveStateError::Backend(
+            "backend does not support fail-fast write admission".into(),
+        ))
+    }
     async fn multi_get(
         &self,
         keys: &[StateKey],
@@ -229,6 +263,28 @@ pub trait LiveStateBackend: Send + Sync {
     /// (RocksLiveState::admitted_batch) and keep source/overlay memory bounded.
     async fn write_batch(&self, batch: WriteBatch) -> Result<()>;
     async fn snapshot(&self) -> Result<StateSnapshot>;
+    /// Explicit shutdown after all operator/table handles have been released.
+    async fn close(self: Arc<Self>) -> Result<()> {
+        Err(LiveStateError::Backend(
+            "backend does not support explicit close".into(),
+        ))
+    }
+    /// Reserve queue capacity before a producer builds owned write buffers.
+    /// Adapters without accounted admission reject this capability explicitly.
+    async fn admit_write(
+        &self,
+        _max_bytes: usize,
+        _max_operations: usize,
+    ) -> Result<write::AdmittedWriteBatch> {
+        Err(LiveStateError::Backend(
+            "backend does not support accounted write admission".into(),
+        ))
+    }
+    async fn write_admitted(&self, _batch: write::AdmittedWriteBatch) -> Result<()> {
+        Err(LiveStateError::Backend(
+            "backend does not support accounted write admission".into(),
+        ))
+    }
     async fn put(&self, key: StateKey, value: Vec<u8>, max_bytes: usize) -> Result<()> {
         self.write_batch(WriteBatch {
             operations: vec![WriteOperation::Put { key, value }],

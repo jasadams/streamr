@@ -28,8 +28,10 @@ use arroyo_rpc::grpc::rpc::TableConfig;
 use arroyo_rpc::grpc::rpc::{DiskKeyedTableConfig, TableEnum};
 use arroyo_state::global_table_config;
 use arroyo_state::live::{
-    ReadOptions, lifecycle::RocksStateConfig, rocks::RocksLiveState, table::LiveTable,
-    worker::configured_worker_resources,
+    LiveStateBackend, ReadOptions,
+    lifecycle::RocksStateConfig,
+    table::LiveTable,
+    worker::{BackendConstruction, configured_worker_resources, construct_backend},
 };
 
 use arroyo_types::CheckpointBarrier;
@@ -51,7 +53,7 @@ struct StateOp {
 pub struct StatefulProcessorFunc {
     // Values are Option<String>: Some(v) = live entry, None = tombstone (deleted).
     state: HashMap<String, HashMap<String, Option<String>>>,
-    rocks: Option<Arc<RocksLiveState>>,
+    live_backend: Option<Arc<dyn LiveStateBackend>>,
     live_tables: HashMap<String, LiveTable>,
     dirty_keys: HashMap<String, HashSet<String>>,
     map_names: Vec<String>,
@@ -159,19 +161,22 @@ impl ArrowOperator for StatefulProcessorFunc {
                 arroyo_types::CheckpointFilePathLayout::Protocol { generation, .. } => generation,
                 _ => 0,
             };
-            let backend = Arc::new(
-                RocksLiveState::open_worker(RocksStateConfig {
+            let resources = configured_worker_resources()
+                .map_err(external)?
+                .ok_or_else(|| external("missing live-state resources"))?;
+            let backend = construct_backend(
+                BackendConstruction::Rocksdb(RocksStateConfig {
                     root: disk.directory.join(uuid::Uuid::new_v4().to_string()),
                     job_id: ctx.task_info.job_id.clone(),
                     operator_id: ctx.task_info.operator_id.clone(),
                     subtask: ctx.task_info.task_index,
                     generation,
                     attempt: 0,
-                })
-                .await
-                .map_err(external)?,
-            );
-            backend.remove_on_drop();
+                }),
+                resources,
+            )
+            .await
+            .map_err(external)?;
             for name in &self.map_names {
                 let table = ctx
                     .table_manager
@@ -180,7 +185,7 @@ impl ArrowOperator for StatefulProcessorFunc {
                     .map_err(external)?;
                 self.live_tables.insert(name.clone(), table);
             }
-            self.rocks = Some(backend);
+            self.live_backend = Some(backend);
         } else {
             for map_name in &self.map_names {
                 let gs = ctx
@@ -229,7 +234,7 @@ impl ArrowOperator for StatefulProcessorFunc {
                 .map_err(|e| arroyo_rpc::errors::DataflowError::ExternalError(e.to_string()))?;
         }
 
-        if self.rocks.is_some() {
+        if self.live_backend.is_some() {
             let mut fields = self.input_schema.schema.fields().to_vec();
             for op in &self.ops {
                 let dt = match op.op_type {
@@ -264,7 +269,7 @@ impl ArrowOperator for StatefulProcessorFunc {
     ) -> DataflowResult<()> {
         // One row is a bounded execution chunk. Complete its ordered writes
         // before emitting output; the next row observes those completed writes.
-        let disk_limit = self.rocks.as_ref().map(|_| {
+        let disk_limit = self.live_backend.as_ref().map(|_| {
             config()
                 .worker
                 .disk_sql_state
@@ -487,7 +492,7 @@ impl ArrowOperator for StatefulProcessorFunc {
         ctx: &mut OperatorContext,
         _: &mut dyn Collector,
     ) -> DataflowResult<()> {
-        if self.rocks.is_some() {
+        if self.live_backend.is_some() {
             return Ok(());
         }
         // Legacy global tables checkpoint only entries explicitly staged in this
@@ -694,10 +699,10 @@ impl StatefulProcessorFunc {
         value: Option<String>,
         limit: Option<usize>,
     ) -> DataflowResult<()> {
-        if let (Some(backend), Some(limit)) = (&self.rocks, limit) {
+        if let (Some(backend), Some(limit)) = (&self.live_backend, limit) {
             let key = self.live_tables[name].key(key.into_bytes(), None);
             let mut batch = backend
-                .admitted_batch(limit.saturating_mul(2).saturating_add(1024), 1)
+                .admit_write(limit.saturating_mul(2).saturating_add(1024), 1)
                 .await
                 .map_err(external)?;
             match value {
@@ -819,7 +824,7 @@ impl OperatorConstructor for StatefulProcessorConstructor {
         Ok(ConstructedOperator::from_operator(Box::new(
             StatefulProcessorFunc {
                 state,
-                rocks: None,
+                live_backend: None,
                 live_tables: HashMap::new(),
                 dirty_keys,
                 map_names,

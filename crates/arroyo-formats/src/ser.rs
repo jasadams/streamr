@@ -103,12 +103,16 @@ impl ArrowSerializer {
             self.projection = Self::projection(&batch.schema());
         }
 
-        if self.kafka_schema.is_none() {
-            self.kafka_schema = Some(Self::kafka_schema(&batch.schema()));
-        }
-
-        if self.avro_schema.is_none() {
-            self.avro_schema = Some(Arc::new(Self::avro_schema(&batch.schema())));
+        // Only construct schemas consumed by the selected format. Plain JSON
+        // supports Arrow types that Kafka Connect and Avro schemas cannot represent.
+        match &self.format {
+            Format::Json(json) if json.include_schema && self.kafka_schema.is_none() => {
+                self.kafka_schema = Some(Self::kafka_schema(&batch.schema()));
+            }
+            Format::Avro(_) if self.avro_schema.is_none() => {
+                self.avro_schema = Some(Arc::new(Self::avro_schema(&batch.schema())));
+            }
+            _ => {}
         }
 
         let batch = batch
@@ -622,5 +626,149 @@ mod tests {
         assert_eq!(iter.next().unwrap(), br#"{"value":"MTIzMTIz"}"#);
         assert_eq!(iter.next().unwrap(), br#"{"value":"AAECAwQ="}"#);
         assert_eq!(iter.next(), None);
+    }
+
+    fn map_json_batch() -> arrow_array::RecordBatch {
+        use arrow_array::Array;
+        use arrow_array::builder::{Int64Builder, MapBuilder, StringBuilder};
+
+        let mut values = MapBuilder::new(None, StringBuilder::new(), Int64Builder::new());
+        values.keys().append_value("a\"b");
+        values.values().append_value(7);
+        values.keys().append_value("missing");
+        values.values().append_null();
+        values.append(true).unwrap();
+        values.append(true).unwrap();
+        values.append(false).unwrap();
+        let values = values.finish();
+        let schema = Arc::new(Schema::new(vec![
+            arrow_schema::Field::new("value", values.data_type().clone(), true),
+            arrow_schema::Field::new(
+                "_timestamp",
+                arrow_schema::DataType::Timestamp(TimeUnit::Nanosecond, None),
+                false,
+            ),
+        ]));
+        arrow_array::RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(values),
+                Arc::new(arrow_array::TimestampNanosecondArray::from(vec![0, 1, 2])),
+            ],
+        )
+        .unwrap()
+    }
+
+    fn scalar_serialization_batch() -> arrow_array::RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            arrow_schema::Field::new("value", arrow_schema::DataType::Int64, false),
+            arrow_schema::Field::new(
+                "_timestamp",
+                arrow_schema::DataType::Timestamp(TimeUnit::Nanosecond, None),
+                false,
+            ),
+        ]));
+        arrow_array::RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(arrow_array::Int64Array::from(vec![7])),
+                Arc::new(arrow_array::TimestampNanosecondArray::from(vec![0])),
+            ],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn test_plain_json_map_without_unrelated_schemas() {
+        let batch = map_json_batch();
+        let mut serializer = ArrowSerializer::new(Format::Json(JsonFormat::default()));
+        let expected = vec![
+            br#"{"value":{"a\"b":7,"missing":null}}"#.to_vec(),
+            br#"{"value":{}}"#.to_vec(),
+            br#"{"value":null}"#.to_vec(),
+        ];
+        for _ in 0..2 {
+            assert_eq!(serializer.serialize(&batch).collect::<Vec<_>>(), expected);
+        }
+        assert_eq!(
+            serializer.serialize(&batch.slice(1, 2)).collect::<Vec<_>>(),
+            expected[1..]
+        );
+        assert!(serializer.kafka_schema.is_none());
+        assert!(serializer.avro_schema.is_none());
+    }
+
+    #[test]
+    fn test_json_included_schema_is_initialized() {
+        let batch = scalar_serialization_batch();
+        let mut serializer = ArrowSerializer::new(Format::Json(JsonFormat {
+            include_schema: true,
+            ..Default::default()
+        }));
+        for _ in 0..2 {
+            let rows = serializer.serialize(&batch).collect::<Vec<_>>();
+            assert_eq!(rows.len(), 1);
+            let row: serde_json::Value = serde_json::from_slice(&rows[0]).unwrap();
+            assert_eq!(
+                row,
+                serde_json::json!({
+                    "schema": {
+                        "type": "struct", "name": "ArroyoJson", "optional": false,
+                        "fields": [{"type": "int64", "field": "value", "optional": false}]
+                    },
+                    "payload": {"value": 7}
+                })
+            );
+        }
+        assert!(serializer.kafka_schema.is_some());
+        assert!(serializer.avro_schema.is_none());
+    }
+
+    #[test]
+    fn test_confluent_json_map_preserves_header_and_payload() {
+        let batch = map_json_batch();
+        let mut serializer = ArrowSerializer::new(Format::Json(JsonFormat {
+            confluent_schema_registry: true,
+            schema_id: Some(0x01020304),
+            ..Default::default()
+        }));
+        let expected = [
+            br#"{"value":{"a\"b":7,"missing":null}}"#.as_slice(),
+            br#"{"value":{}}"#.as_slice(),
+            br#"{"value":null}"#.as_slice(),
+        ];
+        let rows = serializer.serialize(&batch).collect::<Vec<_>>();
+        assert_eq!(rows.len(), expected.len());
+        for (row, payload) in rows.iter().zip(expected) {
+            assert_eq!(&row[..5], &[0, 1, 2, 3, 4]);
+            assert_eq!(&row[5..], payload);
+        }
+        assert!(serializer.kafka_schema.is_none());
+        assert!(serializer.avro_schema.is_none());
+    }
+
+    #[test]
+    fn test_avro_schema_is_initialized_and_raw_datums_decode() {
+        let batch = scalar_serialization_batch();
+        let mut serializer = ArrowSerializer::new(Format::Avro(
+            arroyo_rpc::formats::AvroFormat::new(false, true, false),
+        ));
+        for _ in 0..2 {
+            let buffers = serializer.serialize(&batch).collect::<Vec<_>>();
+            assert_eq!(buffers.len(), 1);
+            let schema = serializer.avro_schema.as_ref().unwrap();
+            let mut input = buffers[0].as_slice();
+            let row = apache_avro::from_avro_datum(schema, &mut input, None).unwrap();
+            assert!(input.is_empty(), "raw datum has trailing bytes");
+            assert_eq!(
+                row,
+                apache_avro::types::Value::Record(vec![(
+                    "value".to_owned(),
+                    apache_avro::types::Value::Long(7)
+                )])
+            );
+        }
+        assert!(serializer.avro_schema.is_some());
+        assert!(serializer.kafka_schema.is_none());
     }
 }

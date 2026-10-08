@@ -17,7 +17,7 @@ use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::execution::{FunctionRegistry, SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::aggregate::{AggregateExprBuilder, AggregateFunctionExpr};
 use datafusion::physical_expr::{LexOrdering, PhysicalExpr};
-use datafusion::physical_plan::{ExecutionPlan, displayable};
+use datafusion::physical_plan::ExecutionPlan;
 use datafusion_proto::physical_plan::from_proto::{parse_physical_expr, parse_physical_sort_expr};
 use datafusion_proto::physical_plan::{
     AsExecutionPlan, DefaultPhysicalExtensionCodec, PhysicalExtensionCodec,
@@ -31,20 +31,32 @@ use prost::Message as ProstMessage;
 use std::borrow::Cow;
 use std::sync::Arc;
 use std::sync::RwLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 
+mod aggregate_codec;
+mod aggregate_store;
 pub mod async_udf;
+pub(crate) mod execution;
 pub mod incremental_aggregator;
 pub mod instant_join;
 pub mod join_with_expiration;
 pub mod lookup_join;
 pub mod session_aggregating_window;
+mod session_native;
+mod session_store;
 pub mod sliding_aggregating_window;
+pub mod state_table;
+mod state_table_concat;
+pub mod state_table_owner;
+pub mod state_table_runtime;
 pub mod stateful_processor;
 pub(crate) mod sync;
 pub mod tumbling_aggregating_window;
 mod updating_cache;
 pub mod watermark_generator;
 pub mod window_fn;
+mod window_native;
+mod window_store;
 
 pub struct ValueExecutionOperator {
     name: String,
@@ -101,6 +113,7 @@ pub struct ProjectionOperator {
     name: String,
     output_schema: ArroyoSchema,
     exprs: Vec<Arc<dyn PhysicalExpr>>,
+    resources: Option<Arc<execution::ExecutionResources>>,
 }
 
 pub struct ProjectionConstructor;
@@ -133,6 +146,7 @@ impl OperatorConstructor for ProjectionConstructor {
                 name: config.name,
                 output_schema,
                 exprs: exprs?,
+                resources: execution::configured_execution_resources()?,
             },
         )))
     }
@@ -160,6 +174,11 @@ impl ArrowOperator for ProjectionOperator {
         _: &mut OperatorContext,
         collector: &mut dyn Collector,
     ) -> DataflowResult<()> {
+        let _input_reservation = self
+            .resources
+            .as_ref()
+            .map(|resources| resources.reserve_batch("Streamr projection input", &record_batch))
+            .transpose()?;
         let outputs = self
             .exprs
             .iter()
@@ -169,12 +188,13 @@ impl ArrowOperator for ProjectionOperator {
             })
             .try_collect()?;
 
-        collector
-            .collect(RecordBatch::try_new(
-                self.output_schema.schema.clone(),
-                outputs,
-            )?)
-            .await
+        let output = RecordBatch::try_new(self.output_schema.schema.clone(), outputs)?;
+        let _output_reservation = self
+            .resources
+            .as_ref()
+            .map(|resources| resources.reserve_batch("Streamr projection output", &output))
+            .transpose()?;
+        collector.collect(output).await
     }
 }
 
@@ -247,52 +267,147 @@ pub struct StatelessPhysicalExecutor {
     batch: Arc<RwLock<Option<RecordBatch>>>,
     plan: Arc<dyn ExecutionPlan>,
     task_context: Arc<TaskContext>,
+    resources: Option<Arc<execution::ExecutionResources>>,
+    active: Arc<AtomicBool>,
+}
+
+struct ExecutionInputGuard {
+    batch: Arc<RwLock<Option<RecordBatch>>>,
+    active: Arc<AtomicBool>,
+}
+
+impl Drop for ExecutionInputGuard {
+    fn drop(&mut self) {
+        self.batch.write().unwrap().take();
+        self.active.store(false, Ordering::Release);
+    }
+}
+
+fn failed_execution_stream(
+    schema: SchemaRef,
+    error: datafusion::common::DataFusionError,
+) -> SendableRecordBatchStream {
+    Box::pin(
+        datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
+            schema,
+            futures::stream::once(async move { Err(error) }),
+        ),
+    )
 }
 
 impl StatelessPhysicalExecutor {
-    pub fn new(mut proto: &[u8], registry: &Registry) -> anyhow::Result<Self> {
+    pub fn new(proto: &[u8], registry: &Registry) -> anyhow::Result<Self> {
+        Self::new_with_resources(
+            proto,
+            registry,
+            execution::configured_execution_resources()?,
+        )
+    }
+
+    fn new_with_resources(
+        mut proto: &[u8],
+        registry: &Registry,
+        resources: Option<Arc<execution::ExecutionResources>>,
+    ) -> anyhow::Result<Self> {
         let batch = Arc::new(RwLock::default());
 
-        let plan = PhysicalPlanNode::decode(&mut proto).unwrap();
+        let plan = PhysicalPlanNode::decode(&mut proto)?;
         let codec = ArroyoPhysicalExtensionCodec {
             context: DecodingContext::SingleLockedBatch(batch.clone()),
         };
 
-        let plan =
-            plan.try_into_physical_plan(registry, &RuntimeEnvBuilder::new().build()?, &codec)?;
+        let runtime = match &resources {
+            Some(resources) => resources.runtime.clone(),
+            None => RuntimeEnvBuilder::new().build_arc()?,
+        };
+        let plan = plan.try_into_physical_plan(registry, &runtime, &codec)?;
+        let task_context = match &resources {
+            Some(resources) => resources.task_context(),
+            None => SessionContext::new_with_config_rt(Default::default(), runtime).task_ctx(),
+        };
 
         Ok(Self {
             batch,
             plan,
-            task_context: SessionContext::new().task_ctx(),
+            task_context,
+            resources,
+            active: Arc::new(AtomicBool::new(false)),
         })
     }
 
     pub async fn process_batch(&mut self, batch: RecordBatch) -> SendableRecordBatchStream {
+        if self.active.swap(true, Ordering::AcqRel) {
+            return failed_execution_stream(self.plan.schema(), datafusion::common::DataFusionError::Execution(
+                "stateless executor requires the previous stream to finish or be dropped before another input".into(),
+            ));
+        }
+        let input_guard = ExecutionInputGuard {
+            batch: self.batch.clone(),
+            active: self.active.clone(),
+        };
+        let input_reservation = match self
+            .resources
+            .as_ref()
+            .map(|resources| resources.reserve_batch("execution input", &batch))
+            .transpose()
+        {
+            Ok(reservation) => reservation,
+            Err(error) => return failed_execution_stream(self.plan.schema(), error),
+        };
         {
             let mut writer = self.batch.write().unwrap();
             *writer = Some(batch);
         }
-        self.plan.reset().expect("reset execution plan");
-        self.plan
-            .execute(0, self.task_context.clone())
-            .unwrap_or_else(|e| {
-                panic!(
-                    "failed to compute plan: {}\n{}",
-                    e,
-                    displayable(&*self.plan).indent(false)
-                )
-            })
+        let result = self
+            .plan
+            .reset()
+            .and_then(|_| self.plan.execute(0, self.task_context.clone()));
+        let stream = match result {
+            Ok(stream) => stream,
+            Err(error) => return failed_execution_stream(self.plan.schema(), error),
+        };
+        let schema = stream.schema();
+        let runtime = self
+            .resources
+            .as_ref()
+            .map(|resources| resources.runtime.clone());
+        let held_input = async_stream::try_stream! {
+            let _input_guard = input_guard;
+            let _runtime = runtime;
+            let _reservation = input_reservation;
+            let mut stream = stream;
+            while let Some(batch) = stream.next().await {
+                yield batch?;
+            }
+        };
+        let held_input = Box::pin(
+            datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(schema, held_input),
+        );
+        match &self.resources {
+            Some(resources) => sync::streams::bounded_output_stream(
+                held_input,
+                resources.runtime.memory_pool.clone(),
+                resources.limits.max_batch_bytes,
+            ),
+            None => held_input,
+        }
     }
 
-    pub async fn process_single(&mut self, batch: RecordBatch) -> RecordBatch {
+    /// The returned batch is caller-owned after the stream has drained; callers
+    /// retaining it must supply their own output reservation.
+    pub async fn process_single(&mut self, batch: RecordBatch) -> DFResult<RecordBatch> {
         let mut stream = self.process_batch(batch).await;
-        let result = stream.next().await.unwrap().unwrap();
-        assert!(
-            stream.next().await.is_none(),
-            "Should only produce one output batch"
-        );
-        result
+        let result = stream.next().await.transpose()?.ok_or_else(|| {
+            datafusion::common::DataFusionError::Execution(
+                "expected one output batch, received none".into(),
+            )
+        })?;
+        if stream.next().await.transpose()?.is_some() {
+            return Err(datafusion::common::DataFusionError::Execution(
+                "expected one output batch, received more than one".into(),
+            ));
+        }
+        Ok(result)
     }
 }
 

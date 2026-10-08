@@ -123,7 +123,10 @@ message UpdatingAggregateOperator {
   bytes aggregate_exec = 5;
   bytes metadata_expr = 6;
   uint64 flush_interval_micros = 7;
+  // Zero retains the legacy default of 24 hours unless retain_indefinitely is true.
   uint64 ttl_micros = 8;
+  // Only explicit true disables state expiry; absent/false preserves finite TTL behavior.
+  optional bool retain_indefinitely = 9;
 }
 
 enum StateOpType {
@@ -149,6 +152,74 @@ message StatefulProcessorOperator {
   repeated string map_names = 3;
   ArroyoSchema input_schema = 4;
   repeated bytes final_exprs = 5;
+}
+
+// Retained, caller-schema state access. SQL planning creates these descriptors;
+// execution requires a fused serial event owner (STR-41). They are never
+// independently scheduled batch operators or per-row database transactions.
+message StateTableDefinition {
+  string name = 1;
+  string table_identity = 2;
+  string schema_identity = 3;
+  string schema_json = 4;
+  repeated uint64 primary_key = 5;
+  repeated uint64 partition_key = 6;
+  uint32 parallelism = 7;
+}
+
+message StateTableFieldValue {
+  uint64 field_index = 1;
+  bytes expression = 2;
+}
+
+message StateTableMutationClause {
+  bool matched = 1;
+  optional bytes predicate = 2;
+  string action = 3;
+  repeated StateTableFieldValue values = 4;
+}
+
+message StateTableOperator {
+  StateTableDefinition table = 1;
+  string event_scope_id = 2;
+  bool requires_fused_serial_owner = 3;
+  optional string captured_result_name = 4;
+  ArroyoSchema input_schema = 5;
+  ArroyoSchema output_schema = 6;
+  string expression_schema_json = 7;
+  repeated bytes key_expressions = 8;
+  repeated StateTableMutationClause clauses = 9;
+  optional string lookup_join_type = 10;
+  repeated string ownership_bindings = 11;
+}
+
+// A single scheduled owner executes all related accesses for one source event.
+// A step's parent is the source event when parent_step is absent. Captures are
+// taken immediately after the named step, then emitted only after its bounded
+// working chunk commits. The captured structs carry row presence in validity.
+message FusedStateTableStep {
+  optional uint32 parent_step = 1;
+  string kind = 2; // projection, value, or state_access
+  bytes operator_config = 3;
+  repeated uint32 captures = 4;
+  ArroyoSchema output_schema = 5;
+}
+
+message FusedStateTableOperator {
+  string event_scope_id = 1;
+  ArroyoSchema input_schema = 2;
+  ArroyoSchema output_schema = 3;
+  repeated FusedStateTableStep steps = 4;
+  repeated StateTableDefinition tables = 5;
+  repeated ArroyoSchema capture_schemas = 6;
+}
+
+// Extracts one typed capture from the owner's envelope and drops only rows
+// where that capture's struct validity is false.
+message StateTableCaptureOperator {
+  uint32 capture_index = 1;
+  ArroyoSchema input_schema = 2;
+  ArroyoSchema output_schema = 3;
 }
 
 message WasmUdfs {

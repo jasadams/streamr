@@ -1,10 +1,10 @@
-# Team Configuration
+# Streamr team
 
-- **Team key:** STR
-- **Team name:** Streamr
-- **GitHub repo:** jasadams/streamr
-- **Local checkout:** /home/jason/repos/streamr
+team_key: STR
+team_name: Streamr
 
-## Scope
+github_repo: jasadams/streamr
+local_checkout: /home/jason/repos/streamr
 
-Streamr owns the Arroyo fork and engine changes. Arcstream pipeline integration belongs to ARC. Internal Arroyo crate and binary names are retained.
+Streamr owns the engine; external application integration belongs in the
+application repository. Internal Arroyo crate and binary names are retained.

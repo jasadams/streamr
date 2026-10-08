@@ -33,9 +33,11 @@ use std::{
     time::SystemTime,
 };
 
+use super::session_native::NativeSession;
 use arroyo_operator::context::Collector;
 use arroyo_operator::operator::{AsDisplayable, DisplayableOperator, Registry};
 use arroyo_planner::physical::{ArroyoPhysicalExtensionCodec, DecodingContext};
+use arroyo_rpc::config::config as worker_config;
 use arroyo_rpc::df::{ArroyoSchema, ArroyoSchemaRef};
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
@@ -48,6 +50,7 @@ use tracing::{debug, warn};
 // TODO: advance futures outside of method calls.
 
 pub struct SessionAggregatingWindowFunc {
+    native: Option<NativeSession>,
     config: Arc<SessionWindowConfig>,
     keys_by_next_watermark_action: BTreeMap<SystemTime, HashSet<Vec<u8>>>,
     key_computations: HashMap<Vec<u8>, KeyComputingHolder>,
@@ -433,60 +436,24 @@ impl ActiveSession {
             .as_any()
             .downcast_ref::<TimestampNanosecondArray>()
             .unwrap();
-        let start = timestamp_column.value(0);
-        let end = timestamp_column.value(batch.num_rows() - 1);
-
-        if end < to_nanos(self.data_end + gap) as i64 {
-            // all data in the batch is within the current session interval
-            // add it to the current session and update the gap
-            self.data_end = self.data_end.max(from_nanos(end as u128));
-            self.data_start = self.data_start.min(from_nanos(start as u128));
+        let (split_at, data_start, data_end) =
+            session_prefix(timestamp_column, self.data_start, self.data_end, gap)?;
+        if split_at == 0 {
+            return Ok(Some((from_nanos(timestamp_column.value(0) as u128), batch)));
+        }
+        self.data_start = data_start;
+        self.data_end = data_end;
+        if split_at == batch.num_rows() {
             self.sender.as_ref().unwrap().send(batch)?;
             return Ok(None);
         }
+        self.sender
+            .as_ref()
+            .unwrap()
+            .send(batch.slice(0, split_at))?;
 
-        if (to_nanos(self.data_end + gap) as i64) < start {
-            // all data in the batch is after the current session interval
-            // return the batch
-            warn!("got batch that is entirely after the current session interval");
-            return Ok(Some((from_nanos(start as u128), batch)));
-        }
-
-        if start < to_nanos(self.data_start - gap) as i64 {
-            bail!(
-                "received a batch that starts before the current data_start - gap, this should not have happened."
-            );
-        }
-        if start < to_nanos(self.data_start) as i64 {
-            self.data_start = from_nanos(start as u128);
-        }
-        // TODO: test best way to compute this
-        let mut index = 1;
-        while index < batch.num_rows() {
-            let value = timestamp_column.value(index);
-            index += 1;
-            //
-            if value < to_nanos(self.data_end) as i64 {
-                continue;
-            }
-            if value < to_nanos(self.data_end + gap) as i64 {
-                // this value is within the current session interval
-                // add it to the current session and update the gap
-                self.data_end = from_nanos(value as u128);
-                continue;
-            }
-            break;
-        }
-        if index == batch.num_rows() {
-            // all data in the batch is within the current session interval
-            // we've already updated the gap, so we can just add it to the current session
-            self.sender.as_ref().unwrap().send(batch)?;
-            return Ok(None);
-        }
-        self.sender.as_ref().unwrap().send(batch.slice(0, index))?;
-
-        let batch = batch.slice(index, batch.num_rows() - index);
-        let start_time = from_nanos(timestamp_column.value(index) as u128);
+        let batch = batch.slice(split_at, batch.num_rows() - split_at);
+        let start_time = from_nanos(timestamp_column.value(split_at) as u128);
 
         Ok(Some((start_time, batch)))
     }
@@ -520,6 +487,33 @@ impl ActiveSession {
             batch,
         })
     }
+}
+
+// Return the prefix connected to the active session. Equality joins: an event at
+// data_end + gap extends the session, and may connect later rows in the same batch.
+fn session_prefix(
+    timestamps: &TimestampNanosecondArray,
+    data_start: SystemTime,
+    data_end: SystemTime,
+    gap: Duration,
+) -> Result<(usize, SystemTime, SystemTime)> {
+    let first = from_nanos(timestamps.value(0) as u128);
+    if first < data_start - gap {
+        bail!("received a batch that starts before the current data_start - gap");
+    }
+    let mut start = data_start;
+    let mut end = data_end;
+    let mut prefix = 0;
+    for value in timestamps.values() {
+        let timestamp = from_nanos(*value as u128);
+        if timestamp > end + gap {
+            break;
+        }
+        start = start.min(timestamp);
+        end = end.max(timestamp);
+        prefix += 1;
+    }
+    Ok((prefix, start, end))
 }
 
 #[derive(Debug)]
@@ -709,6 +703,11 @@ impl OperatorConstructor for SessionAggregatingWindowConstructor {
         config: Self::ConfigT,
         registry: Arc<Registry>,
     ) -> anyhow::Result<ConstructedOperator> {
+        let native = worker_config()
+            .worker
+            .window_state
+            .map(|limits| NativeSession::new(&config, registry.clone(), limits))
+            .transpose()?;
         let window_field = Arc::new(Field::new(
             config.window_field_name,
             window_arrow_struct(),
@@ -761,6 +760,7 @@ impl OperatorConstructor for SessionAggregatingWindowConstructor {
 
         Ok(ConstructedOperator::from_operator(Box::new(
             SessionAggregatingWindowFunc {
+                native,
                 config: Arc::new(config),
                 keys_by_next_watermark_action: BTreeMap::new(),
                 keys_by_start_time: BTreeMap::new(),
@@ -800,6 +800,10 @@ impl ArrowOperator for SessionAggregatingWindowFunc {
     }
 
     async fn on_start(&mut self, ctx: &mut OperatorContext) -> DataflowResult<()> {
+        if let Some(native) = self.native.as_mut() {
+            native.on_start(ctx).await?;
+            return Ok(());
+        }
         let start_times_map: &mut GlobalKeyedView<u32, Option<SystemTime>> =
             ctx.table_manager.get_global_keyed_state("e").await?;
         let start_time = start_times_map
@@ -853,6 +857,12 @@ impl ArrowOperator for SessionAggregatingWindowFunc {
         ctx: &mut OperatorContext,
         _: &mut dyn Collector,
     ) -> DataflowResult<()> {
+        if let Some(native) = self.native.as_mut() {
+            native
+                .process_batch(batch, ctx, &self.row_converter)
+                .await?;
+            return Ok(());
+        }
         debug!("received batch {:?}", batch);
         let current_watermark = ctx.last_present_watermark();
         let batch = if let Some(watermark) = current_watermark {
@@ -900,6 +910,12 @@ impl ArrowOperator for SessionAggregatingWindowFunc {
         ctx: &mut OperatorContext,
         collector: &mut dyn Collector,
     ) -> DataflowResult<Option<Watermark>> {
+        if let Some(native) = self.native.as_mut() {
+            native
+                .handle_watermark(ctx, collector, &self.row_converter)
+                .await?;
+            return Ok(Some(watermark));
+        }
         self.advance(ctx, collector).await?;
         Ok(Some(watermark))
     }
@@ -910,6 +926,9 @@ impl ArrowOperator for SessionAggregatingWindowFunc {
         ctx: &mut OperatorContext,
         _: &mut dyn Collector,
     ) -> DataflowResult<()> {
+        if self.native.is_some() {
+            return Ok(());
+        }
         let watermark = ctx.last_present_watermark();
         let table = ctx
             .table_manager
@@ -925,6 +944,9 @@ impl ArrowOperator for SessionAggregatingWindowFunc {
     }
 
     fn tables(&self) -> HashMap<String, TableConfig> {
+        if let Some(native) = &self.native {
+            return native.tables();
+        }
         let mut tables = global_table_config("e", "earliest start time of all active batches.");
         tables.insert(
             "s".to_string(),
@@ -938,5 +960,52 @@ impl ArrowOperator for SessionAggregatingWindowFunc {
             ),
         );
         tables
+    }
+}
+
+#[cfg(test)]
+mod session_boundary_tests {
+    use super::*;
+
+    #[test]
+    fn exact_gap_and_following_row_join_in_one_or_multiple_batches() {
+        let gap = Duration::from_nanos(10);
+        let (prefix, start, end) = session_prefix(
+            &TimestampNanosecondArray::from(vec![0, 10, 12, 23]),
+            from_nanos(0),
+            from_nanos(0),
+            gap,
+        )
+        .unwrap();
+        assert_eq!((prefix, to_nanos(start), to_nanos(end)), (3, 0, 12));
+
+        let (prefix, _, end) = session_prefix(
+            &TimestampNanosecondArray::from(vec![10]),
+            from_nanos(0),
+            from_nanos(0),
+            gap,
+        )
+        .unwrap();
+        assert_eq!((prefix, to_nanos(end)), (1, 10));
+        let (prefix, _, end) = session_prefix(
+            &TimestampNanosecondArray::from(vec![12, 23]),
+            from_nanos(0),
+            end,
+            gap,
+        )
+        .unwrap();
+        assert_eq!((prefix, to_nanos(end)), (1, 12));
+    }
+
+    #[test]
+    fn first_row_past_gap_leaves_entire_batch_for_next_session() {
+        let (prefix, start, end) = session_prefix(
+            &TimestampNanosecondArray::from(vec![11, 12]),
+            from_nanos(0),
+            from_nanos(0),
+            Duration::from_nanos(10),
+        )
+        .unwrap();
+        assert_eq!((prefix, to_nanos(start), to_nanos(end)), (0, 0, 0));
     }
 }

@@ -62,7 +62,7 @@ impl RocksLiveState {
         Self::open_worker_with_resources(config, resources).await
     }
 
-    async fn open_worker_with_resources(
+    pub(crate) async fn open_worker_with_resources(
         config: RocksStateConfig,
         resources: WorkerStateResources,
     ) -> Result<Self> {
@@ -217,6 +217,7 @@ impl RocksLiveState {
             self.resources.clone(),
             keys,
             read,
+            false,
         )
         .await
     }
@@ -227,6 +228,7 @@ async fn read_many(
     resources: WorkerStateResources,
     keys: &[StateKey],
     read: ReadOptions,
+    fail_fast: bool,
 ) -> Result<Vec<Option<Vec<u8>>>> {
     let mut request_bytes = keys
         .len()
@@ -235,10 +237,12 @@ async fn read_many(
         request_bytes =
             request_bytes.saturating_add(encoding::encoded_key_size(key)?.saturating_mul(2));
     }
-    let permit = resources
-        .decoded_value(read.max_bytes.saturating_add(request_bytes))
-        .await
-        .map_err(LiveStateError::from)?;
+    let bytes = read.max_bytes.saturating_add(request_bytes);
+    let permit = if fail_fast {
+        resources.try_decoded_value(bytes)
+    } else {
+        resources.decoded_value(bytes).await
+    }?;
     let keys = keys.iter().map(encode_key).collect::<Result<Vec<_>>>()?;
     let task_resources = resources.clone();
     resources
@@ -277,6 +281,40 @@ async fn read_many(
 
 #[async_trait]
 impl LiveStateBackend for RocksLiveState {
+    async fn try_get(&self, key: &StateKey, options: ReadOptions) -> Result<Option<Vec<u8>>> {
+        Ok(read_many(
+            DbHandle::Live(self.db.clone()),
+            self.resources.clone(),
+            std::slice::from_ref(key),
+            options,
+            true,
+        )
+        .await?
+        .pop()
+        .flatten())
+    }
+    fn try_admit_write(
+        &self,
+        bytes: usize,
+        operations: usize,
+    ) -> Result<super::write::AdmittedWriteBatch> {
+        super::write::AdmittedWriteBatch::try_reserve(self.resources.clone(), bytes, operations)
+    }
+    async fn close(self: Arc<Self>) -> Result<()> {
+        let backend = Arc::try_unwrap(self)
+            .map_err(|_| LiveStateError::Backend("live backend still has active handles".into()))?;
+        RocksLiveState::close(backend).await
+    }
+    async fn admit_write(
+        &self,
+        max_bytes: usize,
+        max_operations: usize,
+    ) -> Result<super::write::AdmittedWriteBatch> {
+        self.admitted_batch(max_bytes, max_operations).await
+    }
+    async fn write_admitted(&self, batch: super::write::AdmittedWriteBatch) -> Result<()> {
+        RocksLiveState::write_admitted(self, batch).await
+    }
     async fn get(&self, key: &StateKey, read: ReadOptions) -> Result<Option<Vec<u8>>> {
         Ok(self
             .read_many(std::slice::from_ref(key), read)
@@ -455,10 +493,31 @@ impl SnapshotReader for RocksSnapshot {
             self.resources.clone(),
             keys,
             read,
+            false,
         )
         .await
     }
+    async fn try_get(&self, key: &StateKey, read: ReadOptions) -> Result<Option<Vec<u8>>> {
+        Ok(read_many(
+            DbHandle::Snapshot(self.db.clone()),
+            self.resources.clone(),
+            std::slice::from_ref(key),
+            read,
+            true,
+        )
+        .await?
+        .pop()
+        .flatten())
+    }
+    async fn try_scan(&self, request: ScanRequest) -> Result<ScanPage> {
+        self.scan_admission(request, true).await
+    }
     async fn scan(&self, request: ScanRequest) -> Result<ScanPage> {
+        self.scan_admission(request, false).await
+    }
+}
+impl RocksSnapshot {
+    async fn scan_admission(&self, request: ScanRequest, fail_fast: bool) -> Result<ScanPage> {
         request.validate(self.id)?;
         let id = self.id;
         let db = DbHandle::Snapshot(self.db.clone());
@@ -483,17 +542,16 @@ impl SnapshotReader for RocksSnapshot {
             .min(request.max_bytes / namespace_bytes.saturating_add(3))
             .saturating_mul(std::mem::size_of::<ScanEntry>())
             .saturating_mul(2);
-        let permit = self
-            .resources
-            .scan_page(
-                request
-                    .max_bytes
-                    .saturating_mul(4)
-                    .saturating_add(request_bytes.saturating_mul(4))
-                    .saturating_add(container_bytes),
-            )
-            .await
-            .map_err(LiveStateError::from)?;
+        let bytes = request
+            .max_bytes
+            .saturating_mul(4)
+            .saturating_add(request_bytes.saturating_mul(4))
+            .saturating_add(container_bytes);
+        let permit = if fail_fast {
+            self.resources.try_scan_page(bytes)
+        } else {
+            self.resources.scan_page(bytes).await
+        }?;
         let resources = self.resources.clone();
         self.resources
             .run_blocking(move || {

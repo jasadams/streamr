@@ -428,6 +428,35 @@ message DiskKeyedTableTaskCheckpointMetadata {
   map<uint32, DiskKeyedTableSubtaskCheckpointMetadata> subtasks = 2;
 }
 
+// A native typed state table uses the same full logical snapshot transport as
+// a disk map, but has an independent contract and checkpoint discriminator.
+message TypedStateTableConfig {
+  string transport_name = 1;
+  bytes table_identity = 2;
+  bytes schema_identity = 3;
+  bytes schema_json = 4;
+  repeated uint32 primary_key = 5;
+  repeated uint32 partition_key = 6;
+  uint32 encoding_version = 7;
+}
+
+message TypedStateTableSubtaskCheckpointMetadata {
+  uint32 subtask_index = 1;
+  uint32 format_version = 2;
+  uint32 encoding_version = 3;
+  bytes schema_identity = 4;
+  bytes namespace = 5;
+  uint64 generation = 6;
+  uint32 epoch = 7;
+  bool empty = 8;
+  repeated DiskCheckpointFile files = 9;
+}
+
+message TypedStateTableTaskCheckpointMetadata {
+  uint32 format_version = 1;
+  map<uint32, TypedStateTableSubtaskCheckpointMetadata> subtasks = 2;
+}
+
 message ExpiringKeyedTimeTableConfig {
   string table_name = 1;
   string description = 2;
@@ -497,6 +526,7 @@ enum TableEnum {
   GlobalKeyValue = 1;
   ExpiringKeyedTimeTable = 2;
   DiskKeyedMap = 3;
+  TypedStateTable = 4;
 }
 
 // Worker

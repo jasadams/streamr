@@ -206,6 +206,7 @@ impl ParquetBackend {
                     });
                 }
                 rpc::TableEnum::DiskKeyedMap => None,
+                rpc::TableEnum::TypedStateTable => None,
                 rpc::TableEnum::GlobalKeyValue => {
                     GlobalKeyedTable::compact_data(
                         table_config,
@@ -263,6 +264,16 @@ impl ParquetBackend {
                 rpc::TableEnum::DiskKeyedMap => {
                     DiskKeyedTable::files_to_keep(table_config, metadata.clone())?
                 }
+                rpc::TableEnum::TypedStateTable => {
+                    arroyo_state_protocol::typed_checkpoint::files_to_keep(
+                        table_config,
+                        metadata.clone(),
+                    )
+                    .map_err(|error| StateError::Other {
+                        table: table_name.clone(),
+                        error,
+                    })?
+                }
                 rpc::TableEnum::GlobalKeyValue => {
                     GlobalKeyedTable::files_to_keep(table_config, metadata.clone())?
                 }
@@ -302,6 +313,16 @@ impl ParquetBackend {
                     }
                     rpc::TableEnum::DiskKeyedMap => {
                         DiskKeyedTable::files_to_keep(table_config, metadata.clone())?
+                    }
+                    rpc::TableEnum::TypedStateTable => {
+                        arroyo_state_protocol::typed_checkpoint::files_to_keep(
+                            table_config,
+                            metadata.clone(),
+                        )
+                        .map_err(|error| StateError::Other {
+                            table: table_name.clone(),
+                            error,
+                        })?
                     }
                     rpc::TableEnum::GlobalKeyValue => {
                         GlobalKeyedTable::files_to_keep(table_config, metadata.clone())?

@@ -1263,6 +1263,41 @@ mod tests {
     use bytes::Bytes;
 
     #[test]
+    fn updating_aggregate_retention_wire_presence() {
+        use crate::grpc::api::UpdatingAggregateOperator;
+        use prost::Message;
+
+        // Legacy messages have only tag 8 for TTL and no retention-presence field.
+        #[derive(Clone, PartialEq, Message)]
+        struct LegacyUpdatingAggregateOperator {
+            #[prost(uint64, tag = "8")]
+            ttl_micros: u64,
+        }
+
+        for ttl_micros in [0, 1_800_000_000, 86_400_000_000] {
+            let legacy = LegacyUpdatingAggregateOperator { ttl_micros }.encode_to_vec();
+            let config = UpdatingAggregateOperator::decode(legacy.as_slice()).unwrap();
+            assert_eq!(config.ttl_micros, ttl_micros);
+            assert_eq!(config.retain_indefinitely, None);
+            assert_eq!(config.encode_to_vec(), legacy);
+        }
+
+        // Presence distinguishes explicit disabled retention from legacy zero TTL.
+        for retain_indefinitely in [Some(true), Some(false)] {
+            let config = UpdatingAggregateOperator {
+                ttl_micros: 0,
+                retain_indefinitely,
+                ..Default::default()
+            };
+            let encoded = config.encode_to_vec();
+            let decoded = UpdatingAggregateOperator::decode(encoded.as_slice()).unwrap();
+            assert_eq!(decoded.retain_indefinitely, retain_indefinitely);
+            let legacy = LegacyUpdatingAggregateOperator::decode(encoded.as_slice()).unwrap();
+            assert_eq!(legacy.ttl_micros, 0);
+        }
+    }
+
+    #[test]
     fn test_parse_expr() {
         let sql = "concat(1 + hello, 'blah')";
         let parsed = parse_expr(sql).unwrap();

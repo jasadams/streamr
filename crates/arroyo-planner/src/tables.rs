@@ -136,7 +136,7 @@ impl From<Field> for FieldSpec {
     }
 }
 
-fn produce_optimized_plan(
+pub(crate) fn produce_optimized_plan(
     statement: &Statement,
     schema_provider: &ArroyoSchemaProvider,
 ) -> Result<LogicalPlan> {
@@ -149,6 +149,16 @@ fn produce_optimized_plan(
         &ConfigOptions::default(),
         |_plan, _rule| {},
     )?;
+
+    // The general optimizer may introduce null-key filters or eliminate joins
+    // before the event-driven lookup rewriter can enforce complete-key reads.
+    // Preserve the analyzed shape whenever retained state is a query input.
+    if analyzed_plan.exists(|node| {
+        Ok(matches!(node, LogicalPlan::TableScan(scan)
+            if schema_provider.get_state_table_reference(&scan.table_name).is_some()))
+    })? {
+        return Ok(analyzed_plan);
+    }
 
     let rules: Vec<Arc<dyn OptimizerRule + Send + Sync>> = vec![
         Arc::new(EliminateNestedUnion::new()),
@@ -601,11 +611,16 @@ fn plan_generating_expr(
         .expect("generating expression should produce one statement");
 
     let mut schema_provider = schema_provider.clone();
-    schema_provider.insert_table(Table::MemoryTable {
-        name: name.to_string(),
-        fields: schema.fields().to_vec(),
-        logical_plan: None,
-    });
+    schema_provider.insert_table(
+        Table::MemoryTable {
+            name: name.to_string(),
+            fields: schema.fields().to_vec(),
+            logical_plan: None,
+        },
+        crate::state_tables::reference_components(&datafusion::common::TableReference::parse_str(
+            name,
+        )),
+    );
 
     let plan = produce_optimized_plan(&statement, &schema_provider)?;
 
@@ -1026,7 +1041,22 @@ impl Insert {
         statement: &Statement,
         schema_provider: &mut ArroyoSchemaProvider,
     ) -> Result<Insert> {
+        if matches!(
+            statement,
+            Statement::Merge { .. } | Statement::Update { .. } | Statement::Delete(_)
+        ) {
+            return plan_err!("state-table MERGE, UPDATE and DELETE are not implemented");
+        }
         if let Statement::Insert(insert) = statement {
+            if schema_provider
+                .get_state_table(insert.table.to_string())
+                .is_some()
+            {
+                return plan_err!(
+                    "INSERT into state table '{}' is not implemented; use continuous MERGE once supported",
+                    insert.table
+                );
+            }
             infer_sink_schema(
                 insert.source.as_ref().unwrap(),
                 insert.table.to_string(),

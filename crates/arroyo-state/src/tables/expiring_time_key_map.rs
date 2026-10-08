@@ -522,6 +522,7 @@ impl TimeTableCompactor {
             let reader_builder = ParquetRecordBatchStreamBuilder::new(reader)
                 .await
                 .map_err(|e| StateError::ArrowError(e.into()))?;
+            compactor.validate_source_schema(reader_builder.schema().as_ref())?;
             let mut stream = reader_builder
                 .build()
                 .map_err(|e| StateError::ArrowError(e.into()))?;
@@ -564,8 +565,7 @@ impl TimeTableCompactor {
                         .map(|c| take(c, &indices, None).unwrap())
                         .collect();
 
-                    let sorted =
-                        RecordBatch::try_new(schema.state_schema().schema.clone(), columns)?;
+                    let sorted = RecordBatch::try_new(time_filtered.schema(), columns)?;
                     let sorted_keys = take(&partitions, &indices, None)?;
 
                     let partition = partition(vec![sorted_keys.clone()].as_slice())?;
@@ -591,6 +591,7 @@ impl TimeTableCompactor {
         partition: usize,
         record_batch: RecordBatch,
     ) -> Result<(), StateError> {
+        self.validate_source_schema(record_batch.schema().as_ref())?;
         if let std::collections::hash_map::Entry::Vacant(e) = self.writers.entry(partition) {
             let file_name = table_checkpoint_path_with_layout(
                 &self.file_path_layout,
@@ -605,7 +606,7 @@ impl TimeTableCompactor {
 
             let writer = Some(AsyncArrowWriter::try_new(
                 buf_writer,
-                self.schema.state_schema().schema.clone(),
+                record_batch.schema(),
                 None,
             )?);
             e.insert(CompactedFileWriter {
@@ -620,6 +621,16 @@ impl TimeTableCompactor {
 
         writer.write_batch(record_batch).await?;
 
+        Ok(())
+    }
+
+    fn validate_source_schema(&self, source: &arrow_schema::Schema) -> Result<(), StateError> {
+        if source != self.schema.state_schema().schema.as_ref() {
+            return Err(StateError::Other {
+                table: self.table.clone(),
+                error: "checkpoint schema differs from the configured state schema; cannot compact it safely; restore from a compatible checkpoint or replay from the source".into(),
+            });
+        }
         Ok(())
     }
 
@@ -1145,6 +1156,11 @@ impl UncachedKeyValueView {
                             let schema = schema.clone();
                             let task_info = parent.task_info.clone();
                             async move {
+                                if batch.schema().as_ref() != schema.state_schema().schema.as_ref() {
+                                    anyhow::bail!(
+                                        "checkpoint schema differs from the configured state schema; cannot restore it safely; restore from a compatible checkpoint or replay from the source"
+                                    );
+                                }
                                 if needs_filtering {
                                     match schema
                                         .filter_by_hash_index(batch, &task_info.key_range)?
@@ -1171,5 +1187,154 @@ impl UncachedKeyValueView {
             })
             .buffer_unordered(1)
             .try_flatten()
+    }
+}
+
+#[cfg(test)]
+mod schema_compatibility_tests {
+    use super::*;
+    use arrow_array::{BinaryArray, TimestampNanosecondArray, UInt64Array};
+    use arrow_schema::{DataType, Field, Schema, TimeUnit};
+    use arroyo_rpc::TIMESTAMP_FIELD;
+    use arroyo_storage::StorageProvider;
+
+    const FORMAT_KEY: &str = "test.state-format";
+
+    fn table_schema() -> SchemaWithHashAndOperation {
+        let timestamp = Field::new(
+            TIMESTAMP_FIELD,
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            false,
+        )
+        .with_metadata(HashMap::from([(FORMAT_KEY.into(), "v1".into())]));
+        let memory =
+            ArroyoSchema::from_schema_unkeyed(Arc::new(Schema::new(vec![timestamp]))).unwrap();
+        SchemaWithHashAndOperation::new(Arc::new(memory), false)
+    }
+
+    fn state_batch(schema: &SchemaWithHashAndOperation, legacy: bool) -> RecordBatch {
+        let mut source = (*schema.state_schema().schema).clone();
+        if legacy {
+            let fields: Vec<_> = source
+                .fields()
+                .iter()
+                .map(|field| {
+                    let mut field = (**field).clone();
+                    if field.name() == TIMESTAMP_FIELD {
+                        field = field.with_metadata(HashMap::new());
+                    }
+                    Arc::new(field)
+                })
+                .collect();
+            source = Schema::new(fields);
+        }
+        RecordBatch::try_new(
+            Arc::new(source),
+            vec![
+                Arc::new(TimestampNanosecondArray::from(vec![1_000_000, 2_000_000])),
+                Arc::new(UInt64Array::from(vec![0, u64::MAX])),
+                Arc::new(BinaryArray::from(vec![
+                    Some(&b"insert"[..]),
+                    Some(&b"insert"[..]),
+                ])),
+            ],
+        )
+        .unwrap()
+    }
+
+    async fn read_file(storage: &StorageProviderRef, path: &str) -> RecordBatch {
+        let meta = storage.head(path).await.unwrap();
+        let reader = ParquetObjectReader::new(storage.get_backing_store(), meta.location)
+            .with_file_size(meta.size);
+        let mut stream = ParquetRecordBatchStreamBuilder::new(reader)
+            .await
+            .unwrap()
+            .build()
+            .unwrap();
+        stream.try_next().await.unwrap().unwrap()
+    }
+
+    async fn compact_fixture(
+        legacy: bool,
+        parallelism: u64,
+    ) -> Result<Vec<RecordBatch>, StateError> {
+        let directory = tempfile::tempdir().unwrap();
+        let storage: StorageProviderRef = Arc::new(
+            StorageProvider::for_url(&format!("file://{}", directory.path().display()))
+                .await
+                .unwrap(),
+        );
+        let schema = table_schema();
+        let source = state_batch(&schema, legacy);
+        let path = "source.parquet";
+        let mut writer =
+            AsyncArrowWriter::try_new(storage.buf_writer(path), source.schema(), None).unwrap();
+        writer.write(&source).await.unwrap();
+        writer.close().await.unwrap();
+
+        let loaded = read_file(&storage, path).await;
+        assert_eq!(loaded.schema(), source.schema());
+        let expected = schema.state_schema();
+        let file = ParquetTimeFile {
+            epoch: 1,
+            file: path.into(),
+            min_routing_key: 0,
+            max_routing_key: u64::MAX,
+            max_timestamp_micros: 2_000,
+            generation: 0,
+        };
+        let metadata = OperatorMetadata {
+            job_id: "schema-compatibility".into(),
+            operator_id: "operator".into(),
+            epoch: 1,
+            parallelism,
+            ..Default::default()
+        };
+        let output = TimeTableCompactor::compact_files(
+            "table".into(),
+            1,
+            1,
+            storage.clone(),
+            CheckpointFilePathLayout::Legacy,
+            schema.clone(),
+            Duration::from_secs(60),
+            &metadata,
+            HashMap::from([(path.into(), file)]),
+        )
+        .await?;
+        let mut batches = Vec::new();
+        for file in output {
+            let batch = read_file(&storage, &file.file).await;
+            assert_eq!(batch.schema().as_ref(), expected.schema.as_ref());
+            batches.push(batch);
+        }
+        Ok(batches)
+    }
+
+    #[tokio::test]
+    async fn compaction_preserves_parquet_field_metadata_in_both_partition_paths() {
+        assert_eq!(compact_fixture(false, 1).await.unwrap().len(), 1);
+        assert_eq!(compact_fixture(false, 2).await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn compaction_rejects_legacy_parquet_before_schema_reconstruction() {
+        for parallelism in [1, 2] {
+            let error = compact_fixture(true, parallelism).await.unwrap_err();
+            assert!(error.to_string().contains("checkpoint schema differs"));
+            assert!(error.to_string().contains("replay from the source"));
+        }
+    }
+
+    #[test]
+    fn hash_filter_preserves_source_schema_metadata() {
+        let schema = table_schema();
+        let legacy = state_batch(&schema, true);
+        let filtered = schema
+            .filter_by_hash_index(legacy.clone(), &(0..=0))
+            .unwrap()
+            .unwrap();
+        assert_eq!(filtered.num_rows(), 1);
+        assert_eq!(filtered.schema(), legacy.schema());
     }
 }

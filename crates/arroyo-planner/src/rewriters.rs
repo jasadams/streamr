@@ -283,10 +283,27 @@ impl TreeNodeRewriter for SourceRewriter<'_> {
             return Ok(Transformed::no(node));
         };
 
-        let table_name = table_scan.table_name.table();
+        if let Some(table) = self
+            .schema_provider
+            .get_state_table_reference(&table_scan.table_name)
+        {
+            if table_scan.projection.is_some() || !table_scan.filters.is_empty() {
+                return plan_err!(
+                    "state-table lookup requires a direct complete keyed JOIN; target scans, projections and filters are unsupported"
+                );
+            }
+            return Ok(Transformed::yes(LogicalPlan::Extension(Extension {
+                node: Arc::new(crate::extension::state_table::StateTableScan {
+                    table: crate::extension::state_table::StateTableDescriptor::from(table),
+                    schema: table_scan.projected_schema,
+                }),
+            })));
+        }
+
+        let table_name = &table_scan.table_name;
         let table = self
             .schema_provider
-            .get_table(table_name)
+            .get_table_reference(table_name)
             .ok_or_else(|| DataFusionError::Plan(format!("Table {table_name} not found")))?;
 
         match table {
@@ -618,15 +635,15 @@ impl SourceMetadataVisitor<'_> {
             "TableSourceExtension" => {
                 let TableSourceExtension { name, .. } =
                     node.as_any().downcast_ref::<TableSourceExtension>()?;
-                name.to_string()
+                name
             }
             "SinkExtension" => {
                 let SinkExtension { name, .. } = node.as_any().downcast_ref::<SinkExtension>()?;
-                name.to_string()
+                name
             }
             _ => return None,
         };
-        let table = self.schema_provider.get_table(&table_name)?;
+        let table = self.schema_provider.get_table_reference(table_name)?;
         match table {
             Table::ConnectorTable(table) => table.id,
             _ => None,

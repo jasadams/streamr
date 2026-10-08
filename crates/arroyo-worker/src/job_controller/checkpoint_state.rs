@@ -6,7 +6,8 @@ use arroyo_rpc::grpc::rpc::{
     CheckpointMetadata, DiskKeyedTableConfig, DiskKeyedTableSubtaskCheckpointMetadata,
     OperatorCheckpointMetadata, OperatorMetadata, SubtaskCheckpointMetadata,
     TableCheckpointMetadata, TableConfig, TableEnum, TableSubtaskCheckpointMetadata,
-    TaskCheckpointCompletedReq, TaskCheckpointEventReq,
+    TaskCheckpointCompletedReq, TaskCheckpointEventReq, TypedStateTableConfig,
+    TypedStateTableSubtaskCheckpointMetadata, TypedStateTableTaskCheckpointMetadata,
 };
 use arroyo_rpc::grpc::{api, rpc};
 use arroyo_rpc::{TaskEventSpans, get_event_spans, grpc, log_trace_event};
@@ -23,6 +24,39 @@ use std::time::{Duration, SystemTime};
 use tracing::{debug, warn};
 
 pub type CommitData = HashMap<String, HashMap<String, HashMap<u32, Vec<u8>>>>;
+
+fn merge_typed_checkpoint_metadata(
+    config: TableConfig,
+    subtasks: HashMap<u32, TableSubtaskCheckpointMetadata>,
+) -> anyhow::Result<Option<TableCheckpointMetadata>> {
+    if config.table_type() != TableEnum::TypedStateTable {
+        bail!("typed state-table type mismatch");
+    }
+    let config = TypedStateTableConfig::decode(config.config.as_slice())?;
+    let mut result = TypedStateTableTaskCheckpointMetadata {
+        format_version: arroyo_state_protocol::typed_checkpoint::TYPED_CHECKPOINT_VERSION,
+        subtasks: HashMap::new(),
+    };
+    for (index, wrapped) in subtasks {
+        if wrapped.table_type() != TableEnum::TypedStateTable || index != wrapped.subtask_index {
+            bail!("typed state-table subtask type or ownership mismatch");
+        }
+        let subtask = TypedStateTableSubtaskCheckpointMetadata::decode(wrapped.data.as_slice())?;
+        if index != subtask.subtask_index {
+            bail!("typed state-table subtask ownership mismatch");
+        }
+        arroyo_state_protocol::typed_checkpoint::validate_subtask(&config, &subtask)
+            .map_err(|e| anyhow!(e))?;
+        result.format_version = subtask.format_version;
+        result.subtasks.insert(index, subtask);
+    }
+    arroyo_state_protocol::typed_checkpoint::validate_table(&config, &result)
+        .map_err(|e| anyhow!(e))?;
+    Ok(Some(TableCheckpointMetadata {
+        table_type: TableEnum::TypedStateTable.into(),
+        data: result.encode_to_vec(),
+    }))
+}
 
 #[derive(Debug, Clone)]
 pub struct CheckpointState {
@@ -136,6 +170,9 @@ impl TableState {
                 self.table_config.clone(),
                 self.subtask_tables,
             )?,
+            TableEnum::TypedStateTable => {
+                merge_typed_checkpoint_metadata(self.table_config.clone(), self.subtask_tables)?
+            }
             TableEnum::GlobalKeyValue => GlobalKeyedTable::merge_checkpoint_metadata(
                 self.table_config.clone(),
                 self.subtask_tables,
@@ -285,6 +322,59 @@ impl CheckpointState {
             bail!("checkpoint completion epoch mismatch");
         }
         for (name, wrapped) in &metadata.table_metadata {
+            if wrapped.table_type() == TableEnum::TypedStateTable {
+                let config = metadata
+                    .table_configs
+                    .get(name)
+                    .ok_or_else(|| anyhow!("missing typed state-table configuration"))?;
+                if config.table_type() != TableEnum::TypedStateTable {
+                    bail!("typed state-table configuration type mismatch");
+                }
+                let config = TypedStateTableConfig::decode(config.config.as_slice())?;
+                let typed =
+                    TypedStateTableSubtaskCheckpointMetadata::decode(wrapped.data.as_slice())?;
+                arroyo_state_protocol::typed_checkpoint::validate_subtask(&config, &typed)
+                    .map_err(|e| anyhow!(e))?;
+                if config.transport_name != *name
+                    || u64::from(typed.epoch) != c.epoch
+                    || typed.subtask_index != metadata.subtask_index
+                    || wrapped.subtask_index != metadata.subtask_index
+                {
+                    bail!(
+                        "typed state-table checkpoint table, epoch or subtask ownership mismatch"
+                    );
+                }
+                let context = c.worker_context.as_ref().ok_or_else(|| {
+                    anyhow!("typed state-table checkpoint missing worker ownership")
+                })?;
+                if context.job_id != *self.job_id {
+                    bail!("typed state-table checkpoint job ownership mismatch");
+                }
+                let legacy_prefix = format!(
+                    "{}/checkpoints/checkpoint-{:07}/operator-{}/table-{}-000/",
+                    self.job_id, c.epoch, c.operator_id, name
+                );
+                let protocol_prefix = format!(
+                    "{}/{}/generations/{}/checkpoints/checkpoint-{:07}/operator-{}/table-{}-000/",
+                    context.pipeline_id,
+                    self.job_id,
+                    typed.generation,
+                    c.epoch,
+                    c.operator_id,
+                    name
+                );
+                for file in &typed.files {
+                    if !(typed.generation == 0 && file.path.starts_with(&legacy_prefix)
+                        || typed.generation == context.generation
+                            && file.path.starts_with(&protocol_prefix))
+                    {
+                        bail!(
+                            "typed state-table checkpoint file is outside exclusive worker table owner"
+                        );
+                    }
+                }
+                continue;
+            }
             if wrapped.table_type() != TableEnum::DiskKeyedMap {
                 continue;
             }
@@ -423,6 +513,7 @@ impl CheckpointState {
                 if let Some(committing_data) = match config.table_type() {
                     TableEnum::MissingTableType => bail!("missing table type"),
                     TableEnum::DiskKeyedMap => None,
+                    TableEnum::TypedStateTable => None,
                     TableEnum::GlobalKeyValue => {
                         GlobalKeyedTable::committing_data(config.clone(), checkpoint_metadata)
                     }

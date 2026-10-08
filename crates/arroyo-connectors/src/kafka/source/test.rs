@@ -6,8 +6,7 @@ use arroyo_state::{BackingStore, StateBackend, StorageProviderFor};
 use rand::random;
 
 use crate::kafka::SourceOffset;
-use arrow::array::{Array, StringArray};
-use arrow::datatypes::DataType::UInt64;
+use arrow::array::{Array, Int64Array, StringArray};
 use arrow::datatypes::TimeUnit;
 use arroyo_operator::context::{
     ArrowCollector, BatchReceiver, OperatorContext, SourceCollector, SourceContext, batch_bounded,
@@ -64,7 +63,7 @@ impl KafkaTopicTester {
             .await
             .expect("deletion should have worked");
         tokio::time::sleep(Duration::from_secs(1)).await;
-        admin_client
+        let results = admin_client
             .create_topics(
                 [&NewTopic::new(
                     &self.topic,
@@ -74,7 +73,67 @@ impl KafkaTopicTester {
                 &AdminOptions::new(),
             )
             .await
-            .expect("deletion should have worked");
+            .expect("test topic creation request failed");
+        assert_eq!(results.len(), 1, "expected one topic creation result");
+        for result in results {
+            result.expect("test topic creation failed");
+        }
+
+        // Topic creation can succeed before broker metadata exposes its leader.
+        // Wait for the fixture before the source makes its one-time assignment.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        let mut last_observation = "no metadata fetched".to_string();
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "Kafka test topic {} not ready: {}",
+                self.topic,
+                last_observation
+            );
+            match admin_client
+                .inner()
+                .fetch_metadata(Some(&self.topic), remaining.min(Duration::from_secs(1)))
+            {
+                Ok(metadata) => {
+                    let topics: Vec<_> = metadata
+                        .topics()
+                        .iter()
+                        .map(|topic| {
+                            let partitions: Vec<_> = topic
+                                .partitions()
+                                .iter()
+                                .map(|partition| {
+                                    (partition.id(), partition.leader(), partition.error())
+                                })
+                                .collect();
+                            (topic.name(), topic.error(), partitions)
+                        })
+                        .collect();
+                    last_observation = format!("{topics:?}");
+                    if metadata.topics().iter().any(|topic| {
+                        topic.name() == self.topic
+                            && topic.error().is_none()
+                            && topic.partitions().len() == 1
+                            && topic.partitions()[0].id() == 0
+                            && topic.partitions()[0].error().is_none()
+                            && topic.partitions()[0].leader() >= 0
+                    }) {
+                        println!(
+                            "Kafka test topic {} ready: {}",
+                            self.topic, last_observation
+                        );
+                        break;
+                    }
+                }
+                Err(error) => last_observation = format!("metadata request failed: {error}"),
+            }
+            tokio::time::sleep(
+                Duration::from_millis(100)
+                    .min(deadline.saturating_duration_since(tokio::time::Instant::now())),
+            )
+            .await;
+        }
     }
     async fn get_source_with_reader(
         &self,
@@ -407,7 +466,7 @@ async fn test_kafka_with_metadata_fields() {
     let metadata_fields = vec![MetadataField {
         field_name: "offset".to_string(),
         key: "offset_id".to_string(),
-        data_type: Some(UInt64),
+        data_type: Some(DataType::Int64),
     }];
 
     // Set metadata fields in KafkaSourceFunc
@@ -427,9 +486,9 @@ async fn test_kafka_with_metadata_fields() {
         metadata_fields,
     };
 
-    let (_to_control_tx, control_rx) = channel(128);
-    let (command_tx, _from_control_rx) = channel(128);
-    let (data_tx, _recv) = batch_bounded(128);
+    let (to_control_tx, control_rx) = channel(128);
+    let (command_tx, from_control_rx) = channel(128);
+    let (data_tx, data_recv) = batch_bounded(128);
 
     let checkpoint_metadata = None;
 
@@ -479,9 +538,11 @@ async fn test_kafka_with_metadata_fields() {
         kafka.run(&mut ctx, &mut collector).await.unwrap();
     });
 
-    let mut reader = kafka_topic_tester
-        .get_source_with_reader((*task_info).clone(), None)
-        .await;
+    let mut reader = KafkaSourceWithReads {
+        to_control_tx,
+        from_control_rx,
+        data_recv,
+    };
     let mut producer = kafka_topic_tester.get_producer();
 
     // Send test data
@@ -494,9 +555,34 @@ async fn test_kafka_with_metadata_fields() {
         .collect();
 
     // Verify received messages
-    reader
-        .assert_next_message_record_values(expected_messages.into())
-        .await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let mut received = 0;
+    while received < expected_messages.len() {
+        let ArrowMessage::Data(record) = reader.next_non_idle_message(deadline).await else {
+            panic!("expected metadata-bearing Kafka data");
+        };
+        let values = record
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let offsets = record
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        for row in 0..record.num_rows() {
+            assert!(
+                received < expected_messages.len(),
+                "unexpected extra Kafka row"
+            );
+            assert!(!values.is_null(row));
+            assert_eq!(values.value(row), expected_messages[received]);
+            assert!(!offsets.is_null(row));
+            assert_eq!(offsets.value(row), received as i64);
+            received += 1;
+        }
+    }
 
     reader
         .to_control_tx

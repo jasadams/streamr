@@ -425,12 +425,28 @@ pub struct CompilerConfig {
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub struct WorkerConfig {
+    /// Opt-in shared DataFusion memory and emitted-batch limits.
+    #[serde(default)]
+    pub execution_resources: Option<ExecutionResourceConfig>,
+
     /// SQL map storage. RocksDB requires explicit disk and worker resource budgets.
     #[serde(default)]
     pub sql_state_backend: SqlStateBackend,
 
     #[serde(default)]
     pub disk_sql_state: Option<DiskSqlStateConfig>,
+
+    /// Native typed state-table limits, independent of the selected live backend.
+    #[serde(default)]
+    pub typed_sql_state: Option<TypedSqlStateConfig>,
+
+    /// Bounded native updating-aggregate state on the configured live backend.
+    #[serde(default)]
+    pub aggregate_state: Option<AggregateStateConfig>,
+
+    /// Opt-in bounded native TUMBLE/HOP partial state on the configured live backend.
+    #[serde(default)]
+    pub window_state: Option<WindowStateConfig>,
 
     /// Explicit worker-wide budgets shared by disk-backed operators.
     #[serde(default)]
@@ -485,6 +501,171 @@ pub struct DiskSqlStateConfig {
     pub directory: PathBuf,
     /// Per-row execution and overlay limit. Oversized rows fail before emission.
     pub max_row_bytes: usize,
+}
+
+/// Explicit bounds for one typed state-table owner. The same SQL kernel uses
+/// these limits with memory, RocksDB, or a future live-state backend adapter.
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct TypedSqlStateConfig {
+    pub key_bytes: usize,
+    pub row_bytes: usize,
+    pub decoded_bytes: usize,
+    pub scope_bytes: usize,
+    pub scope_operations: usize,
+    pub page_bytes: usize,
+    pub page_entries: usize,
+    pub max_working_event_bytes: usize,
+    pub max_captured_event_bytes: usize,
+    pub max_pending_output_rows: usize,
+    pub max_pending_output_bytes: usize,
+    /// Memory-backend resident-state cap. Ignored by disk adapters.
+    pub max_resident_bytes: usize,
+}
+
+/// One updating-aggregate owner's backend-neutral limits. A memory adapter
+/// additionally uses max_resident_bytes; all other limits apply to every
+/// backend and cannot be inferred from unbounded input cardinality.
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct AggregateStateConfig {
+    pub key_bytes: usize,
+    pub value_bytes: usize,
+    pub page_bytes: usize,
+    pub page_entries: usize,
+    pub write_bytes: usize,
+    pub write_operations: usize,
+    pub overlay_bytes: usize,
+    pub max_pending_output_rows: usize,
+    pub max_pending_output_bytes: usize,
+    pub max_resident_bytes: usize,
+}
+
+impl AggregateStateConfig {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        let positive = [
+            self.key_bytes,
+            self.value_bytes,
+            self.page_bytes,
+            self.page_entries,
+            self.write_bytes,
+            self.write_operations,
+            self.overlay_bytes,
+            self.max_pending_output_rows,
+            self.max_pending_output_bytes,
+            self.max_resident_bytes,
+        ];
+        if positive.contains(&0)
+            || self.max_pending_output_rows < 2
+            || self.write_operations < 2
+            || self.page_bytes < self.key_bytes.saturating_add(self.value_bytes)
+            || self.write_bytes < self.key_bytes.saturating_add(self.value_bytes)
+            || self.overlay_bytes < self.key_bytes.saturating_add(self.value_bytes)
+        {
+            bail!(
+                "worker.aggregate-state requires positive limits, two output rows/write operations, and room for one maximum key/value in page, write, and overlay budgets"
+            );
+        }
+        Ok(())
+    }
+}
+
+/// One window owner's backend-neutral limits. Fixed windows retain typed
+/// partials; sessions retain bounded raw rows. Both use the configured state
+/// backend and share their SQL kernel between memory and RocksDB.
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct WindowStateConfig {
+    pub key_bytes: usize,
+    pub partial_bytes: usize,
+    pub page_bytes: usize,
+    pub page_entries: usize,
+    pub write_bytes: usize,
+    pub write_operations: usize,
+    pub max_resident_bytes: usize,
+}
+
+impl WindowStateConfig {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if [
+            self.key_bytes,
+            self.partial_bytes,
+            self.page_bytes,
+            self.page_entries,
+            self.write_bytes,
+            self.max_resident_bytes,
+        ]
+        .contains(&0)
+            || self.write_operations < 4
+            || self.page_bytes < self.key_bytes.saturating_add(self.partial_bytes)
+            || self.write_bytes
+                < self
+                    .key_bytes
+                    .saturating_add(self.partial_bytes)
+                    .saturating_mul(4)
+        {
+            bail!(
+                "worker.window-state requires positive limits and room for one partial and its indexes"
+            );
+        }
+        Ok(())
+    }
+}
+
+impl TypedSqlStateConfig {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if [
+            self.key_bytes,
+            self.row_bytes,
+            self.decoded_bytes,
+            self.scope_bytes,
+            self.scope_operations,
+            self.page_bytes,
+            self.page_entries,
+            self.max_working_event_bytes,
+            self.max_captured_event_bytes,
+            self.max_pending_output_rows,
+            self.max_pending_output_bytes,
+            self.max_resident_bytes,
+        ]
+        .contains(&0)
+            || self.row_bytes > self.decoded_bytes
+            || self
+                .max_captured_event_bytes
+                .checked_add(64)
+                .is_none_or(|minimum| minimum > self.max_pending_output_bytes)
+            || self.max_captured_event_bytes > self.max_working_event_bytes
+        {
+            bail!(
+                "worker.typed-sql-state requires positive compatible state, event, and pending-output budgets"
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Cooperative DataFusion execution accounting, distinct from live-state budgets.
+/// This does not bound arbitrary UDF allocations or retained operator histories.
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct ExecutionResourceConfig {
+    pub memory_bytes: usize,
+    pub max_batch_bytes: usize,
+}
+
+impl ExecutionResourceConfig {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self.memory_bytes == 0
+            || self.max_batch_bytes == 0
+            || self.max_batch_bytes > self.memory_bytes
+            || self.memory_bytes > isize::MAX as usize
+        {
+            bail!(
+                "worker.execution-resources requires 0 < max-batch-bytes <= memory-bytes <= isize::MAX"
+            );
+        }
+        Ok(())
+    }
 }
 
 impl WorkerConfig {
@@ -1114,6 +1295,39 @@ impl TlsConfig {
 mod tests {
     use crate::config::{Config, DatabaseType, Scheduler, SchemaName, SqliteConfig, load_config};
     use url::Url;
+
+    #[test]
+    fn execution_resource_limits_require_nonzero_compatible_capacities() {
+        for (memory_bytes, max_batch_bytes) in [(0, 1), (1, 0), (1024, 1025), (usize::MAX, 1)] {
+            assert!(
+                super::ExecutionResourceConfig {
+                    memory_bytes,
+                    max_batch_bytes
+                }
+                .validate()
+                .is_err()
+            );
+        }
+        assert!(
+            super::ExecutionResourceConfig {
+                memory_bytes: 1024,
+                max_batch_bytes: 512
+            }
+            .validate()
+            .is_ok()
+        );
+        let parsed: super::ExecutionResourceConfig = serde_json::from_value(serde_json::json!({
+            "memory-bytes": 1024, "max-batch-bytes": 512
+        }))
+        .unwrap();
+        assert!(parsed.validate().is_ok());
+        assert!(
+            serde_json::from_value::<super::ExecutionResourceConfig>(serde_json::json!({
+                "memory-bytes": 1024, "max-batch-bytes": 512, "unaccounted-spill": true
+            }))
+            .is_err()
+        );
+    }
 
     #[test]
     fn schema_name_accepts_valid_identifiers() {

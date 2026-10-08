@@ -43,6 +43,7 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tracing::warn;
 
 use super::sync::streams::KeyedCloneableStreamFuture;
+use super::window_native::NativeWindow;
 type NextBatchFuture<K> = KeyedCloneableStreamFuture<K, SendableRecordBatchStream>;
 
 pub struct TumblingAggregatingWindowFunc<K: Copy> {
@@ -59,6 +60,7 @@ pub struct TumblingAggregatingWindowFunc<K: Copy> {
     final_batches_passer: Arc<RwLock<Vec<RecordBatch>>>,
     futures: Arc<Mutex<FuturesUnordered<NextBatchFuture<K>>>>,
     execs: BTreeMap<K, BinComputingHolder<K>>,
+    native: Option<NativeWindow>,
 }
 
 impl<K: Copy> TumblingAggregatingWindowFunc<K> {
@@ -152,6 +154,27 @@ impl OperatorConstructor for TumblingAggregateWindowConstructor {
             .ok_or_else(|| anyhow!("requires partial schema"))?
             .try_into()?;
 
+        let native = arroyo_rpc::config::config()
+            .worker
+            .window_state
+            .filter(|_| width > Duration::ZERO)
+            .map(|limits| {
+                NativeWindow::new(
+                    width,
+                    width,
+                    false,
+                    binning_function.clone(),
+                    &config.binning_function,
+                    &config.partial_aggregation_plan,
+                    &config.final_aggregation_plan,
+                    config.final_projection.as_deref(),
+                    &partial_schema,
+                    registry.clone(),
+                    limits,
+                )
+            })
+            .transpose()?;
+
         let finish_plan = PhysicalPlanNode::decode(&mut config.final_aggregation_plan.as_slice())?;
 
         let final_codec = ArroyoPhysicalExtensionCodec {
@@ -195,6 +218,7 @@ impl OperatorConstructor for TumblingAggregateWindowConstructor {
                 final_batches_passer,
                 futures: Arc::new(Mutex::new(FuturesUnordered::new())),
                 execs: BTreeMap::new(),
+                native,
             },
         )))
     }
@@ -232,6 +256,9 @@ impl ArrowOperator for TumblingAggregatingWindowFunc<SystemTime> {
     }
 
     async fn on_start(&mut self, ctx: &mut OperatorContext) -> DataflowResult<()> {
+        if let Some(native) = self.native.as_mut() {
+            return Ok(native.on_start(ctx).await?);
+        }
         let watermark = ctx.last_present_watermark();
         let table = ctx
             .table_manager
@@ -253,6 +280,9 @@ impl ArrowOperator for TumblingAggregatingWindowFunc<SystemTime> {
         ctx: &mut OperatorContext,
         _: &mut dyn Collector,
     ) -> DataflowResult<()> {
+        if let Some(native) = self.native.as_mut() {
+            return Ok(native.process_batch(batch, ctx).await?);
+        }
         let bin = self
             .binning_function
             .evaluate(&batch)
@@ -324,6 +354,10 @@ impl ArrowOperator for TumblingAggregatingWindowFunc<SystemTime> {
         ctx: &mut OperatorContext,
         collector: &mut dyn Collector,
     ) -> DataflowResult<Option<Watermark>> {
+        if let Some(native) = self.native.as_mut() {
+            native.handle_watermark(ctx, collector).await?;
+            return Ok(Some(watermark));
+        }
         if let Some(watermark) = ctx.last_present_watermark() {
             let bin = self.bin_start(watermark);
             while !self.execs.is_empty() {
@@ -394,6 +428,9 @@ impl ArrowOperator for TumblingAggregatingWindowFunc<SystemTime> {
     fn future_to_poll(
         &mut self,
     ) -> Option<Pin<Box<dyn Future<Output = Box<dyn Any + Send>> + Send>>> {
+        if self.native.is_some() {
+            return None;
+        }
         let future = self.futures.clone();
         Some(Box::pin(async move {
             let mut future = future.lock().await;
@@ -412,6 +449,9 @@ impl ArrowOperator for TumblingAggregatingWindowFunc<SystemTime> {
         _: &mut OperatorContext,
         _: &mut dyn Collector,
     ) -> DataflowResult<()> {
+        if self.native.is_some() {
+            return Ok(());
+        }
         let data: Box<Option<PolledFutureT>> = result.downcast().expect("invalid data in future");
         if let Some((bin, Some((batch, future)))) = *data {
             match self.execs.get_mut(&bin) {
@@ -433,6 +473,9 @@ impl ArrowOperator for TumblingAggregatingWindowFunc<SystemTime> {
         ctx: &mut OperatorContext,
         _: &mut dyn Collector,
     ) -> DataflowResult<()> {
+        if self.native.is_some() {
+            return Ok(());
+        }
         let watermark = ctx
             .watermark()
             .and_then(|watermark: Watermark| match watermark {
@@ -467,6 +510,9 @@ impl ArrowOperator for TumblingAggregatingWindowFunc<SystemTime> {
     }
 
     fn tables(&self) -> HashMap<String, TableConfig> {
+        if let Some(native) = &self.native {
+            return native.tables();
+        }
         vec![(
             "t".to_string(),
             timestamp_table_config(

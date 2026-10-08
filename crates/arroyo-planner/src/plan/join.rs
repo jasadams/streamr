@@ -369,7 +369,7 @@ impl TreeNodeRewriter for JoinRewriter<'_> {
             rewritten_join: final_logical_plan,
             is_instant,
             // only non-instant (updating) joins have a TTL
-            ttl: (!is_instant).then_some(self.schema_provider.planning_options.ttl),
+            ttl: (!is_instant).then_some(self.schema_provider.planning_options.join_ttl),
         };
 
         Ok(Transformed::yes(LogicalPlan::Extension(Extension {

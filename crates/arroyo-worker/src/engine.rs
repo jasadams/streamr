@@ -5,19 +5,23 @@ use crate::arrow::join_with_expiration::JoinWithExpirationConstructor;
 use crate::arrow::lookup_join::LookupJoinConstructor;
 use crate::arrow::session_aggregating_window::SessionAggregatingWindowConstructor;
 use crate::arrow::sliding_aggregating_window::SlidingAggregatingWindowConstructor;
+use crate::arrow::state_table::StateTableCaptureConstructor;
+use crate::arrow::state_table_runtime::FusedStateTableConstructor;
 use crate::arrow::stateful_processor::StatefulProcessorConstructor;
 use crate::arrow::tumbling_aggregating_window::TumblingAggregateWindowConstructor;
 use crate::arrow::watermark_generator::WatermarkGeneratorConstructor;
 use crate::arrow::window_fn::WindowFunctionConstructor;
 use crate::arrow::{KeyExecutionConstructor, ProjectionConstructor, ValueExecutionConstructor};
 use crate::job_controller::WorkerContext;
-use crate::network_manager::{NetworkManager, Quad, Senders};
+use crate::network_manager::{NetworkFailureReporter, NetworkManager, NetworkTasks, Quad, Senders};
 use arroyo_connectors::connectors;
 use arroyo_datastream::logical::{
     LogicalEdge, LogicalEdgeType, LogicalGraph, LogicalNode, OperatorChain, OperatorName,
 };
 use arroyo_operator::ErasedConstructor;
-use arroyo_operator::context::{BatchReceiver, BatchSender, OperatorContext, batch_bounded};
+use arroyo_operator::context::{
+    BatchReceiver, BatchSender, OperatorContext, batch_bounded, batch_bounded_accounted,
+};
 use arroyo_operator::operator::Registry;
 use arroyo_operator::operator::{ChainedOperator, ConstructedOperator, OperatorNode, SourceNode};
 use arroyo_planner::physical::new_registry;
@@ -37,6 +41,7 @@ use futures::stream::FuturesUnordered;
 use petgraph::graph::{DiGraph, NodeIndex};
 use petgraph::visit::EdgeRef;
 use petgraph::{Direction, dot};
+use prost::Message;
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::{Debug, Formatter};
 use std::mem;
@@ -44,6 +49,21 @@ use std::sync::{Arc, RwLock};
 use tokio::sync::Barrier;
 use tokio::sync::mpsc::{Receiver, Sender, channel};
 use tracing::{debug, info, warn};
+
+fn native_fixed_window_enabled(name: &OperatorName, bytes: &[u8], configured: bool) -> bool {
+    if !configured {
+        return false;
+    }
+    match name {
+        OperatorName::TumblingWindowAggregate => {
+            api::TumblingWindowAggregateOperator::decode(bytes)
+                .is_ok_and(|window| window.width_micros > 0)
+        }
+        OperatorName::SlidingWindowAggregate => true,
+        OperatorName::SessionWindowAggregate => true,
+        _ => false,
+    }
+}
 
 pub struct SubtaskNode {
     pub node_id: u32,
@@ -221,6 +241,27 @@ impl Program {
         let mut map_owners = HashMap::new();
         for node in logical.node_weights() {
             for (operator, _) in node.operator_chain.iter() {
+                if operator.operator_name == OperatorName::StateTable {
+                    use prost::Message;
+                    let state =
+                        api::StateTableOperator::decode(operator.operator_config.as_slice())
+                            .map_err(|error| StateError::Other {
+                                table: operator.operator_id.clone(),
+                                error: format!("invalid state-table plan: {error}"),
+                            })?;
+                    let table = state
+                        .table
+                        .as_ref()
+                        .map(|definition| definition.name.clone())
+                        .unwrap_or_else(|| operator.operator_id.clone());
+                    return Err(StateError::Other {
+                        table,
+                        error: format!(
+                            "state-table event scope '{}' requires STR-41 fused serial execution; standalone state-table plans cannot start",
+                            state.event_scope_id
+                        ),
+                    });
+                }
                 if operator.operator_name == OperatorName::StatefulProcessor {
                     use prost::Message;
                     let state =
@@ -241,12 +282,38 @@ impl Program {
             }
         }
         let worker_config = config().worker.clone();
+        if let Some(resources) = &worker_config.execution_resources {
+            resources.validate().map_err(|error| StateError::Other {
+                table: "execution resources".into(),
+                error: error.to_string(),
+            })?;
+        }
         worker_config
             .validate_sql_state()
             .map_err(|error| StateError::Other {
                 table: "SQL state backend".into(),
                 error: error.to_string(),
             })?;
+        let has_updating_aggregate = logical.node_weights().any(|node| {
+            node.operator_chain
+                .iter()
+                .any(|(operator, _)| operator.operator_name == OperatorName::UpdatingAggregate)
+        });
+        if has_updating_aggregate {
+            if let Some(limits) = &worker_config.aggregate_state {
+                limits.validate().map_err(|error| StateError::Other {
+                    table: "native aggregate state".into(),
+                    error: error.to_string(),
+                })?;
+            } else if worker_config.sql_state_backend
+                == arroyo_rpc::config::SqlStateBackend::Rocksdb
+            {
+                return Err(StateError::Other {
+                    table: "native aggregate state".into(),
+                    error: "RocksDB updating aggregates require worker.aggregate-state limits; in-memory legacy aggregate execution cannot use a RocksDB state backend".into(),
+                });
+            }
+        }
         if worker_config.sql_state_backend == arroyo_rpc::config::SqlStateBackend::Rocksdb {
             let owners_per_node: HashMap<_, _> = logical
                 .node_weights()
@@ -256,7 +323,16 @@ impl Program {
                         node.operator_chain
                             .iter()
                             .filter(|(operator, _)| {
-                                operator.operator_name == OperatorName::StatefulProcessor
+                                matches!(
+                                    operator.operator_name,
+                                    OperatorName::StatefulProcessor
+                                        | OperatorName::FusedStateTable
+                                        | OperatorName::UpdatingAggregate
+                                ) || native_fixed_window_enabled(
+                                    &operator.operator_name,
+                                    &operator.operator_config,
+                                    worker_config.window_state.is_some(),
+                                )
                             })
                             .count(),
                     )
@@ -301,8 +377,15 @@ impl Program {
                             | OperatorName::ArrowKey
                             | OperatorName::Projection
                             | OperatorName::StatefulProcessor
+                            | OperatorName::FusedStateTable
+                            | OperatorName::StateTableCapture
+                            | OperatorName::UpdatingAggregate
                             | OperatorName::ConnectorSource
                             | OperatorName::ConnectorSink
+                    ) && !native_fixed_window_enabled(
+                        &operator.operator_name,
+                        &operator.operator_config,
+                        worker_config.window_state.is_some(),
                     ) {
                         return Err(StateError::Other {
                             table: operator.operator_id.clone(),
@@ -397,6 +480,27 @@ impl Program {
         }
 
         let queue_size = config().worker.queue_size;
+        let execution =
+            crate::arrow::execution::configured_execution_resources().map_err(|error| {
+                StateError::Other {
+                    table: "execution graph".into(),
+                    error: error.to_string(),
+                }
+            })?;
+        let new_queue = || {
+            match &execution {
+                Some(resources) => batch_bounded_accounted(
+                    queue_size,
+                    resources.runtime.clone(),
+                    resources.limits.max_batch_bytes,
+                ),
+                None => Ok(batch_bounded(queue_size)),
+            }
+            .map_err(|error| StateError::Other {
+                table: "execution graph".into(),
+                error: error.to_string(),
+            })
+        };
 
         for idx in logical.edge_indices() {
             let edge = logical.edge_weight(idx).unwrap();
@@ -423,7 +527,7 @@ impl Program {
                         );
                     }
                     for (f, t) in from_nodes.iter().zip(&to_nodes) {
-                        let (tx, rx) = batch_bounded(queue_size);
+                        let (tx, rx) = new_queue()?;
                         let edge = PhysicalGraphEdge {
                             edge_idx: 0,
                             in_logical_idx: logical_in_node_idx.index(),
@@ -441,7 +545,7 @@ impl Program {
                 | LogicalEdgeType::RightJoin => {
                     for f in &from_nodes {
                         for (idx, t) in to_nodes.iter().enumerate() {
-                            let (tx, rx) = batch_bounded(queue_size);
+                            let (tx, rx) = new_queue()?;
                             let edge = PhysicalGraphEdge {
                                 edge_idx: idx,
                                 in_logical_idx: logical_in_node_idx.index(),
@@ -482,12 +586,20 @@ pub struct RunningEngine {
     assignments: HashMap<(u32, usize), TaskAssignment>,
     worker_id: WorkerId,
     task_aborts: Vec<tokio::task::AbortHandle>,
+    network_tasks: NetworkTasks,
+}
+
+impl Drop for RunningEngine {
+    fn drop(&mut self) {
+        self.network_tasks.abort();
+    }
 }
 
 impl RunningEngine {
     /// Abruptly cancel local operator tasks, without a final checkpoint or drain.
     /// Recovery must reconstruct a fresh engine from a committed checkpoint.
     pub fn abort_workers(&self) {
+        self.network_tasks.abort();
         for task in &self.task_aborts {
             task.abort();
         }
@@ -674,6 +786,7 @@ impl Engine {
             assignments: self.assignments,
             worker_id,
             task_aborts: self.task_aborts.into_inner().unwrap(),
+            network_tasks: self.network_manager.task_registry(),
         }
     }
 
@@ -712,6 +825,7 @@ impl Engine {
         } else {
             self.connect_to_remote_task(
                 &mut senders,
+                control_tx,
                 idx,
                 node.node_id,
                 node.subtask_idx,
@@ -726,6 +840,7 @@ impl Engine {
     async fn connect_to_remote_task(
         &self,
         senders: &mut Senders,
+        control_tx: &Sender<ControlResp>,
         idx: NodeIndex,
         node_id: u32,
         node_subtask_idx: usize,
@@ -750,10 +865,15 @@ impl Engine {
                     dst_idx: target.subtask_idx(),
                 };
 
-                senders.add(
+                senders.add_reported(
                     quad,
                     edge.weight().schema.schema.clone(),
                     edge.weight().tx.as_ref().unwrap().clone(),
+                    NetworkFailureReporter::new(
+                        control_tx.clone(),
+                        target.id(),
+                        target.subtask_idx(),
+                    ),
                 );
             }
 
@@ -767,11 +887,11 @@ impl Engine {
                     dst_idx: node_subtask_idx,
                 };
 
-                connects.push((edge.id(), quad));
+                connects.push((edge.id(), quad, source.id(), source.subtask_idx()));
             }
         }
 
-        for (id, quad) in connects {
+        for (id, quad, task_id, subtask_idx) in connects {
             let rx = {
                 let mut graph = self.program.graph.write().unwrap();
                 let edge = graph.edge_weight_mut(id).unwrap();
@@ -779,7 +899,16 @@ impl Engine {
             };
 
             self.network_manager
-                .connect(&assignment.worker_addr, quad, rx)
+                .connect_reported(
+                    &assignment.worker_addr,
+                    quad,
+                    rx,
+                    Some(NetworkFailureReporter::new(
+                        control_tx.clone(),
+                        task_id,
+                        subtask_idx,
+                    )),
+                )
                 .await;
         }
 
@@ -1027,6 +1156,13 @@ pub fn construct_operator(
         OperatorName::SessionWindowAggregate => Box::new(SessionAggregatingWindowConstructor),
         OperatorName::UpdatingAggregate => Box::new(IncrementalAggregatingConstructor),
         OperatorName::StatefulProcessor => Box::new(StatefulProcessorConstructor),
+        OperatorName::StateTable => {
+            panic!(
+                "state-table execution requires STR-41 fused serial event owner; standalone state-table operator is unavailable"
+            )
+        }
+        OperatorName::FusedStateTable => Box::new(FusedStateTableConstructor),
+        OperatorName::StateTableCapture => Box::new(StateTableCaptureConstructor),
         OperatorName::ExpressionWatermark => Box::new(WatermarkGeneratorConstructor),
         OperatorName::Join => Box::new(JoinWithExpirationConstructor),
         OperatorName::InstantJoin => Box::new(InstantJoinConstructor),
@@ -1049,4 +1185,53 @@ pub fn construct_operator(
 
     ctor.with_config(config, registry)
         .unwrap_or_else(|e| panic!("Failed to construct operator {operator:?}, with error:\n{e:?}"))
+}
+
+#[cfg(test)]
+mod state_table_preflight_tests {
+    use super::*;
+    use arroyo_rpc::grpc::api::{StateTableDefinition, StateTableOperator};
+    use prost::Message;
+
+    #[tokio::test]
+    async fn state_table_plan_rejects_before_task_construction() {
+        let mut logical = DiGraph::new();
+        let config = StateTableOperator {
+            table: Some(StateTableDefinition {
+                name: "generic_inventory".into(),
+                ..Default::default()
+            }),
+            event_scope_id: "state-event-v1:events".into(),
+            requires_fused_serial_owner: true,
+            ..Default::default()
+        };
+        logical.add_node(LogicalNode::single(
+            0,
+            "state-table-operator".into(),
+            OperatorName::StateTable,
+            config.encode_to_vec(),
+            "generic state access".into(),
+            1,
+        ));
+        let (control_tx, _control_rx) = channel(1);
+        let result = Program::from_logical(
+            "test-job",
+            &logical,
+            &Vec::new(),
+            new_registry(),
+            None,
+            None,
+            CheckpointFilePathLayout::Legacy,
+            control_tx,
+        )
+        .await;
+        let error = result
+            .err()
+            .expect("state table must fail before tasks start");
+        assert!(error.to_string().contains("generic_inventory"), "{error}");
+        assert!(
+            error.to_string().contains("STR-41 fused serial execution"),
+            "{error}"
+        );
+    }
 }

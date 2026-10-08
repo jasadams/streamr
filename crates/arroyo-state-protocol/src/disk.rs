@@ -5,13 +5,23 @@ use arroyo_rpc::grpc::rpc::{
 };
 use std::collections::HashSet;
 
-pub const DISK_CHECKPOINT_VERSION: u32 = 1;
+/// New snapshots use Arroyo's Parquet key/value representation. Version 1 is
+/// accepted only for existing exclusive STRDS001 checkpoints.
+pub const DISK_CHECKPOINT_VERSION: u32 = 2;
+
+pub fn checkpoint_file_extension(format_version: u32) -> Result<&'static str, String> {
+    match format_version {
+        1 => Ok(".bin"),
+        2 => Ok(".parquet"),
+        _ => Err("unsupported live-state checkpoint format version".into()),
+    }
+}
 
 pub fn validate_subtask(
     config: &DiskKeyedTableConfig,
     metadata: &DiskKeyedTableSubtaskCheckpointMetadata,
 ) -> Result<(), String> {
-    if metadata.format_version != DISK_CHECKPOINT_VERSION
+    if checkpoint_file_extension(metadata.format_version).is_err()
         || metadata.encoding_version != 1
         || config.encoding_version != 1
     {
@@ -43,6 +53,7 @@ pub fn validate_subtask(
     if metadata.empty != metadata.files.is_empty() {
         return Err("disk-map checkpoint must declare explicit empty state or a complete nonempty file list".into());
     }
+    let extension = checkpoint_file_extension(metadata.format_version)?;
     let mut seen = HashSet::new();
     for file in &metadata.files {
         crate::types::CheckpointRef::new(file.path.clone()).map_err(|e| e.to_string())?;
@@ -52,6 +63,13 @@ pub fn validate_subtask(
             || !seen.insert(&file.path)
         {
             return Err("invalid or duplicate disk-map checkpoint file".into());
+        }
+        let basename = file.path.rsplit('/').next().unwrap_or_default();
+        if !basename.starts_with("disk-")
+            || !basename.ends_with(extension)
+            || basename.contains('\\')
+        {
+            return Err("disk-map checkpoint file format differs from metadata".into());
         }
         if !file
             .path
@@ -81,7 +99,7 @@ pub fn validate_table(
     config: &DiskKeyedTableConfig,
     metadata: &DiskKeyedTableTaskCheckpointMetadata,
 ) -> Result<(), String> {
-    if metadata.format_version != DISK_CHECKPOINT_VERSION
+    if checkpoint_file_extension(metadata.format_version).is_err()
         || metadata.subtasks.len() != 1
         || !metadata.subtasks.contains_key(&0)
     {
@@ -90,7 +108,7 @@ pub fn validate_table(
         );
     }
     for (&index, subtask) in &metadata.subtasks {
-        if index != subtask.subtask_index {
+        if index != subtask.subtask_index || subtask.format_version != metadata.format_version {
             return Err("disk-map subtask ownership mismatch".into());
         }
         validate_subtask(config, subtask)?;
@@ -104,10 +122,63 @@ pub fn validate_manifest(
 ) -> Result<(), String> {
     use arroyo_rpc::grpc::rpc::{
         DiskKeyedTableConfig, DiskKeyedTableTaskCheckpointMetadata, TableEnum,
+        TypedStateTableConfig, TypedStateTableTaskCheckpointMetadata,
     };
     use prost::Message;
     for operator in &manifest.operators {
         for (table_name, metadata) in &operator.table_checkpoint_metadata {
+            if metadata.table_type() == TableEnum::TypedStateTable {
+                let op = operator
+                    .operator_metadata
+                    .as_ref()
+                    .ok_or("missing typed table operator ownership")?;
+                if op.parallelism != 1
+                    || u64::from(op.epoch) != manifest.epoch
+                    || op.job_id != manifest.job_id
+                {
+                    return Err("typed state-table operator checkpoint ownership mismatch".into());
+                }
+                let config = operator
+                    .table_configs
+                    .get(table_name)
+                    .ok_or("missing typed state-table configuration")?;
+                if config.table_type() != TableEnum::TypedStateTable {
+                    return Err("typed state-table configuration type mismatch".into());
+                }
+                let config = TypedStateTableConfig::decode(config.config.as_slice())
+                    .map_err(|e| e.to_string())?;
+                if config.transport_name != *table_name {
+                    return Err("typed state-table transport name mismatch".into());
+                }
+                let metadata =
+                    TypedStateTableTaskCheckpointMetadata::decode(metadata.data.as_slice())
+                        .map_err(|e| e.to_string())?;
+                crate::typed_checkpoint::validate_table(&config, &metadata)?;
+                let prefix = format!(
+                    "{}/{}/generations/{}/checkpoints/checkpoint-{:07}/operator-{}/table-{}-000/",
+                    manifest.pipeline_id,
+                    manifest.job_id,
+                    manifest.generation,
+                    manifest.epoch,
+                    op.operator_id,
+                    table_name
+                );
+                for subtask in metadata.subtasks.values() {
+                    if subtask.generation != manifest.generation
+                        || u64::from(subtask.epoch) != manifest.epoch
+                    {
+                        return Err(
+                            "typed state-table checkpoint generation or epoch mismatch".into()
+                        );
+                    }
+                    for file in &subtask.files {
+                        if !file.path.starts_with(&prefix) {
+                            return Err("typed state-table file is outside exclusive checkpoint table directory".into());
+                        }
+                    }
+                }
+                continue;
+            }
             if metadata.table_type() != TableEnum::DiskKeyedMap {
                 continue;
             }
@@ -182,6 +253,29 @@ mod tests {
         namespace.push(b'm');
         (DiskKeyedTableConfig { table_name: "m".into(), encoding_version: 1, schema_identity: vec![1] }, DiskKeyedTableSubtaskCheckpointMetadata { subtask_index: 0, format_version: 1, encoding_version: 1, schema_identity: vec![1], namespace, generation: 2, epoch: 3, empty: false, files: vec![DiskCheckpointFile { path: "P/J/generations/2/checkpoints/checkpoint-0000003/operator-o/table-m-000/disk-0.bin".into(), size_bytes: 10, row_count: 1, checksum: vec![0;32] }] })
     }
+    #[test]
+    fn parquet_format_preserves_ownership_and_rejects_mixed_versions() {
+        let (config, mut subtask) = fixture();
+        validate_subtask(&config, &subtask).unwrap();
+        subtask.format_version = DISK_CHECKPOINT_VERSION;
+        assert!(validate_subtask(&config, &subtask).is_err());
+        subtask.files[0].path = subtask.files[0].path.replace(".bin", ".parquet");
+        validate_subtask(&config, &subtask).unwrap();
+        let mut table = DiskKeyedTableTaskCheckpointMetadata {
+            format_version: DISK_CHECKPOINT_VERSION,
+            subtasks: [(0, subtask.clone())].into_iter().collect(),
+        };
+        validate_table(&config, &table).unwrap();
+        table.format_version = 1;
+        assert!(validate_table(&config, &table).is_err());
+        subtask.files[0].path = subtask.files[0]
+            .path
+            .replace("table-m-000", "table-other-000");
+        assert!(validate_subtask(&config, &subtask).is_err());
+        subtask.format_version = 3;
+        assert!(validate_subtask(&config, &subtask).is_err());
+    }
+
     #[test]
     fn explicit_empty_and_complete_lists() {
         let (config, mut metadata) = fixture();

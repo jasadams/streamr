@@ -945,6 +945,7 @@ dependencies = [
  "datafusion",
  "petgraph 0.8.2",
  "prometheus",
+ "prost",
  "rstest",
  "serde",
  "serde_json",
@@ -986,6 +987,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -1000,6 +1002,7 @@ dependencies = [
  "prost",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror 2.0.12",
  "tokio",
  "tracing",
@@ -1137,6 +1140,7 @@ dependencies = [
  "rand 0.9.1",
  "serde",
  "serde_json",
+ "sha2",
  "tokio",
  "tokio-rustls 0.26.2",
  "tokio-stream",
