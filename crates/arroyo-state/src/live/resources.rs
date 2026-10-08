@@ -101,14 +101,59 @@ impl From<ResourceError> for super::LiveStateError {
     }
 }
 
+#[derive(Clone)]
+struct AdmissionMetrics {
+    refusals: IntCounterVec,
+    duration: HistogramVec,
+}
+impl AdmissionMetrics {
+    fn new() -> Result<Self, prometheus::Error> {
+        Ok(Self {
+            refusals: IntCounterVec::new(
+                Opts::new(
+                    "arroyo_live_state_admission_refusals_total",
+                    "Live-state admission refusals by resource and reason; excludes cancellation",
+                ),
+                &["resource", "reason"],
+            )?,
+            duration: HistogramVec::new(
+                HistogramOpts::new(
+                    "arroyo_live_state_admission_duration_seconds",
+                    "Async admission from first poll through acquisition, refusal or cancellation",
+                ),
+                &["resource"],
+            )?,
+        })
+    }
+    fn refused(&self, error: &ResourceError) {
+        let (resource, reason) = match error {
+            ResourceError::RequestTooLarge { resource, .. } => (*resource, "oversized"),
+            ResourceError::Closed { resource } => (*resource, "closed"),
+            ResourceError::ResourceExhausted { resource, .. } => (*resource, "exhausted"),
+            _ => return,
+        };
+        self.refusals.with_label_values(&[resource, reason]).inc();
+    }
+}
+
 struct Budget {
     name: &'static str,
     limit: usize,
     semaphore: Arc<Semaphore>,
     metrics: IntGaugeVec,
+    admission: AdmissionMetrics,
 }
 impl Budget {
-    fn new(name: &'static str, limit: usize, metrics: &IntGaugeVec) -> Self {
+    fn new(
+        name: &'static str,
+        limit: usize,
+        metrics: &IntGaugeVec,
+        admission: &AdmissionMetrics,
+    ) -> Self {
+        for reason in ["oversized", "closed", "exhausted"] {
+            admission.refusals.with_label_values(&[name, reason]);
+        }
+        admission.duration.with_label_values(&[name]);
         metrics
             .with_label_values(&[name, "limit"])
             .set(limit as i64);
@@ -117,9 +162,15 @@ impl Budget {
             limit,
             semaphore: Arc::new(Semaphore::new(limit)),
             metrics: metrics.clone(),
+            admission: admission.clone(),
         }
     }
     async fn acquire(&self, amount: usize) -> Result<ResourcePermit, ResourceError> {
+        let _duration = self
+            .admission
+            .duration
+            .with_label_values(&[self.name])
+            .start_timer();
         // acquire_many takes u32; reject impossible requests rather than wait forever.
         let count = u32::try_from(amount)
             .ok()
@@ -128,7 +179,8 @@ impl Budget {
                 resource: self.name,
                 requested: amount,
                 limit: self.limit.min(u32::MAX as usize),
-            })?;
+            })
+            .inspect_err(|error| self.admission.refused(error))?;
         let waiting = self.metrics.with_label_values(&[self.name, "waiting"]);
         waiting.inc();
         let _waiting = GaugeGuard(waiting);
@@ -139,7 +191,8 @@ impl Budget {
             .await
             .map_err(|_| ResourceError::Closed {
                 resource: self.name,
-            })?;
+            })
+            .inspect_err(|error| self.admission.refused(error))?;
         let used = self.metrics.with_label_values(&[self.name, "used"]);
         used.add(amount as i64);
         Ok(ResourcePermit {
@@ -156,7 +209,8 @@ impl Budget {
                 resource: self.name,
                 requested: amount,
                 limit: self.limit.min(u32::MAX as usize),
-            })?;
+            })
+            .inspect_err(|error| self.admission.refused(error))?;
         let permit = self
             .semaphore
             .clone()
@@ -169,7 +223,8 @@ impl Budget {
                     resource: self.name,
                     limit: self.limit,
                 },
-            })?;
+            })
+            .inspect_err(|error| self.admission.refused(error))?;
         let used = self.metrics.with_label_values(&[self.name, "used"]);
         used.add(amount as i64);
         Ok(ResourcePermit {
@@ -214,7 +269,11 @@ struct CleanupExecutor {
     slots: Budget,
 }
 impl CleanupExecutor {
-    fn new(capacity: usize, metrics: &IntGaugeVec) -> Result<Self, ResourceError> {
+    fn new(
+        capacity: usize,
+        metrics: &IntGaugeVec,
+        admission: &AdmissionMetrics,
+    ) -> Result<Self, ResourceError> {
         let (sender, receiver) = mpsc::sync_channel::<CleanupJob>(capacity);
         std::thread::Builder::new()
             .name("live-state-cleanup".into())
@@ -231,7 +290,7 @@ impl CleanupExecutor {
             .map_err(ResourceError::CleanupThread)?;
         Ok(Self {
             sender,
-            slots: Budget::new("cleanup_slots", capacity, metrics),
+            slots: Budget::new("cleanup_slots", capacity, metrics, admission),
         })
     }
     async fn reserve(&self) -> Result<CleanupPermit, ResourceError> {
@@ -283,6 +342,7 @@ struct Inner {
     databases: Budget,
     cleanup: CleanupExecutor,
     metrics: IntGaugeVec,
+    admission: AdmissionMetrics,
     operation_latency: HistogramVec,
     checkpoint_duration: HistogramVec,
     checkpoint_operations: IntCounterVec,
@@ -432,6 +492,8 @@ impl WorkerStateResources {
             &["resource", "measurement"],
         )
         .map_err(|e| ResourceError::InvalidConfig(e.to_string()))?;
+        let admission =
+            AdmissionMetrics::new().map_err(|e| ResourceError::InvalidConfig(e.to_string()))?;
         let operation_latency = HistogramVec::new(
             HistogramOpts::new(
                 "arroyo_live_state_operation_latency_seconds",
@@ -487,21 +549,38 @@ impl WorkerStateResources {
             cache.clone(),
         );
         Ok(Self(Arc::new(Inner {
-            queued: Budget::new("queued_write_bytes", config.queued_write_bytes, &metrics),
-            decoded: Budget::new("decoded_value_bytes", config.decoded_value_bytes, &metrics),
-            scans: Budget::new("scan_page_bytes", config.scan_page_bytes, &metrics),
+            queued: Budget::new(
+                "queued_write_bytes",
+                config.queued_write_bytes,
+                &metrics,
+                &admission,
+            ),
+            decoded: Budget::new(
+                "decoded_value_bytes",
+                config.decoded_value_bytes,
+                &metrics,
+                &admission,
+            ),
+            scans: Budget::new(
+                "scan_page_bytes",
+                config.scan_page_bytes,
+                &metrics,
+                &admission,
+            ),
             blocking: Budget::new(
                 "blocking_operations",
                 config.max_blocking_operations,
                 &metrics,
+                &admission,
             ),
-            snapshots: Budget::new("snapshots", config.max_snapshots, &metrics),
-            databases: Budget::new("databases", config.max_open_databases, &metrics),
-            cleanup: CleanupExecutor::new(cleanup_capacity, &metrics)?,
+            snapshots: Budget::new("snapshots", config.max_snapshots, &metrics, &admission),
+            databases: Budget::new("databases", config.max_open_databases, &metrics, &admission),
+            cleanup: CleanupExecutor::new(cleanup_capacity, &metrics, &admission)?,
             config,
             cache,
             manager,
             metrics,
+            admission,
             operation_latency,
             checkpoint_duration,
             checkpoint_operations,
@@ -642,6 +721,12 @@ impl WorkerStateResources {
 impl prometheus::core::Collector for WorkerStateResources {
     fn desc(&self) -> Vec<&prometheus::core::Desc> {
         let mut descriptions = prometheus::core::Collector::desc(&self.0.metrics);
+        descriptions.extend(prometheus::core::Collector::desc(
+            &self.0.admission.refusals,
+        ));
+        descriptions.extend(prometheus::core::Collector::desc(
+            &self.0.admission.duration,
+        ));
         descriptions.extend(prometheus::core::Collector::desc(&self.0.operation_latency));
         descriptions.extend(prometheus::core::Collector::desc(
             &self.0.checkpoint_duration,
@@ -657,6 +742,12 @@ impl prometheus::core::Collector for WorkerStateResources {
     fn collect(&self) -> Vec<prometheus::proto::MetricFamily> {
         self.refresh_native_metrics();
         let mut families = prometheus::core::Collector::collect(&self.0.metrics);
+        families.extend(prometheus::core::Collector::collect(
+            &self.0.admission.refusals,
+        ));
+        families.extend(prometheus::core::Collector::collect(
+            &self.0.admission.duration,
+        ));
         families.extend(prometheus::core::Collector::collect(
             &self.0.operation_latency,
         ));
@@ -724,6 +815,148 @@ mod tests {
             disk_reserve_bytes: 1,
         }
     }
+    fn admission_budget() -> Budget {
+        let gauges = IntGaugeVec::new(
+            Opts::new("test_admission", "test admission accounting"),
+            &["resource", "measurement"],
+        )
+        .unwrap();
+        Budget::new(
+            "queued_write_bytes",
+            2,
+            &gauges,
+            &AdmissionMetrics::new().unwrap(),
+        )
+    }
+
+    fn refusals(budget: &Budget, reason: &str) -> u64 {
+        budget
+            .admission
+            .refusals
+            .with_label_values(&[budget.name, reason])
+            .get()
+    }
+
+    fn duration_count(budget: &Budget) -> u64 {
+        budget
+            .admission
+            .duration
+            .with_label_values(&[budget.name])
+            .get_sample_count()
+    }
+
+    #[tokio::test]
+    async fn admission_metrics_count_existing_refusals_and_success() {
+        let budget = admission_budget();
+        let permit = budget.acquire(2).await.unwrap();
+        assert_eq!(duration_count(&budget), 1);
+        assert!(matches!(
+            budget.try_acquire(1),
+            Err(ResourceError::ResourceExhausted { limit: 2, .. })
+        ));
+        assert_eq!(refusals(&budget, "exhausted"), 1);
+        assert!(matches!(
+            budget.acquire(3).await,
+            Err(ResourceError::RequestTooLarge {
+                requested: 3,
+                limit: 2,
+                ..
+            })
+        ));
+        assert!(matches!(
+            budget.try_acquire(3),
+            Err(ResourceError::RequestTooLarge {
+                requested: 3,
+                limit: 2,
+                ..
+            })
+        ));
+        assert_eq!(refusals(&budget, "oversized"), 2);
+        assert_eq!(duration_count(&budget), 2);
+        drop(permit);
+        let next = budget.try_acquire(1).unwrap();
+        drop(next);
+        assert_eq!(duration_count(&budget), 2); // synchronous admission is not timed
+        budget.semaphore.close();
+        assert!(matches!(
+            budget.acquire(1).await,
+            Err(ResourceError::Closed { .. })
+        ));
+        assert!(matches!(
+            budget.try_acquire(1),
+            Err(ResourceError::Closed { .. })
+        ));
+        assert_eq!(refusals(&budget, "closed"), 2);
+        assert_eq!(duration_count(&budget), 3);
+        assert_eq!(
+            budget
+                .metrics
+                .with_label_values(&[budget.name, "waiting"])
+                .get(),
+            0
+        );
+        assert_eq!(
+            budget
+                .metrics
+                .with_label_values(&[budget.name, "used"])
+                .get(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_admission_observes_duration_without_refusal_or_capacity_leak() {
+        let budget = admission_budget();
+        let owner = budget.acquire(2).await.unwrap();
+        {
+            let unpolled = budget.acquire(1);
+            drop(unpolled);
+        }
+        assert_eq!(duration_count(&budget), 1);
+        {
+            let waiter = budget.acquire(1);
+            tokio::pin!(waiter);
+            assert!(futures::poll!(&mut waiter).is_pending());
+            assert_eq!(
+                budget
+                    .metrics
+                    .with_label_values(&[budget.name, "waiting"])
+                    .get(),
+                1
+            );
+        }
+        assert_eq!(duration_count(&budget), 2);
+        assert_eq!(
+            budget
+                .metrics
+                .with_label_values(&[budget.name, "waiting"])
+                .get(),
+            0
+        );
+        assert_eq!(
+            budget
+                .metrics
+                .with_label_values(&[budget.name, "used"])
+                .get(),
+            2
+        );
+        assert_eq!(budget.semaphore.available_permits(), 0);
+        for reason in ["oversized", "closed", "exhausted"] {
+            assert_eq!(refusals(&budget, reason), 0);
+        }
+        drop(owner);
+        assert_eq!(budget.semaphore.available_permits(), 2);
+        assert_eq!(
+            budget
+                .metrics
+                .with_label_values(&[budget.name, "used"])
+                .get(),
+            0
+        );
+        drop(budget.acquire(2).await.unwrap());
+        assert_eq!(duration_count(&budget), 3);
+    }
+
     #[tokio::test]
     async fn worker_database_admission_fails_fast_but_diagnostic_admission_waits() {
         let resources = WorkerStateResources::new(config()).unwrap();
@@ -812,7 +1045,7 @@ mod tests {
             &["resource", "measurement"],
         )
         .unwrap();
-        CleanupExecutor::new(capacity, &metrics).unwrap()
+        CleanupExecutor::new(capacity, &metrics, &AdmissionMetrics::new().unwrap()).unwrap()
     }
 
     #[tokio::test]
@@ -926,6 +1159,35 @@ mod tests {
                 .iter()
                 .any(|label| label.value() == "block_cache_bytes")
         }));
+        let refusals = families
+            .iter()
+            .find(|family| family.name() == "arroyo_live_state_admission_refusals_total")
+            .unwrap();
+        let admission = families
+            .iter()
+            .find(|family| family.name() == "arroyo_live_state_admission_duration_seconds")
+            .unwrap();
+        assert_eq!(refusals.get_metric().len(), 7 * 3);
+        assert_eq!(admission.get_metric().len(), 7);
+        for metric in refusals.get_metric() {
+            assert!(metric.get_label().iter().all(|label| {
+                match label.name() {
+                    "resource" => [
+                        "queued_write_bytes",
+                        "decoded_value_bytes",
+                        "scan_page_bytes",
+                        "blocking_operations",
+                        "snapshots",
+                        "databases",
+                        "cleanup_slots",
+                    ]
+                    .contains(&label.value()),
+                    "reason" => ["oversized", "closed", "exhausted"].contains(&label.value()),
+                    _ => false,
+                }
+            }));
+            assert_eq!(metric.get_counter().as_ref().unwrap().value(), 0.0);
+        }
         let latency = families
             .iter()
             .find(|family| family.name() == "arroyo_live_state_operation_latency_seconds")

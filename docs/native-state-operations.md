@@ -105,13 +105,15 @@ truncation are not acceptable operational workarounds.
 
 Production workers register live resources with the default Prometheus registry;
 the configured admin HTTP service exposes `/metrics`. Label sets are fixed
-resource/measurement, operation, direction/outcome or bounded graph identity,
+resource/measurement, resource/reason, operation, direction/outcome or bounded graph identity,
 without caller keys or values. Code presence remains distinct from a captured
 current-candidate production scrape.
 
 | Signal | Current evidence/source | Limit or remaining gap |
 | --- | --- | --- |
 | `arroyo_live_state_resources{resource,measurement}` | Admission `used`, `limit`, `waiting`; native cache/memtable refresh; pinned cache, disk available/refusals | Disk available reflects the last admission check, not a continuously refreshed filesystem gauge; logical table cardinality/bytes is not supplied |
+| `arroyo_live_state_admission_refusals_total{resource,reason}` | Existing oversized, closed and exhausted admission errors; reasons are `oversized`, `closed`, `exhausted` | Counts only returned refusals, never cancelled waits; excludes disk/configuration failures and execution-pool admission |
+| `arroyo_live_state_admission_duration_seconds{resource}` | Async admission from first poll through acquisition, refusal or cancellation, including immediate outcomes | Includes validation and semaphore wait; excludes time before first poll, synchronous try-admission, permit holding and native work; cancellation contributes a duration sample without a refusal |
 | `arroyo_live_state_operation_latency_seconds{operation}` | Fixed read/write/scan/snapshot/open histogram | Native operation time after admission; does not separately report total queue wait or RocksDB write-stall duration |
 | `arroyo_live_state_checkpoint_duration_seconds{direction,outcome}` | Logical namespace export/restore durations, success/error/cancelled outcomes | Not entire controller barrier/publication duration or worker startup latency |
 | `arroyo_live_state_checkpoint_operations_total{direction,outcome}` | Full logical export/restore operation counts | Requires actual scrape/fault evidence to establish deployment behavior |
@@ -119,6 +121,15 @@ current-candidate production scrape.
 | `arroyo_worker_execution_memory_bytes{measurement}` | Actual shared pool reserved bytes (`used`), configured memory limit (`limit`) and batch limit (`max_batch`), refreshed on scrape | Cooperative reservations in the latest observed configured pool, not RSS or graph/network breakdown; reservations surviving in a replaced pool are not summed; all three read zero when the observed pool is gone; no admission wait/failure counter |
 | `arroyo_worker_tx_bytes`, `arroyo_worker_tx_queue_size`, `arroyo_worker_tx_queue_rem` | Payload bytes, configured row capacity, and remaining row capacity respectively | Collector-attached graph queues refresh on admission, drain, failed delivery and receiver teardown (including signals); total capacity is the queue row limit and remains constant when empty. These are payload/row gauges, not shared-pool reservation totals |
 | `process_resident_memory_bytes` | Server-common enables Prometheus's process collector feature | Verify actual candidate scrape; harness `wait4`/`/proc` RSS is separate test-process evidence |
+
+Admission labels are limited to `queued_write_bytes`, `decoded_value_bytes`,
+`scan_page_bytes`, `blocking_operations`, `snapshots`, `databases` and
+`cleanup_slots`. A request waiting for capacity is not a refusal. Dropping its
+polled future releases its waiting gauge and semaphore queue position; the
+current owner's usage and permits remain held until that owner releases them.
+These durations cover individual budget acquisitions, not a complete multi-budget
+operation or RocksDB stall. Focused source tests cover these boundaries; they
+have not been executed for STR-48 under the requested lint-only validation.
 
 Remaining STR-26 instrumentation includes exact live logical state size,
 continuous free/local disk usage, explicit I/O stalls, execution admission failures
