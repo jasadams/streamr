@@ -11,6 +11,7 @@ import unittest
 
 
 REPO = Path(__file__).resolve().parents[2]
+CONTAINER_SHELL = '"$@"; result=$?; sccache --stop-server >/dev/null 2>&1; exit "$result"'
 
 
 class CargoDevTest(unittest.TestCase):
@@ -21,6 +22,9 @@ class CargoDevTest(unittest.TestCase):
         self.root = self.base / "repo"
         (self.root / "scripts").mkdir(parents=True)
         (self.root / "Dockerfile.dev").write_bytes((REPO / "Dockerfile.dev").read_bytes())
+        (self.root / "docker").mkdir()
+        shutil.copy2(REPO / "docker/cargo-dev-config.toml",
+                     self.root / "docker/cargo-dev-config.toml")
         for name in ("cargo-dev", "rust-build"):
             shutil.copy2(REPO / "scripts" / name, self.root / "scripts" / name)
         self.bin = self.base / "bin"
@@ -38,12 +42,17 @@ record = {'command': 'podman', 'args': sys.argv[1:], 'cwd': os.getcwd(),
 if sys.argv[1] == 'build':
     context = pathlib.Path(sys.argv[-1])
     record['context'] = str(context)
-    record['files'] = sorted(p.name for p in context.iterdir())
+    record['files'] = sorted(str(p.relative_to(context)) for p in context.rglob('*'))
+    record['cargo_config'] = (context / 'docker/cargo-dev-config.toml').read_text()
     record['dockerfile'] = (context / 'Dockerfile.dev').read_text()
 with open(os.environ['WRAPPER_TEST_LOG'], 'a') as log:
     log.write(json.dumps(record) + '\\n')
 if sys.argv[1:3] == ['image', 'exists']:
     sys.exit(int(os.environ.get('IMAGE_STATUS', '0')))
+if sys.argv[1] == 'run' and os.environ.get('EXECUTE_CONTAINER_SHELL'):
+    import subprocess
+    shell_index = sys.argv.index('sh')
+    sys.exit(subprocess.call(sys.argv[shell_index:]))
 sys.exit(int(os.environ.get('COMMAND_STATUS', '0')))
 """)
 
@@ -72,10 +81,40 @@ sys.exit(int(os.environ.get('COMMAND_STATUS', '0')))
             '-v', f'{self.root}:/app:z',
             '-v', 'streamr-cargo-registry:/usr/local/cargo/registry',
             '-v', 'streamr-cargo-git:/usr/local/cargo/git',
-            'arroyo-dev', 'cargo', 'test', '-p', 'crate', '--', 'a spaced argument'])
+            '-v', 'streamr-sccache:/var/cache/sccache',
+            'arroyo-dev', 'sh', '-c', CONTAINER_SHELL, 'sh', 'cargo', 'test', '-p', 'crate', '--', 'a spaced argument'])
         self.assertEqual(run['cwd'], str(self.root))
         self.assertEqual(run['queue'], str(self.base / 'cache/rust-build/build.lock'))
         self.assertIsNone(image['queue'])
+
+    def test_stats_uses_same_container_shell_and_cache(self):
+        result = self.run_wrapper('--stats')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        image, run = self.records()
+        self.assertEqual(run['args'][-7:],
+                         ['arroyo-dev', 'sh', '-c', CONTAINER_SHELL, 'sh',
+                          'sccache', '--show-stats'])
+        self.assertIn('streamr-sccache:/var/cache/sccache', run['args'])
+
+    def test_container_shell_preserves_command_status_when_shutdown_fails(self):
+        self.write_stub('cargo', """
+with open(os.environ['WRAPPER_TEST_LOG'], 'a') as log:
+    log.write(json.dumps({'command': 'cargo', 'args': sys.argv[1:]}) + '\\n')
+sys.exit(int(os.environ.get('CARGO_STATUS', '0')))
+""")
+        self.write_stub('sccache', """
+with open(os.environ['WRAPPER_TEST_LOG'], 'a') as log:
+    log.write(json.dumps({'command': 'sccache', 'args': sys.argv[1:]}) + '\\n')
+sys.exit(37)
+""")
+        for status in ('0', '101'):
+            with self.subTest(status=status):
+                result = self.run_wrapper('test', '--', 'a spaced argument',
+                                          EXECUTE_CONTAINER_SHELL='1', CARGO_STATUS=status)
+                self.assertEqual(result.returncode, int(status), result.stderr)
+                self.assertEqual(self.records()[-2:], [
+                    {'command': 'cargo', 'args': ['test', '--', 'a spaced argument']},
+                    {'command': 'sccache', 'args': ['--stop-server']}])
 
     def test_custom_image_jobs_and_failure_status(self):
         result = self.run_wrapper('check', STREAMR_DEV_IMAGE='custom:image',
@@ -94,13 +133,16 @@ sys.exit(int(os.environ.get('COMMAND_STATUS', '0')))
                 record, = self.records()
                 self.assertEqual(record['args'][:2], ['build', '-f'])
                 self.assertEqual(record['args'][3:5], ['-t', 'arroyo-dev'])
-                self.assertEqual(record['files'], ['Dockerfile.dev'])
+                self.assertEqual(record['files'], ['Dockerfile.dev', 'docker',
+                                                   'docker/cargo-dev-config.toml'])
+                self.assertEqual(record['cargo_config'],
+                                 (REPO / 'docker/cargo-dev-config.toml').read_text())
                 self.assertEqual(record['dockerfile'], (REPO / 'Dockerfile.dev').read_text())
                 self.assertTrue(record['queue'])
                 self.assertFalse(Path(record['context']).exists())
 
     def test_usage_and_image_errors_do_not_start_container(self):
-        for args in ((), ('--build', 'extra')):
+        for args in ((), ('--build', 'extra'), ('--stats', 'extra')):
             self.assertEqual(self.run_wrapper(*args).returncode, 2)
             self.assertFalse(self.log.exists())
         result = self.run_wrapper('check', IMAGE_STATUS='125')

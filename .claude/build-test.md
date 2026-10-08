@@ -17,6 +17,23 @@ scripts/cargo-dev test -p arroyo-worker
 scripts/cargo-dev clippy -p arroyo-worker -- -D warnings
 ```
 
+## Build acceleration
+
+The amd64 development image pins Rust 1.96.0 and sccache 0.14.0 (verified
+against its release checksum), uses mold for linking, and persists up to 30 GiB
+of compiled Rust artifacts in the `streamr-sccache` named volume. Cargo download
+volumes and `target/milestone2-runtime` remain in use. Rebuild the image with
+`scripts/cargo-dev --build` before using these changes; changing the compiler
+and linker flags requires an initial rebuild of existing artifacts.
+
+Dev/test profiles use line-table debug information and disable incremental
+compilation to allow sccache reuse. Full debugger type/variable information is
+reduced. The wrapper stops the cache server before its disposable container
+exits so pending writes finish while preserving Cargo's exit status.
+`scripts/cargo-dev --stats` reports persisted cache size; request/hit counters
+are per container and reset on each run. Use Cargo's `--timings` to measure
+build performance. The machine-wide build queue and four-job default remain.
+
 ## Crates that build natively on Fedora 44
 
 These crates have no vendored C dependencies and can be checked locally:

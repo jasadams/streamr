@@ -1,8 +1,21 @@
-FROM rust:1.96-bookworm
+# Match the existing dev toolchain; updating it invalidates compiled artifacts.
+FROM rust:1.96.0-bookworm
 
 RUN apt-get update && \
     apt-get -y install pkg-config build-essential libssl-dev openssl \
-    cmake clang libclang-dev libsasl2-dev protobuf-compiler && \
+    cmake clang libclang-dev mold libsasl2-dev protobuf-compiler && \
     rm -rf /var/lib/apt/lists/*
+
+# Pinned upstream static binary, verified against the release asset digest.
+RUN test "$(dpkg --print-architecture)" = amd64 || { echo "This dev image requires amd64 (pinned sccache binary)" >&2; exit 1; }; \
+    curl -fsSL https://github.com/mozilla/sccache/releases/download/v0.14.0/sccache-v0.14.0-x86_64-unknown-linux-musl.tar.gz -o /tmp/sccache.tar.gz && \
+    echo '8424b38cda4ecce616a1557d81328f3d7c96503a171eab79942fad618b42af44  /tmp/sccache.tar.gz' | sha256sum -c - && \
+    tar -xzf /tmp/sccache.tar.gz -C /tmp && \
+    install /tmp/sccache-v0.14.0-x86_64-unknown-linux-musl/sccache /usr/local/bin/sccache && \
+    rm -rf /tmp/sccache*
+
+COPY docker/cargo-dev-config.toml /usr/local/cargo/config.toml
+ENV SCCACHE_DIR=/var/cache/sccache \
+    SCCACHE_CACHE_SIZE=30G
 
 WORKDIR /app
