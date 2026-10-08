@@ -9,20 +9,20 @@ with vendored C dependencies (sasl2-sys, rdkafka-sys, aws-lc-sys).
 
 ```bash
 # Build the dev container (one-time)
-podman build -f Dockerfile.dev -t arroyo-dev .
+scripts/cargo-dev --build
 
 # Run cargo commands inside the container
-podman run --rm -e CARGO_TARGET_DIR=/app/target/milestone2-runtime -e CARGO_INCREMENTAL=0 -v "$(pwd):/app:z" arroyo-dev cargo check -p arroyo-worker
-podman run --rm -e CARGO_TARGET_DIR=/app/target/milestone2-runtime -e CARGO_INCREMENTAL=0 -v "$(pwd):/app:z" arroyo-dev cargo test -p arroyo-worker
-podman run --rm -e CARGO_TARGET_DIR=/app/target/milestone2-runtime -e CARGO_INCREMENTAL=0 -v "$(pwd):/app:z" arroyo-dev cargo clippy -p arroyo-worker -- -D warnings
+scripts/cargo-dev check -p arroyo-worker
+scripts/cargo-dev test -p arroyo-worker
+scripts/cargo-dev clippy -p arroyo-worker -- -D warnings
 ```
 
 ## Crates that build natively on Fedora 44
 
 These crates have no vendored C dependencies and can be checked locally:
-- `cargo check -p arroyo-rpc` (proto generation)
-- `cargo check -p arroyo-datastream`
-- `cargo check -p arroyo-operator`
+- `scripts/rust-build cargo check -p arroyo-rpc` (proto generation)
+- `scripts/rust-build cargo check -p arroyo-datastream`
+- `scripts/rust-build cargo check -p arroyo-operator`
 
 ## Crates that require the dev container
 
@@ -36,14 +36,14 @@ These build native dependencies, including Kafka/SASL or RocksDB:
 ## Quick check (per modified crate)
 
 ```bash
-podman run --rm -e CARGO_TARGET_DIR=/app/target/milestone2-runtime -e CARGO_INCREMENTAL=0 -v "$(pwd):/app:z" arroyo-dev cargo check -p <crate>
-podman run --rm -e CARGO_TARGET_DIR=/app/target/milestone2-runtime -e CARGO_INCREMENTAL=0 -v "$(pwd):/app:z" arroyo-dev cargo clippy -p <crate> -- -D warnings
+scripts/cargo-dev check -p <crate>
+scripts/cargo-dev clippy -p <crate> -- -D warnings
 ```
 
 ## Test commands
 
 ```bash
-podman run --rm -e CARGO_TARGET_DIR=/app/target/milestone2-runtime -e CARGO_INCREMENTAL=0 -v "$(pwd):/app:z" arroyo-dev cargo test -p <crate>
+scripts/cargo-dev test -p <crate>
 ```
 
 ## Notes
@@ -59,3 +59,48 @@ podman run --rm -e CARGO_TARGET_DIR=/app/target/milestone2-runtime -e CARGO_INCR
 - The Dockerfile.dev at repo root is the minimal dev container (no node/pnpm/postgres)
 - The full Docker build is at docker/Dockerfile (includes webui, postgres migrations)
 - Do NOT hack around build failures with CFLAGS or vendoring overrides
+
+## Backlog workflow
+
+The default branch is `main`. Fetch `origin main` before selection, compare
+`git rev-list --left-right --count main...origin/main`, and create ticket
+worktrees from `origin/main`. Report unpublished local main commits without
+resetting or incorporating them. Use `STR-<number>` in shared skill examples.
+Run Streamr tooling from this repository rather than Kyomi's checkout.
+
+Before claiming, run `scripts/check-ticket-in-flight.sh STR-<number>`.
+Only exit 0 permits claiming: 1 means existing work, 2 means usage error,
+and 3 means incomplete checks. Inspect reported work before proceeding.
+Before independent review, repeat from the ticket workspace with
+`--self "$BRANCH"` to exclude only your own branch.
+
+Create a unique ticket branch/worktree with:
+
+```bash
+git worktree add -b "$BRANCH" "$WORKSPACE" origin/main
+```
+
+Use an absolute workspace path and that workspace's scripts. Before pushing,
+fetch `origin main`, rebase onto `origin/main` if it advanced, and confirm
+the diff contains only ticket work. Preserve other agents' changes.
+
+Run finite builds through `scripts/cargo-dev`, which uses the cooperative
+machine-wide `scripts/rust-build` queue. Do not queue servers or watches.
+The wrapper uses the existing Bookworm image, Cargo download volumes, and
+`target/milestone2-runtime`; build it with `scripts/cargo-dev --build`.
+
+Pre-PR gates (omit `-p` for workspace scope):
+
+```bash
+scripts/cargo-dev check --locked -p <crate>
+scripts/preflight-clippy.sh -p <crate>
+```
+
+The Clippy gate retains CI's flags and adds `--locked`; only exit 0 passes.
+Tooling-only changes can be verified without compiling Rust:
+
+```bash
+bash scripts/tests/check-ticket-in-flight-self-test.sh
+python3 scripts/tests/preflight-clippy-self-test.py
+python3 scripts/tests/cargo-dev-self-test.py
+```

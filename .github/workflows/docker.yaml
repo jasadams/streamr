@@ -3,7 +3,7 @@ name: Docker Build
 on:
   push:
     branches:
-      - master
+      - main
       - dev
       - '*docker*'
     tags:
@@ -183,7 +183,7 @@ jobs:
           docker buildx imagetools inspect ghcr.io/arroyosystems/${{ matrix.image_name }}:${{ steps.meta.outputs.version }}
       - name: Push to tip tag.
         working-directory: /tmp/digests/${{ matrix.image_name }}
-        if: github.ref == 'refs/heads/master'
+        if: github.ref == 'refs/heads/main'
         run: |
           docker buildx imagetools create --tag ghcr.io/arroyosystems/${{ matrix.image_name }}:tip \
             $(printf 'ghcr.io/arroyosystems/${{ matrix.image_name }}@sha256:%s ' *)
