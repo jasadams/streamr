@@ -1,0 +1,27 @@
+name: Backlog tooling
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  tooling:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check shell syntax
+        run: |
+          bash -n scripts/check-ticket-in-flight.sh
+          bash -n scripts/cargo-dev
+          bash -n scripts/rust-build
+          bash -n scripts/preflight-clippy.sh
+          bash -n scripts/tests/check-ticket-in-flight-self-test.sh
+      - name: Test ticket guard
+        run: bash scripts/tests/check-ticket-in-flight-self-test.sh
+      - name: Test Clippy preflight
+        run: python3 scripts/tests/preflight-clippy-self-test.py
+      - name: Test Cargo development wrapper
+        run: python3 scripts/tests/cargo-dev-self-test.py

@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# Cooperative machine-wide queue, shared by native and container builds.
+set -euo pipefail
+# Use the host queue and its disk-reserve check when available.
+host_wrapper="$HOME/.local/bin/rust-build"
+if [[ -x "$host_wrapper" && ! "$host_wrapper" -ef "${BASH_SOURCE[0]}" ]]; then
+    exec "$host_wrapper" "$@"
+fi
+if (( $# == 0 )); then
+    echo 'Usage: rust-build <command> [args...]' >&2
+    exit 2
+fi
+queue_dir="${XDG_CACHE_HOME:-$HOME/.cache}/rust-build"
+mkdir -p "$queue_dir"
+queue_lock="$queue_dir/build.lock"
+# Build scripts can themselves call a project's queued Cargo wrapper.
+if [[ "${RUST_BUILD_QUEUE_HELD:-}" == "$queue_lock" ]]; then
+    exec "$@"
+fi
+echo 'Rust build queue: waiting for the machine build slot.' >&2
+# The flock parent keeps the lock; close it in the command so background
+# services such as sccache cannot accidentally retain it after the build.
+exec flock --exclusive --close "$queue_lock" \
+    env "RUST_BUILD_QUEUE_HELD=$queue_lock" "$@"

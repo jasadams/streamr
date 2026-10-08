@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# Finite Cargo commands in the committed Bookworm development image.
+set -euo pipefail
+repo_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+image="${STREAMR_DEV_IMAGE:-arroyo-dev}"
+if (( $# == 0 )); then
+    echo 'Usage: scripts/cargo-dev <cargo args...> | --build' >&2
+    exit 2
+fi
+cd -- "$repo_dir"
+if [[ "$1" == --build ]]; then
+    if (( $# != 1 )); then
+        echo 'Usage: scripts/cargo-dev --build' >&2
+        exit 2
+    fi
+    # Do not send target/ or unrelated working files to Podman.
+    build_context="$(mktemp -d)"
+    trap 'rm -rf "$build_context"' EXIT
+    cp "$repo_dir/Dockerfile.dev" "$build_context/Dockerfile.dev"
+    "$repo_dir/scripts/rust-build" podman build \
+        -f "$build_context/Dockerfile.dev" -t "$image" "$build_context"
+    exit
+fi
+if podman image exists "$image"; then
+    :
+else
+    image_status=$?
+    echo 'Build the dev image first: scripts/cargo-dev --build' >&2
+    exit "$image_status"
+fi
+exec "$repo_dir/scripts/rust-build" podman run --rm \
+    -w /app \
+    -e CARGO_TARGET_DIR=/app/target/milestone2-runtime \
+    -e CARGO_INCREMENTAL=0 \
+    -e "CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-4}" \
+    -v "$repo_dir:/app:z" \
+    -v streamr-cargo-registry:/usr/local/cargo/registry \
+    -v streamr-cargo-git:/usr/local/cargo/git \
+    "$image" cargo "$@"
