@@ -3,6 +3,8 @@
 Record reproducible build and QA infrastructure issues here so later agents can
 reuse the diagnosis. Keep product regressions and ticket acceptance gaps separate
 from infrastructure failures. Preserve the initial failed result when retrying.
+The [2026-10-08 batch report](batch-qa-2026-10-08.md) records the final coverage
+and acceptance gaps after the environment repair.
 
 ## OpenSSL generates Solaris assembly on Linux
 
@@ -128,6 +130,15 @@ transition and checkpoint boundary without assuming input wins the first tick;
 changing engine emission scheduling would be a separate semantic change.
 
 ## Evidence and process cleanup for this incident
+
+An all-target `cargo check` after the SQL executable and selected library tests
+started another RocksDB native build under a different Cargo build fingerprint,
+despite reusing the same target directory. Quiet Cargo output alone did not mean
+the build was stuck: live `cc1plus` commands and increasing object counts showed
+progress. Changing package/target/feature scopes can change dependency artifacts;
+plan a consistent scope and reserve time for native builds. Do not delete caches
+or bypass the shared build queue merely to force visible progress. This is an
+observed build cost, not a diagnosed product failure.
 
 Local-only evidence is under
 `/home/jason/qa-evidence/streamr-676475b9/`: `sql-build.log`,
