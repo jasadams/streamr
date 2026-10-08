@@ -1,0 +1,26 @@
+# Local development candidate: the pinned builder retains Rust, clang, protoc,
+# and cached dependencies needed to compile the Arcstream profile UDF.
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+
+WORKDIR /app
+ARG GIT_REVISION
+ARG SOURCE_SHA256
+ARG BINARY_SHA256
+ARG BASE_IMAGE_ID
+LABEL org.opencontainers.image.title="Streamr local candidate" \
+      org.opencontainers.image.source="https://github.com/jasadams/streamr" \
+      org.opencontainers.image.revision="${GIT_REVISION}" \
+      app.streamr.source.sha256="${SOURCE_SHA256}" \
+      app.streamr.binary.sha256="${BINARY_SHA256}" \
+      app.streamr.builder.image-id="${BASE_IMAGE_ID}"
+
+RUN mkdir -p /app/crates/arroyo-api
+COPY arroyo /app/arroyo
+COPY webui-dist /app/webui/dist
+COPY swagger-ui /app/
+COPY provenance.json /app/streamr-provenance.json
+ENV ARROYO__API__RUN_HTTP_PORT=5115
+EXPOSE 5115
+ENTRYPOINT ["/app/arroyo"]
+CMD ["cluster"]
