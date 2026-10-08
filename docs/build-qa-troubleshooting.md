@@ -94,6 +94,39 @@ uncertain writes blindly, expose credentials, or claim a ticket was updated.
 No writes were attempted during this outage because the required fresh reads
 failed. Recheck connector health before resuming ticket recording.
 
+## Aggregate capture fails strict physical row counts
+
+Observed against the preserved SQL executable above on 2026-10-08:
+
+- `test-native-aggregate-ordering.py --total-order`: first native memory/batch-1
+  controller checkpoint capture has three rows, while the driver requires two.
+- `test-native-unordered-first-last.py`: four memory cases pass, then RocksDB
+  batch-1/controller recovery has three rows, while the driver requires two.
+
+The failing assertion is `smoke_tests.rs:2227` in the pinned revision. Logs are
+`aggregate-ordering/native-memory-1-controller/capture.log` and
+`aggregate-unordered/rocksdb-1-controller/capture.log` under the local evidence
+directory. Both drivers set a 3600-second aggregate flush interval. The recorded
+extra rows show intermediate changelog updates with continuous before-images;
+the unordered recovered stream advances event counts 2 → 3 → 5.
+
+Source review found `tokio::time::interval(period)` in `operator.rs:984`, whose
+first tick is immediate. The select loop can consume input before that tick;
+`incremental_aggregator.rs:2715` flushes changed groups on the tick and again on
+EOF. A long interval therefore does not guarantee a single emission per key.
+The same class is already recorded in
+[milestone-3-validation.md](milestone-3-validation.md), around line 450: a valid
+extra initial CDC update failed an exact row-count assumption.
+
+Independent review classified this evidence as timing-sensitive fixture
+cardinality, with no demonstrated FIRST/LAST value regression. Preserve the
+failures and any bounded rerun separately, and keep these checks incomplete.
+Do not loosen expected counts, drop intermediate rows, or claim the full matrix
+passed on the basis of final values alone. No product or assertion change was
+made during this batch. A follow-up harness repair should validate every CDC
+transition and checkpoint boundary without assuming input wins the first tick;
+changing engine emission scheduling would be a separate semantic change.
+
 ## Evidence and process cleanup for this incident
 
 Local-only evidence is under
