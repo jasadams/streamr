@@ -1,5 +1,5 @@
 [build]
-rustc-wrapper = "sccache"
+rustc-wrapper = "/usr/local/bin/streamr-rustc-cache"
 jobs = 4
 
 # Disable incremental compilation so Rust compilations are eligible for sccache.

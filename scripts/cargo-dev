@@ -18,6 +18,7 @@ if [[ "$1" == --build ]]; then
     trap 'rm -rf "$build_context"' EXIT
     mkdir "$build_context/docker"
     cp "$repo_dir/docker/cargo-dev-config.toml" "$build_context/docker/"
+    cp "$repo_dir/docker/rustc-cache" "$build_context/docker/"
     cp "$repo_dir/Dockerfile.dev" "$build_context/Dockerfile.dev"
     "$repo_dir/scripts/rust-build" podman build \
         -f "$build_context/Dockerfile.dev" -t "$image" "$build_context"

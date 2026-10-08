@@ -1,6 +1,8 @@
 # Match the existing dev toolchain; updating it invalidates compiled artifacts.
 FROM rust:1.96.0-bookworm
 
+RUN rustup component add rustfmt clippy
+
 RUN apt-get update && \
     apt-get -y install pkg-config build-essential libssl-dev openssl \
     cmake clang libclang-dev mold libsasl2-dev protobuf-compiler && \
@@ -14,6 +16,10 @@ RUN test "$(dpkg --print-architecture)" = amd64 || { echo "This dev image requir
     install /tmp/sccache-v0.14.0-x86_64-unknown-linux-musl/sccache /usr/local/bin/sccache && \
     rm -rf /tmp/sccache*
 
+# Keep sccache specific to Rust: cc-rs otherwise adopts RUSTC_WRAPPER=sccache
+# for C probes, whose cached /dev/null outputs break OpenSSL assembler detection.
+COPY docker/rustc-cache /usr/local/bin/streamr-rustc-cache
+RUN chmod +x /usr/local/bin/streamr-rustc-cache
 COPY docker/cargo-dev-config.toml /usr/local/cargo/config.toml
 ENV SCCACHE_DIR=/var/cache/sccache \
     SCCACHE_CACHE_SIZE=30G

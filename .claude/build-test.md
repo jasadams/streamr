@@ -7,6 +7,11 @@ with vendored C dependencies (sasl2-sys, rdkafka-sys, aws-lc-sys).
 
 **All builds must use the dev container:**
 
+The image installs rustfmt and Clippy. Its `streamr-rustc-cache` wrapper caches
+Rust compilation only. Do not replace it with `RUSTC_WRAPPER=sccache`: cc-rs
+would also wrap C compiler probes, and a cached OpenSSL assembler probe writing
+to `/dev/null` fails with EBUSY and generates incompatible Solaris assembly.
+
 ```bash
 # Build the dev container (one-time)
 scripts/cargo-dev --build
