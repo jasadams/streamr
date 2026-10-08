@@ -46,6 +46,8 @@ pub(crate) struct SessionStore {
     /// One admitted group only. A proof is never serialized and starts cold
     /// after restore; all mutations pass through this serial owner.
     last_group: Mutex<Option<CachedGroup>>,
+    /// A negative expiry proof only; never persisted or shared with another owner.
+    deadline: Mutex<Option<CachedDeadline>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -53,6 +55,19 @@ enum GroupProof {
     Empty,
     Sole(SessionMeta),
     Unknown,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DeadlineProof {
+    Unknown,
+    Empty,
+    /// Every deadline is at least this value; deletion need not advance it.
+    LowerBound(i64),
+}
+
+struct CachedDeadline {
+    proof: DeadlineProof,
+    _permit: ResourcePermit,
 }
 
 struct CachedGroup {
@@ -176,6 +191,19 @@ impl SessionStore {
                 <= resources.config().queued_write_bytes,
             "native SESSION queued-write pool cannot admit one write batch"
         );
+        // Optional headroom only: a valid nine-row reader configuration must
+        // retain its existing fallback rather than fail to construct a cache.
+        let charge = std::mem::size_of::<CachedDeadline>() + 128;
+        let deadline = limits
+            .partial_bytes
+            .checked_mul(9)
+            .and_then(|required| required.checked_add(charge))
+            .filter(|required| *required <= resources.config().decoded_value_bytes)
+            .and_then(|_| resources.try_decoded_value(charge).ok())
+            .map(|permit| CachedDeadline {
+                proof: DeadlineProof::Unknown,
+                _permit: permit,
+            });
         Ok(Self {
             backend,
             table,
@@ -184,6 +212,7 @@ impl SessionStore {
             limits,
             gap,
             last_group: Mutex::new(None),
+            deadline: Mutex::new(deadline),
         })
     }
 
@@ -266,10 +295,21 @@ impl SessionStore {
         // The final reader can concurrently hold a two-slot queue (6 rows)
         // and decode one more row (3 rows). A cache may use only headroom above
         // the constructor's mandatory nine-row decoded reservation.
+        let deadline_charge = if self
+            .deadline
+            .lock()
+            .map_err(|_| anyhow::anyhow!("native SESSION deadline cache lock poisoned"))?
+            .is_some()
+        {
+            std::mem::size_of::<CachedDeadline>() + 128
+        } else {
+            0
+        };
         if self
             .limits
             .partial_bytes
             .checked_mul(9)
+            .and_then(|required| required.checked_add(deadline_charge))
             .and_then(|required| required.checked_add(charge))
             .is_none_or(|required| required > self.resources.config().decoded_value_bytes)
         {
@@ -411,6 +451,13 @@ impl SessionStore {
         let expiry = deadline_key(group, session.start, deadline)?;
         let mut value = vec![VERSION];
         value.extend_from_slice(&session.end.to_be_bytes());
+        // Lower before awaiting: cancellation or an ambiguous write failure
+        // must never preserve Empty or a bound above the possible new deadline.
+        self.update_deadline(|proof| match proof {
+            DeadlineProof::Unknown => DeadlineProof::Unknown,
+            DeadlineProof::Empty => DeadlineProof::LowerBound(deadline),
+            DeadlineProof::LowerBound(bound) => DeadlineProof::LowerBound(bound.min(deadline)),
+        })?;
         let prior = self.invalidate_group(group)?;
         self.write_pair((&key, Some(&value)), (&expiry, Some(&[])))
             .await?;
@@ -533,29 +580,88 @@ impl SessionStore {
         self.add_session(group, merged).await
     }
 
+    fn update_deadline(&self, update: impl FnOnce(DeadlineProof) -> DeadlineProof) -> Result<()> {
+        let mut cache = self
+            .deadline
+            .lock()
+            .map_err(|_| anyhow::anyhow!("native SESSION deadline cache lock poisoned"))?;
+        if let Some(cache) = cache.as_mut() {
+            cache.proof = update(cache.proof);
+        }
+        Ok(())
+    }
+
+    fn no_deadline_due(&self, watermark: Option<i64>) -> Result<bool> {
+        let cache = self
+            .deadline
+            .lock()
+            .map_err(|_| anyhow::anyhow!("native SESSION deadline cache lock poisoned"))?;
+        Ok(cache.as_ref().is_some_and(|cache| match cache.proof {
+            DeadlineProof::Empty => true,
+            DeadlineProof::LowerBound(bound) => watermark.is_some_and(|time| time <= bound),
+            DeadlineProof::Unknown => false,
+        }))
+    }
+
     pub async fn first_due(
         &self,
         watermark: Option<i64>,
     ) -> Result<Option<(Vec<u8>, SessionMeta)>> {
+        if self.no_deadline_due(watermark)? {
+            return Ok(None);
+        }
         let snapshot = self.snapshot().await?;
-        let page = snapshot
-            .try_scan(ScanRequest {
-                range: ScanRange {
-                    namespace: self.table.namespace().clone(),
-                    prefix: Some(vec![DEADLINE]),
-                    start: None,
-                    end: watermark.map(|time| {
-                        let mut end = vec![DEADLINE];
-                        end.extend_from_slice(&ordered_time(time));
-                        end
-                    }),
-                },
-                max_entries: 1,
-                max_bytes: self.limits.page_bytes,
-                cursor: None,
-            })
-            .await?;
+        let request = ScanRequest {
+            range: ScanRange {
+                namespace: self.table.namespace().clone(),
+                prefix: Some(vec![DEADLINE]),
+                start: None,
+                end: watermark.map(|time| {
+                    let mut end = vec![DEADLINE];
+                    end.extend_from_slice(&ordered_time(time));
+                    end
+                }),
+            },
+            max_entries: 1,
+            max_bytes: self.limits.page_bytes,
+            cursor: None,
+        };
+        let page = snapshot.try_scan(request.clone()).await?;
         let Some(entry) = page.entries.into_iter().next() else {
+            // A watermark-limited empty range is not globally Empty. Peek at
+            // the global minimum using the same snapshot, but do not surface
+            // future malformed metadata or optional read errors before due.
+            if watermark.is_none() && page.next_cursor.is_none() {
+                self.update_deadline(|_| DeadlineProof::Empty)?;
+                return Ok(None);
+            }
+            let mut global = request;
+            global.range.end = None;
+            if let Ok(page) = snapshot.try_scan(global).await {
+                let proof = match page.entries.first() {
+                    None if page.next_cursor.is_none() => Some(DeadlineProof::Empty),
+                    Some(entry)
+                        if entry.key.key.len() >= 21
+                            && entry.key.key[0] == DEADLINE
+                            && entry.value.is_empty()
+                            && entry.key.key.len()
+                                == 21
+                                    + u32::from_be_bytes(
+                                        entry.key.key[9..13]
+                                            .try_into()
+                                            .expect("checked key length"),
+                                    ) as usize =>
+                    {
+                        decode_time(&entry.key.key[1..9])
+                            .ok()
+                            .map(DeadlineProof::LowerBound)
+                    }
+                    _ => None,
+                };
+                if let Some(proof) = proof {
+                    self.update_deadline(|_| proof)?;
+                }
+            }
             return Ok(None);
         };
         ensure!(
@@ -563,6 +669,7 @@ impl SessionStore {
             "native SESSION deadline index is malformed"
         );
         let deadline = decode_time(&entry.key.key[1..9])?;
+        self.update_deadline(|_| DeadlineProof::LowerBound(deadline))?;
         let group_len = u32::from_be_bytes(entry.key.key[9..13].try_into()?) as usize;
         ensure!(
             entry.key.key.len() == 21 + group_len,
@@ -860,6 +967,225 @@ mod tests {
 
     fn store() -> SessionStore {
         store_with_decoded(1024 * 1024)
+    }
+
+    struct ObservedBackend {
+        inner: Arc<dyn LiveStateBackend>,
+        snapshots: std::sync::atomic::AtomicUsize,
+        pause_write: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl LiveStateBackend for ObservedBackend {
+        async fn get(
+            &self,
+            key: &arroyo_state::live::StateKey,
+            options: ReadOptions,
+        ) -> arroyo_state::live::Result<Option<Vec<u8>>> {
+            self.inner.get(key, options).await
+        }
+        async fn multi_get(
+            &self,
+            keys: &[arroyo_state::live::StateKey],
+            options: ReadOptions,
+        ) -> arroyo_state::live::Result<Vec<Option<Vec<u8>>>> {
+            self.inner.multi_get(keys, options).await
+        }
+        async fn write_batch(
+            &self,
+            batch: arroyo_state::live::WriteBatch,
+        ) -> arroyo_state::live::Result<()> {
+            self.inner.write_batch(batch).await
+        }
+        async fn write_admitted(
+            &self,
+            batch: AdmittedWriteBatch,
+        ) -> arroyo_state::live::Result<()> {
+            if self.pause_write.load(std::sync::atomic::Ordering::SeqCst) {
+                std::future::pending::<()>().await;
+            }
+            self.inner.write_admitted(batch).await
+        }
+        async fn snapshot(&self) -> arroyo_state::live::Result<StateSnapshot> {
+            self.snapshots
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.snapshot().await
+        }
+    }
+
+    fn observed_store() -> (SessionStore, Arc<ObservedBackend>) {
+        let mut store = store();
+        let observed = Arc::new(ObservedBackend {
+            inner: store.backend.clone(),
+            snapshots: std::sync::atomic::AtomicUsize::new(0),
+            pause_write: std::sync::atomic::AtomicBool::new(false),
+        });
+        store.backend = observed.clone();
+        (store, observed)
+    }
+
+    fn snapshots(backend: &ObservedBackend) -> usize {
+        backend.snapshots.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    #[tokio::test]
+    async fn deadline_proof_skips_snapshots_through_hot_extensions_but_not_expiry_or_eof() {
+        let (store, backend) = observed_store();
+        store
+            .insert(b"a", 100, &row(store.schema.clone(), 100))
+            .await
+            .unwrap();
+        assert_eq!(store.first_due(Some(100)).await.unwrap(), None);
+        let before = snapshots(&backend);
+        for time in 101..110 {
+            store
+                .insert(b"a", time, &row(store.schema.clone(), time))
+                .await
+                .unwrap();
+            assert_eq!(store.first_due(Some(110)).await.unwrap(), None);
+        }
+        assert_eq!(snapshots(&backend), before);
+        // The old conservative bound is 110; a later check refreshes it to119.
+        assert_eq!(store.first_due(Some(119)).await.unwrap(), None);
+        let refreshed = snapshots(&backend);
+        assert_eq!(store.first_due(Some(119)).await.unwrap(), None);
+        assert_eq!(snapshots(&backend), refreshed);
+        assert_eq!(
+            store.first_due(Some(120)).await.unwrap().unwrap().1.end,
+            109
+        );
+        assert_eq!(store.first_due(None).await.unwrap().unwrap().1.end, 109);
+        assert_eq!(snapshots(&backend), refreshed + 2);
+    }
+
+    #[tokio::test]
+    async fn deadline_empty_proof_out_of_order_insert_and_earliest_delete_remain_conservative() {
+        let (store, backend) = observed_store();
+        assert_eq!(store.first_due(Some(0)).await.unwrap(), None);
+        let empty = snapshots(&backend);
+        assert_eq!(store.first_due(None).await.unwrap(), None);
+        assert_eq!(snapshots(&backend), empty);
+        store
+            .insert(b"a", 100, &row(store.schema.clone(), 100))
+            .await
+            .unwrap();
+        assert_eq!(store.first_due(Some(110)).await.unwrap(), None);
+        store
+            .insert(b"b", 0, &row(store.schema.clone(), 0))
+            .await
+            .unwrap();
+        let (group, session) = store.first_due(Some(11)).await.unwrap().unwrap();
+        assert_eq!(group, b"b");
+        store.retire(&group, session).await.unwrap();
+        assert_eq!(store.first_due(Some(110)).await.unwrap(), None);
+        let (group, session) = store.first_due(None).await.unwrap().unwrap();
+        assert_eq!(group, b"a");
+        store.retire(&group, session).await.unwrap();
+        assert_eq!(store.first_due(None).await.unwrap(), None);
+        let empty = snapshots(&backend);
+        assert_eq!(store.first_due(Some(i64::MAX)).await.unwrap(), None);
+        assert_eq!(snapshots(&backend), empty);
+    }
+
+    #[tokio::test]
+    async fn deadline_add_failure_and_cancellation_downgrade_before_write() {
+        let (mut store, backend) = observed_store();
+        assert_eq!(store.first_due(None).await.unwrap(), None);
+        let limit = store.limits.write_bytes;
+        store.limits.write_bytes = 1;
+        let session = SessionMeta { start: 0, end: 0 };
+        assert!(store.add_session(b"a", session).await.is_err());
+        assert!(!store.no_deadline_due(Some(11)).unwrap());
+        store.limits.write_bytes = limit;
+        assert_eq!(store.first_due(None).await.unwrap(), None);
+        backend
+            .pause_write
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut pending = Box::pin(store.add_session(b"a", session));
+        assert!(futures::poll!(&mut pending).is_pending());
+        assert!(!store.no_deadline_due(Some(11)).unwrap());
+        drop(pending);
+        backend
+            .pause_write
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(store.first_due(Some(11)).await.unwrap(), None);
+        store.add_session(b"a", session).await.unwrap();
+        assert_eq!(store.first_due(Some(11)).await.unwrap().unwrap().1, session);
+    }
+
+    #[tokio::test]
+    async fn deadline_future_malformed_entry_and_scan_limit_error_wait_until_due() {
+        for oversized in [false, true] {
+            let store = store();
+            let key = deadline_key(b"a", 100, 110).unwrap();
+            let value = if oversized {
+                vec![0; store.limits.page_bytes + 1]
+            } else {
+                vec![1]
+            };
+            store
+                .backend
+                .put(
+                    store.table.key(key, None),
+                    value,
+                    store.limits.page_bytes * 2,
+                )
+                .await
+                .unwrap();
+            assert_eq!(store.first_due(Some(110)).await.unwrap(), None);
+            assert!(store.first_due(Some(111)).await.is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn deadline_recovered_store_starts_unknown_and_tight_reader_budget_falls_back() {
+        let store = store();
+        store
+            .insert(b"a", 0, &row(store.schema.clone(), 0))
+            .await
+            .unwrap();
+        assert_eq!(store.first_due(Some(10)).await.unwrap(), None);
+        let recovered = SessionStore::new(
+            store.backend.clone(),
+            store.table.clone(),
+            store.resources.clone(),
+            store.schema.clone(),
+            store.limits,
+            store.gap,
+        )
+        .unwrap();
+        assert!(!recovered.no_deadline_due(Some(10)).unwrap());
+        assert_eq!(
+            recovered.first_due(Some(11)).await.unwrap().unwrap().1.end,
+            0
+        );
+        let tight = store_with_decoded(9 * 1024);
+        assert!(tight.deadline.lock().unwrap().is_none());
+        tight
+            .insert(b"a", 0, &row(tight.schema.clone(), 0))
+            .await
+            .unwrap();
+        assert_eq!(tight.first_due(Some(11)).await.unwrap().unwrap().1.end, 0);
+    }
+
+    #[tokio::test]
+    async fn deadline_and_group_caches_share_only_headroom_above_nine_row_reader() {
+        let deadline_charge = std::mem::size_of::<CachedDeadline>() + 128;
+        let group_charge = 2 + std::mem::size_of::<CachedGroup>() + 128;
+        let budget = 9 * 1024 + deadline_charge + group_charge - 1;
+        let store = store_with_decoded(budget);
+        assert!(store.deadline.lock().unwrap().is_some());
+        store
+            .insert(b"a", 0, &row(store.schema.clone(), 0))
+            .await
+            .unwrap();
+        assert_eq!(store.cached_proof(b"a").unwrap(), None);
+        let resources = store.resources.clone();
+        let reader = resources.try_decoded_value(9 * 1024).unwrap();
+        drop(reader);
+        assert!(resources.try_decoded_value(budget).is_err());
+        drop(store);
+        assert!(resources.try_decoded_value(budget).is_ok());
     }
 
     fn row(schema: SchemaRef, value: i64) -> RecordBatch {

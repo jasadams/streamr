@@ -26,8 +26,18 @@ integration tests); duplicate push CI failed a Kafka metadata test timeout.
 The independently reviewed fixture-only repair passed formatting, affected
 all-target/all-feature check, strict Clippy, test build and 11 separate-process
 parallel Kafka tests with no retries. Both unchanged baselines also passed; the
-CI timeout was not reproduced. Publication and fresh current-head CI remain
-required; overall checks on the preceding head are not green.
+CI timeout was not reproduced. Repair `77ca1517` is published; both fresh CI
+workflows passed, each with 709 library tests, six skipped and 12 integration
+tests. All seven checks are green for that head. The subsequent large hot
+SESSION case failed early with default queue8192 under a 16 MiB execution pool;
+a separate existing queue32 configuration exceeded the unchanged900-second
+capture deadline. Both failures are preserved. A reviewed private, constant-size
+expiry proof in session_store.rs passed fresh v16 formatting, workspace check,
+strict Clippy, 25 library suites (714 passed, zero failed, six ignored), full
+all-target build and all 12 small recovery integrations. Fresh SQL/production
+executables are pinned with Cargo profile and source provenance. Independent
+actual-evidence review precedes publication and fresh exact-head CI; old
+published-head CI does not qualify this Rust change.
 These are small integration cases: large SESSION preparation and actual retained
 capacity qualification remain separate. Frozen v14b gates do not qualify the
 changed `network_manager.rs`; existing finite native and partial external parity
@@ -55,11 +65,26 @@ failures as well as successes.
 | 11. Run combined capacity and fault qualification | STR-32; STR-16/17/20/26 | Complete fixed-parallelism ≥10× combined workload with hot keys, backfill and slow consumers on the final candidate. | Actual retained-state floor ≥10× declared pool sum, fixed topology/pool/config manifest, exact external oracle values, bounded resource/output accounting, throughput/latency/backpressure observations and worker/controller fault recovery on required protocols. | Long serialized qualification after 2–10. Component-only capacity and older-source passes cannot substitute; failures return to scoped repair packets. |
 | 12. Run actual 24-hour qualification and final acceptance audit | STR-32; all M3 parents | Complete 24 hours of the required live/fault workload on final qualified source and audit every parent acceptance gate. | Start/end wall-clock receipts covering actual 24 hours, continuous workload/captures/metrics, scheduled fault/recovery records, exact external oracle checks, source/config hashes and ticket-by-ticket evidence ledger with no open required gates. | Long serialized run after 11 and all functional gates; broker uptime or finite replay is insufficient. A source change invalidates affected qualification and needs a scoped rerun. |
 
-Finish task 1 with the bounded Kafka fixture repair, independent review and
-green current-head CI. Next run task 4 against that validated candidate, reusing
-the existing prepared SESSION fixtures and pinned executables with explicit
-source/dependency reconciliation. Task 2 coverage planning and tasks 5/6 decision
+The Kafka repair increment in task1 is published and green. The task4 large
+SESSION failure now has a bounded internal expiry-check repair with passing v16
+gates, fresh artifact pins and small integrations; finish independent evidence
+review, publish and obtain fresh CI before the unchanged large queue32 case. Reuse the
+prepared fixtures and preserve both prior failures and all original receipts. Task 2 coverage planning and tasks 5/6 decision
 packets can be delegated independently without competing for the build queue.
+
+Next bounded qualification order after the hot SESSION rerun: task4's many-key
+SESSION case and remaining checkpoint-protocol coverage, then task3's existing
+eight-key aggregate smoke before the declared 100,000-key capacity case in
+`native-aggregate-capacity.md`. Bind each run to fresh executables and source
+receipts; an individual hot/leader pass does not cover those additional cases.
+
+Task5 decision preparation must distinguish working result composition from
+missing expiry: the recorded quiet-key result is lifetime3/recent1 instead of
+lifetime3/recent0. Existing UNION/current-result composition passes its selected
+value/recovery cases, but retains the most recent nonempty HOP count. Supporting
+updating-input joins would enable the proposed standard SQL plan; it would not
+alone settle sparse/all-idle clock advancement. Discuss the required clock,
+zero-versus-delete behavior, retained keys and fan-out before selecting a change.
 
 Use one Debian Bookworm development-container target,
 `target/milestone2-runtime`, with incremental compilation disabled; serialize

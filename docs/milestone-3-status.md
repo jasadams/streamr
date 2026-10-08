@@ -6,8 +6,10 @@ Read this first when resuming. Historical evidence belongs in
 
 ## Current task and next action
 
-User steering: proceed with manageable tasks. Active task: publish the reviewed
-Kafka fixture-readiness repair and verify fresh PR #6 CI. The preceding reviewed
+User steering: proceed with manageable tasks. Active task: finish the serialized
+v16 validation of the reviewed session-expiry snapshot optimization, publish it,
+verify fresh PR #6 CI, then rerun the unchanged large queue32 SESSION case.
+The Kafka fixture-readiness repair is already published and green. The preceding reviewed
 increment is published as `65827b2622f4c8acb6c9e1de31fcf58a1c64ead7`.
 Its pull-request workflow `37705609443` passed (709 library tests and 12
 integration tests); duplicate push workflow `37705605554` failed a Kafka
@@ -26,17 +28,67 @@ with zero retries. Logs, source and executable hashes, baseline/parser-error
 receipts and reviews are in
 `target/milestone-3-pr6-publication/kafka-ci-diagnosis/`. Check required a distinct
 native build-script dependency profile; Clippy and final test build reused their
-respective native caches. All runs are terminal; no build is active.
+respective native caches. Those Kafka validation runs are terminal; the later
+v16 combined validation below is active.
 
-Next: publish this three-file increment after final evidence review, then wait
-for all current-head CI checks. Keep PR #6 draft and M3 tickets open. After green
-CI, seal the reviewed source reconciliation and run one prepared RocksDB/leader
-hot-key SESSION capacity case with independent retained-checkpoint proof.
-Preparation: `target/native-session-large-v15-preflight/`. The test-only change
-is excluded from the pinned SQL/production artifacts; conditional reuse review
-requires exact final diff/head, complete new inventory and fresh CI. Original
-build receipts must remain unchanged. No capacity case has run yet.
+Published repair: `77ca1517cc99bd596b81f742a4f4f78ebd4e602f`. Final independent
+evidence review passed. Push/PR CI runs `37709508918` and `37709514364` both passed: each has 709
+passing library tests, six skipped and 12 passing integration tests. All seven
+current-head checks are green; watcher `88454` is terminal zero. The concrete
+source-reconciliation seal and exact reviewed driver are activated; final
+activation review passed. The one RocksDB/leader hot-key SESSION case failed;
+root session `87793` is terminal one. SQL child failed after 0.69 seconds before
+checkpointing: graph queue reservation needed 259.0 KB with 194.3 KB left in the
+16 MiB execution pool. No capacity/recovery or actual-retained-state pass is
+claimed. Preserve log `target/native-session-large-v15-preflight/one-case-driver-77ca1517.log`
+and the full `case-77ca1517...-rocksdb-leader/` evidence. Read-only diagnosis is complete: default queue_size8192 can retain roughly
+64.75 MiB of these batches per edge; fail-fast shared-pool admission is existing
+tested behavior, with no leak or contract violation established. Prepare a
+separate declared queue_size32 operational candidate using existing native
+configuration after sanitation, preserving the failed case and all batch/input/
+pool/RSS/timeout/value/retained-proof assertions. Independent review passed for the separate queue_size32 driver. That run
+also failed: SQL capture exceeded its unchanged 900-second deadline after the
+reference run and checkpoint-prefix processing, before recovery and actual
+retained proof completed. Root session `27539` is terminal one, with no SQL
+process left. Preserve `one-case-driver-77ca1517-queue32.log` and the distinct
+`case-77ca1517...-rocksdb-leader-queue32/` directory. No capacity pass is claimed.
 
+Active bounded repair: `repair_validation_preflight` owns only
+`crates/arroyo-worker/src/arrow/session_store.rs` and inline tests for a constant-size,
+conservative expiry proof that avoids snapshots when no session can be due.
+`publication_review_coverage` independently reviews its contract and final diff.
+Use existing strict expiry boundaries; Unknown after recovery; conservative
+mutation/cancellation handling; no SQL/API/backend read-view/checkpoint change.
+If those contracts cannot be preserved, discuss with the user before proceeding.
+No new resource limits, deadline, batch, fixture or assertion changes are approved.
+Source repair is ready and independently approved at SHA-256
+`cf3f5d909fd901d35b5cd56664e6c59e86738eb149944c19dfdf6403de89bf02`,
+with six new focused inline tests. Fresh v16 formatting, workspace all-target
+check (15m34s) and strict Clippy (1m24s) passed. Library tests passed across 25
+suites: 714 passed, zero failed, six ignored, including all six new expiry-proof
+tests. The full all-target build passed (227.83 seconds). All 12 small recovery
+integrations passed: hot8 SESSION, many4 SESSION and packaged unordered
+operations across memory/RocksDB and controller/leader. Complete typed rows,
+multiplicities and committed prefixes were checked. Exact current-source gate,
+artifact and integration receipts are under
+`target/native-m3-reviewed-repairs-v16-validation/run/`. Independent evidence
+review passed with no blocking findings. It independently checked complete typed
+outputs/prefixes and peak child RSS of 185,573,376–196,108,288 bytes (<512 MiB).
+Report: `target/native-m3-reviewed-repairs-v16-validation/review-actual-evidence.md`.
+This finite scope is not capacity proof.
+`prepare_repair_runtime_smokes` prepared the combined runner/freeze in
+`target/native-m3-reviewed-repairs-v16-validation/`; source seal is now true after independent runner approval.
+The runner passed independent review before root sealed and launched its five
+gates, artifact pinning and same 12 small integrations in one shared queue
+reservation. Combined v16 validation root session `85738` is terminal zero;
+foreground log `target/native-m3-reviewed-repairs-v16-validation/foreground.log`.
+Fresh Cargo-selected SQL ELF SHA-256:
+`c07a2391ab7a1545b97fa000e9483e56e09df0b9a5085864da6b7561df40ce78`;
+production ELF: `74a23212802c544915b2f354f343802fe8f1bafda5af0e7e7f697cd508b400cc`.
+Both are pinned outside Cargo caches. Green CI above qualifies only published
+`77ca1517`, not this upcoming Rust change. Publish the reviewed repair and obtain
+fresh exact-head CI, then finalize the inactive v16 capacity packet and rerun the
+unchanged large queue32 case. Preserve both prior failed attempts.
 ## Evidence and limits
 
 - Independent native/execution/harness partition and repair reviews cover all
