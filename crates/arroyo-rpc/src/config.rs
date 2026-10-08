@@ -425,6 +425,11 @@ pub struct CompilerConfig {
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub struct WorkerConfig {
+    /// Explicit worker-wide budgets for the live-state prototype. Operators must
+    /// opt into the live-state API; this does not enable disk-backed SQL recovery.
+    #[serde(default)]
+    pub live_state_resources: Option<LiveStateResourceConfig>,
+
     /// Bind address for the worker RPC socket
     pub bind_address: IpAddr,
 
@@ -457,6 +462,21 @@ pub struct WorkerConfig {
 
     /// Maximum number of checkpoints to keep in history for serving the checkpoint details APIs
     pub checkpoint_details_to_keep: u32,
+}
+
+/// No production defaults: values must be supplied from deployment measurements.
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct LiveStateResourceConfig {
+    pub block_cache_bytes: usize,
+    pub memtable_bytes: usize,
+    pub queued_write_bytes: usize,
+    pub decoded_value_bytes: usize,
+    pub scan_page_bytes: usize,
+    pub max_blocking_operations: usize,
+    pub max_snapshots: usize,
+    pub max_open_databases: usize,
+    pub disk_reserve_bytes: u64,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]

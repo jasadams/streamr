@@ -8,19 +8,21 @@ on:
       - '*_build'
 
 env:
-  REFINERY_CONFIG: postgres://arroyo:arroyo@localhost:5432/arroyo
-  REFINERY_VERSION: 0.8.14
+  DATABASE_URL: postgres://arroyo:arroyo@localhost:5432/arroyo
   PROTOC_VERSION: 27.3
 
 jobs:
   linux:
+    env:
+      CARGO_BUILD_JOBS: "2"
+      CARGO_INCREMENTAL: "0"
     strategy:
       fail-fast: true
       matrix:
         # see https://docs.github.com/en/actions/using-github-hosted-runners/using-github-hosted-runners/about-github-hosted-runners#standard-github-hosted-runners-for-public-repositories
         config:
-          - { runner: ubuntu-22.04-32, protoc: linux-x86_64, python_arch: x64, artifact: linux-x86_64 }
-          - { runner: ubuntu-22.04-32-arm, protoc: linux-aarch_64, python_arch: arm64, artifact: linux-arm64 }
+          - { runner: ubuntu-22.04, protoc: linux-x86_64, python_arch: x64, artifact: linux-x86_64 }
+          - { runner: ubuntu-22.04-arm, protoc: linux-aarch_64, python_arch: arm64, artifact: linux-arm64 }
     runs-on: ${{ matrix.config.runner }}
     services:
       postgres:
@@ -49,15 +51,15 @@ jobs:
       - name: Update rust
         run: |
           rustup update
+      - name: Install RocksDB native build tools
+        run: sudo apt-get update && sudo apt-get install -y build-essential clang libclang-dev cmake
       - name: Setup Python 3.12
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
           architecture: ${{ matrix.config.python_arch }}
       - name: Run DB migrations
-        run: |          
-          cargo install --debug refinery_cli --version $REFINERY_VERSION
-          refinery migrate -e REFINERY_CONFIG -p crates/arroyo-api/migrations
+        run: bash scripts/migrate-build-db.sh
       - name: Run frontend build
         run: cd webui && pnpm install && pnpm build
       - name: Create output directory
@@ -75,13 +77,15 @@ jobs:
   macos:
     env:
       CMAKE_ARGS: -DCMAKE_POLICY_VERSION_MINIMUM=3.5
+      CARGO_BUILD_JOBS: "2"
+      CARGO_INCREMENTAL: "0"
     strategy:
       fail-fast: true
       matrix:
         # see https://docs.github.com/en/actions/using-github-hosted-runners/using-github-hosted-runners/about-github-hosted-runners#standard-github-hosted-runners-for-public-repositories
         config:
-          - { runner: macos-14-large, protoc: osx-x86_64, artifact: macos-x86_64 }
-          - { runner: macos-14-xlarge, protoc: osx-aarch_64, artifact: macos-m1 }
+          - { runner: macos-15-intel, protoc: osx-x86_64, artifact: macos-x86_64 }
+          - { runner: macos-14, protoc: osx-aarch_64, artifact: macos-m1 }
     runs-on: ${{ matrix.config.runner }}
     steps:
       - name: Check out
@@ -114,13 +118,25 @@ jobs:
           unzip protoc*.zip && sudo mv bin/protoc /usr/local/bin
       - name: Install Postgres and prepare DB
         run: |
-          brew install postgresql@14 && brew services start postgresql && sleep 10
+          brew install postgresql@14
+          postgres_bin="$(brew --prefix postgresql@14)/bin"
+          echo "$postgres_bin" >> "$GITHUB_PATH"
+          export PATH="$postgres_bin:$PATH"
+          brew services start postgresql@14
+          for attempt in {1..30}; do
+            if pg_isready -h localhost -p 5432 -q; then
+              break
+            fi
+            if [ "$attempt" -eq 30 ]; then
+              echo "PostgreSQL 14 did not become ready on localhost:5432" >&2
+              exit 1
+            fi
+            sleep 2
+          done
           psql postgres -c "CREATE USER arroyo WITH PASSWORD 'arroyo' SUPERUSER;"
           createdb arroyo
       - name: Run DB migrations
-        run: |
-          cargo install --debug refinery_cli --version $REFINERY_VERSION
-          refinery migrate -e REFINERY_CONFIG -p crates/arroyo-api/migrations
+        run: bash scripts/migrate-build-db.sh
       - name: Run frontend build
         run: cd webui && pnpm install && pnpm build
       - name: Create output directory

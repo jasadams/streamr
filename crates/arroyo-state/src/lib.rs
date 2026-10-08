@@ -22,6 +22,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use tokio::sync::Mutex;
 
+pub mod live;
 mod metrics;
 pub mod parquet;
 pub(crate) mod schemas;
