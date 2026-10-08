@@ -141,8 +141,9 @@ relation planning.
 
 ## Backend construction and lifecycle
 
-Tables use `pipeline.sql_state_backend`, whose default is memory. SQL contains
-no backend implementation or selection. The existing ownership-aware
+Tables use the worker's configured SQL state backend (`worker.sql-state-backend`
+in the configuration file), whose default is `memory`; `rocksdb` is opt-in.
+SQL contains no backend implementation or selection. The existing ownership-aware
 `LiveStateBackend`, `LiveTableManager`, worker backend construction, lifecycle
 and checkpoint interfaces supply the generic storage boundary. An additional
 adapter must meet the same bounded owned reads/writes, read-after-write visibility,
