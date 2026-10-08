@@ -1,5 +1,10 @@
 # Arroyo Fork Build & Test Procedures
 
+Known build and QA infrastructure failures, reproductions and verified repairs
+are recorded in [docs/build-qa-troubleshooting.md](../docs/build-qa-troubleshooting.md).
+Consult it before repeating a settled investigation, and add new findings with
+their source/image versions, evidence and unresolved checks.
+
 ## Build Environment
 
 Arroyo requires Debian Bookworm toolchain. Fedora 44's GCC 16 and OpenSSL 3.5 are incompatible
