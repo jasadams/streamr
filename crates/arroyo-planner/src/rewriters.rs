@@ -902,11 +902,7 @@ impl TreeNodeRewriter for StatefulProcessorRewriter {
         if ops.is_empty() {
             // No state functions found -- reconstruct unchanged projection
             return Ok(Transformed::no(LogicalPlan::Projection(
-                Projection::try_new_with_schema(
-                    new_exprs,
-                    projection.input,
-                    projection.schema,
-                )?,
+                Projection::try_new_with_schema(new_exprs, projection.input, projection.schema)?,
             )));
         }
 

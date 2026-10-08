@@ -2,7 +2,7 @@ FROM rust:1-bookworm
 
 RUN apt-get update && \
     apt-get -y install pkg-config build-essential libssl-dev openssl \
-    cmake clang libsasl2-dev protobuf-compiler && \
+    cmake clang libclang-dev libsasl2-dev protobuf-compiler && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

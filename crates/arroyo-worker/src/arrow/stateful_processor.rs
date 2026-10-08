@@ -15,8 +15,8 @@ use arroyo_rpc::grpc::rpc::TableConfig;
 use arroyo_state::global_table_config;
 use arroyo_types::CheckpointBarrier;
 use datafusion::physical_expr::PhysicalExpr;
-use datafusion_proto::physical_plan::from_proto::parse_physical_expr;
 use datafusion_proto::physical_plan::DefaultPhysicalExtensionCodec;
+use datafusion_proto::physical_plan::from_proto::parse_physical_expr;
 use datafusion_proto::protobuf::PhysicalExprNode;
 use itertools::Itertools;
 use prost::Message;
@@ -97,9 +97,9 @@ impl ArrowOperator for StatefulProcessorFunc {
                 self.input_schema.schema.fields().iter().cloned().collect();
             for op in &self.ops {
                 let dt = match op.op_type {
-                    StateOpType::StateGet
-                    | StateOpType::StatePut
-                    | StateOpType::StateUpsert => DataType::Utf8,
+                    StateOpType::StateGet | StateOpType::StatePut | StateOpType::StateUpsert => {
+                        DataType::Utf8
+                    }
                     StateOpType::StateUpdate | StateOpType::StateDelete => DataType::Boolean,
                 };
                 fields.push(Arc::new(Field::new(&op.output_field, dt, true)));
@@ -184,7 +184,11 @@ impl ArrowOperator for StatefulProcessorFunc {
                         let ResultBuilder::Str(builder) = &mut builders[op_idx] else {
                             unreachable!();
                         };
-                        match key.as_ref().and_then(|k| map.get(k)).and_then(|v| v.as_ref()) {
+                        match key
+                            .as_ref()
+                            .and_then(|k| map.get(k))
+                            .and_then(|v| v.as_ref())
+                        {
                             Some(v) => builder.append_value(v),
                             None => builder.append_null(),
                         }
@@ -274,8 +278,7 @@ impl ArrowOperator for StatefulProcessorFunc {
                         };
                         match key {
                             Some(k) => {
-                                let existed =
-                                    map.get(&k).map(|v| v.is_some()).unwrap_or(false);
+                                let existed = map.get(&k).map(|v| v.is_some()).unwrap_or(false);
                                 self.dirty_keys
                                     .entry(op.map_name.clone())
                                     .or_default()
@@ -291,8 +294,7 @@ impl ArrowOperator for StatefulProcessorFunc {
         }
 
         // Build intermediate batch: input columns + result columns
-        let mut intermediate_columns: Vec<Arc<dyn Array>> =
-            batch.columns().to_vec();
+        let mut intermediate_columns: Vec<Arc<dyn Array>> = batch.columns().to_vec();
         let mut intermediate_fields: Vec<Arc<Field>> =
             batch.schema().fields().iter().cloned().collect();
 
@@ -314,8 +316,7 @@ impl ArrowOperator for StatefulProcessorFunc {
         }
 
         let intermediate_schema = Arc::new(Schema::new(intermediate_fields));
-        let intermediate_batch =
-            RecordBatch::try_new(intermediate_schema, intermediate_columns)?;
+        let intermediate_batch = RecordBatch::try_new(intermediate_schema, intermediate_columns)?;
 
         // Apply final projection to produce the user's SELECT schema
         if self.final_exprs.is_empty() {
@@ -688,7 +689,7 @@ mod tests {
     fn test_dirty_tracking_get_does_not_mark_dirty() {
         let mut map = new_state();
         map.insert("k1".to_string(), Some("v1".to_string()));
-        let mut dirty: HashSet<String> = HashSet::new();
+        let dirty: HashSet<String> = HashSet::new();
 
         // Get does NOT mark dirty
         let _ = map.get("k1");

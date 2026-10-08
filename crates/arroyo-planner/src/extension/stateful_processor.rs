@@ -5,7 +5,7 @@ use arrow_schema::DataType;
 use arroyo_datastream::logical::{LogicalEdge, LogicalEdgeType, LogicalNode, OperatorName};
 use arroyo_rpc::df::{ArroyoSchema, ArroyoSchemaRef};
 use arroyo_rpc::grpc::api::{StateOpType, StateOperation, StatefulProcessorOperator};
-use datafusion::common::{plan_err, DFSchemaRef, Result};
+use datafusion::common::{DFSchemaRef, Result, plan_err};
 use datafusion::logical_expr::{Expr, LogicalPlan, UserDefinedLogicalNodeCore};
 use prost::Message;
 use std::collections::HashSet;
@@ -48,12 +48,7 @@ pub(crate) struct StatefulProcessorExtension {
     pub(crate) final_schema: DFSchemaRef,
 }
 
-crate::multifield_partial_ord!(
-    StatefulProcessorExtension,
-    input,
-    ops,
-    final_exprs
-);
+crate::multifield_partial_ord!(StatefulProcessorExtension, input, ops, final_exprs);
 
 impl UserDefinedLogicalNodeCore for StatefulProcessorExtension {
     fn name(&self) -> &str {
@@ -225,12 +220,7 @@ impl ArroyoExtension for StatefulProcessorExtension {
                 }
                 StateOpType::StateUpdate | StateOpType::StateDelete => DataType::Boolean,
             };
-            intermediate_fields.push(DFField::new(
-                None,
-                &op.output_field,
-                dt,
-                true,
-            ));
+            intermediate_fields.push(DFField::new(None, &op.output_field, dt, true));
         }
         let intermediate_dfschema = schema_from_df_fields(&intermediate_fields)?;
 

@@ -20,8 +20,8 @@ use arroyo_rpc::{
     CheckpointCompleted, ControlMessage, ControlResp, MetadataField, MetadataOrManifest,
 };
 use arroyo_types::{
-    ArrowMessage, ChainInfo, CheckpointBarrier, SignalMessage, TaskInfo, single_item_hash_map,
-    to_micros,
+    ArrowMessage, ChainInfo, CheckpointBarrier, SignalMessage, TaskInfo, Watermark,
+    single_item_hash_map, to_micros,
 };
 use rdkafka::ClientConfig;
 use rdkafka::admin::{AdminClient, AdminOptions, NewTopic};
@@ -205,46 +205,53 @@ struct KafkaSourceWithReads {
 }
 
 impl KafkaSourceWithReads {
-    async fn assert_next_message_record_values(&mut self, mut expected_values: VecDeque<String>) {
-        while !expected_values.is_empty() {
-            match self.data_recv.recv().await {
-                Some(item) => {
-                    if let ArrowMessage::Data(record) = item {
-                        let a = record.columns()[1]
-                            .as_any()
-                            .downcast_ref::<StringArray>()
-                            .unwrap();
+    async fn next_non_idle_message(&mut self, deadline: tokio::time::Instant) -> ArrowMessage {
+        loop {
+            let item = tokio::time::timeout_at(deadline, self.data_recv.recv())
+                .await
+                .expect("timed out waiting for Kafka source output")
+                .expect("Kafka source output closed before the expected message");
+            // A source without an assigned partition can announce idleness before data arrives.
+            if matches!(
+                item,
+                ArrowMessage::Signal(SignalMessage::Watermark(Watermark::Idle))
+            ) {
+                continue;
+            }
+            return item;
+        }
+    }
 
-                        for v in a {
-                            assert_eq!(
-                                expected_values
-                                    .pop_front()
-                                    .expect("found more elements than expected"),
-                                v.unwrap()
-                            );
-                        }
-                    } else {
-                        unreachable!("expected data, got {:?}", item);
+    async fn assert_next_message_record_values(&mut self, mut expected_values: VecDeque<String>) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        while !expected_values.is_empty() {
+            match self.next_non_idle_message(deadline).await {
+                ArrowMessage::Data(record) => {
+                    let a = record.columns()[1]
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .unwrap();
+
+                    for v in a {
+                        assert_eq!(
+                            expected_values
+                                .pop_front()
+                                .expect("found more elements than expected"),
+                            v.unwrap()
+                        );
                     }
                 }
-                None => {
-                    unreachable!("option shouldn't be missing")
-                }
+                item => panic!("expected data, got {:?}", item),
             }
         }
     }
     async fn assert_next_message_checkpoint(&mut self, expected_epoch: u32) {
-        match self.data_recv.recv().await {
-            Some(item) => {
-                if let ArrowMessage::Signal(SignalMessage::Barrier(barrier)) = item {
-                    assert_eq!(expected_epoch, barrier.epoch);
-                } else {
-                    unreachable!("expected a record, got {:?}", item);
-                }
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        match self.next_non_idle_message(deadline).await {
+            ArrowMessage::Signal(SignalMessage::Barrier(barrier)) => {
+                assert_eq!(expected_epoch, barrier.epoch);
             }
-            None => {
-                unreachable!("option shouldn't be missing")
-            }
+            item => panic!("expected checkpoint barrier, got {:?}", item),
         }
     }
 

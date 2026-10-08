@@ -9,7 +9,7 @@ ARG FEATURES=python
 
 RUN apt-get update && \
     apt-get -y install curl pkg-config unzip build-essential libssl-dev openssl \
-    cmake clang wget postgresql postgresql-client supervisor sudo bash libsasl2-dev && \
+    cmake clang libclang-dev wget postgresql postgresql-client supervisor sudo bash libsasl2-dev && \
     cargo install refinery_cli
 
 # Install Python (manually, as no bookworm package for 3.12)
