@@ -56,9 +56,13 @@ Verification performed:
 - An actual cc-rs 1.2.26 build script observed the Rust-only wrapper, selected
   the raw C compiler, and passed three compiler probes and three GNU section
   generation assertions using the locked OpenSSL generator.
-- The pinned SQL executable build produced both `libssl.a` and `libcrypto.a`
-  using the repaired image. Full executable completion and runtime QA are
-  separate checks; consult the batch result before claiming those passed.
+- The pinned SQL executable build passed in 14m44s with the repaired image:
+  `scripts/cargo-dev test --locked -p arroyo-sql-testing --no-run`, with
+  `STREAMR_DEV_IMAGE` set to the immutable image ID below. It produced both
+  OpenSSL archives and the actual SQL worker test executable. Its preserved
+  SHA-256 is `6711f30fa5448a7cc964844f244dd78187f0292fd218b2bb7d83f0bef57ad5cb`.
+  Runtime QA is a separate check; consult the batch result before claiming it
+  passed.
 
 The verified local image is
 `cdeb96c9e3e929b42343c216ab6ace675c5c321ada45e6b78038c776611fe74e`, tagged
