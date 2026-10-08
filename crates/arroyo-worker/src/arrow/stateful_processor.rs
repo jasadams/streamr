@@ -76,6 +76,13 @@ impl ArrowOperator for StatefulProcessorFunc {
     }
 
     async fn on_start(&mut self, ctx: &mut OperatorContext) -> DataflowResult<()> {
+        if ctx.task_info.parallelism != 1 {
+            return Err(arroyo_rpc::errors::DataflowError::ExternalError(format!(
+                "StatefulProcessor requires parallelism 1; received {}. State maps are not partitioned by key",
+                ctx.task_info.parallelism
+            )));
+        }
+
         // Load state from checkpoint
         for map_name in &self.map_names {
             let gs = ctx
@@ -128,7 +135,7 @@ impl ArrowOperator for StatefulProcessorFunc {
     async fn process_batch(
         &mut self,
         batch: RecordBatch,
-        _ctx: &mut OperatorContext,
+        ctx: &mut OperatorContext,
         collector: &mut dyn Collector,
     ) -> DataflowResult<()> {
         let num_rows = batch.num_rows();
@@ -328,18 +335,26 @@ impl ArrowOperator for StatefulProcessorFunc {
                 .map(|expr| expr.evaluate(&intermediate_batch)?.into_array(num_rows))
                 .try_collect()?;
 
-            let projected_fields: Vec<Arc<Field>> = self
-                .final_exprs
-                .iter()
-                .map(|expr| {
-                    let dt = expr.data_type(intermediate_batch.schema().as_ref())?;
-                    let nullable = expr.nullable(intermediate_batch.schema().as_ref())?;
-                    let name = expr.to_string();
-                    Ok(Arc::new(Field::new(name, dt, nullable)))
-                })
-                .collect::<datafusion::common::Result<_>>()?;
-
-            let projected_schema = Arc::new(Schema::new(projected_fields));
+            // The outgoing edge declares SELECT aliases, field nullability, and
+            // the _timestamp field required by downstream operators. Physical
+            // expression display names do not preserve that declared schema.
+            let projected_schema = if let Some(out_schema) = &ctx.out_schema {
+                out_schema.schema.clone()
+            } else {
+                let projected_fields: Vec<Arc<Field>> = self
+                    .final_exprs
+                    .iter()
+                    .map(|expr| {
+                        let dt = expr.data_type(intermediate_batch.schema().as_ref())?;
+                        let nullable = expr.nullable(intermediate_batch.schema().as_ref())?;
+                        let name = expr.to_string();
+                        Ok(Arc::new(Field::new(name, dt, nullable)))
+                    })
+                    .collect::<datafusion::common::Result<_>>()?;
+                Arc::new(Schema::new(projected_fields))
+            };
+            // RecordBatch validates projected column count, types and nullability
+            // against the outgoing schema before passing anything downstream.
             let projected_batch = RecordBatch::try_new(projected_schema, projected)?;
             collector.collect(projected_batch).await?;
         }
@@ -353,23 +368,19 @@ impl ArrowOperator for StatefulProcessorFunc {
         ctx: &mut OperatorContext,
         _: &mut dyn Collector,
     ) -> DataflowResult<()> {
+        // GlobalKeyedTable regenerates a complete snapshot every epoch; its
+        // checkpointer does not inherit entries or files from previous epochs.
+        // Write every key, including unchanged entries and deletion tombstones,
+        // so restoring a later checkpoint cannot lose previously stored state.
         for map_name in &self.map_names {
-            let dirty = self.dirty_keys.get(map_name);
-            if dirty.map(|d| d.is_empty()).unwrap_or(true) {
-                continue;
-            }
-
             let gs = ctx
                 .table_manager
                 .get_global_keyed_state::<String, Option<String>>(map_name)
                 .await?;
 
-            let dirty = self.dirty_keys.get(map_name).unwrap();
             if let Some(entries) = self.state.get(map_name) {
-                for k in dirty {
-                    if let Some(v) = entries.get(k) {
-                        gs.insert(k.clone(), v.clone()).await;
-                    }
+                for (key, value) in entries {
+                    gs.insert(key.clone(), value.clone()).await;
                 }
             }
         }
@@ -763,5 +774,464 @@ mod tests {
             state.get("map_a").unwrap().get("key"),
             Some(&Some("value_a".to_string()))
         );
+    }
+
+    // Exercise the production constructor, expression decoding, batch execution,
+    // final projection, and table-manager checkpoint staging together.
+    #[derive(Default)]
+    struct RuntimeCollector {
+        batches: Vec<RecordBatch>,
+    }
+
+    #[async_trait::async_trait]
+    impl Collector for RuntimeCollector {
+        async fn collect(&mut self, batch: RecordBatch) -> DataflowResult<()> {
+            self.batches.push(batch);
+            Ok(())
+        }
+
+        async fn broadcast_watermark(
+            &mut self,
+            _watermark: arroyo_types::Watermark,
+        ) -> DataflowResult<()> {
+            Ok(())
+        }
+    }
+
+    fn runtime_schema() -> ArroyoSchema {
+        ArroyoSchema::from_fields(vec![
+            Field::new("key", DataType::Utf8, true),
+            Field::new("value", DataType::Utf8, true),
+            Field::new("condition", DataType::Boolean, true),
+        ])
+    }
+
+    fn runtime_batch(
+        keys: Vec<Option<&str>>,
+        values: Vec<Option<&str>>,
+        conditions: Vec<Option<bool>>,
+    ) -> RecordBatch {
+        let timestamps = arrow_array::TimestampNanosecondArray::from(vec![0; keys.len()]);
+        RecordBatch::try_new(
+            runtime_schema().schema,
+            vec![
+                Arc::new(StringArray::from(keys)),
+                Arc::new(StringArray::from(values)),
+                Arc::new(arrow_array::BooleanArray::from(conditions)),
+                Arc::new(timestamps),
+            ],
+        )
+        .unwrap()
+    }
+
+    fn runtime_column(name: &str, index: usize) -> Vec<u8> {
+        let expr: Arc<dyn PhysicalExpr> = Arc::new(
+            datafusion::physical_expr::expressions::Column::new(name, index),
+        );
+        datafusion_proto::physical_plan::to_proto::serialize_physical_expr(
+            &expr,
+            &DefaultPhysicalExtensionCodec {},
+        )
+        .unwrap()
+        .encode_to_vec()
+    }
+
+    fn runtime_config(
+        operations: &[StateOpType],
+        projection: &[usize],
+    ) -> StatefulProcessorOperator {
+        StatefulProcessorOperator {
+            name: "runtime-regression".to_string(),
+            operations: operations
+                .iter()
+                .enumerate()
+                .map(|(index, op)| arroyo_rpc::grpc::api::StateOperation {
+                    map_name: "__sp_runtime".to_string(),
+                    op_type: *op as i32,
+                    key_expr: runtime_column("key", 0),
+                    value_expr: if matches!(
+                        op,
+                        StateOpType::StatePut | StateOpType::StateUpsert | StateOpType::StateUpdate
+                    ) {
+                        runtime_column("value", 1)
+                    } else {
+                        vec![]
+                    },
+                    condition_expr: if *op == StateOpType::StateUpdate {
+                        runtime_column("condition", 2)
+                    } else {
+                        vec![]
+                    },
+                    output_field: format!("__state_result_{index}"),
+                })
+                .collect(),
+            map_names: vec!["__sp_runtime".to_string()],
+            input_schema: Some(runtime_schema().into()),
+            final_exprs: projection
+                .iter()
+                .map(|index| runtime_column(&format!("__state_result_{index}"), 4 + index))
+                .collect(),
+        }
+    }
+
+    fn runtime_operator(config: StatefulProcessorOperator) -> Box<dyn ArrowOperator + Send> {
+        match StatefulProcessorConstructor
+            .with_config(config, Arc::new(Registry::default()))
+            .unwrap()
+        {
+            ConstructedOperator::Operator(operator) => operator,
+            ConstructedOperator::Source(_) => panic!("expected a stateful operator"),
+        }
+    }
+
+    async fn runtime_context(operator: &(dyn ArrowOperator + Send)) -> OperatorContext {
+        runtime_context_with_parallelism(operator, 1).await
+    }
+
+    async fn runtime_context_with_parallelism(
+        operator: &(dyn ArrowOperator + Send),
+        parallelism: u32,
+    ) -> OperatorContext {
+        let (control_tx, _control_rx) = tokio::sync::mpsc::channel(16);
+        OperatorContext::new(
+            Arc::new(arroyo_types::TaskInfo {
+                job_id: "stateful-runtime-regression".to_string(),
+                operator_idx: 0,
+                operator_name: "StatefulProcessor".to_string(),
+                operator_id: "runtime".to_string(),
+                task_index: 0,
+                parallelism,
+                key_range: 0..=u64::MAX,
+                checkpoint_file_path_layout: Default::default(),
+            }),
+            None,
+            control_tx,
+            1,
+            vec![Arc::new(runtime_schema())],
+            None,
+            operator.tables(),
+        )
+        .await
+    }
+
+    fn runtime_strings(batch: &RecordBatch, column: usize) -> Vec<Option<&str>> {
+        batch
+            .column(column)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .iter()
+            .collect()
+    }
+
+    fn runtime_bools(batch: &RecordBatch, column: usize) -> Vec<Option<bool>> {
+        batch
+            .column(column)
+            .as_any()
+            .downcast_ref::<arrow_array::BooleanArray>()
+            .unwrap()
+            .iter()
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn test_runtime_same_key_rows_and_projection_across_batches() {
+        let mut operator = runtime_operator(runtime_config(
+            &[StateOpType::StateUpsert, StateOpType::StateGet],
+            &[1, 0],
+        ));
+        let mut context = runtime_context(operator.as_ref()).await;
+        operator.on_start(&mut context).await.unwrap();
+        let mut collector = RuntimeCollector::default();
+        operator
+            .process_batch(
+                runtime_batch(
+                    vec![Some("a"), Some("a"), Some("b")],
+                    vec![Some("first"), Some("ignored"), Some("other")],
+                    vec![None; 3],
+                ),
+                &mut context,
+                &mut collector,
+            )
+            .await
+            .unwrap();
+        let output = &collector.batches[0];
+        // Final projection must discard the four input fields and reorder results.
+        assert_eq!(output.num_columns(), 2);
+        assert!(
+            output
+                .schema()
+                .field(0)
+                .name()
+                .starts_with("__state_result_1")
+        );
+        assert!(
+            output
+                .schema()
+                .field(1)
+                .name()
+                .starts_with("__state_result_0")
+        );
+        for column in 0..2 {
+            assert_eq!(
+                runtime_strings(output, column),
+                vec![Some("first"), Some("first"), Some("other")]
+            );
+        }
+        operator
+            .process_batch(
+                runtime_batch(vec![Some("a")], vec![Some("later")], vec![None]),
+                &mut context,
+                &mut collector,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            runtime_strings(&collector.batches[1], 0),
+            vec![Some("first")]
+        );
+        assert_eq!(
+            runtime_strings(&collector.batches[1], 1),
+            vec![Some("first")]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_runtime_ordered_writes_deletes_and_null_inputs() {
+        let mut operator = runtime_operator(runtime_config(
+            &[
+                StateOpType::StateGet,
+                StateOpType::StatePut,
+                StateOpType::StateGet,
+                StateOpType::StateUpdate,
+                StateOpType::StateGet,
+                StateOpType::StateDelete,
+                StateOpType::StateGet,
+            ],
+            &[0, 1, 2, 3, 4, 5, 6],
+        ));
+        let mut context = runtime_context(operator.as_ref()).await;
+        operator.on_start(&mut context).await.unwrap();
+        let mut collector = RuntimeCollector::default();
+        operator
+            .process_batch(
+                runtime_batch(
+                    vec![Some("a"), Some("a"), None, Some("a"), Some("a")],
+                    vec![
+                        Some("one"),
+                        Some("two"),
+                        Some("ignored"),
+                        None,
+                        Some("last"),
+                    ],
+                    vec![Some(true), Some(false), Some(true), Some(true), None],
+                ),
+                &mut context,
+                &mut collector,
+            )
+            .await
+            .unwrap();
+        let output = &collector.batches[0];
+        assert_eq!(output.num_columns(), 7);
+        assert_eq!(runtime_strings(output, 0), vec![None; 5]);
+        let written = vec![Some("one"), Some("two"), None, None, Some("last")];
+        for column in [1, 2, 4] {
+            assert_eq!(runtime_strings(output, column), written);
+        }
+        assert_eq!(
+            runtime_bools(output, 3),
+            vec![
+                Some(true),
+                Some(false),
+                Some(false),
+                Some(false),
+                Some(false)
+            ]
+        );
+        assert_eq!(
+            runtime_bools(output, 5),
+            vec![Some(true), Some(true), Some(false), Some(false), Some(true)]
+        );
+        assert_eq!(runtime_strings(output, 6), vec![None; 5]);
+    }
+
+    #[tokio::test]
+    async fn test_runtime_checkpoint_stages_deletion_for_operator_reload() {
+        let mut operator = runtime_operator(runtime_config(&[StateOpType::StatePut], &[0]));
+        let mut context = runtime_context(operator.as_ref()).await;
+        operator.on_start(&mut context).await.unwrap();
+        let mut collector = RuntimeCollector::default();
+        operator
+            .process_batch(
+                runtime_batch(
+                    vec![Some("deleted"), Some("retained")],
+                    vec![Some("old"), Some("keep")],
+                    vec![None; 2],
+                ),
+                &mut context,
+                &mut collector,
+            )
+            .await
+            .unwrap();
+        let barrier = CheckpointBarrier {
+            epoch: 1,
+            min_epoch: 1,
+            timestamp: std::time::SystemTime::UNIX_EPOCH,
+            then_stop: false,
+        };
+        operator
+            .handle_checkpoint(barrier, &mut context, &mut collector)
+            .await
+            .unwrap();
+        let mut deleter = runtime_operator(runtime_config(&[StateOpType::StateDelete], &[0]));
+        deleter.on_start(&mut context).await.unwrap();
+        deleter
+            .process_batch(
+                runtime_batch(vec![Some("deleted")], vec![None], vec![None]),
+                &mut context,
+                &mut collector,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            runtime_bools(collector.batches.last().unwrap(), 0),
+            vec![Some(true)]
+        );
+        deleter
+            .handle_checkpoint(barrier, &mut context, &mut collector)
+            .await
+            .unwrap();
+        // This checks the real table-manager staging path and on_start loading,
+        // not a durable backend flush/restart (which requires checkpoint metadata).
+        let mut reader = runtime_operator(runtime_config(&[StateOpType::StateGet], &[0]));
+        reader.on_start(&mut context).await.unwrap();
+        reader
+            .process_batch(
+                runtime_batch(
+                    vec![Some("deleted"), Some("retained")],
+                    vec![None; 2],
+                    vec![None; 2],
+                ),
+                &mut context,
+                &mut collector,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            runtime_strings(collector.batches.last().unwrap(), 0),
+            vec![None, Some("keep")]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_runtime_rejects_parallel_state_maps() {
+        let mut operator = runtime_operator(runtime_config(&[StateOpType::StateGet], &[0]));
+        let mut context = runtime_context_with_parallelism(operator.as_ref(), 2).await;
+        let error = operator.on_start(&mut context).await.unwrap_err();
+        assert!(error.to_string().contains("requires parallelism 1"));
+    }
+
+    #[tokio::test]
+    async fn test_runtime_updates_preserve_state_in_row_order() {
+        let mut operator = runtime_operator(runtime_config(
+            &[
+                StateOpType::StateGet,
+                StateOpType::StateUpdate,
+                StateOpType::StateGet,
+            ],
+            &[0, 1, 2],
+        ));
+        let mut context = runtime_context(operator.as_ref()).await;
+        operator.on_start(&mut context).await.unwrap();
+        let mut collector = RuntimeCollector::default();
+        operator
+            .process_batch(
+                runtime_batch(
+                    vec![Some("a"); 4],
+                    vec![
+                        Some("first"),
+                        Some("ignored"),
+                        Some("ignored"),
+                        Some("last"),
+                    ],
+                    vec![Some(true), Some(false), None, Some(true)],
+                ),
+                &mut context,
+                &mut collector,
+            )
+            .await
+            .unwrap();
+        let output = &collector.batches[0];
+        assert_eq!(
+            runtime_strings(output, 0),
+            vec![None, Some("first"), Some("first"), Some("first")]
+        );
+        assert_eq!(
+            runtime_bools(output, 1),
+            vec![Some(true), Some(false), Some(false), Some(true)]
+        );
+        assert_eq!(
+            runtime_strings(output, 2),
+            vec![Some("first"), Some("first"), Some("first"), Some("last")]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_runtime_preserves_declared_output_schema() {
+        let mut config =
+            runtime_config(&[StateOpType::StateUpdate, StateOpType::StateGet], &[1, 0]);
+        config
+            .final_exprs
+            .push(runtime_column(arroyo_rpc::TIMESTAMP_FIELD, 3));
+        let mut operator = runtime_operator(config);
+        let mut context = runtime_context(operator.as_ref()).await;
+        let declared = Arc::new(ArroyoSchema::from_fields(vec![
+            Field::new("canonical_id", DataType::Utf8, true),
+            Field::new("update_applied", DataType::Boolean, false),
+        ]));
+        context.out_schema = Some(declared.clone());
+        operator.on_start(&mut context).await.unwrap();
+        let mut collector = RuntimeCollector::default();
+        operator
+            .process_batch(
+                runtime_batch(vec![Some("a")], vec![Some("canonical")], vec![Some(true)]),
+                &mut context,
+                &mut collector,
+            )
+            .await
+            .unwrap();
+        let output = &collector.batches[0];
+        assert_eq!(output.schema(), declared.schema);
+        assert_eq!(runtime_strings(output, 0), vec![Some("canonical")]);
+        assert_eq!(runtime_bools(output, 1), vec![Some(true)]);
+        assert_eq!(output.schema().field(2).name(), arroyo_rpc::TIMESTAMP_FIELD);
+        assert!(!output.schema().field(2).is_nullable());
+    }
+
+    #[tokio::test]
+    async fn test_runtime_rejects_projection_incompatible_with_declared_schema() {
+        // Missing state emits NULL; it cannot satisfy a non-null output field.
+        let mut config = runtime_config(&[StateOpType::StateGet], &[0]);
+        config
+            .final_exprs
+            .push(runtime_column(arroyo_rpc::TIMESTAMP_FIELD, 3));
+        let mut operator = runtime_operator(config);
+        let mut context = runtime_context(operator.as_ref()).await;
+        context.out_schema = Some(Arc::new(ArroyoSchema::from_fields(vec![Field::new(
+            "canonical_id",
+            DataType::Utf8,
+            false,
+        )])));
+        operator.on_start(&mut context).await.unwrap();
+        let mut collector = RuntimeCollector::default();
+        let result = operator
+            .process_batch(
+                runtime_batch(vec![Some("missing")], vec![None], vec![None]),
+                &mut context,
+                &mut collector,
+            )
+            .await;
+        assert!(result.is_err());
+        assert!(collector.batches.is_empty());
     }
 }

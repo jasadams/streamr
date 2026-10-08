@@ -58,3 +58,45 @@ async fn test_udf() {
         .await
         .unwrap();
 }
+
+#[test(tokio::test)]
+async fn stateful_processor_runtime_fixture_plans() {
+    use arroyo_datastream::logical::OperatorName;
+    use arroyo_rpc::grpc::api::StatefulProcessorOperator;
+    use prost::Message;
+    use std::collections::HashSet;
+
+    for query in [
+        include_str!(
+            "../../../arroyo-sql-testing/src/test/queries/stateful_processor_qualified_filter.sql"
+        ),
+        include_str!(
+            "../../../arroyo-sql-testing/src/test/queries/stateful_processor_computed_cte.sql"
+        ),
+        include_str!(
+            "../../../arroyo-sql-testing/src/test/queries/stateful_processor_sequential_ctes.sql"
+        ),
+    ] {
+        let compiled =
+            parse_and_get_program(query, ArroyoSchemaProvider::new(), SqlConfig::default())
+                .await
+                .unwrap();
+        let mut result_fields = HashSet::new();
+        let mut stateful_nodes = 0;
+        for node in compiled.program.graph.node_weights() {
+            for (operator, _) in node.operator_chain.iter() {
+                if operator.operator_name != OperatorName::StatefulProcessor {
+                    continue;
+                }
+                stateful_nodes += 1;
+                assert_eq!(node.parallelism, 1);
+                let config =
+                    StatefulProcessorOperator::decode(operator.operator_config.as_slice()).unwrap();
+                for operation in config.operations {
+                    assert!(result_fields.insert(operation.output_field));
+                }
+            }
+        }
+        assert!(stateful_nodes > 0);
+    }
+}

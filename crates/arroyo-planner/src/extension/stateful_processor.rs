@@ -158,11 +158,13 @@ impl ArroyoExtension for StatefulProcessorExtension {
         }
 
         let input_schema = input_schemas[0].clone();
-        // Use the logical plan's DFSchema for serializing op expressions -- it
-        // preserves table qualifiers (e.g. `nexmark.bid`) that the Arrow schema
-        // drops.  The Arrow-derived DFSchema is still used for final_exprs which
-        // reference unqualified intermediate columns.
+        // The rewriter materializes the complete input plan before this operator,
+        // so its logical field order must match the physical edge. Retain table
+        // qualifiers for both operation expressions and the final projection.
         let input_dfschema = self.input.schema().as_ref().clone();
+        if input_dfschema.as_arrow() != input_schema.schema.as_ref() {
+            return plan_err!("StatefulProcessor input schema differs from its materialized input");
+        }
 
         // Collect unique map names, namespaced to avoid collision with
         // internal table names used by other operators.
@@ -210,11 +212,14 @@ impl ArroyoExtension for StatefulProcessorExtension {
             })
             .collect::<Result<_>>()?;
 
-        // Build the intermediate schema: input fields + one result column per op.
-        // The operator appends these columns; final_exprs project them to the user schema.
-        let mut intermediate_fields = fields_with_qualifiers(self.input.schema());
+        let mut intermediate_fields = fields_with_qualifiers(&input_dfschema);
         for op in &self.ops {
-            let dt = match StateOpType::try_from(op.op_type).unwrap_or(StateOpType::StateGet) {
+            let dt = match StateOpType::try_from(op.op_type).map_err(|_| {
+                datafusion::common::DataFusionError::Plan(format!(
+                    "unknown StateOpType: {}",
+                    op.op_type
+                ))
+            })? {
                 StateOpType::StateGet | StateOpType::StatePut | StateOpType::StateUpsert => {
                     DataType::Utf8
                 }

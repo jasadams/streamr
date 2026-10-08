@@ -256,6 +256,16 @@ impl TreeNodeVisitor<'_> for WindowDetectingVisitor {
 // ensuring they have _timestamp field, amongst other things.
 pub struct ArroyoRewriter<'a> {
     pub(crate) schema_provider: &'a ArroyoSchemaProvider,
+    stateful_rewriter: StatefulProcessorRewriter,
+}
+
+impl<'a> ArroyoRewriter<'a> {
+    pub fn new(schema_provider: &'a ArroyoSchemaProvider) -> Self {
+        Self {
+            schema_provider,
+            stateful_rewriter: StatefulProcessorRewriter::new(),
+        }
+    }
 }
 
 impl TreeNodeRewriter for ArroyoRewriter<'_> {
@@ -315,7 +325,9 @@ impl TreeNodeRewriter for ArroyoRewriter<'_> {
 
                 // Intercept state function calls before async UDF rewriting so
                 // that `state_get(...)` etc. are handled first.
-                let result = StatefulProcessorRewriter::new().f_up(node)?;
+                // Use self.stateful_rewriter (not a fresh instance) so the counter
+                // increments globally, keeping __state_result_N names unique across CTEs.
+                let result = self.stateful_rewriter.f_up(node)?;
                 if result.transformed {
                     return Ok(result);
                 }
