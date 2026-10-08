@@ -1,11 +1,21 @@
 # Arroyo Fork Build & Test Procedures
 
+Known build and QA infrastructure failures, reproductions and verified repairs
+are recorded in [docs/build-qa-troubleshooting.md](../docs/build-qa-troubleshooting.md).
+Consult it before repeating a settled investigation, and add new findings with
+their source/image versions, evidence and unresolved checks.
+
 ## Build Environment
 
 Arroyo requires Debian Bookworm toolchain. Fedora 44's GCC 16 and OpenSSL 3.5 are incompatible
 with vendored C dependencies (sasl2-sys, rdkafka-sys, aws-lc-sys).
 
 **All builds must use the dev container:**
+
+The image installs rustfmt and Clippy. Its `streamr-rustc-cache` wrapper caches
+Rust compilation only. Do not replace it with `RUSTC_WRAPPER=sccache`: cc-rs
+would also wrap C compiler probes, and a cached OpenSSL assembler probe writing
+to `/dev/null` fails with EBUSY and generates incompatible Solaris assembly.
 
 ```bash
 # Build the dev container (one-time)

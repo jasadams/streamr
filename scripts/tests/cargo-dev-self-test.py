@@ -25,6 +25,7 @@ class CargoDevTest(unittest.TestCase):
         (self.root / "docker").mkdir()
         shutil.copy2(REPO / "docker/cargo-dev-config.toml",
                      self.root / "docker/cargo-dev-config.toml")
+        shutil.copy2(REPO / "docker/rustc-cache", self.root / "docker/rustc-cache")
         for name in ("cargo-dev", "rust-build"):
             shutil.copy2(REPO / "scripts" / name, self.root / "scripts" / name)
         self.bin = self.base / "bin"
@@ -96,6 +97,19 @@ sys.exit(int(os.environ.get('COMMAND_STATUS', '0')))
                           'sccache', '--show-stats'])
         self.assertIn('streamr-sccache:/var/cache/sccache', run['args'])
 
+    def test_rust_only_cache_shim_preserves_arguments_and_failure(self):
+        self.write_stub('sccache', """
+with open(os.environ['WRAPPER_TEST_LOG'], 'a') as log:
+    log.write(json.dumps({'args': sys.argv[1:]}) + '\\n')
+sys.exit(23)
+""")
+        result = subprocess.run(['sh', str(self.root / 'docker/rustc-cache'),
+                                 '/path with spaces/rustc', '--crate-name', 'probe'],
+                                env=self.env, capture_output=True, timeout=10)
+        self.assertEqual(result.returncode, 23)
+        self.assertEqual(self.records(),
+                         [{'args': ['/path with spaces/rustc', '--crate-name', 'probe']}])
+
     def test_container_shell_preserves_command_status_when_shutdown_fails(self):
         self.write_stub('cargo', """
 with open(os.environ['WRAPPER_TEST_LOG'], 'a') as log:
@@ -134,7 +148,8 @@ sys.exit(37)
                 self.assertEqual(record['args'][:2], ['build', '-f'])
                 self.assertEqual(record['args'][3:5], ['-t', 'arroyo-dev'])
                 self.assertEqual(record['files'], ['Dockerfile.dev', 'docker',
-                                                   'docker/cargo-dev-config.toml'])
+                                                   'docker/cargo-dev-config.toml',
+                                                   'docker/rustc-cache'])
                 self.assertEqual(record['cargo_config'],
                                  (REPO / 'docker/cargo-dev-config.toml').read_text())
                 self.assertEqual(record['dockerfile'], (REPO / 'Dockerfile.dev').read_text())

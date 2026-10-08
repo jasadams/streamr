@@ -1,0 +1,3 @@
+#!/bin/sh
+# Rust-only entry point; cc-rs must not infer a C/C++ compiler cache wrapper.
+exec sccache "$@"
