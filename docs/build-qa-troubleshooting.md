@@ -131,6 +131,14 @@ changing engine emission scheduling would be a separate semantic change.
 
 ## Evidence and process cleanup for this incident
 
+On this SELinux host, the independent image smoke test could not read its
+host-mounted evidence script with a plain `:ro` bind mount (`Permission denied`).
+Using `:ro,z` for the run-owned evidence directory allowed the same script to
+run and all assertions passed. Read-only access does not by itself supply the
+container SELinux label. Follow repository mount conventions and label only
+the intended workspace/evidence paths; do not disable host SELinux or relabel
+unrelated directories to work around this error.
+
 An all-target `cargo check` after the SQL executable and selected library tests
 started another RocksDB native build under a different Cargo build fingerprint,
 despite reusing the same target directory. Quiet Cargo output alone did not mean
