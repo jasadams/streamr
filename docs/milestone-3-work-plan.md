@@ -20,7 +20,14 @@ committed prefixes were independently checked; peak child RSS was
 original gate receipts and distinct rebuilt-artifact provenance remain in
 `target/native-m3-reviewed-repairs-v15-build-evidence/` and
 `target/native-m3-reviewed-repairs-v15-runtime-smokes/integration-evidence.json`.
-No publication has occurred; PR #6 remains draft and candidate CI is pending.
+The reviewed increment is published as `65827b2622f4c8acb6c9e1de31fcf58a1c64ead7`
+on draft PR #6. Pull-request CI passed completely (709 library tests and 12
+integration tests); duplicate push CI failed a Kafka metadata test timeout.
+The independently reviewed fixture-only repair passed formatting, affected
+all-target/all-feature check, strict Clippy, test build and 11 separate-process
+parallel Kafka tests with no retries. Both unchanged baselines also passed; the
+CI timeout was not reproduced. Publication and fresh current-head CI remain
+required; overall checks on the preceding head are not green.
 These are small integration cases: large SESSION preparation and actual retained
 capacity qualification remain separate. Frozen v14b gates do not qualify the
 changed `network_manager.rs`; existing finite native and partial external parity
@@ -48,9 +55,10 @@ failures as well as successes.
 | 11. Run combined capacity and fault qualification | STR-32; STR-16/17/20/26 | Complete fixed-parallelism ≥10× combined workload with hot keys, backfill and slow consumers on the final candidate. | Actual retained-state floor ≥10× declared pool sum, fixed topology/pool/config manifest, exact external oracle values, bounded resource/output accounting, throughput/latency/backpressure observations and worker/controller fault recovery on required protocols. | Long serialized qualification after 2–10. Component-only capacity and older-source passes cannot substitute; failures return to scoped repair packets. |
 | 12. Run actual 24-hour qualification and final acceptance audit | STR-32; all M3 parents | Complete 24 hours of the required live/fault workload on final qualified source and audit every parent acceptance gate. | Start/end wall-clock receipts covering actual 24 hours, continuous workload/captures/metrics, scheduled fault/recovery records, exact external oracle checks, source/config hashes and ticket-by-ticket evidence ledger with no open required gates. | Long serialized run after 11 and all functional gates; broker uptime or finite replay is insufficient. A source change invalidates affected qualification and needs a scoped rerun. |
 
-Start with task 1: restored permissions alone do not validate the repaired Rust
-source. Next run task 4 against that validated candidate, reusing the existing
-prepared SESSION fixtures. Task 2 coverage planning and tasks 5/6 decision
+Finish task 1 with the bounded Kafka fixture repair, independent review and
+green current-head CI. Next run task 4 against that validated candidate, reusing
+the existing prepared SESSION fixtures and pinned executables with explicit
+source/dependency reconciliation. Task 2 coverage planning and tasks 5/6 decision
 packets can be delegated independently without competing for the build queue.
 
 Use one Debian Bookworm development-container target,

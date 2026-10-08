@@ -7,16 +7,35 @@ Read this first when resuming. Historical evidence belongs in
 ## Current task and next action
 
 User steering: proceed with manageable tasks. Active task: publish the reviewed
-repair increment and verify PR #6 CI for the published head. The five fresh
-Bookworm gates and all 12 small comparator integrations are terminal and passed.
-No build or test is in flight. Do not restart completed validation without a
-source change or contradictory evidence.
+Kafka fixture-readiness repair and verify fresh PR #6 CI. The preceding reviewed
+increment is published as `65827b2622f4c8acb6c9e1de31fcf58a1c64ead7`.
+Its pull-request workflow `37705609443` passed (709 library tests and 12
+integration tests); duplicate push workflow `37705605554` failed a Kafka
+metadata test output timeout. Overall checks on that head are not green.
 
-Next action: finish the final evidence review, commit only the reviewed batch,
-push the existing PR branch, update its description and wait for current-head CI.
-Keep PR #6 draft and M3 tickets open. Then execute one prepared RocksDB/leader
-hot-key SESSION capacity case, with independent retained-checkpoint proof;
-preparation is in `target/native-session-large-v15-preflight/`.
+The narrow repair checks each topic-creation result and waits for exact
+partition/leader metadata readiness before starting the reader. Production
+behavior, topic/group IDs, output deadlines and value assertions are unchanged.
+Independent source review confirms the applied file matches the reviewed
+candidate. Both unchanged baselines passed all 11 Kafka tests; the CI timeout
+was not reproduced locally, and precise causation remains inference.
+
+Repaired-source validation passed: formatting, affected all-target/all-feature
+check, strict Clippy, test build and 11 separate-process parallel Kafka tests
+with zero retries. Logs, source and executable hashes, baseline/parser-error
+receipts and reviews are in
+`target/milestone-3-pr6-publication/kafka-ci-diagnosis/`. Check required a distinct
+native build-script dependency profile; Clippy and final test build reused their
+respective native caches. All runs are terminal; no build is active.
+
+Next: publish this three-file increment after final evidence review, then wait
+for all current-head CI checks. Keep PR #6 draft and M3 tickets open. After green
+CI, seal the reviewed source reconciliation and run one prepared RocksDB/leader
+hot-key SESSION capacity case with independent retained-checkpoint proof.
+Preparation: `target/native-session-large-v15-preflight/`. The test-only change
+is excluded from the pinned SQL/production artifacts; conditional reuse review
+requires exact final diff/head, complete new inventory and fresh CI. Original
+build receipts must remain unchanged. No capacity case has run yet.
 
 ## Evidence and limits
 

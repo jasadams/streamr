@@ -63,7 +63,7 @@ impl KafkaTopicTester {
             .await
             .expect("deletion should have worked");
         tokio::time::sleep(Duration::from_secs(1)).await;
-        admin_client
+        let results = admin_client
             .create_topics(
                 [&NewTopic::new(
                     &self.topic,
@@ -73,7 +73,67 @@ impl KafkaTopicTester {
                 &AdminOptions::new(),
             )
             .await
-            .expect("deletion should have worked");
+            .expect("test topic creation request failed");
+        assert_eq!(results.len(), 1, "expected one topic creation result");
+        for result in results {
+            result.expect("test topic creation failed");
+        }
+
+        // Topic creation can succeed before broker metadata exposes its leader.
+        // Wait for the fixture before the source makes its one-time assignment.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        let mut last_observation = "no metadata fetched".to_string();
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "Kafka test topic {} not ready: {}",
+                self.topic,
+                last_observation
+            );
+            match admin_client
+                .inner()
+                .fetch_metadata(Some(&self.topic), remaining.min(Duration::from_secs(1)))
+            {
+                Ok(metadata) => {
+                    let topics: Vec<_> = metadata
+                        .topics()
+                        .iter()
+                        .map(|topic| {
+                            let partitions: Vec<_> = topic
+                                .partitions()
+                                .iter()
+                                .map(|partition| {
+                                    (partition.id(), partition.leader(), partition.error())
+                                })
+                                .collect();
+                            (topic.name(), topic.error(), partitions)
+                        })
+                        .collect();
+                    last_observation = format!("{topics:?}");
+                    if metadata.topics().iter().any(|topic| {
+                        topic.name() == self.topic
+                            && topic.error().is_none()
+                            && topic.partitions().len() == 1
+                            && topic.partitions()[0].id() == 0
+                            && topic.partitions()[0].error().is_none()
+                            && topic.partitions()[0].leader() >= 0
+                    }) {
+                        println!(
+                            "Kafka test topic {} ready: {}",
+                            self.topic, last_observation
+                        );
+                        break;
+                    }
+                }
+                Err(error) => last_observation = format!("metadata request failed: {error}"),
+            }
+            tokio::time::sleep(
+                Duration::from_millis(100)
+                    .min(deadline.saturating_duration_since(tokio::time::Instant::now())),
+            )
+            .await;
+        }
     }
     async fn get_source_with_reader(
         &self,
