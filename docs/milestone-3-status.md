@@ -4,27 +4,19 @@ Read this first when resuming. Historical evidence belongs in
 [milestone-3-validation.md](milestone-3-validation.md); manageable tasks are in
 [milestone-3-work-plan.md](milestone-3-work-plan.md).
 
-## Current ticket: STR-38 review handoff
+## Current ticket: STR-48 admission telemetry
 
-User resumed work with two constraints: ONE ticket at a time, and pause/report
-if unfinished after one hour. No automatic switch to another ticket.
-
-- Start: 2026-10-08 04:44:16 UTC / 15:44:16 AEDT.
-- Deadline: 2026-10-08 05:44:16 UTC / 16:44:16 AEDT.
-- Outcome: native state-table DDL/catalog/execution contract, already implemented
-  in draft PR #6; audit all four acceptance requirements, close real in-scope
-  gaps, independently review and deliver ready for review. No merge/Done.
-- Acceptance: parser/catalog/plan diagnostics and composite ownership tests;
-  documented visibility/limits/compatibility/retention/parallelism; event-driven
-  current-row lookups without retained history; serial per-event read/write/
-  output scope and checkpoint replay without per-row database transactions.
-- Result: all four requirements have implementation and executed evidence; the
-  only correction is the documented worker backend configuration path. See
-  [STR-38 acceptance](str-38-acceptance.md). No engine behavior changed.
-- Delivery: publish the reviewed documentation increment, verify latest PR #6
-  checks and hand STR-38 to review. Tracker/PR record the publication outcome.
-  Stop this turn after that handoff; no next ticket has started. No local build
-  or runtime is active.
+- Start: 2026-10-08 10:18 UTC; deadline: 2026-10-08 11:18 UTC.
+- Acceptance: count existing oversized/closed/exhausted budget refusals with
+  finite resource/reason labels; time async admission, preserve existing errors,
+  ordering and permit lifetimes, and cover cancelled waits without refusals.
+- Implementation: shared budget metrics and collector registration, focused
+  success/refusal/cancellation source tests, and documented duration boundaries.
+- Validation constraint: explicit user lint-only override; no cargo
+  build/check/clippy/test execution. Tests remain unexecuted and runtime behavior
+  is unqualified by this increment.
+- Next action: formatting/static diff checks, independent review and coordinator
+  delivery. No other ticket work is authorized in this increment.
 
 ## Frozen source and existing evidence
 
