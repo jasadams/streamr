@@ -22,7 +22,7 @@ const ROW: u8 = b'R';
 const SESSION: u8 = b'S';
 const DEADLINE: u8 = b'D';
 const COUNTER: u8 = b'C';
-const VERSION: u8 = 1;
+const VERSION: u8 = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct SessionMeta {
@@ -345,7 +345,7 @@ impl SessionStore {
     fn decode_session(entry: &ScanEntry, prefix: &[u8]) -> Result<SessionMeta> {
         ensure!(
             entry.key.key.len() == prefix.len() + 8
-                && entry.value.len() == 9
+                && entry.value.len() == 10
                 && entry.value[0] == VERSION,
             "native SESSION metadata is malformed"
         );
@@ -451,6 +451,7 @@ impl SessionStore {
         let expiry = deadline_key(group, session.start, deadline)?;
         let mut value = vec![VERSION];
         value.extend_from_slice(&session.end.to_be_bytes());
+        value.push(0);
         // Lower before awaiting: cancellation or an ambiguous write failure
         // must never preserve Empty or a bound above the possible new deadline.
         self.update_deadline(|proof| match proof {
@@ -469,6 +470,43 @@ impl SessionStore {
             self.remember_group(group, proof)?;
         }
         Ok(())
+    }
+
+    /// The output has been accepted; persist this phase before deleting any
+    /// input. A cancelled retirement resumes deletion without aggregating a
+    /// partially removed history or emitting that session again.
+    pub async fn mark_closing(&self, group: &[u8], session: SessionMeta) -> Result<()> {
+        let key = session_key(group, session.start)?;
+        let deadline = session
+            .end
+            .checked_add(self.gap)
+            .context("native SESSION deadline overflow")?;
+        let expiry = deadline_key(group, session.start, deadline)?;
+        let mut value = vec![VERSION];
+        value.extend_from_slice(&session.end.to_be_bytes());
+        value.push(1);
+        self.write_pair((&key, Some(&value)), (&expiry, Some(&[])))
+            .await
+    }
+
+    pub async fn is_closing(&self, group: &[u8], session: SessionMeta) -> Result<bool> {
+        let value = self
+            .table
+            .get(
+                session_key(group, session.start)?,
+                None,
+                ReadOptions { max_bytes: 10 },
+            )
+            .await?
+            .context("native SESSION closing metadata missing")?;
+        ensure!(
+            value.len() == 10
+                && value[0] == VERSION
+                && value[9] <= 1
+                && i64::from_be_bytes(value[1..9].try_into()?) == session.end,
+            "native SESSION closing metadata is malformed"
+        );
+        Ok(value[9] == 1)
     }
 
     async fn remove_session(&self, group: &[u8], session: SessionMeta) -> Result<()> {
@@ -682,12 +720,12 @@ impl SessionStore {
             .get(
                 session_key(&group, start)?,
                 None,
-                ReadOptions { max_bytes: 9 },
+                ReadOptions { max_bytes: 10 },
             )
             .await?
             .context("native SESSION deadline points to missing session")?;
         ensure!(
-            metadata.len() == 9 && metadata[0] == VERSION,
+            metadata.len() == 10 && metadata[0] == VERSION,
             "native SESSION metadata version changed"
         );
         let end = i64::from_be_bytes(metadata[1..9].try_into()?);
@@ -749,13 +787,28 @@ impl SessionStore {
                     reader.schema() == self.schema,
                     "native SESSION retained row schema changed"
                 );
-                let batch = reader
+                let decoded = reader
                     .next()
                     .transpose()?
                     .context("native SESSION retained row is empty")?;
                 ensure!(
-                    batch.num_rows() == 1 && reader.next().transpose()?.is_none(),
+                    decoded.num_rows() == 1 && reader.next().transpose()?.is_none(),
                     "native SESSION retained value must contain one Arrow row"
+                );
+                // IPC arrays can share the whole record body as backing storage.
+                // Compact the row before retention/aggregation so each member
+                // does not appear to own the body once per source column. The
+                // three-value reader permit covers IPC, decoded and copied row.
+                let indices = arrow_array::UInt32Array::from(vec![0]);
+                let columns = decoded
+                    .columns()
+                    .iter()
+                    .map(|column| arrow::compute::take(column, &indices, None))
+                    .collect::<arrow::error::Result<Vec<_>>>()?;
+                let batch = RecordBatch::try_new(self.schema.clone(), columns)?;
+                ensure!(
+                    batch.get_array_memory_size() <= self.limits.partial_bytes,
+                    "native SESSION decoded retained row exceeds configured value limit"
                 );
                 return Ok(Some(SessionRow {
                     key: entry.key.key,
@@ -909,7 +962,7 @@ impl SessionStore {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use arrow_array::Int64Array;
     use arrow_schema::{DataType, Field, Schema};
@@ -969,10 +1022,24 @@ mod tests {
         store_with_decoded(1024 * 1024)
     }
 
-    struct ObservedBackend {
+    pub(in crate::arrow) struct ObservedBackend {
         inner: Arc<dyn LiveStateBackend>,
         snapshots: std::sync::atomic::AtomicUsize,
         pause_write: std::sync::atomic::AtomicBool,
+        paused_write_reached: std::sync::atomic::AtomicBool,
+    }
+
+    impl ObservedBackend {
+        pub(in crate::arrow) fn paused_write_reached(&self) -> bool {
+            self.paused_write_reached
+                .load(std::sync::atomic::Ordering::SeqCst)
+        }
+        pub(in crate::arrow) fn pause_writes(&self, paused: bool) {
+            self.paused_write_reached
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+            self.pause_write
+                .store(paused, std::sync::atomic::Ordering::SeqCst);
+        }
     }
 
     #[async_trait::async_trait]
@@ -1002,6 +1069,8 @@ mod tests {
             batch: AdmittedWriteBatch,
         ) -> arroyo_state::live::Result<()> {
             if self.pause_write.load(std::sync::atomic::Ordering::SeqCst) {
+                self.paused_write_reached
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
                 std::future::pending::<()>().await;
             }
             self.inner.write_admitted(batch).await
@@ -1013,14 +1082,20 @@ mod tests {
         }
     }
 
-    fn observed_store() -> (SessionStore, Arc<ObservedBackend>) {
-        let mut store = store();
+    pub(in crate::arrow) fn observe(store: &mut SessionStore) -> Arc<ObservedBackend> {
         let observed = Arc::new(ObservedBackend {
             inner: store.backend.clone(),
             snapshots: std::sync::atomic::AtomicUsize::new(0),
             pause_write: std::sync::atomic::AtomicBool::new(false),
+            paused_write_reached: std::sync::atomic::AtomicBool::new(false),
         });
         store.backend = observed.clone();
+        observed
+    }
+
+    fn observed_store() -> (SessionStore, Arc<ObservedBackend>) {
+        let mut store = store();
+        let observed = observe(&mut store);
         (store, observed)
     }
 
@@ -1440,6 +1515,173 @@ mod tests {
             store.next_session(b"a", None).await.unwrap().unwrap().start,
             8
         );
+    }
+
+    #[tokio::test]
+    async fn acknowledged_closure_survives_cancelled_retirement_and_fresh_owner() {
+        let (mut store, backend) = observed_store();
+        store.limits.page_entries = 1;
+        for time in [0, 1, 2, 40, 41] {
+            store
+                .insert(b"reused", time, &row(store.schema.clone(), time))
+                .await
+                .unwrap();
+        }
+        let closed = SessionMeta { start: 0, end: 2 };
+        let open = SessionMeta { start: 40, end: 41 };
+        assert!(!store.is_closing(b"reused", closed).await.unwrap());
+        store.mark_closing(b"reused", closed).await.unwrap();
+        // One committed page followed by a blocked next write models an
+        // interrupted drain; the closing phase must precede either deletion.
+        let snapshot = store.snapshot().await.unwrap();
+        let first = store
+            .next_row(&snapshot, b"reused", closed, None)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut writes = AdmittedWriteBatch::try_reserve(
+            store.resources.clone(),
+            store.limits.write_bytes,
+            store.limits.write_operations,
+        )
+        .unwrap();
+        writes
+            .delete(&store.table.key(first.key.clone(), None))
+            .unwrap();
+        store.backend.write_admitted(writes).await.unwrap();
+        drop((first, snapshot));
+        backend
+            .pause_write
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut pending = Box::pin(store.retire(b"reused", closed));
+        assert!(futures::poll!(&mut pending).is_pending());
+        drop(pending);
+        backend
+            .pause_write
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let directory = std::env::temp_dir().join(format!(
+            "streamr-session-closing-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let storage =
+            arroyo_state::get_storage_provider(&arroyo_state::StorageProviderFor::Controller {
+                storage_url: Some(format!("file://{}", directory.display())),
+            })
+            .await
+            .unwrap();
+        let config = arroyo_rpc::grpc::rpc::DiskKeyedTableConfig {
+            table_name: "session".into(),
+            encoding_version: 1,
+            schema_identity: b"native-session-raw.v2".to_vec(),
+        };
+        let snapshot = store.snapshot().await.unwrap();
+        let checkpoint = arroyo_state::live::checkpoint::export(
+            &snapshot,
+            store.table.namespace(),
+            &config,
+            &storage,
+            "checkpoint/session",
+            1,
+            0,
+            0,
+        )
+        .await
+        .unwrap();
+        drop(snapshot);
+        let resources = store.resources.clone();
+        let limits = store.limits;
+        let schema = store.schema.clone();
+        let gap = store.gap;
+        drop((store, backend));
+        let fresh_backend: Arc<dyn LiveStateBackend> = Arc::new(
+            MemoryLiveState::bounded(resources.clone(), limits.max_resident_bytes).unwrap(),
+        );
+        let mut tables = LiveTableManager::new(
+            fresh_backend.clone(),
+            Ownership::PartitionLocal {
+                subtask: 0,
+                parallelism: 1,
+            },
+        )
+        .unwrap();
+        let table = tables.register("session").unwrap();
+        arroyo_state::live::checkpoint::restore(
+            fresh_backend.as_ref(),
+            table.namespace(),
+            &config,
+            &checkpoint,
+            &storage,
+        )
+        .await
+        .unwrap();
+        let recovered = SessionStore::new(
+            fresh_backend,
+            table,
+            resources.clone(),
+            schema.clone(),
+            limits,
+            gap,
+        )
+        .unwrap();
+        assert!(recovered.is_closing(b"reused", closed).await.unwrap());
+        assert!(!recovered.is_closing(b"reused", open).await.unwrap());
+        assert_eq!(
+            recovered.first_due(Some(13)).await.unwrap(),
+            Some((b"reused".to_vec(), closed))
+        );
+        recovered.retire(b"reused", closed).await.unwrap();
+        assert_eq!(
+            recovered.first_due(None).await.unwrap(),
+            Some((b"reused".to_vec(), open))
+        );
+        recovered.mark_closing(b"reused", open).await.unwrap();
+        recovered.retire(b"reused", open).await.unwrap();
+        assert!(recovered.first_due(None).await.unwrap().is_none());
+        recovered
+            .insert(b"reused", 80, &row(recovered.schema.clone(), 99))
+            .await
+            .unwrap();
+        assert!(
+            !recovered
+                .is_closing(b"reused", SessionMeta { start: 80, end: 80 })
+                .await
+                .unwrap()
+        );
+        drop(storage);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn many_key_closure_pages_leave_future_sessions_and_reused_keys_exact() {
+        let mut store = store();
+        store.limits.page_entries = 1;
+        for key in 0..24u8 {
+            for time in [0, 5, 40] {
+                store
+                    .insert(&[key], time, &row(store.schema.clone(), i64::from(key)))
+                    .await
+                    .unwrap();
+            }
+        }
+        let mut seen = Vec::new();
+        while let Some((group, session)) = store.first_due(Some(16)).await.unwrap() {
+            assert_eq!(session, SessionMeta { start: 0, end: 5 });
+            assert!(!store.is_closing(&group, session).await.unwrap());
+            store.mark_closing(&group, session).await.unwrap();
+            store.retire(&group, session).await.unwrap();
+            seen.push(group);
+        }
+        assert_eq!(seen, (0..24u8).map(|key| vec![key]).collect::<Vec<_>>());
+        for key in 0..24u8 {
+            assert_eq!(
+                store.next_session(&[key], None).await.unwrap(),
+                Some(SessionMeta { start: 40, end: 40 })
+            );
+        }
     }
 
     #[tokio::test]
