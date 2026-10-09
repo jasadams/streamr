@@ -2203,26 +2203,6 @@ fn process_rss_bytes() -> usize {
         * 1024
 }
 
-#[cfg(target_os = "linux")]
-fn directory_bytes(path: &Path) -> u64 {
-    let Ok(entries) = std::fs::read_dir(path) else {
-        return 0;
-    };
-    entries
-        .filter_map(Result::ok)
-        .map(|entry| {
-            let Ok(metadata) = entry.metadata() else {
-                return 0;
-            };
-            if metadata.is_dir() {
-                directory_bytes(&entry.path())
-            } else {
-                metadata.len()
-            }
-        })
-        .sum()
-}
-
 fn configure_test_worker() {
     config::config();
     config::update(|c| {
