@@ -1483,7 +1483,8 @@ mod test {
                 Some(&resources),
             ));
             assert!(futures::poll!(&mut writing).is_pending());
-            assert_eq!(resources.runtime.memory_pool.reserved(), 256);
+            // 256 signal bytes plus the existing 256-byte network envelope.
+            assert_eq!(resources.runtime.memory_pool.reserved(), 512);
         }
         assert_eq!(resources.runtime.memory_pool.reserved(), 0);
         drop(reader);
