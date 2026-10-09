@@ -1056,6 +1056,227 @@ mod tests {
         )
     }
 
+    fn resource_usage(registry: &prometheus::Registry, resource: &str, measurement: &str) -> usize {
+        registry
+            .gather()
+            .into_iter()
+            .find(|family| family.name() == "arroyo_live_state_resources")
+            .unwrap()
+            .get_metric()
+            .iter()
+            .find(|metric| {
+                metric
+                    .get_label()
+                    .iter()
+                    .any(|label| label.name() == "resource" && label.value() == resource)
+                    && metric
+                        .get_label()
+                        .iter()
+                        .any(|label| label.name() == "measurement" && label.value() == measurement)
+            })
+            .unwrap()
+            .get_gauge()
+            .as_ref()
+            .unwrap()
+            .value() as usize
+    }
+
+    #[tokio::test]
+    async fn checkpoint_cancelled_admission_releases_buffers_and_fresh_retry_succeeds() {
+        use crate::live::{lifecycle::RocksStateConfig, rocks::RocksLiveState};
+
+        let resources = WorkerStateResources::new(ResourceConfig {
+            block_cache_bytes: 8 * PAGE_BYTES,
+            memtable_bytes: 2 * PAGE_BYTES,
+            queued_write_bytes: 16 * PAGE_BYTES,
+            decoded_value_bytes: 16 * PAGE_BYTES,
+            scan_page_bytes: 16 * PAGE_BYTES,
+            max_blocking_operations: 2,
+            max_snapshots: 2,
+            max_open_databases: 2,
+            disk_reserve_bytes: 0,
+        })
+        .unwrap();
+        let registry = prometheus::Registry::new();
+        resources.register_metrics(&registry).unwrap();
+        // Measurement series are lazy. Admit zero bytes through each real budget
+        // so baseline and final assertions both require the same existing series.
+        // Keep resource_usage strict: a missing series after admission is a failure.
+        drop(resources.decoded_value(0).await.unwrap());
+        drop(resources.scan_page(0).await.unwrap());
+        drop(resources.queued_write(0).await.unwrap());
+        let usage =
+            |resource: &str, measurement: &str| resource_usage(&registry, resource, measurement);
+        let directory = tempfile::tempdir().unwrap();
+        let storage = storage(&directory).await;
+        let source = MemoryLiveState::new();
+        source
+            .put(key(1), b"checkpoint-owner".to_vec(), 1024)
+            .await
+            .unwrap();
+        let snapshot = source.snapshot().await.unwrap();
+        let namespace = namespace();
+        let config = config();
+        let export_observation = CheckpointObservation::new(None, CheckpointDirection::Export);
+        let path = "J/checkpoints/checkpoint-0000001/operator-o/table-map-000";
+        let held_scan = resources
+            .try_scan_page(resources.config().scan_page_bytes)
+            .unwrap();
+        {
+            let mut export = Box::pin(export_snapshot_inner(
+                &snapshot,
+                &namespace,
+                &config.table_name,
+                config.table_name.as_bytes(),
+                &config.schema_identity,
+                1,
+                &storage,
+                path,
+                1,
+                0,
+                0,
+                MAX_FILES,
+                Some(resources.clone()),
+                &export_observation,
+            ));
+            assert!(futures::poll!(&mut export).is_pending());
+            assert_eq!(
+                usage("decoded_value_bytes", "used"),
+                ParquetCheckpointBudget::new(Some(&resources))
+                    .unwrap()
+                    .decoded_bytes
+            );
+            assert_eq!(usage("scan_page_bytes", "waiting"), 1);
+            assert_eq!(usage("queued_write_bytes", "used"), 0);
+        }
+        assert_eq!(usage("decoded_value_bytes", "used"), 0);
+        assert_eq!(usage("scan_page_bytes", "waiting"), 0);
+        assert_eq!(
+            usage("scan_page_bytes", "used"),
+            resources.config().scan_page_bytes
+        );
+        drop(held_scan);
+        assert_eq!(usage("scan_page_bytes", "used"), 0);
+        let metadata = export_snapshot_inner(
+            &snapshot,
+            &namespace,
+            &config.table_name,
+            config.table_name.as_bytes(),
+            &config.schema_identity,
+            1,
+            &storage,
+            path,
+            1,
+            0,
+            0,
+            MAX_FILES,
+            Some(resources.clone()),
+            &export_observation,
+        )
+        .await
+        .unwrap();
+        for resource in [
+            "decoded_value_bytes",
+            "scan_page_bytes",
+            "queued_write_bytes",
+        ] {
+            assert_eq!(usage(resource, "used"), 0);
+        }
+        let state_config = RocksStateConfig {
+            root: directory.path().join("live"),
+            job_id: "cancel-retry".into(),
+            operator_id: "owner".into(),
+            subtask: 0,
+            generation: 0,
+            attempt: 1,
+        };
+        let destination = RocksLiveState::open(state_config.clone(), resources.clone())
+            .await
+            .unwrap();
+        let restore_observation = CheckpointObservation::new(None, CheckpointDirection::Restore);
+        let held_write = resources
+            .try_queued_write(resources.config().queued_write_bytes)
+            .unwrap();
+        {
+            let mut restore = Box::pin(restore_snapshot_inner(
+                &destination,
+                &namespace,
+                1,
+                &config.schema_identity,
+                &metadata,
+                &storage,
+                Some(resources.clone()),
+                &restore_observation,
+            ));
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                tokio::select! {
+                    result = &mut restore => panic!("restore unexpectedly completed: {result:?}"),
+                    _ = async {
+                        while usage("queued_write_bytes", "waiting") == 0 {
+                            tokio::task::yield_now().await;
+                        }
+                    } => {}
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(usage("queued_write_bytes", "waiting"), 1);
+            assert_eq!(
+                usage("decoded_value_bytes", "used"),
+                ParquetCheckpointBudget::new(Some(&resources))
+                    .unwrap()
+                    .decoded_bytes
+            );
+            assert_eq!(usage("scan_page_bytes", "used"), 0);
+        }
+        assert_eq!(usage("queued_write_bytes", "waiting"), 0);
+        assert_eq!(usage("decoded_value_bytes", "used"), 0);
+        assert_eq!(usage("scan_page_bytes", "used"), 0);
+        assert_eq!(
+            usage("queued_write_bytes", "used"),
+            resources.config().queued_write_bytes
+        );
+        drop(held_write);
+        destination.close_and_remove().await.unwrap();
+        let destination = RocksLiveState::open(
+            RocksStateConfig {
+                attempt: 2,
+                ..state_config
+            },
+            resources.clone(),
+        )
+        .await
+        .unwrap();
+        restore_snapshot_inner(
+            &destination,
+            &namespace,
+            1,
+            &config.schema_identity,
+            &metadata,
+            &storage,
+            Some(resources.clone()),
+            &restore_observation,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            destination
+                .get(&key(1), ReadOptions { max_bytes: 1024 })
+                .await
+                .unwrap(),
+            Some(b"checkpoint-owner".to_vec())
+        );
+        for resource in [
+            "decoded_value_bytes",
+            "scan_page_bytes",
+            "queued_write_bytes",
+        ] {
+            assert_eq!(usage(resource, "used"), 0);
+            assert_eq!(usage(resource, "waiting"), 0);
+        }
+        destination.close_and_remove().await.unwrap();
+    }
+
     #[tokio::test]
     async fn legacy_binary_checkpoint_remains_readable() {
         let directory = tempfile::tempdir().unwrap();

@@ -1367,6 +1367,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn accounted_data_and_signals_release_cancelled_and_failed_sends() {
+        for signal in [false, true] {
+            let message = || {
+                if signal {
+                    ArrowMessage::Signal(SignalMessage::Watermark(Watermark::Idle))
+                } else {
+                    ArrowMessage::Data(queue_batch())
+                }
+            };
+            let bytes = message_bytes(&message());
+            let charge = queue_message_charge(bytes as usize).unwrap();
+            let runtime = queue_runtime(1024 * 1024);
+            let pool = runtime.memory_pool.clone();
+            let (tx, mut rx) = batch_bounded_accounted(1, runtime, 1024).unwrap();
+            tx.send_checked(message()).await.unwrap();
+            let baseline = queue_metadata_bytes(1).unwrap();
+            assert_eq!(pool.reserved(), baseline + charge);
+            {
+                let mut cancelled = Box::pin(tx.send_checked(message()));
+                assert!(futures::poll!(&mut cancelled).is_pending());
+                assert_eq!(pool.reserved(), baseline + 2 * charge);
+                assert_eq!(tx.capacity(), 0);
+                assert_eq!(tx.queued_bytes(), bytes);
+            }
+            assert_eq!(pool.reserved(), baseline + charge);
+            assert_eq!(tx.capacity(), 0);
+            // Successful receive transfers the payload to the consumer and frees
+            // exactly the queue envelope/slot. The consumer admits retained work.
+            let received = rx.recv().await.unwrap();
+            assert_eq!(message_bytes(&received), bytes);
+            assert_eq!(pool.reserved(), baseline);
+            assert_eq!(tx.capacity(), 1);
+            assert_eq!(tx.queued_bytes(), 0);
+            drop(received);
+            tx.send_checked(message()).await.unwrap();
+            let mut failed = Box::pin(tx.send_checked(message()));
+            assert!(futures::poll!(&mut failed).is_pending());
+            assert_eq!(pool.reserved(), baseline + 2 * charge);
+            drop(rx);
+            assert!(failed.await.is_err());
+            assert_eq!(pool.reserved(), baseline);
+            assert_eq!(tx.capacity(), 1);
+            assert_eq!(tx.queued_bytes(), 0);
+            assert!(tx.send_checked(message()).await.is_err());
+            assert_eq!(pool.reserved(), baseline);
+            drop(tx);
+            assert_eq!(pool.reserved(), 0);
+        }
+    }
+
+    #[tokio::test]
     async fn accounted_empty_batches_backpressure_and_pending_send_remains_charged() {
         let empty = queue_batch().slice(0, 0);
         let bytes = empty.get_array_memory_size();
