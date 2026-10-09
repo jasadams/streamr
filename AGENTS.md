@@ -1,5 +1,25 @@
 # Project instructions
 
+## Pre-release compatibility policy
+
+Streamr is pre-release. Backward compatibility is not required for code, SQL,
+APIs, configuration, saved plans, checkpoints or state formats.
+
+- Remove obsolete implementations completely, including registrations,
+  dispatch, serialized types, tests, fixtures, examples, scripts and
+  documentation. Do not retain aliases, compatibility shims, deprecated paths,
+  migration tooling or special handling for removed features.
+- Do not spend implementation time preserving or analyzing legacy
+  compatibility unless the user explicitly requests it for a particular task.
+  Backward incompatibility alone is not a reason to ask for approval or block
+  authorized work.
+- Keep reusable infrastructure needed by the current native engine and verify
+  current behavior. Follow normal protocol/schema integrity rules without
+  retaining legacy implementations.
+- This policy does not authorize deleting user data, rewriting Git history,
+  introducing unrelated semantics or redesigning architecture. Current
+  correctness, resource bounds and recovery remain required.
+
 ## Engine and application boundary
 
 Streamr is a general-purpose streaming engine. Applications depend on Streamr;
@@ -69,6 +89,8 @@ capability before proposing a replacement.
   for agreement before implementing the change. Do not stop asking merely to
   avoid interrupting progress. Repairs that preserve the established contract
   can proceed within the authorized task.
+  Removing obsolete behavior already authorized by the user follows the
+  pre-release policy above and does not require a separate compatibility review.
 
 Preserve unrelated user changes. Follow [.claude/build-test.md](.claude/build-test.md)
 for the required development container and checks. Record exact validation

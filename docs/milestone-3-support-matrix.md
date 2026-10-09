@@ -26,7 +26,7 @@ implemented or qualified:
 | Native SESSION | [STR-20](https://trakkt.app/issues/STR-20) | Gap/late-input/deadline/max-duration semantics, bounded histories and closure recovery |
 | Bounded aggregate ranking and arrays | [STR-17](https://trakkt.app/issues/STR-17) | Existing SQL top-K without full member-array materialization, exact typed CDC and recovery |
 | Quiet-key expiry/result composition | [STR-29](https://trakkt.app/issues/STR-29) | Approved watermark-driven zero counts for retained keys; bounded replacement output/recovery, no invented idle clock |
-| Legacy state_* SQL function removal | [STR-43](https://trakkt.app/issues/STR-43) | Native caller migration, explicit old-plan/checkpoint handling and removal from active catalogs/examples |
+| Legacy state_* SQL function removal | [STR-43](https://trakkt.app/issues/STR-43) | Complete removal of legacy SQL/runtime/protocol paths and associated artifacts; no pre-release compatibility layer |
 
 [STR-26](https://trakkt.app/issues/STR-26) maintains the actual native plans and
 maps each required behavior to supported SQL, a demonstrated defect or a policy
@@ -45,9 +45,10 @@ remains a separate path until STR-43 removal; future providers belong in the
 construction adapter rather than these SQL owners.
 
 The five legacy functions are state_get, state_put, state_upsert, state_update
-and state_delete. They remain in the current code until STR-43's prerequisites
-pass; ordinary native table INSERT/MERGE and backend get/put APIs are retained.
-Historical milestone 2 evidence is preserved as evidence of the old path.
+and state_delete. STR-43 removes them completely, including obsolete checked-in
+artifacts. Streamr is pre-release: preserving old plans/checkpoints, shims and
+migration tooling is not required. Ordinary native table INSERT/MERGE and backend
+get/put APIs remain current infrastructure. Git history retains historical evidence.
 
 No new SQL timer/callback API is preselected. Native windows already schedule
 their own closure. Application emission/deadline requirements must be tested

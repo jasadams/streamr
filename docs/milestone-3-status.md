@@ -6,7 +6,7 @@ current dispatch instructions. No implementation worker is claimed by this reset
 
 ## Available features
 
-All seven tickets are Todo, agent-ready and unblocked. Independent agents may work
+All eight tickets are Todo, agent-ready and unblocked. Independent agents may work
 in parallel in separate worktrees with the file ownership in each ticket.
 
 | Ticket | Deliverable | Primary ownership |
@@ -19,6 +19,8 @@ in parallel in separate worktrees with the file ownership in each ticket.
 | [STR-42](https://trakkt.app/issues/STR-42) | Three-epoch nonempty/changed/empty state-table recovery | Conformance driver/fixtures and multi-epoch capture scenario |
 | [STR-29](https://trakkt.app/issues/STR-29) | Watermark-driven zero counts for quiet retained keys | Result composition/expiry, coordinated with STR-19 |
 
+| [STR-43](https://trakkt.app/issues/STR-43) | Complete removal of legacy state SQL and processor code | Legacy catalog/planner/runtime/protocol paths and their fixtures/docs |
+
 One feature per worker. Claim with worker/session, start, acceptance and owned
 files; only then set In Progress. Coordinate shared sections before editing.
 STR-17 owns aggregate capture assertions in smoke_tests.rs; STR-42 owns the
@@ -29,8 +31,8 @@ multi-epoch scenario. Compiler/capacity jobs remain serialized through cargo-dev
 - STR-29's contract was approved on 2026-10-09: watermark expiry emits zero
   rolling counts for retained lifetime/key rows; complete input silence does
   not advance event time. Ordinary window behavior remains unchanged.
-- STR-43 is blocked on legacy SQL plan/checkpoint compatibility and native
-  replacement acceptance. This does not block the seven available features.
+- STR-43 is approved and ready: remove the legacy implementation completely.
+  Streamr is pre-release; no compatibility shims or migration tooling are required.
 - STR-32 holds one shared operator/combined capacity, resource, backfill,
   process-loss/storage-fault and actual 24-hour acceptance checklist. Heavy runs
   require an explicitly requested shared batch; held/cancelled cases stay held.
