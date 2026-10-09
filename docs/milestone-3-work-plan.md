@@ -14,6 +14,7 @@ single active queue and twelve planning groups; Git history retains that text.
 | STR-20 | Many-key/hot-session closure must stay paged and recover remaining open state | Existing SESSION semantics; no application timer emulation |
 | STR-26 | Health signals must describe actual logical/disk/execution/checkpoint pressure | Existing generic lifecycle hooks and accurate operations/support docs |
 | STR-42 | Recovery must cover nonempty, changed/deleted/reinserted and completely empty epochs | Conformance harness; no new snapshot or compatibility format |
+| STR-29 | Quiet retained keys receive zero rolling counts when watermarks pass expiry | Approved event-time composition; ordinary windows unchanged |
 
 Each agent claims one feature, uses a separate worktree, owns its declared files,
 adds focused regressions, obtains independent review and delivers a PR. If the
@@ -36,17 +37,17 @@ an unexecuted regression as passed. Shared runtime checks belong to STR-32.
 
 ## Explicit blocked features
 
-STR-29 implements quiet-key rolling replacement only after its observable
-clock/zero-vs-delete/retained-key contract is agreed. Existing last-nonempty
-composition returns lifetime3/recent1 instead of3/0; adding a join alone does not
-settle all-input-idle clocks. Keep this same ticket blocked, then put the agreed
-contract in its description and mark it ready; no separate decision ticket.
+STR-29 is now ready: the user approved watermark-driven expiry on 2026-10-09.
+For retained lifetime/key rows, recent count becomes zero after expiry;
+removing the retaining key removes its composed result. Complete input silence
+without watermark progress does not advance event time. Ordinary window
+outputs remain unchanged. No new public timer callback API is preapproved.
 
 STR-43 removes legacy state_* SQL only after explicit old-plan/checkpoint
 compatibility is agreed and native replacements are accepted. It does not wait
 for a completed final STR-32 soak. Application caller migration is external.
 
-These blocked features do not prevent any of the six independent assignments.
+STR-43 does not prevent any of the seven independent assignments.
 New public semantics/interface changes require discussion; ordinary repairs
 preserving existing contracts proceed autonomously. STR-44 remains post-MVP.
 

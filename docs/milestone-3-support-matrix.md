@@ -25,7 +25,7 @@ implemented or qualified:
 | Native TUMBLE and HOP panes and closure | [STR-19](https://trakkt.app/issues/STR-19) | Configured-backend migration, watermark/expiry/quiet-key behavior and bounded open-window recovery |
 | Native SESSION | [STR-20](https://trakkt.app/issues/STR-20) | Gap/late-input/deadline/max-duration semantics, bounded histories and closure recovery |
 | Bounded aggregate ranking and arrays | [STR-17](https://trakkt.app/issues/STR-17) | Existing SQL top-K without full member-array materialization, exact typed CDC and recovery |
-| Quiet-key expiry/result composition | [STR-29](https://trakkt.app/issues/STR-29) | Agreed clock/zero-or-delete contract, bounded replacement output and recovery |
+| Quiet-key expiry/result composition | [STR-29](https://trakkt.app/issues/STR-29) | Approved watermark-driven zero counts for retained keys; bounded replacement output/recovery, no invented idle clock |
 | Legacy state_* SQL function removal | [STR-43](https://trakkt.app/issues/STR-43) | Native caller migration, explicit old-plan/checkpoint handling and removal from active catalogs/examples |
 
 [STR-26](https://trakkt.app/issues/STR-26) maintains the actual native plans and

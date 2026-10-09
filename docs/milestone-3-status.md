@@ -6,7 +6,7 @@ current dispatch instructions. No implementation worker is claimed by this reset
 
 ## Available features
 
-All six tickets are Todo, agent-ready and unblocked. Independent agents may work
+All seven tickets are Todo, agent-ready and unblocked. Independent agents may work
 in parallel in separate worktrees with the file ownership in each ticket.
 
 | Ticket | Deliverable | Primary ownership |
@@ -17,6 +17,7 @@ in parallel in separate worktrees with the file ownership in each ticket.
 | [STR-20](https://trakkt.app/issues/STR-20) | Bounded many-key/hot-key SESSION closure and recovery | Session stores/operators/fixtures |
 | [STR-26](https://trakkt.app/issues/STR-26) | Native state health metrics and usable operating limits | Collectors/metric hooks and operations/support docs |
 | [STR-42](https://trakkt.app/issues/STR-42) | Three-epoch nonempty/changed/empty state-table recovery | Conformance driver/fixtures and multi-epoch capture scenario |
+| [STR-29](https://trakkt.app/issues/STR-29) | Watermark-driven zero counts for quiet retained keys | Result composition/expiry, coordinated with STR-19 |
 
 One feature per worker. Claim with worker/session, start, acceptance and owned
 files; only then set In Progress. Coordinate shared sections before editing.
@@ -25,9 +26,11 @@ multi-epoch scenario. Compiler/capacity jobs remain serialized through cargo-dev
 
 ## Decisions and final acceptance
 
-- STR-29 is blocked on an explicit quiet-key expiry/clock/zero-or-delete contract.
+- STR-29's contract was approved on 2026-10-09: watermark expiry emits zero
+  rolling counts for retained lifetime/key rows; complete input silence does
+  not advance event time. Ordinary window behavior remains unchanged.
 - STR-43 is blocked on legacy SQL plan/checkpoint compatibility and native
-  replacement acceptance. Neither decision blocks the six available features.
+  replacement acceptance. This does not block the seven available features.
 - STR-32 holds one shared operator/combined capacity, resource, backfill,
   process-loss/storage-fault and actual 24-hour acceptance checklist. Heavy runs
   require an explicitly requested shared batch; held/cancelled cases stay held.
