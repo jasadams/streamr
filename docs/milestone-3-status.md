@@ -53,3 +53,40 @@ strong window/hot-session and selected all-key capacity results already exist.
 Later cancelled reruns do not erase earlier passes or authorize another run.
 Full current-candidate qualification remains STR-32; no test was run by this
 backlog rewrite. Git history preserves the previous working ledger.
+
+## STR-20 implementation ready — 2026-10-09
+
+Worker `jason/str-20-session-bounds`, started 08:22 UTC; deadline 09:22 UTC.
+The session operators/store and fixture increment passed the focused verification
+below. Current independent review, PR and CI outcomes are recorded on STR-20.
+
+Acknowledged closure is persisted before paged retirement. Cancellation before
+acknowledgment retains complete history; cancellation afterward resumes deletion
+without re-emission, including full checkpoint restore into a fresh backend.
+One bounded in-worker acknowledgment is flushed before checkpoint capture.
+IPC rows are compacted within the existing reader admission to avoid shared-body
+memory overcounting. Native ARRAY_AGG accepts direct source value/order/filter
+columns, uses paged input/value admission and separately reserved execution
+scratch. Its planner Final/Partial pair is locally normalized with original order,
+filters and unchanged output schema. Oversized values error without truncation or
+budget increases. Session format/identity is version 2; disk encoding stays 1.
+
+Executed in verified Bookworm image `cdeb96c9` on final source:
+- `scripts/cargo-dev check --locked -p arroyo-worker` — exit 0.
+- `scripts/preflight-clippy.sh -p arroyo-worker` — exit 0.
+- `scripts/cargo-dev fmt --all -- --check` — exit 0.
+- `scripts/cargo-dev test --locked -p arroyo-worker --lib arrow::session -- --test-threads=1`
+  — exit 0; all 21 tests pass. Coverage includes actual planner/constructor typed
+  integer/text/Boolean arrays and filtered first/last metadata, expanded-expression
+  rejection, slow collection, cancellation before/after acknowledgment, full
+  checkpoint/fresh-backend partial retirement, remaining open state, reused keys,
+  24-key one-entry-page closure and oversized hot-collection history preservation.
+
+Earlier Clippy exited 1 on new test helper visibility/storage-access errors; fixed.
+Earlier focused tests exited 101 (18/21 then 20/21 passes): IPC backing-memory
+admission, fresh database ownership, and physical-schema alias assertions were
+repaired without increasing limits. These failures do not establish passing results.
+Prepared SQL backend/protocol/reused-key fixtures are not runtime matrix passes.
+Historical 12 normal/late and hot capacity results stay source-specific. Full
+fixture matrix and heavy capacity/RSS/fault/soak qualification remain STR-32.
+Read-view lifetime and stopped-input event-time semantics are unchanged.
