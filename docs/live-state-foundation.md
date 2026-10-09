@@ -178,10 +178,6 @@ The tests include native backend conformance, identity-checked reopen, independe
 operators, snapshot lifetime, corruption and cleanup failures, cancellation and
 admission, Arrow fidelity, hot-key pagination and atomic expiry indexes.
 
-The original qualification found workspace formatting differences in planner
-`extension/stateful_processor.rs` and `rewriters.rs`, and worker `arrow/mod.rs`
-and `arrow/stateful_processor.rs`. The 2026-10-08 review applies formatting-only
-repairs to those four files so the unchanged workspace formatting gate can run.
 Supported Linux arm64/macOS distribution builds and complete packaging remain
 qualification gates; no local state/RPC test result implies they have passed.
 

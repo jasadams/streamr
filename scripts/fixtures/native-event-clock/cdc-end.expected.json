@@ -1,0 +1,62 @@
+[
+  [
+    "+",
+    {
+      "session_id": 42,
+      "duration": 5,
+      "event_reference": "2026-10-10T00:00:03",
+      "date_reference": "2026-10-10",
+      "progress_expression": "2026-10-10T00:00:05"
+    }
+  ],
+  [
+    "-",
+    {
+      "session_id": 42,
+      "duration": 5,
+      "event_reference": "2026-10-10T00:00:03",
+      "date_reference": "2026-10-10",
+      "progress_expression": "2026-10-10T00:00:05"
+    }
+  ],
+  [
+    "+",
+    {
+      "session_id": 42,
+      "duration": 7,
+      "event_reference": "2026-10-10T00:00:03",
+      "date_reference": "2026-10-10",
+      "progress_expression": "2026-10-10T00:00:05"
+    }
+  ],
+  [
+    "-",
+    {
+      "session_id": 42,
+      "duration": 7,
+      "event_reference": "2026-10-10T00:00:03",
+      "date_reference": "2026-10-10",
+      "progress_expression": "2026-10-10T00:00:05"
+    }
+  ],
+  [
+    "+",
+    {
+      "session_id": 42,
+      "duration": 86400,
+      "event_reference": "2026-10-11T00:00:01",
+      "date_reference": "2026-10-11",
+      "progress_expression": "2026-10-11T00:00:05"
+    }
+  ],
+  [
+    "-",
+    {
+      "session_id": 42,
+      "duration": 86400,
+      "event_reference": "2026-10-11T00:00:01",
+      "date_reference": "2026-10-11",
+      "progress_expression": "2026-10-11T00:00:05"
+    }
+  ]
+]

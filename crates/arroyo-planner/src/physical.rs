@@ -1071,12 +1071,24 @@ fn debezium_type_compatible(actual: &DataType, declared: &DataType) -> bool {
     }
 }
 
+fn debezium_value_metadata(field: &arrow_schema::Field) -> std::collections::BTreeMap<&str, &str> {
+    field
+        .metadata()
+        .iter()
+        .filter(|(key, _)| key.as_str() != crate::rewriters::EVENT_CLOCK_PROVENANCE)
+        .map(|(key, value)| (key.as_str(), value.as_str()))
+        .collect()
+}
+
 // Arrow 55 exposes dictionary identity only through this deprecated accessor;
 // dropping the check would silently relabel dictionary values at the CDC sink.
 #[allow(deprecated)]
 fn debezium_field_compatible(actual: &arrow_schema::Field, declared: &arrow_schema::Field) -> bool {
     actual.name() == declared.name()
-        && actual.metadata() == declared.metadata()
+        // Event-clock provenance is a planner annotation. DataFusion physical
+        // projection aliases do not carry alias metadata into Arrow fields;
+        // it has no effect on the CDC payload's value representation.
+        && debezium_value_metadata(actual) == debezium_value_metadata(declared)
         && actual.dict_id() == declared.dict_id()
         && actual.dict_is_ordered() == declared.dict_is_ordered()
         && debezium_type_compatible(actual.data_type(), declared.data_type())
@@ -1482,6 +1494,26 @@ mod debezium_declared_schema_tests {
     use arrow::array::new_empty_array;
     use arrow_schema::Field;
     use std::collections::HashMap;
+
+    #[test]
+    fn logical_clock_provenance_does_not_change_debezium_value_type() {
+        let plain = Field::new("clock", DataType::Date32, false);
+        let annotated = plain
+            .clone()
+            .with_metadata(std::collections::HashMap::from([(
+                crate::rewriters::EVENT_CLOCK_PROVENANCE.to_string(),
+                "trigger".to_string(),
+            )]));
+        assert!(debezium_field_compatible(&plain, &annotated));
+        assert!(debezium_field_compatible(&annotated, &plain));
+        let value_metadata = plain
+            .clone()
+            .with_metadata(std::collections::HashMap::from([(
+                "value_metadata".to_string(),
+                "required".to_string(),
+            )]));
+        assert!(!debezium_field_compatible(&plain, &value_metadata));
+    }
 
     #[test]
     #[allow(deprecated)]

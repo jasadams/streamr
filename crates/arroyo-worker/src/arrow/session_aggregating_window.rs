@@ -926,7 +926,8 @@ impl ArrowOperator for SessionAggregatingWindowFunc {
         ctx: &mut OperatorContext,
         _: &mut dyn Collector,
     ) -> DataflowResult<()> {
-        if self.native.is_some() {
+        if let Some(native) = &self.native {
+            native.prepare_checkpoint().await?;
             return Ok(());
         }
         let watermark = ctx.last_present_watermark();

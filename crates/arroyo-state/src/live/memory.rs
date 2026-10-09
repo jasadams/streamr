@@ -315,6 +315,7 @@ impl SnapshotReader for MemorySnapshot {
         Ok(ScanPage {
             entries,
             next_cursor,
+            _reservation: None,
         })
     }
 }

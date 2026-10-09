@@ -394,7 +394,6 @@ fn set_internal_parallelism(graph: &mut Graph<LogicalNode, LogicalEdge>, paralle
         node.operator_chain
             .iter()
             .any(|(operator, _)| match operator.operator_name {
-                OperatorName::StatefulProcessor => true,
                 OperatorName::UpdatingAggregate => native_aggregate,
                 OperatorName::SlidingWindowAggregate => native_window,
                 OperatorName::SessionWindowAggregate => native_window,
@@ -518,50 +517,7 @@ async fn run_and_checkpoint(
 
     // trigger checkpoint 3, which will include the compacted files
     advance(&running_engine, checkpoint_interval).await;
-    let captured_bytes = checkpoint(ctx, 3).await;
-    if ctx.job_id.starts_with("milestone2_probe-") {
-        assert!(
-            captured_bytes >= 10 * 12 * 1024 * 1024,
-            "selected checkpoint must exceed ten times assigned state budgets"
-        );
-        let cleanup_started = std::time::Instant::now();
-        for _ in 0..2 {
-            if leader_mode() {
-                let storage = arroyo_state::get_storage_provider(&StorageProviderFor::Worker)
-                    .await
-                    .unwrap();
-                let paths = arroyo_state_protocol::ProtocolPaths::new(
-                    arroyo_types::PipelineId::new("pipe-test"),
-                    arroyo_types::JobId(ctx.job_id.clone()),
-                );
-                arroyo_state_protocol::gc::cleanup_leader_checkpoints(
-                    storage.as_ref(),
-                    &paths,
-                    paths
-                        .checkpoint_manifest(arroyo_state_protocol::types::Generation(0), Epoch(3)),
-                    Epoch(3),
-                )
-                .await
-                .unwrap();
-            } else {
-                for operator in tasks_per_operator.keys() {
-                    ParquetBackend::cleanup_operator(
-                        &StorageProviderFor::Worker,
-                        (*ctx.job_id).clone(),
-                        operator.clone(),
-                        1,
-                        3,
-                    )
-                    .await
-                    .unwrap();
-                }
-            }
-        }
-        println!(
-            "QUALIFICATION_CLEANUP retained_epoch=3 retries=2 elapsed_seconds={:.3}",
-            cleanup_started.elapsed().as_secs_f64()
-        );
-    }
+    checkpoint(ctx, 3).await;
     if std::env::var("STREAMR_TEST_CRASH").as_deref() == Ok("1") {
         // Flush at least one complete source batch so newer writes actually
         // reach the state operator before cancellation.
@@ -1048,6 +1004,19 @@ async fn local_program(
     epoch: Option<u64>,
     control_tx: tokio::sync::mpsc::Sender<ControlResp>,
 ) -> Program {
+    local_program_selected(job_id, graph, udfs, epoch, control_tx, false).await
+}
+
+// Retained commits are selected explicitly by the lifecycle harness. Ordinary
+// recovery continues to require the generation's currently published commit.
+async fn local_program_selected(
+    job_id: &str,
+    graph: &LogicalGraph,
+    udfs: &[LocalUdf],
+    epoch: Option<u64>,
+    control_tx: tokio::sync::mpsc::Sender<ControlResp>,
+    retained: bool,
+) -> Program {
     if !leader_mode() {
         return Program::local_from_logical(job_id.to_owned(), graph, udfs, epoch, control_tx)
             .await;
@@ -1077,10 +1046,54 @@ async fn local_program(
             GenerationResolution::Ready { checkpoint_ref } => checkpoint_ref,
             other => panic!("leader recovery not ready: {other:?}"),
         };
-        assert_eq!(
-            checkpoint_ref,
-            paths.checkpoint_manifest(generation, Epoch(epoch))
-        );
+        let checkpoint_ref = if retained {
+            let selected = paths.checkpoint_manifest(generation, Epoch(epoch));
+            let selected_metadata: arroyo_rpc::grpc::rpc::CheckpointManifest =
+                read_protobuf(storage.as_ref(), &selected)
+                    .await
+                    .unwrap()
+                    .expect("selected checkpoint was not published");
+            assert_eq!(selected_metadata.job_id, job_id);
+            assert_eq!(selected_metadata.epoch, epoch);
+            assert!(
+                !selected_metadata.needs_commit,
+                "selected checkpoint requires commit"
+            );
+            let mut cursor = checkpoint_ref;
+            let mut seen = HashSet::new();
+            loop {
+                assert!(
+                    seen.insert(cursor.clone()),
+                    "checkpoint history contains a cycle"
+                );
+                let committed: arroyo_rpc::grpc::rpc::CheckpointManifest =
+                    read_protobuf(storage.as_ref(), &cursor)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                assert_eq!(committed.job_id, job_id);
+                assert!(
+                    !committed.needs_commit,
+                    "retained checkpoint requires commit"
+                );
+                if cursor == selected {
+                    break;
+                }
+                cursor = arroyo_state_protocol::types::CheckpointRef::new(
+                    committed
+                        .parent_checkpoint_ref
+                        .expect("selected epoch is not in committed history"),
+                )
+                .unwrap();
+            }
+            selected
+        } else {
+            assert_eq!(
+                checkpoint_ref,
+                paths.checkpoint_manifest(generation, Epoch(epoch))
+            );
+            checkpoint_ref
+        };
         Some(
             read_protobuf(storage.as_ref(), &checkpoint_ref)
                 .await
@@ -1921,6 +1934,7 @@ async fn external_sql_checkpoint_capture_inner() {
     }
     let (control_tx, mut control_rx) = channel(128);
     let program = local_program(&job_id, &logical.graph, &udfs, None, control_tx).await;
+    crate::event_clock_probe::install(&program, &output_path, "initial");
     let initial_engine = Engine::for_local(program, "pipe-test".into(), job_id.clone())
         .await
         .unwrap();
@@ -1998,6 +2012,7 @@ async fn external_sql_checkpoint_capture_inner() {
     }
     let (control_tx, mut control_rx) = channel(128);
     let program = local_program(&job_id, &logical.graph, &udfs, None, control_tx).await;
+    crate::event_clock_probe::install(&program, &output_path, "checkpoint");
     let running = Engine::for_local(program, "pipe-test".into(), job_id.clone())
         .await
         .unwrap()
@@ -2111,6 +2126,7 @@ async fn external_sql_checkpoint_capture_inner() {
         control_tx,
     )
     .await;
+    crate::event_clock_probe::install(&program, &output_path, "recovered");
     let restored = Engine::for_local(program, "pipe-test".into(), job_id.clone())
         .await
         .unwrap()
@@ -2232,250 +2248,6 @@ async fn capture_rows(path: &Path, expected: usize, max_name: &str) -> usize {
     count
 }
 
-/// Run separately: resources and RSS measurements belong to one worker process.
-#[cfg(target_os = "linux")]
-#[test_log(tokio::test)]
-#[ignore = "dedicated-process larger-than-RAM qualification"]
-async fn milestone2_larger_than_ram() {
-    use std::io::Write;
-    assert_eq!(
-        std::env::var("STREAMR_TEST_BACKEND").as_deref(),
-        Ok("rocksdb")
-    );
-    // Qualification runs alone: native fsync and full exports on slow test
-    // storage need a larger deadline than the small fixture smoke tests.
-    unsafe {
-        env::set_var(
-            "STREAMR_TEST_RUNTIME_TIMEOUT_SECONDS",
-            env::var("STREAMR_TEST_RUNTIME_TIMEOUT_SECONDS").unwrap_or_else(|_| "600".into()),
-        );
-    }
-    let cardinality = 32_768usize;
-    let payload_bytes = 4096usize;
-    let logical_bytes = cardinality * payload_bytes;
-    let assigned_bytes = 12 * 1024 * 1024usize;
-    assert!(logical_bytes >= 10 * assigned_bytes);
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let input = root.join("inputs/milestone2_probe.json");
-    let golden = root.join("golden_outputs/milestone2_probe.json");
-    std::fs::create_dir_all(root.join("outputs")).unwrap();
-    let query_path = root.join("outputs/milestone2_probe.sql");
-    let mut source = std::io::BufWriter::new(std::fs::File::create(&input).unwrap());
-    let mut expected = std::io::BufWriter::new(std::fs::File::create(&golden).unwrap());
-    let payload = |key: usize| {
-        let mut rng = (key as u64 + 1).wrapping_mul(0x9e3779b97f4a7c15);
-        (0..payload_bytes)
-            .map(|_| {
-                rng ^= rng << 13;
-                rng ^= rng >> 7;
-                rng ^= rng << 17;
-                (b'a' + (rng % 26) as u8) as char
-            })
-            .collect::<String>()
-    };
-    // Grow uniformly, then mutate existing keys before skewed reads. Epoch 3
-    // captures the first 32 updates; the crash advances into newer updates.
-    // The expected previous version therefore detects accepting a local WAL
-    // or losing committed updates, as well as missing unchanged older keys.
-    let update_rows = 128usize;
-    for phase in 0..2 {
-        for index in 0..cardinality {
-            let writing = phase == 0 || index < update_rows;
-            let key = if phase == 0 {
-                index
-            } else if index % 4 == 0 {
-                0
-            } else if index >= update_rows && index % 4 == 1 {
-                // Also revisit updated cold keys instead of checking only the
-                // hot key and untouched tail of the original population.
-                1 + ((index / 4) % (update_rows - 1))
-            } else {
-                index
-            };
-            let before_seed = if phase == 0 {
-                None
-            } else if index < update_rows {
-                Some(if key == 0 && index > 0 {
-                    cardinality + index - 4
-                } else {
-                    key
-                })
-            } else if key == 0 {
-                Some(cardinality + update_rows - 4)
-            } else if key < update_rows && key % 4 != 0 {
-                Some(cardinality + key)
-            } else {
-                Some(key)
-            };
-            let after_seed = if phase == 1 && writing {
-                cardinality + index
-            } else {
-                before_seed.unwrap_or(key)
-            };
-            let id = phase * cardinality + index;
-            serde_json::to_writer(
-                &mut source,
-                &serde_json::json!({
-                    "id": id,
-                    "key": key.to_string(),
-                    "payload": payload(after_seed),
-                    "expected_before": before_seed.map(payload),
-                    "writing": writing,
-                }),
-            )
-            .unwrap();
-            writeln!(source).unwrap();
-            writeln!(expected, "{{\"id\":{id},\"matches\":true}}").unwrap();
-        }
-    }
-    source.flush().unwrap();
-    expected.flush().unwrap();
-    std::fs::write(
-        &query_path,
-        format!(
-            r#"--checkpoint-interval={}
-CREATE TABLE events (id BIGINT, key TEXT, payload TEXT, expected_before TEXT, writing BOOLEAN)
-WITH (connector='single_file',path='$input_dir/milestone2_probe.json',format='json',type='source');
-CREATE TABLE output (id BIGINT, matches BOOLEAN)
-WITH (connector='single_file',path='$output_path',format='json',type='sink');
-INSERT INTO output
-WITH before_step AS (
- SELECT id,key,payload,expected_before,writing,
-  state_get('qualified',key) AS previous_value FROM events
-), after_step AS (
- SELECT id,payload,expected_before,previous_value,
-  CASE WHEN writing THEN state_put('qualified',key,payload)
-  ELSE state_get('qualified',key) END AS final_value FROM before_step
-)
-SELECT id,
- (previous_value IS NOT DISTINCT FROM expected_before)
- AND final_value = payload AS matches FROM after_step;
-"#,
-            cardinality / 4 + 8
-        ),
-    )
-    .unwrap();
-    let envelope_bytes = std::env::var("STREAMR_TEST_RSS_MIB")
-        .unwrap_or_else(|_| "768".into())
-        .parse::<usize>()
-        .unwrap()
-        * 1024
-        * 1024;
-    let started = std::time::Instant::now();
-    let probe_output = root.join("outputs/milestone2_probe.json");
-    if probe_output.exists() {
-        std::fs::remove_file(&probe_output).unwrap();
-    }
-    let monitor = tokio::spawn(async move {
-        use std::io::{Read, Seek, SeekFrom};
-        use std::os::unix::fs::MetadataExt;
-        let mut inode = 0;
-        let mut offset = 0;
-        let mut records = 0usize;
-        let mut next_sample = cardinality / 4;
-        loop {
-            let rss = process_rss_bytes();
-            assert!(rss > 0, "qualification requires a working RSS measurement");
-            assert!(
-                rss <= envelope_bytes,
-                "SQL process RSS {rss} exceeds envelope {envelope_bytes}"
-            );
-            if let Ok(mut file) = std::fs::File::open(&probe_output) {
-                let metadata = file.metadata().unwrap();
-                if inode != metadata.ino() || metadata.len() < offset {
-                    inode = metadata.ino();
-                    offset = 0;
-                    records = 0;
-                    next_sample = cardinality / 4;
-                }
-                file.seek(SeekFrom::Start(offset)).unwrap();
-                let mut bytes = [0u8; 65536];
-                for _ in 0..8 {
-                    let read = file.read(&mut bytes).unwrap();
-                    if read == 0 {
-                        break;
-                    }
-                    records += bytes[..read].iter().filter(|&&b| b == b'\n').count();
-                    offset += read as u64;
-                }
-                if records >= next_sample {
-                    println!(
-                        "GROWTH emitted_records={records} cardinality_upper={} rss_bytes={rss} local_state_disk_bytes={} elapsed_seconds={:.3}",
-                        records.min(cardinality),
-                        directory_bytes(Path::new("/tmp/streamr-sql-live")),
-                        started.elapsed().as_secs_f64()
-                    );
-                    next_sample = records + cardinality / 4;
-                }
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-    });
-    run_smoketest(&query_path).await;
-    let monitor_failed = monitor.is_finished();
-    monitor.abort();
-    if monitor_failed {
-        monitor.await.unwrap();
-    }
-    let peak_rss = std::fs::read_to_string("/proc/self/status")
-        .unwrap()
-        .lines()
-        .find_map(|line| {
-            line.strip_prefix("VmHWM:")?
-                .split_whitespace()
-                .next()?
-                .parse::<usize>()
-                .ok()
-        })
-        .unwrap()
-        * 1024;
-    assert!(
-        peak_rss <= envelope_bytes,
-        "peak RSS {peak_rss} exceeds {envelope_bytes}"
-    );
-    println!("PEAK_RSS bytes={peak_rss}");
-    for family in prometheus::gather() {
-        if family.name().starts_with("streamr_sql_state_") {
-            for metric in family.get_metric() {
-                let histogram = metric.get_histogram();
-                let count = histogram.get_sample_count();
-                if count == 0 {
-                    continue;
-                }
-                let bound = |quantile: f64| {
-                    histogram
-                        .get_bucket()
-                        .iter()
-                        .find(|bucket| bucket.cumulative_count() as f64 >= count as f64 * quantile)
-                        .map(|bucket| bucket.upper_bound())
-                        .unwrap_or(f64::INFINITY)
-                };
-                println!(
-                    "LATENCY metric={} samples={count} mean_seconds={:.6} p50_upper_seconds={:.6} p99_upper_seconds={:.6}",
-                    family.name(),
-                    histogram.get_sample_sum() / count as f64,
-                    bound(0.5),
-                    bound(0.99)
-                );
-            }
-        }
-    }
-    println!(
-        "QUALIFICATION mode={} cardinality={cardinality} payload_bytes={payload_bytes} logical_bytes={logical_bytes} assigned_state_bytes={assigned_bytes} rss_bytes={} envelope_bytes={envelope_bytes} elapsed_seconds={:.3} output_records={} skew=25%-hot-key",
-        if leader_mode() {
-            "leader"
-        } else {
-            "controller"
-        },
-        process_rss_bytes(),
-        started.elapsed().as_secs_f64(),
-        cardinality * 2
-    );
-    for file in [input, golden, query_path] {
-        std::fs::remove_file(file).unwrap();
-    }
-}
-
 fn process_rss_bytes() -> usize {
     std::fs::read_to_string("/proc/self/status")
         .unwrap_or_default()
@@ -2491,31 +2263,16 @@ fn process_rss_bytes() -> usize {
         * 1024
 }
 
-#[cfg(target_os = "linux")]
-fn directory_bytes(path: &Path) -> u64 {
-    let Ok(entries) = std::fs::read_dir(path) else {
-        return 0;
-    };
-    entries
-        .filter_map(Result::ok)
-        .map(|entry| {
-            let Ok(metadata) = entry.metadata() else {
-                return 0;
-            };
-            if metadata.is_dir() {
-                directory_bytes(&entry.path())
-            } else {
-                metadata.len()
-            }
-        })
-        .sum()
-}
-
 fn configure_test_worker() {
     config::config();
     config::update(|c| {
         // reduce the batch size to increase consistency
         c.pipeline.source_batch_size = 32;
+        if env::var("STREAMR_CAPTURE_EVENT_CLOCK_PROBE").as_deref() == Ok("1") {
+            // Keep focused clock fixture batches deterministic across backend startup.
+            // Existing source barriers and EOF still flush partial batches.
+            c.pipeline.source_batch_linger = Duration::from_secs(3600).into();
+        }
         if let Ok(seconds) = std::env::var("STREAMR_TEST_AGGREGATE_FLUSH_SECONDS") {
             let seconds: u64 = seconds.parse().expect("invalid aggregate flush interval");
             assert!(seconds > 0, "aggregate flush interval must be positive");
@@ -2705,3 +2462,6 @@ fn configure_test_worker() {
 
 #[path = "smoke_fault_tests.rs"]
 mod fault_tests;
+
+#[path = "smoke_state_table_lifecycle.rs"]
+mod smoke_state_table_lifecycle;

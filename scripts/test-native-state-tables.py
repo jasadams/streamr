@@ -10,14 +10,85 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import shutil
 
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("binary", type=Path, help="Fresh arroyo-sql-testing test executable")
 parser.add_argument("--directory", type=Path, default=Path("/app/target/native-state-table-fixtures"))
 parser.add_argument("--target-timestamp", action="store_true", help="Also exercise a retained value named _timestamp")
+parser.add_argument("--prepare-only", action="store_true", help="Prepare fixtures without executing the Rust test binary")
+parser.add_argument("--lifecycle", action="store_true", help="Run the three-epoch typed native state-table lifecycle matrix")
 args = parser.parse_args()
-binary = str(args.binary.resolve(strict=True))
+binary = str(args.binary.resolve(strict=not args.prepare_only))
 root = args.directory.resolve()
+
+if args.lifecycle:
+    fixture = Path(__file__).resolve().parent / 'fixtures' / 'native-state-table-lifecycle'
+    manifest = json.loads((fixture / 'manifest.json').read_text())
+    for backend in manifest['backends']:
+        for batch in manifest['source_batch_rows']:
+            for mode in manifest['checkpoint_modes']:
+                case = f'{backend}-{batch}-{mode}'
+                directory = root / case
+                directory.mkdir(parents=True, exist_ok=True)
+                for source in fixture.glob('*.json*'):
+                    shutil.copyfile(source, directory / source.name)
+                (directory / 'query.sql').write_text((fixture / 'query.sql').read_text().replace('{directory}', str(directory)))
+                if args.prepare_only:
+                    continue
+                environment = dict(os.environ,
+                    STREAMR_TEST_EXECUTION_BYTES='16777216',
+                    STREAMR_TEST_TYPED_SQL='1',
+                    STREAMR_TEST_SOURCE_BATCH_ROWS=str(batch),
+                    STREAMR_TEST_BACKEND=backend,
+                    STREAMR_TEST_CHECKPOINT_MODE=mode,
+                    STREAMR_CAPTURE_QUERY=str(directory / 'query.sql'),
+                    STREAMR_CAPTURE_OUTPUT=str(directory / 'output.jsonl'),
+                    STREAMR_CAPTURE_EPOCH_PREFIXES=','.join(map(str, manifest['epoch_prefixes'])),
+                    STREAMR_CAPTURE_EXPECTED_ROWS=str(manifest['total_input_rows']))
+                for phase in ['native', 'switched']:
+                    if phase == 'switched':
+                        committed = json.loads((directory / 'committed-manifests.json').read_text())
+                        environment['STREAMR_LIFECYCLE_RESTORE_JOB'] = committed[0]['job_id']
+                        environment['STREAMR_TEST_BACKEND'] = 'rocksdb' if backend == 'memory' else 'memory'
+                    logfile = root / f'{case}-{phase}.log'
+                    with logfile.open('w') as output:
+                        result = subprocess.run([binary, 'native_state_table_multi_epoch_capture',
+                            '--ignored', '--test-threads=1', '--nocapture'],
+                            env=environment, stdout=output, stderr=subprocess.STDOUT)
+                    if result.returncode or '1 passed' not in logfile.read_text():
+                        raise RuntimeError(f'{case} failed: {result.returncode}; inspect {logfile}')
+                    committed = json.loads((directory / 'committed-manifests.json').read_text())
+                    if [item['committed_epoch'] for item in committed] != [1, 2, 3]:
+                        raise RuntimeError(f'{case}: missing committed epoch evidence')
+                    for epoch in range(1, 4):
+                        for sink in ['output', 'mirror']:
+                            actual = [json.loads(line) for line in (directory / f'{sink}.checkpoint-{epoch}.jsonl').read_text().splitlines()]
+                            checkpoint_oracle = [json.loads(line) for line in (fixture / f'expected.checkpoint-{epoch}.jsonl').read_text().splitlines()]
+                            if actual != checkpoint_oracle:
+                                raise RuntimeError(f'{case}/{sink}: checkpoint {epoch} prefix differs from oracle')
+                        for sink, oracle in [('output', f'expected.epoch-{epoch}.jsonl'),
+                                             ('mirror', f'expected.epoch-{epoch}.jsonl'),
+                                             ('mid', f'expected.mid.epoch-{epoch}.jsonl')]:
+                            captured = directory / f'{sink}.epoch-{epoch}.jsonl'
+                            actual = [json.loads(line) for line in captured.read_text().splitlines()]
+                            expected_rows = [json.loads(line) for line in (fixture / oracle).read_text().splitlines()]
+                            shutil.copyfile(captured, directory / f'{sink}.epoch-{epoch}.{phase}.jsonl')
+                            if actual != expected_rows:
+                                raise RuntimeError(f'{case}/{captured.name}: {actual} != {expected_rows}')
+                    for commit in committed:
+                        if len(commit['artifacts']) != 3:
+                            raise RuntimeError(f'{case}: missing sink artifact evidence')
+                        for artifact in commit['artifacts']:
+                            paths = ['checkpoint_path', 'native_path']
+                            if phase == 'switched':
+                                paths.append('switched_path')
+                            for key in paths:
+                                if not Path(artifact[key]).is_file():
+                                    raise RuntimeError(f'{case}: missing preserved artifact {artifact[key]}')
+                print(f'PASS lifecycle/{case}: 18 exact full-row native/switched epoch comparisons; 12 committed-prefix comparisons', flush=True)
+    print('Prepared 8 lifecycle SQL configurations.' if args.prepare_only else 'Qualified 8 lifecycle SQL configurations.')
+    raise SystemExit(0)
 
 events = [
     {'seq': 1, 'scope_key': 'a', 'item_id': 1, 'delta': 10, 'mode': 'write'},
@@ -118,6 +189,8 @@ INSERT INTO mutation_mirror SELECT seq, scope_key, item_id, first_old, first_new
 """
             (directory / 'query.sql').write_text(query)
 print('Prepared 8 generic SQL configurations; not executed or qualified.')
+if args.prepare_only:
+    raise SystemExit(0)
 
 for backend in ['memory', 'rocksdb']:
     for batch in [1, 8]:

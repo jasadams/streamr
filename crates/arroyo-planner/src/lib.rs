@@ -140,6 +140,11 @@ pub fn register_functions(registry: &mut dyn FunctionRegistry) {
     functions::register_all(registry);
 
     for p in SessionStateDefaults::default_scalar_functions() {
+        let p = if p.name() == "now" {
+            Arc::new(p.as_ref().clone().with_aliases(["current_timestamp"]))
+        } else {
+            p
+        };
         registry.register_udf(p).unwrap();
     }
 
@@ -572,6 +577,9 @@ impl FunctionRegistry for ArroyoSchemaProvider {
     }
 
     fn register_udf(&mut self, udf: Arc<ScalarUDF>) -> Result<Option<Arc<ScalarUDF>>> {
+        for alias in udf.aliases() {
+            self.functions.insert(alias.clone(), Arc::clone(&udf));
+        }
         Ok(self.functions.insert(udf.name().to_string(), udf))
     }
 
@@ -708,6 +716,7 @@ pub fn rewrite_plan(
     plan: LogicalPlan,
     schema_provider: &ArroyoSchemaProvider,
 ) -> Result<LogicalPlan> {
+    let has_event_clock = rewriters::plan_contains_event_clock(&plan)?;
     let rewritten_plan = plan
         .rewrite_with_subqueries(&mut ArroyoRewriter::new(schema_provider))?
         .data
@@ -718,7 +727,21 @@ pub fn rewrite_plan(
         .data
         .visit_with_subqueries(&mut TimeWindowUdfChecker {})?;
 
-    Ok(rewritten_plan.data)
+    if has_event_clock {
+        // Constant folding is deferred while event-clock markers need row
+        // context. Now that they are columns, simplify standard stable
+        // expressions (including CURRENT_DATE/CURRENT_TIMESTAMP) as usual.
+        datafusion::optimizer::optimizer::Optimizer::with_rules(vec![Arc::new(
+            datafusion::optimizer::simplify_expressions::SimplifyExpressions::new(),
+        )])
+        .optimize(
+            rewritten_plan.data,
+            &datafusion::optimizer::OptimizerContext::default(),
+            |_plan, _rule| {},
+        )
+    } else {
+        Ok(rewritten_plan.data)
+    }
 }
 
 fn build_sink_inputs(extensions: &[LogicalPlan]) -> HashMap<NamedNode, Vec<LogicalPlan>> {

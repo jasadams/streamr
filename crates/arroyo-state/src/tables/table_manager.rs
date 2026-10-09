@@ -31,6 +31,7 @@ use std::{collections::HashMap, sync::Arc, time::SystemTime};
 use crate::StorageProviderFor;
 use anyhow::{Result, anyhow, bail};
 use arroyo_rpc::CompactionResult;
+use arroyo_rpc::progress::{decode_progress, encode_progress};
 use arroyo_rpc::{
     CheckpointCompleted, ControlResp,
     grpc::rpc::{
@@ -38,7 +39,7 @@ use arroyo_rpc::{
     },
 };
 use arroyo_storage::StorageProviderRef;
-use arroyo_types::{CheckpointBarrier, Data, Key, TaskInfo, from_micros, to_micros};
+use arroyo_types::{CheckpointBarrier, Data, Key, TaskInfo, to_micros};
 use tokio::sync::{
     mpsc::{self, Receiver, Sender},
     oneshot,
@@ -321,11 +322,13 @@ impl BackendFlusher {
         self.current_epoch += 1;
 
         // send controller the subtask metadata
+        let (watermark, watermark_negative_nanos) = encode_progress(cp.watermark)?;
         let subtask_metadata = SubtaskCheckpointMetadata {
             subtask_index: self.task_info.task_index,
             start_time: to_micros(cp.time),
             finish_time: to_micros(SystemTime::now()),
-            watermark: cp.watermark.map(to_micros),
+            watermark,
+            watermark_negative_nanos,
             table_metadata: metadatas,
             table_configs: self.table_configs.clone(),
             bytes: bytes as u64,
@@ -445,6 +448,7 @@ fn validate_disk_tables_wire_budget(
         start_time: u64::MAX,
         finish_time: u64::MAX,
         watermark: Some(u64::MAX),
+        watermark_negative_nanos: Some(i64::MIN),
         bytes: u64::MAX,
         table_configs: HashMap::new(),
         table_metadata: HashMap::new(),
@@ -609,12 +613,11 @@ impl TableManager {
             {
                 bail!("operator checkpoint epoch differs from selected checkpoint");
             }
-            let watermark = operator_metadata
-                .operator_metadata
-                .as_ref()
-                .unwrap()
-                .min_watermark
-                .map(from_micros);
+            let progress = operator_metadata.operator_metadata.as_ref().unwrap();
+            let watermark = decode_progress(
+                progress.min_watermark,
+                progress.min_watermark_negative_nanos,
+            )?;
 
             (watermark, Some(operator_metadata))
         } else {
@@ -1631,6 +1634,7 @@ mod tests {
             start_time: u64::MAX,
             finish_time: u64::MAX,
             watermark: Some(u64::MAX),
+            watermark_negative_nanos: Some(i64::MIN),
             bytes: u64::MAX,
             table_metadata: HashMap::from([
                 (

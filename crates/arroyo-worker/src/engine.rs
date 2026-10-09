@@ -7,7 +7,6 @@ use crate::arrow::session_aggregating_window::SessionAggregatingWindowConstructo
 use crate::arrow::sliding_aggregating_window::SlidingAggregatingWindowConstructor;
 use crate::arrow::state_table::StateTableCaptureConstructor;
 use crate::arrow::state_table_runtime::FusedStateTableConstructor;
-use crate::arrow::stateful_processor::StatefulProcessorConstructor;
 use crate::arrow::tumbling_aggregating_window::TumblingAggregateWindowConstructor;
 use crate::arrow::watermark_generator::WatermarkGeneratorConstructor;
 use crate::arrow::window_fn::WindowFunctionConstructor;
@@ -238,7 +237,6 @@ impl Program {
         file_path_layout: CheckpointFilePathLayout,
         control_tx: Sender<ControlResp>,
     ) -> Result<Program, StateError> {
-        let mut map_owners = HashMap::new();
         for node in logical.node_weights() {
             for (operator, _) in node.operator_chain.iter() {
                 if operator.operator_name == OperatorName::StateTable {
@@ -261,23 +259,6 @@ impl Program {
                             state.event_scope_id
                         ),
                     });
-                }
-                if operator.operator_name == OperatorName::StatefulProcessor {
-                    use prost::Message;
-                    let state =
-                        api::StatefulProcessorOperator::decode(operator.operator_config.as_slice())
-                            .map_err(|error| StateError::Other {
-                                table: operator.operator_id.clone(),
-                                error: error.to_string(),
-                            })?;
-                    for map in state.map_names {
-                        if let Some(owner) =
-                            map_owners.insert(map.clone(), operator.operator_id.clone())
-                            && owner != operator.operator_id
-                        {
-                            return Err(StateError::Other { table: map, error: "named SQL maps require one ordered execution owner; branching stateful stages are unsupported".into() });
-                        }
-                    }
                 }
             }
         }
@@ -325,9 +306,7 @@ impl Program {
                             .filter(|(operator, _)| {
                                 matches!(
                                     operator.operator_name,
-                                    OperatorName::StatefulProcessor
-                                        | OperatorName::FusedStateTable
-                                        | OperatorName::UpdatingAggregate
+                                    OperatorName::FusedStateTable | OperatorName::UpdatingAggregate
                                 ) || native_fixed_window_enabled(
                                     &operator.operator_name,
                                     &operator.operator_config,
@@ -376,7 +355,6 @@ impl Program {
                             | OperatorName::ArrowValue
                             | OperatorName::ArrowKey
                             | OperatorName::Projection
-                            | OperatorName::StatefulProcessor
                             | OperatorName::FusedStateTable
                             | OperatorName::StateTableCapture
                             | OperatorName::UpdatingAggregate
@@ -1155,7 +1133,6 @@ pub fn construct_operator(
         OperatorName::SlidingWindowAggregate => Box::new(SlidingAggregatingWindowConstructor),
         OperatorName::SessionWindowAggregate => Box::new(SessionAggregatingWindowConstructor),
         OperatorName::UpdatingAggregate => Box::new(IncrementalAggregatingConstructor),
-        OperatorName::StatefulProcessor => Box::new(StatefulProcessorConstructor),
         OperatorName::StateTable => {
             panic!(
                 "state-table execution requires STR-41 fused serial event owner; standalone state-table operator is unavailable"

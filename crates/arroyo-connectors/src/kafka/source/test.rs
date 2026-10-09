@@ -394,6 +394,8 @@ async fn test_kafka() {
                 epoch: 1,
                 min_watermark: Some(0),
                 max_watermark: Some(0),
+                min_watermark_negative_nanos: None,
+                max_watermark_negative_nanos: None,
                 parallelism: 1,
             }),
         },
