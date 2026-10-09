@@ -1048,6 +1048,19 @@ async fn local_program(
     epoch: Option<u64>,
     control_tx: tokio::sync::mpsc::Sender<ControlResp>,
 ) -> Program {
+    local_program_selected(job_id, graph, udfs, epoch, control_tx, false).await
+}
+
+// Retained commits are selected explicitly by the lifecycle harness. Ordinary
+// recovery continues to require the generation's currently published commit.
+async fn local_program_selected(
+    job_id: &str,
+    graph: &LogicalGraph,
+    udfs: &[LocalUdf],
+    epoch: Option<u64>,
+    control_tx: tokio::sync::mpsc::Sender<ControlResp>,
+    retained: bool,
+) -> Program {
     if !leader_mode() {
         return Program::local_from_logical(job_id.to_owned(), graph, udfs, epoch, control_tx)
             .await;
@@ -1077,10 +1090,54 @@ async fn local_program(
             GenerationResolution::Ready { checkpoint_ref } => checkpoint_ref,
             other => panic!("leader recovery not ready: {other:?}"),
         };
-        assert_eq!(
-            checkpoint_ref,
-            paths.checkpoint_manifest(generation, Epoch(epoch))
-        );
+        let checkpoint_ref = if retained {
+            let selected = paths.checkpoint_manifest(generation, Epoch(epoch));
+            let selected_metadata: arroyo_rpc::grpc::rpc::CheckpointManifest =
+                read_protobuf(storage.as_ref(), &selected)
+                    .await
+                    .unwrap()
+                    .expect("selected checkpoint was not published");
+            assert_eq!(selected_metadata.job_id, job_id);
+            assert_eq!(selected_metadata.epoch, epoch);
+            assert!(
+                !selected_metadata.needs_commit,
+                "selected checkpoint requires commit"
+            );
+            let mut cursor = checkpoint_ref;
+            let mut seen = HashSet::new();
+            loop {
+                assert!(
+                    seen.insert(cursor.clone()),
+                    "checkpoint history contains a cycle"
+                );
+                let committed: arroyo_rpc::grpc::rpc::CheckpointManifest =
+                    read_protobuf(storage.as_ref(), &cursor)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                assert_eq!(committed.job_id, job_id);
+                assert!(
+                    !committed.needs_commit,
+                    "retained checkpoint requires commit"
+                );
+                if cursor == selected {
+                    break;
+                }
+                cursor = arroyo_state_protocol::types::CheckpointRef::new(
+                    committed
+                        .parent_checkpoint_ref
+                        .expect("selected epoch is not in committed history"),
+                )
+                .unwrap();
+            }
+            selected
+        } else {
+            assert_eq!(
+                checkpoint_ref,
+                paths.checkpoint_manifest(generation, Epoch(epoch))
+            );
+            checkpoint_ref
+        };
         Some(
             read_protobuf(storage.as_ref(), &checkpoint_ref)
                 .await
@@ -2705,3 +2762,6 @@ fn configure_test_worker() {
 
 #[path = "smoke_fault_tests.rs"]
 mod fault_tests;
+
+#[path = "smoke_state_table_lifecycle.rs"]
+mod smoke_state_table_lifecycle;
