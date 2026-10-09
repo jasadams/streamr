@@ -32,6 +32,95 @@ underscores become hyphens. For example:
 `ARROYO__WORKER__LIVE_STATE_RESOURCES__`, with each kebab-case leaf converted to
 underscores. These are one worker-wide pool, not one pool per operator.
 
+### Runnable bounded example
+
+Save this as `native-state.toml`. These values reproduce small native fixture
+limits, with room for two live owners; they are an example to qualify, not
+production defaults. The worker must be able to create both local directories.
+Existing service, connector and authentication configuration still applies.
+
+```toml
+checkpoint-url = "file:///tmp/streamr-checkpoints"
+
+[admin]
+http-port = 8001
+
+[worker]
+sql-state-backend = "rocksdb"
+
+[worker.disk-sql-state]
+directory = "/tmp/streamr-live"
+max-row-bytes = 24576
+
+[worker.execution-resources]
+memory-bytes = 16777216
+max-batch-bytes = 1048576
+
+[worker.live-state-resources]
+block-cache-bytes = 8388608
+memtable-bytes = 4194304
+queued-write-bytes = 33554432
+decoded-value-bytes = 16777216
+scan-page-bytes = 2097152
+max-blocking-operations = 2
+max-snapshots = 2
+max-open-databases = 2
+disk-reserve-bytes = 67108864
+
+[worker.typed-sql-state]
+key-bytes = 4096
+row-bytes = 24576
+decoded-bytes = 65536
+scope-bytes = 262144
+scope-operations = 128
+page-bytes = 131072
+page-entries = 64
+max-working-event-bytes = 262144
+max-captured-event-bytes = 131072
+max-pending-output-rows = 64
+max-pending-output-bytes = 524288
+max-resident-bytes = 8388608
+
+[worker.aggregate-state]
+key-bytes = 512
+value-bytes = 32768
+page-bytes = 131072
+page-entries = 64
+write-bytes = 2097152
+write-operations = 128
+overlay-bytes = 2097152
+max-pending-output-rows = 64
+max-pending-output-bytes = 524288
+max-resident-bytes = 134217728
+
+[worker.window-state]
+key-bytes = 512
+partial-bytes = 32768
+page-bytes = 131072
+page-entries = 64
+write-bytes = 524288
+write-operations = 64
+max-resident-bytes = 134217728
+```
+
+With the pinned production executable available as `arroyo` and a caller-owned
+supported query in `query.sql`, run a local pipeline at singleton parallelism:
+
+```sh
+mkdir -p /tmp/streamr-live /tmp/streamr-checkpoints
+arroyo --config native-state.toml run --parallelism 1 --state-dir file:///tmp/streamr-checkpoints query.sql
+```
+
+For a configured cluster, start its worker with
+`arroyo --config native-state.toml worker`, then submit the same supported
+singleton plan through that cluster's normal submission path. Inspect
+`curl --fail http://127.0.0.1:8001/metrics` on the worker admin endpoint; local
+`run` and a cluster worker have different service lifecycles, so do not infer
+worker scrape evidence from query output. To exercise the same bounded native
+operators in memory, set `ARROYO__WORKER__SQL_STATE_BACKEND=memory` on a fresh
+run and keep the resource/operator blocks. Do not override the backend of an
+existing restore without proven compatibility.
+
 Operator limits are independent of backend choice:
 
 - `worker.typed-sql-state`: `key-bytes`, `row-bytes`, `decoded-bytes`,
@@ -53,11 +142,11 @@ Committed checkpoints retain existing schema/encoding/ownership metadata and
 recover full logical namespaces. Preserve the remote store and selected
 checkpoint; local scratch alone is not a portable recovery artifact.
 
-State-table ownership and native SESSION currently reject parallelism other
-than one. Larger fixed parallelism for another operator is not automatically
+RocksDB SQL rejects every graph node with parallelism other than one. Native
+state-table ownership and SESSION also require singleton ownership in memory.
+Larger fixed memory parallelism for another operator is not automatically
 qualified merely because its constructor admits a subtask index. Do not rescale
 or switch backend/schema/key ownership without explicit compatibility evidence.
-
 
 ## Admission failures and sizing
 
@@ -79,6 +168,31 @@ execution spill is disabled. Supported graph/network admission shares execution
 resources and may reject startup or message delivery when that pool cannot fit
 queue metadata, actual payloads and retained work. Arbitrary UDF allocations and
 TLS internals are not thereby bounded.
+
+### Invalid configuration examples
+
+Apply each change separately to the example above, on a disposable fresh run.
+Some validation happens at graph/backend construction rather than CLI parsing;
+submit a query using the affected owner to exercise that check. An invalid
+configuration is expected to fail, not silently fall back to memory.
+
+| Change to example | Expected rejection boundary |
+| --- | --- |
+| Remove `[worker.disk-sql-state]` with backend `rocksdb` | RocksDB SQL requires `worker.disk-sql-state` |
+| Remove `[worker.live-state-resources]` with backend `rocksdb` | RocksDB SQL requires explicit worker resources |
+| Set `worker.disk-sql-state.max-row-bytes = 262145` | Maximum disk SQL row is 262144 bytes |
+| Set `worker.execution-resources.max-batch-bytes = 16777217` | Batch allowance exceeds the 16777216-byte execution pool |
+| Set `worker.live-state-resources.max-open-databases = 0` | Live resources must be positive; owner capacity also must fit the actual graph |
+| Set `worker.live-state-resources.memtable-bytes = 8388609` | Memtable allowance exceeds the 8388608-byte cache allowance |
+| Set `worker.aggregate-state.max-pending-output-rows = 1` | Aggregate admission requires two output rows |
+| Set `worker.window-state.write-operations = 3` | Window admission requires at least four writes |
+| Set `worker.typed-sql-state.decoded-bytes = 24575` | Typed row allowance exceeds decoded allowance |
+| Run RocksDB with `--parallelism 2` | RocksDB SQL requires singleton execution and unchanged parallelism |
+
+All sizes in these config blocks are bytes, not MiB. Output row counts and
+operation/owner counts are separate dimensions. Configured maxima must fit
+encoded keys, indexes, cursor/metadata overhead and overlapping live buffers;
+a value fitting `row-bytes` alone can still fail a stricter operation allowance.
 
 Measure retained logical payload, checkpoint-prefix state and whole-process RSS
 separately. Existing fixture budgets are examples, not production defaults:
@@ -103,20 +217,26 @@ truncation are not acceptable operational workarounds.
 
 Production workers register live resources with the default Prometheus registry;
 the configured admin HTTP service exposes `/metrics`. Label sets are fixed
-resource/measurement, resource/reason, operation, direction/outcome or bounded graph identity,
+resource/measurement, resource/reason, backend/part, operation/outcome,
+phase/outcome, direction/outcome or bounded graph identity,
 without caller keys or values. Code presence remains distinct from a captured
 current-candidate production scrape.
 
 | Signal | Current evidence/source | Limit or remaining gap |
 | --- | --- | --- |
-| `arroyo_live_state_resources{resource,measurement}` | Admission `used`, `limit`, `waiting`; native cache/memtable refresh; pinned cache, disk available/refusals | Disk available reflects the last admission check, not a continuously refreshed filesystem gauge; logical table cardinality/bytes is not supplied |
+| `arroyo_live_state_resources{resource,measurement}` | Admission `used`, `limit`, `waiting`; native cache/memtable refresh; pinned cache, disk available/refusals | Disk available reflects the last admission check, not a continuously refreshed filesystem gauge; use the separate logical and native health families below |
 | `arroyo_live_state_admission_refusals_total{resource,reason}` | Existing oversized, closed and exhausted admission errors; reasons are `oversized`, `closed`, `exhausted` | Counts only returned refusals, never cancelled waits; excludes disk/configuration failures and execution-pool admission |
 | `arroyo_live_state_admission_duration_seconds{resource}` | Async admission from first poll through acquisition, refusal or cancellation, including immediate outcomes | Includes validation and semaphore wait; excludes time before first poll, synchronous try-admission, permit holding and native work; cancellation contributes a duration sample without a refusal |
 | `arroyo_live_state_operation_latency_seconds{operation}` | Fixed read/write/scan/snapshot/open histogram | Native operation time after admission; does not separately report total queue wait or RocksDB write-stall duration |
 | `arroyo_live_state_checkpoint_duration_seconds{direction,outcome}` | Logical namespace export/restore durations, success/error/cancelled outcomes | Not entire controller barrier/publication duration or worker startup latency |
 | `arroyo_live_state_checkpoint_operations_total{direction,outcome}` | Full logical export/restore operation counts | Requires actual scrape/fault evidence to establish deployment behavior |
 | `arroyo_live_state_checkpoint_encoded_page_bytes_total{direction}` | Successfully uploaded/applied immutable checkpoint object bytes, including compressed Parquet; existing metric name retained | Rate gives completed object transfer throughput, excluding manifests, transport overhead and failed-transfer bytes; not live logical state size |
-| `arroyo_worker_execution_memory_bytes{measurement}` | Actual shared pool reserved bytes (`used`), configured memory limit (`limit`) and batch limit (`max_batch`), refreshed on scrape | Cooperative reservations in the latest observed configured pool, not RSS or graph/network breakdown; reservations surviving in a replaced pool are not summed; all three read zero when the observed pool is gone; no admission wait/failure counter |
+| `arroyo_live_state_logical_keys{backend}` / `arroyo_live_state_logical_bytes{backend,part}` | Current live record count and unencoded key/value payload bytes (`part=key,value`), summed across known memory/RocksDB attempts | Includes internal index/metadata records in registered namespaces. Excludes namespace, routing, encoding and allocation overhead. Check `health_observations{measurement="logical"}` before treating the sum as complete |
+| `arroyo_live_state_native_health{measurement}` | Cached `sst_bytes`, `free_bytes`, `write_stopped`, `delayed_write_bytes_per_second`, `sample_age_milliseconds` | Sampled at admitted RocksDB open/write completion. SST is total SST file lengths, excluding WAL/manifests/snapshots; free bytes is the minimum filesystem free space across observed attempts, never summed for shared disks. Stopped databases and delayed-write byte/second rates are summed; sample age is maximum monotonic milliseconds |
+| `arroyo_live_state_health_observations{measurement,outcome}` | Live database counts with `available` / `unavailable` measurements | Memory participates only in logical observations. Unsupported/error properties are unavailable, excluded from aggregate values; a zero aggregate with unavailable observations is not a measured zero. Native sample age makes idle/background-compaction staleness explicit |
+| `arroyo_worker_execution_memory_bytes{measurement}` | Actual shared pool reserved bytes (`used`), limits (`limit`, `max_batch`) and reservation classes (`spillable`, `nonspillable`), refreshed on scrape | Cooperative reservations in the latest configured pool, not RSS. Class means DataFusion consumer spillability; it does not enable disk spill. Concurrent updates can briefly make class sums differ from `used`. All values read zero after the observed pool dies |
+| `arroyo_worker_execution_admission_refusals_total{operation,outcome}` | Cumulative actual pool `try_grow` failures and checked `batch_limit` failures, with `outcome=refused` | No wait queue exists in this execution pool; cancellation is not a refusal. Does not cover untracked allocations or queue-local validation failures that never call the pool |
+| `arroyo_worker_lifecycle_duration_seconds{phase,outcome}` / `arroyo_worker_lifecycle_operations_total{phase,outcome}` | Monotonic stage elapsed seconds and success/error/cancelled counts for protocol/metadata publication, worker initialization and startup/restart readiness | Exact boundaries below; phase labels are finite. Neither publication timing includes the preceding distributed barrier nor readiness the preceding controller/process scheduling |
 | `arroyo_worker_tx_bytes`, `arroyo_worker_tx_queue_size`, `arroyo_worker_tx_queue_rem` | Payload bytes, configured row capacity, and remaining row capacity respectively | Collector-attached graph queues refresh on admission, drain, failed delivery and receiver teardown (including signals); total capacity is the queue row limit and remains constant when empty. These are payload/row gauges, not shared-pool reservation totals |
 | `process_resident_memory_bytes` | Server-common enables Prometheus's process collector feature | Verify actual candidate scrape; harness `wait4`/`/proc` RSS is separate test-process evidence |
 
@@ -129,12 +249,57 @@ These durations cover individual budget acquisitions, not a complete multi-budge
 operation or RocksDB stall. Focused source tests cover these boundaries; they
 have not been executed for STR-48 under the requested lint-only validation.
 
-Remaining STR-26 instrumentation includes exact live logical state size,
-continuous free/local disk usage, explicit I/O stalls, execution admission failures
-and graph/network reservation breakdown, total checkpoint bandwidth/
-publication duration and full worker restart time. Existing counters do not fill
-those gaps by renaming them. Production defaults remain a measured deployment
-sizing deliverable. This doc does not claim the full STR-26 ticket is complete.
+Logical accounting applies only after successful atomic batches: insertion adds
+one record and its full logical key/value lengths, replacement changes value
+length only, deletion subtracts an existing record, and deletion of a missing
+key changes nothing. Repeated operations on one key use the batch's final value.
+Failed batches leave counts unchanged. Fresh worker attempts and checkpoint
+restore through ordinary puts establish exact baselines. Explicit `reopen` of
+an existing local RocksDB directory has an unavailable logical baseline; no
+unbounded startup/scrape scan invents it. If a telemetry-only old-value read
+fails, logical availability becomes unknown without refusing a valid write.
+Closed attempts and snapshots do not contribute live logical counts.
+
+Native sampling calls a fixed number of native properties/statvfs operations
+inside existing admitted blocking work; Prometheus collection only reads cached
+values and weak observations, with no filesystem scans, spawned collection
+tasks or retained database/reservation owners. Unix filesystem availability uses
+`f_bavail * f_frsize`; non-Unix availability is unsupported (the existing disk
+admission contract also requires Unix). `write_stopped` observes RocksDB's
+current stop flag and the delayed rate observes its current slowdown setting;
+neither is cumulative stall time or stall-event count. WAL, manifest, snapshot
+and total directory allocated disk bytes, cumulative stall duration and storage
+device I/O remain explicitly unsupported. Monitor those with host/storage
+telemetry and preserve disk reserve; SST lengths are not total local disk use.
+
+Lifecycle `protocol_publication` surrounds exactly `publish_checkpoint`, including
+its validation/storage publication work; `metadata_publication` surrounds
+`write_checkpoint_metadata` in controller mode. Both start when the future is
+first polled and stop when it returns or is dropped, with error and cancellation
+kept separate. `worker_initialization` covers `initialize_inner` through engine
+construction/phase transition, excluding the subsequent controller notification;
+it does not imply operator restore has completed. `startup_readiness` and
+`restart_readiness` run from worker `initialize` handling to reception of all
+assigned local `TaskStarted` events after operator startup/restore. Restore epoch
+or manifest presence selects restart; duplicate/unknown task events cannot
+finish early. This includes leader waiting, excludes RPC forwarding after the
+last event, and records failure or teardown cancellation exactly once. It is
+local worker readiness, not process boot, controller scheduling, global sink
+readiness or end-to-end outage duration. Namespace export/restore remains the
+separate existing live-state checkpoint metric.
+
+Queue payload/row gauges above and execution reservation classes provide distinct
+queue/reservation views. Queue metadata, retained consumer batches, operator and
+network transfer reservations are included in their actual DataFusion consumer
+classes; per-resource attribution of these reservations is not exposed, and
+subtracting payload gauges from total reservations does not produce such a
+measurement. Transfer byte rates come from successfully transferred checkpoint
+objects and exclude manifest/transport/failed bytes.
+
+Actual candidate `/metrics` scrapes under load, restoration, resource pressure
+and cancellation, and measured production sizing/defaults remain the shared
+[STR-32](https://trakkt.app/issues/STR-32) qualification. Source fixtures and local
+checks establish instrumentation contracts, not production scrape acceptance.
 
 ## Source-free SQL capture artifact
 
@@ -191,7 +356,8 @@ It is therefore separate from a source-free **production top-level binary**
 startup, service/database/broker setup, supported fixed-parallelism plan submission,
 committed checkpoint publication, abrupt worker process loss, pinned-candidate
 restart and source/sink delivery comparison. Those production gates remain open
-on the current native candidate until an actual run records process/run IDs,
+in [STR-32](https://trakkt.app/issues/STR-32) on the current native candidate
+until an actual run records process/run IDs,
 selected restore metadata, source positions, independent outputs and metrics.
 The historical external local-service evidence does not qualify today's native
 paths or supply required application checkouts.
@@ -219,7 +385,8 @@ qualification; this bundle does not inject them.
 
 Rollback means restarting the pinned prior candidate with its proven compatible
 config/plan/checkpoint, preserving independent outputs and source/sink guarantees.
-If the selected plans have different checkpoint schema/ownership,
-rollback needs an application-approved replay path; swapping executables
-or renaming operators is not compatibility evidence. This runbook makes no
+If the pinned candidates have different checkpoint schema/ownership, do not
+restore the new checkpoint into the old executable. Use the prior candidate's
+qualified checkpoint and source/sink replay contract, or stop for a caller-owned
+cutover decision. Swapping executables or renaming operators is not compatibility evidence. This runbook makes no
 production cutover or data-retention change.

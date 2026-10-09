@@ -485,7 +485,11 @@ impl RunningJobModel {
                     created_at: SystemTime::now(),
                 };
 
-                let res = publish_checkpoint(storage.as_ref(), publish_req).await?;
+                let res = crate::lifecycle_metrics::observe(
+                    crate::lifecycle_metrics::Phase::ProtocolPublication,
+                    publish_checkpoint(storage.as_ref(), publish_req),
+                )
+                .await?;
 
                 self.checkpoint_parent_ref = Some(checkpoint_ref);
 
@@ -658,7 +662,11 @@ impl RunningJobModel {
 
                 let metadata = checkpointing.build_metadata();
 
-                StateBackend::write_checkpoint_metadata(&storage_role, metadata).await?;
+                crate::lifecycle_metrics::observe(
+                    crate::lifecycle_metrics::Phase::MetadataPublication,
+                    StateBackend::write_checkpoint_metadata(&storage_role, metadata),
+                )
+                .await?;
 
                 metadata_span.finish();
 

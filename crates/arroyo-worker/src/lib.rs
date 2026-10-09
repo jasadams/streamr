@@ -75,6 +75,7 @@ pub mod arrow;
 
 pub mod engine;
 pub mod job_controller;
+mod lifecycle_metrics;
 mod network_manager;
 pub mod utils;
 
@@ -153,6 +154,7 @@ impl Display for WorkerExecutionPhase {
 struct EngineState {
     // Keep the network task owner alive through both waiting and running phases.
     _running_engine: RunningEngine,
+    readiness: Option<lifecycle_metrics::Readiness>,
     sources: Vec<Sender<ControlMessage>>,
     sinks: Vec<Sender<ControlMessage>>,
     operator_to_node: HashMap<String, u32>,
@@ -219,10 +221,23 @@ pub struct WorkerState {
 impl WorkerState {
     async fn initialize(self, shutdown_guard: ShutdownGuard, req: StartExecutionReq) {
         let worker_context = self.worker_context.clone();
+        let readiness = lifecycle_metrics::Readiness::new(
+            req.tasks
+                .iter()
+                .filter(|task| task.worker_id == worker_context.worker_id.0)
+                .map(|task| (task.task_id, task.subtask_idx)),
+            req.restore_epoch.is_some() || req.checkpoint_manifest_ref.is_some(),
+        );
 
         let phase = self.phase.clone();
 
-        let error_message = if let Err(e) = self.initialize_inner(shutdown_guard, req).await {
+        let error_message = if let Err(e) = lifecycle_metrics::observe(
+            lifecycle_metrics::Phase::WorkerInitialization,
+            self.initialize_inner(shutdown_guard, req, Some(readiness.clone())),
+        )
+        .await
+        {
+            readiness.failed();
             let mut phase_guard = phase.lock().unwrap();
             *phase_guard = WorkerExecutionPhase::Failed {
                 started_at: SystemTime::now(),
@@ -323,6 +338,7 @@ impl WorkerState {
         mut self,
         shutdown_guard: ShutdownGuard,
         req: StartExecutionReq,
+        readiness: Option<lifecycle_metrics::Readiness>,
     ) -> Result<()> {
         let mut registry = new_registry();
         let logical = Arc::new(
@@ -443,6 +459,7 @@ impl WorkerState {
 
         let engine_state = EngineState {
             _running_engine: engine,
+            readiness,
             sources,
             sinks,
             operator_to_node,
@@ -545,6 +562,9 @@ impl WorkerState {
                             )).await.err()
                         }
                         Some(ControlResp::TaskFailed { task_id, subtask_idx, error }) => {
+                            if let WorkerExecutionPhase::Running(state) = &*self.phase.lock().unwrap()
+                                && let Some(readiness) = &state.readiness { readiness.failed(); }
+
                             job_controller.task_failed(Request::new(
                                 TaskFailedReq {
                                     worker_context: Some(self.worker_context.as_proto()),
@@ -579,6 +599,10 @@ impl WorkerState {
                             )).await.err()
                         }
                         Some(ControlResp::TaskStarted {task_id, subtask_idx, start_time}) => {
+                            if let WorkerExecutionPhase::Running(state) = &*self.phase.lock().unwrap()
+                                && let Some(readiness) = &state.readiness {
+                                readiness.task_started((task_id, subtask_idx));
+                            }
                             controller.task_started(Request::new(
                                 TaskStartedReq {
                                     worker_context: Some(self.worker_context.as_proto()),
@@ -1499,6 +1523,7 @@ mod engine_lifetime_tests {
                 operator_to_node: engine.operator_to_node(),
                 operator_controls: engine.operator_controls(),
                 _running_engine: engine,
+                readiness: None,
                 shutdown_guard: shutdown.guard("engine-state"),
             };
             WorkerExecutionPhase::WaitingOnLeader {
@@ -1666,6 +1691,7 @@ mod engine_lifetime_tests {
             operator_to_node: engine.operator_to_node(),
             operator_controls: engine.operator_controls(),
             _running_engine: engine,
+            readiness: None,
             shutdown_guard: worker
                 .shutdown_guard
                 .clone_temporary()

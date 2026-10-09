@@ -50,6 +50,53 @@ against native composition before proposing an additional generic interface.
 Application SQL, schemas and oracles stay in the consuming repository. Proposed
 external SQL is not physical-plan/native-runtime evidence.
 
+## Current native operating boundary
+
+Use the exact configuration and invalid examples in the
+[native operations runbook](native-state-operations.md). Backend selection is
+`worker.sql-state-backend = "memory"` or `"rocksdb"`; configure the corresponding
+native operator block as well as shared live resources. Merely selecting memory
+without those blocks does not qualify every pre-existing execution path as a
+bounded native route.
+
+| Native query shape | Memory and RocksDB contract | Restrictions and remaining qualification |
+| --- | --- | --- |
+| Typed state table, INSERT/MERGE, current-row lookup and RETURNING | One ordered owner; bounded whole-row reads and captured output; `worker.typed-sql-state` | Singleton; independent retained table/output relations; branching competing map owners rejected; three-epoch changed/empty restore is STR-42 |
+| Updating GROUP BY aggregates | Common native accumulator/member state; `worker.aggregate-state`; exact selected scalar/ordered/FILTER/NULL recovery fixtures | Maximum key/value, write/overlay and pending CDC limits apply; bounded SQL top-K and broader collection qualification remain STR-17 |
+| TUMBLE/HOP | Common native partial store; `worker.window-state`; selected full-payload checkpoint/recovery captures | Watermark-driven closure; overlapping HOP windows multiply retained/output work; bounded closure/collections remain STR-19 |
+| SESSION | Common native session store; `worker.window-state`; bounded retained raw rows and selected recovery captures | Singleton; closes only when watermark is strictly beyond last event plus gap; no configured maximum duration; hot/many-key bounded closure remains STR-20 |
+| Join/analytic or other retained operator outside the RocksDB allowlist | Existing memory behavior does not establish bounded configured-backend support | RocksDB graph admission rejects unsupported retained-state operators; general historical joins/rescaling remain outside this qualification |
+
+RocksDB currently requires **all graph nodes** at parallelism one and counts
+execution owners against the worker's `max-open-databases`. State-table and
+SESSION singleton restrictions also apply to memory. Fixed ownership is part of
+the checkpoint contract; constructor acceptance of a subtask index is not a
+rescaling qualification. Worker-wide live budgets and cooperative execution
+memory are separate from each operator's value/output limits. The memory
+adapter additionally enforces `max-resident-bytes`; RocksDB does not use that
+field to cap logical state. Neither resource sum is a process RSS limit.
+
+Changelog sinks must preserve updating-row semantics, including retractions,
+replacement values and typed arrays; an append-only capture alone cannot prove
+that downstream contract. Collection state may grow with member count even on
+disk: whole-value decode/rewrite and output limits still apply. Selected passing
+ARRAY_AGG/DISTINCT/UNNEST fixtures do not qualify arbitrary collection shapes or
+silent truncation.
+
+Event time follows watermarks. EOF in a finite fixture and a stopped live source
+are different observations: complete input silence does not autonomously advance
+event time. Updating aggregate TTL provides retention, not a general wall-clock
+emission service. [STR-29](https://trakkt.app/issues/STR-29) owns the approved
+watermark-driven zero rolling counts for retained lifetime/key rows; pending
+implementation must not be described as ordinary TUMBLE/HOP empty-window output.
+
+[STR-32](https://trakkt.app/issues/STR-32) owns current-candidate combined capacity,
+fault/restart and actual 24-hour qualification, actual production `/metrics`
+captures under load/restart, and measured deployment sizing. Configuration
+examples, prepared regression tests and historical source-specific passes do not
+satisfy those gates. Keep logical payload, physical disk bytes, checkpoint
+transfer bytes and RSS separate when selecting deployment limits.
+
 ## Native route evidence
 
 The [historical native capability audit](milestone-3-native-capabilities.md) maps all

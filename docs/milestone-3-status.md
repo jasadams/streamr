@@ -45,6 +45,34 @@ multi-epoch scenario. Compiler/capacity jobs remain serialized through cargo-dev
   STR-32. No user decision or read-view redesign is required. Next action: finish
   final PR CI and merge review.
 
+## STR-26 integration repair
+
+2026-10-09 worker `health_repair`, start 21:26 UTC, deadline 22:26 UTC.
+PR #16 is being merged with current main `d0d910e3`; preserve native health
+telemetry and current engine ownership/clock contracts. Only documentation
+conflicts required manual resolution; source merged automatically. Local builds,
+tests and Clippy not run: documentation-only repair. Staged whitespace and
+unresolved-conflict checks passed. Acceptance/next action: independent review,
+publish the repair and verify current-head CI. No user decision is pending;
+actual load/restart/sizing qualification remains STR-32.
+
+Prior implementation evidence (not current integration validation):
+
+2026-10-09 worker `str-26-native-health`, started 01:22 UTC, deadline 02:22 UTC:
+implementation complete and staged: logical accounting, weak cached SST/free/
+stall observations, execution refusal/reservation classes, monotonic publication/
+initialization/local readiness timings, and operating/support docs. Current-source
+repaired-Bookworm/shared-target gates passed: narrowed state/worker check,
+state health tests 2/2, worker execution/lifecycle metrics tests 7/7, required
+all-feature/all-target preflight Clippy, and workspace formatting. Independent
+source review found no issues; exact next action is final reviewed receipt and PR
+delivery. Evidence: `/home/jason/qa-evidence/streamr-str26-20261009/` (base SHA,
+staged patch/hash, image ID, commands, exit statuses and logs). Actual load/restart
+scrapes and production sizing remain STR-32; total allocated directory bytes,
+cumulative stall duration, per-resource reservation attribution and end-to-end
+outage time are explicitly unsupported. No SQL, admission or checkpoint semantics
+change; no user decision or local verification blocker remains.
+
 ## Decisions and final acceptance
 
 STR-17 continuation: Codex `/root` and `/root/implement` started 2026-10-09
