@@ -36,17 +36,18 @@ fn scalar_schema_compatible(physical: &Schema, declared: &Schema) -> bool {
             .iter()
             .zip(declared.fields())
             .all(|(actual, expected)| {
+                // Context-bound clock provenance is a logical dependency. The
+                // physical expression codec does not retain alias annotations.
+                // Keep every other field attribute under the existing contract.
+                let actual = arroyo_rpc::without_event_clock_provenance(actual);
+                let expected = arroyo_rpc::without_event_clock_provenance(expected);
                 if actual.is_nullable() == expected.is_nullable() {
                     return actual == expected;
                 }
                 if actual.is_nullable() {
                     return false;
                 }
-                let normalized = actual
-                    .as_ref()
-                    .clone()
-                    .with_nullable(expected.is_nullable());
-                normalized == **expected
+                actual.with_nullable(expected.is_nullable()) == expected
             })
 }
 
@@ -1106,6 +1107,24 @@ pub(crate) fn rebuild(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn scalar_schema_clock_provenance_is_logical_only() {
+        let plain = Schema::new(vec![Field::new("clock", DataType::Date32, false)]);
+        let annotated = Schema::new(vec![plain.field(0).clone().with_metadata(HashMap::from([
+            (
+                crate::rewriters::EVENT_CLOCK_PROVENANCE.into(),
+                "trigger".into(),
+            ),
+        ]))]);
+        assert!(scalar_schema_compatible(&plain, &annotated));
+        assert!(scalar_schema_compatible(&annotated, &plain));
+        let other =
+            Schema::new(vec![annotated.field(0).clone().with_metadata(
+                HashMap::from([("origin".into(), "different".into())]),
+            )]);
+        assert!(!scalar_schema_compatible(&plain, &other));
+    }
+
     #[test]
     fn scalar_schema_allows_only_outer_nullability_widening() {
         let child = Arc::new(Field::new("field", DataType::Utf8, true));

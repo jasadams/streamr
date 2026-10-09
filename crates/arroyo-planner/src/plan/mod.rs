@@ -27,8 +27,11 @@ use crate::{
         join::JOIN_NODE_NAME,
     },
     fields_with_qualifiers, find_window,
-    rewriters::RowTimeRewriter,
     rewriters::SourceRewriter,
+    rewriters::{
+        EVENT_CLOCK_PROVENANCE, EventClockRewriter, RowTimeRewriter, depends_on_event_clock,
+        event_timestamp_index,
+    },
     schema_from_df_fields_with_metadata,
     schemas::{add_timestamp_field, has_timestamp_field},
 };
@@ -336,6 +339,39 @@ impl TreeNodeRewriter for ArroyoRewriter<'_> {
     fn f_up(&mut self, mut node: Self::Node) -> Result<Transformed<Self::Node>> {
         match node {
             LogicalPlan::Projection(ref mut projection) => {
+                let clock_outputs = projection
+                    .expr
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, expression)| {
+                        depends_on_event_clock(expression, projection.input.schema())
+                            .then_some(index)
+                    })
+                    .collect::<Vec<_>>();
+                if !clock_outputs.is_empty() {
+                    let mut output_fields = fields_with_qualifiers(&projection.schema);
+                    for index in clock_outputs {
+                        let mut metadata = output_fields[index].metadata().clone();
+                        metadata.insert(EVENT_CLOCK_PROVENANCE.to_string(), "trigger".to_string());
+                        output_fields[index] = output_fields[index].clone().with_metadata(metadata);
+                    }
+                    projection.schema = Arc::new(schema_from_df_fields_with_metadata(
+                        &output_fields,
+                        projection.schema.metadata().clone(),
+                    )?);
+                }
+                projection.expr = projection
+                    .expr
+                    .iter()
+                    .map(|expr| {
+                        Ok(expr
+                            .clone()
+                            .rewrite(&mut EventClockRewriter {
+                                input: &projection.input,
+                            })?
+                            .data)
+                    })
+                    .collect::<Result<Vec<_>>>()?;
                 if projection.input.exists(|plan| {
                     Ok(matches!(plan, LogicalPlan::Extension(extension)
                         if extension.node.as_any().is::<crate::extension::state_table::StateTableScan>()))
@@ -344,29 +380,7 @@ impl TreeNodeRewriter for ArroyoRewriter<'_> {
                         "state-table scans require an input-event keyed INNER or LEFT JOIN; standalone target scans are unsupported"
                     );
                 }
-                let direct_event_index =
-                    if let LogicalPlan::Extension(extension) = projection.input.as_ref() {
-                        extension
-                            .node
-                            .as_any()
-                            .downcast_ref::<crate::extension::state_table::StateTableAccess>()
-                            .and_then(|access| access.event_timestamp_index)
-                    } else {
-                        None
-                    };
-                let event_index = direct_event_index.or_else(|| {
-                    let timestamps = projection
-                        .input
-                        .schema()
-                        .fields()
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(index, field)| {
-                            (field.name() == TIMESTAMP_FIELD).then_some(index)
-                        })
-                        .collect::<Vec<_>>();
-                    (timestamps.len() == 1).then(|| timestamps[0])
-                });
+                let event_index = event_timestamp_index(&projection.input);
                 let retained_timestamp_in_lineage = projection.input.exists(|plan| {
                     Ok(matches!(plan, LogicalPlan::Extension(extension)
                         if extension.node.as_any().downcast_ref::<crate::extension::state_table::StateTableAccess>()
@@ -461,6 +475,16 @@ impl TreeNodeRewriter for ArroyoRewriter<'_> {
                 return AsyncUdfRewriter::new(self.schema_provider).f_up(result.data);
             }
             LogicalPlan::Aggregate(aggregate) => {
+                if aggregate
+                    .aggr_expr
+                    .iter()
+                    .chain(&aggregate.group_expr)
+                    .any(|expression| depends_on_event_clock(expression, aggregate.input.schema()))
+                {
+                    return plan_err!(
+                        "WATERMARK_TIMESTAMP()/WATERMARK_DATE() requires current-trigger clock metadata for maintained aggregates (STR-62); retained contribution time is a distinct input"
+                    );
+                }
                 return AggregateRewriter {
                     schema_provider: self.schema_provider,
                 }
@@ -481,7 +505,11 @@ impl TreeNodeRewriter for ArroyoRewriter<'_> {
                 }
                 .f_up(LogicalPlan::TableScan(table_scan));
             }
-            LogicalPlan::Filter(f) => {
+            LogicalPlan::Filter(mut f) => {
+                f.predicate = f
+                    .predicate
+                    .rewrite(&mut EventClockRewriter { input: &f.input })?
+                    .data;
                 // Reject state functions used outside SELECT projections
                 if contains_state_function(&f.predicate) {
                     return plan_err!(

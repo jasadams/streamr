@@ -1921,6 +1921,7 @@ async fn external_sql_checkpoint_capture_inner() {
     }
     let (control_tx, mut control_rx) = channel(128);
     let program = local_program(&job_id, &logical.graph, &udfs, None, control_tx).await;
+    crate::event_clock_probe::install(&program, &output_path, "initial");
     let initial_engine = Engine::for_local(program, "pipe-test".into(), job_id.clone())
         .await
         .unwrap();
@@ -1998,6 +1999,7 @@ async fn external_sql_checkpoint_capture_inner() {
     }
     let (control_tx, mut control_rx) = channel(128);
     let program = local_program(&job_id, &logical.graph, &udfs, None, control_tx).await;
+    crate::event_clock_probe::install(&program, &output_path, "checkpoint");
     let running = Engine::for_local(program, "pipe-test".into(), job_id.clone())
         .await
         .unwrap()
@@ -2111,6 +2113,7 @@ async fn external_sql_checkpoint_capture_inner() {
         control_tx,
     )
     .await;
+    crate::event_clock_probe::install(&program, &output_path, "recovered");
     let restored = Engine::for_local(program, "pipe-test".into(), job_id.clone())
         .await
         .unwrap()
@@ -2516,6 +2519,11 @@ fn configure_test_worker() {
     config::update(|c| {
         // reduce the batch size to increase consistency
         c.pipeline.source_batch_size = 32;
+        if env::var("STREAMR_CAPTURE_EVENT_CLOCK_PROBE").as_deref() == Ok("1") {
+            // Keep focused clock fixture batches deterministic across backend startup.
+            // Existing source barriers and EOF still flush partial batches.
+            c.pipeline.source_batch_linger = Duration::from_secs(3600).into();
+        }
         if let Ok(seconds) = std::env::var("STREAMR_TEST_AGGREGATE_FLUSH_SECONDS") {
             let seconds: u64 = seconds.parse().expect("invalid aggregate flush interval");
             assert!(seconds > 0, "aggregate flush interval must be positive");

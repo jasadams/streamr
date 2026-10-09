@@ -277,6 +277,8 @@ mod tests {
                 epoch: 0,
                 min_watermark: None,
                 max_watermark: None,
+                min_watermark_negative_nanos: None,
+                max_watermark_negative_nanos: None,
                 parallelism: 1,
             }),
             start_time: 0,

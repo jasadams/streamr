@@ -1581,5 +1581,22 @@ mod test {
             .expect("timed out");
 
         assert_eq!(result, message);
+
+        // Exercise the actual outbound encoder and inbound signal decoder,
+        // including progress before the epoch and a partition becoming idle.
+        for watermark in [
+            arroyo_types::Watermark::EventTime(SystemTime::UNIX_EPOCH - Duration::from_secs(2)),
+            arroyo_types::Watermark::EventTime(SystemTime::UNIX_EPOCH - Duration::from_nanos(1)),
+            arroyo_types::Watermark::Idle,
+            arroyo_types::Watermark::EventTime(SystemTime::UNIX_EPOCH + Duration::from_secs(2)),
+        ] {
+            let message = ArrowMessage::Signal(SignalMessage::Watermark(watermark));
+            client_tx.send(message.clone()).await.unwrap();
+            let received = timeout(Duration::from_secs(1), server_rx.recv())
+                .await
+                .unwrap()
+                .expect("network signal channel closed");
+            assert_eq!(received, message);
+        }
     }
 }
