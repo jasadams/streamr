@@ -11,7 +11,7 @@ use rocksdb::checkpoint::Checkpoint;
 use rocksdb::{BlockBasedIndexType, BlockBasedOptions, DB, DBRecoveryMode, Options, WriteOptions};
 use std::path::PathBuf;
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicBool, Ordering},
 };
 use tokio::sync::oneshot;
@@ -110,10 +110,15 @@ impl RocksLiveState {
                         return Err(error);
                     }
                 };
+                let health = health::BackendHealth::new("rocksdb", !reopen);
+                health.sample_native(&db, &path);
+                task_resources.observe_health(&health);
                 let (finished, completion) = oneshot::channel();
                 Ok(Self {
                     db: Arc::new(NativeDb {
                         db: Some(db),
+                        write_lock: Mutex::new(()),
+                        health: Some(health),
                         path: path.clone(),
                         remove: AtomicBool::new(false),
                         permit: Some(database_permit),
@@ -164,19 +169,77 @@ impl RocksLiveState {
                 resources
                     .ensure_disk_space(&path, bytes as u64)
                     .map_err(LiveStateError::from)?;
-                let mut native = rocksdb::WriteBatch::default();
+                // Serialize touched-key observations with the native commit. The
+                // map contains only the final operation per admitted key, so
+                // repeated puts/deletes within one atomic batch count once.
+                let _write = db.write_lock.lock().map_err(backend)?;
+                let mut final_values = std::collections::BTreeMap::new();
                 for operation in batch.operations {
                     match operation {
                         WriteOperation::Put { key, value } => {
-                            native.put(encode_key(&key)?, encode_value(&value))
+                            final_values.insert(
+                                encode_key(&key)?,
+                                (key.key.len(), Some(encode_value(&value))),
+                            );
                         }
-                        WriteOperation::Delete { key } => native.delete(encode_key(&key)?),
+                        WriteOperation::Delete { key } => {
+                            final_values.insert(encode_key(&key)?, (key.key.len(), None));
+                        }
+                    }
+                }
+                let mut logical = db
+                    .health
+                    .as_ref()
+                    .and_then(|health| *health.logical.lock().unwrap_or_else(|e| e.into_inner()));
+                let mut native = rocksdb::WriteBatch::default();
+                for (key, (key_bytes, value)) in final_values {
+                    if logical.is_some() {
+                        // Pinned access avoids copying an old value merely to
+                        // measure it. Telemetry read failures make the baseline
+                        // unavailable; they never veto an otherwise valid write.
+                        match db.get_pinned(&key) {
+                            Ok(old) => {
+                                let size = logical.as_mut().expect("known logical baseline");
+                                if let Some(old) = old {
+                                    if let Some(old_bytes) = old.len().checked_sub(1) {
+                                        size.keys -= 1;
+                                        size.key_bytes -= key_bytes as u64;
+                                        size.value_bytes -= old_bytes as u64;
+                                    } else {
+                                        logical = None;
+                                    }
+                                }
+                                if let Some(size) = &mut logical
+                                    && let Some(value) = &value
+                                {
+                                    size.keys += 1;
+                                    size.key_bytes += key_bytes as u64;
+                                    size.value_bytes += (value.len() - 1) as u64;
+                                }
+                            }
+                            Err(error) => {
+                                tracing::warn!(%error, "logical state measurement unavailable");
+                                logical = None;
+                            }
+                        }
+                    }
+                    if let Some(value) = value {
+                        native.put(key, value);
+                    } else {
+                        native.delete(key);
                     }
                 }
                 let mut options = WriteOptions::default();
                 options.disable_wal(false);
                 options.set_sync(sync_writes);
-                db.write_opt(native, &options).map_err(backend)
+                let result = db.write_opt(native, &options).map_err(backend);
+                if let Some(health) = &db.health {
+                    if result.is_ok() {
+                        *health.logical.lock().unwrap_or_else(|e| e.into_inner()) = logical;
+                    }
+                    health.sample_native(&db, &path);
+                }
+                result
             })
             .await
             .map_err(LiveStateError::from)?
@@ -393,6 +456,8 @@ impl LiveStateBackend for RocksLiveState {
                 Ok(StateSnapshot(Arc::new(RocksSnapshot {
                     db: Arc::new(NativeDb {
                         db: Some(snapshot_db),
+                        write_lock: Mutex::new(()),
+                        health: None,
                         path,
                         remove: AtomicBool::new(true),
                         permit: Some(permit),
@@ -423,6 +488,8 @@ impl std::ops::Deref for DbHandle {
 }
 struct NativeDb {
     db: Option<DB>,
+    write_lock: Mutex<()>,
+    health: Option<Arc<health::BackendHealth>>,
     path: PathBuf,
     remove: AtomicBool,
     permit: Option<ResourcePermit>,
@@ -678,6 +745,212 @@ mod tests {
         })
         .unwrap()
     }
+    fn health_value(registry: &prometheus::Registry, name: &str, labels: &[(&str, &str)]) -> f64 {
+        registry
+            .gather()
+            .iter()
+            .find(|family| family.name() == name)
+            .unwrap()
+            .get_metric()
+            .iter()
+            .find(|metric| {
+                labels.iter().all(|(name, value)| {
+                    metric
+                        .get_label()
+                        .iter()
+                        .any(|label| label.name() == *name && label.value() == *value)
+                })
+            })
+            .unwrap()
+            .get_gauge()
+            .as_ref()
+            .unwrap()
+            .value()
+    }
+
+    async fn exercise_logical_accounting(
+        state: &dyn LiveStateBackend,
+        registry: &prometheus::Registry,
+        backend: &str,
+    ) {
+        let assert_size = |keys, key_bytes, value_bytes| {
+            assert_eq!(
+                health_value(
+                    registry,
+                    "arroyo_live_state_logical_keys",
+                    &[("backend", backend)]
+                ),
+                keys
+            );
+            for (part, expected) in [("key", key_bytes), ("value", value_bytes)] {
+                assert_eq!(
+                    health_value(
+                        registry,
+                        "arroyo_live_state_logical_bytes",
+                        &[("backend", backend), ("part", part)]
+                    ),
+                    expected
+                );
+            }
+        };
+        let key_bytes = key().key.len() as f64;
+        assert_size(0.0, 0.0, 0.0);
+        state.put(key(), vec![1; 7], 1024).await.unwrap();
+        assert_size(1.0, key_bytes, 7.0);
+        state.put(key(), vec![2; 3], 1024).await.unwrap();
+        assert_size(1.0, key_bytes, 3.0);
+        state
+            .write_batch(WriteBatch {
+                operations: vec![
+                    WriteOperation::Put {
+                        key: key(),
+                        value: vec![3; 11],
+                    },
+                    WriteOperation::Delete { key: key() },
+                    WriteOperation::Put {
+                        key: key(),
+                        value: vec![4; 5],
+                    },
+                ],
+                max_bytes: 1024,
+            })
+            .await
+            .unwrap();
+        assert_size(1.0, key_bytes, 5.0);
+        assert!(
+            state
+                .write_batch(WriteBatch {
+                    operations: vec![WriteOperation::Put {
+                        key: key(),
+                        value: vec![5; 8]
+                    }],
+                    max_bytes: 1
+                })
+                .await
+                .is_err()
+        );
+        assert_size(1.0, key_bytes, 5.0);
+        state
+            .write_batch(WriteBatch {
+                operations: vec![
+                    WriteOperation::Delete { key: key() },
+                    WriteOperation::Delete { key: key() },
+                ],
+                max_bytes: 1024,
+            })
+            .await
+            .unwrap();
+        assert_size(0.0, 0.0, 0.0);
+        state
+            .write_batch(WriteBatch {
+                operations: vec![WriteOperation::Delete { key: key() }],
+                max_bytes: 1024,
+            })
+            .await
+            .unwrap();
+        assert_size(0.0, 0.0, 0.0);
+    }
+
+    #[tokio::test]
+    async fn health_accounting_matches_atomic_memory_and_rocks_batches() {
+        for backend in ["memory", "rocksdb"] {
+            let resources = resources();
+            let registry = prometheus::Registry::new();
+            resources.register_metrics(&registry).unwrap();
+            if backend == "memory" {
+                let state = memory::MemoryLiveState::bounded(resources, 1024).unwrap();
+                exercise_logical_accounting(&state, &registry, backend).await;
+                state.put(key(), vec![1; 4], 1024).await.unwrap();
+                drop(state);
+            } else {
+                let config = config();
+                let state = RocksLiveState::open(config.clone(), resources.clone())
+                    .await
+                    .unwrap();
+                exercise_logical_accounting(&state, &registry, backend).await;
+                state.put(key(), vec![1; 4], 1024).await.unwrap();
+                // WAL-backed logical payloads are independent of SST files.
+                assert_eq!(
+                    health_value(
+                        &registry,
+                        "arroyo_live_state_health_observations",
+                        &[("measurement", "sst_bytes"), ("outcome", "available")],
+                    ),
+                    1.0
+                );
+                assert_eq!(
+                    health_value(
+                        &registry,
+                        "arroyo_live_state_native_health",
+                        &[("measurement", "sst_bytes")]
+                    ),
+                    0.0
+                );
+                assert!(
+                    health_value(
+                        &registry,
+                        "arroyo_live_state_native_health",
+                        &[("measurement", "free_bytes")]
+                    ) > 0.0
+                );
+                let weak = Arc::downgrade(state.db.health.as_ref().unwrap());
+                let snapshot = state.snapshot().await.unwrap();
+                assert_eq!(
+                    health_value(
+                        &registry,
+                        "arroyo_live_state_logical_keys",
+                        &[("backend", backend)]
+                    ),
+                    1.0
+                );
+                drop(snapshot);
+                state.close().await.unwrap();
+                assert!(weak.upgrade().is_none());
+                // Reopen deliberately does not invent a baseline by scanning
+                // an arbitrarily large existing database during collection.
+                let state = RocksLiveState::reopen(config.clone(), resources.clone())
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    health_value(
+                        &registry,
+                        "arroyo_live_state_health_observations",
+                        &[("measurement", "logical"), ("outcome", "unavailable")]
+                    ),
+                    1.0
+                );
+                state.put(key(), vec![2; 2], 1024).await.unwrap();
+                assert_eq!(
+                    health_value(
+                        &registry,
+                        "arroyo_live_state_health_observations",
+                        &[("measurement", "logical"), ("outcome", "unavailable")]
+                    ),
+                    1.0
+                );
+                state.close_and_remove().await.unwrap();
+                drain_cleanup(&resources).await;
+                std::fs::remove_dir_all(config.root).unwrap();
+            }
+            assert_eq!(
+                health_value(
+                    &registry,
+                    "arroyo_live_state_logical_keys",
+                    &[("backend", backend)]
+                ),
+                0.0
+            );
+            assert_eq!(
+                health_value(
+                    &registry,
+                    "arroyo_live_state_health_observations",
+                    &[("measurement", "logical"), ("outcome", "available")]
+                ),
+                0.0
+            );
+        }
+    }
+
     async fn drain_cleanup(resources: &WorkerStateResources) {
         let (tx, rx) = oneshot::channel();
         resources.cleanup().await.unwrap().submit(move || {

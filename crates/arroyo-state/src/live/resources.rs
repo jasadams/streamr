@@ -342,6 +342,7 @@ struct Inner {
     databases: Budget,
     cleanup: CleanupExecutor,
     metrics: IntGaugeVec,
+    health: super::health::HealthMetrics,
     admission: AdmissionMetrics,
     operation_latency: HistogramVec,
     checkpoint_duration: HistogramVec,
@@ -576,6 +577,8 @@ impl WorkerStateResources {
             snapshots: Budget::new("snapshots", config.max_snapshots, &metrics, &admission),
             databases: Budget::new("databases", config.max_open_databases, &metrics, &admission),
             cleanup: CleanupExecutor::new(cleanup_capacity, &metrics, &admission)?,
+            health: super::health::HealthMetrics::new()
+                .map_err(|e| ResourceError::InvalidConfig(e.to_string()))?,
             config,
             cache,
             manager,
@@ -587,6 +590,10 @@ impl WorkerStateResources {
             checkpoint_encoded_page_bytes,
         })))
     }
+    pub(crate) fn observe_health(&self, health: &Arc<super::health::BackendHealth>) {
+        self.0.health.observe(health);
+    }
+
     pub fn same_pool(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
     }
@@ -721,6 +728,7 @@ impl WorkerStateResources {
 impl prometheus::core::Collector for WorkerStateResources {
     fn desc(&self) -> Vec<&prometheus::core::Desc> {
         let mut descriptions = prometheus::core::Collector::desc(&self.0.metrics);
+        descriptions.extend(prometheus::core::Collector::desc(&self.0.health));
         descriptions.extend(prometheus::core::Collector::desc(
             &self.0.admission.refusals,
         ));
@@ -742,6 +750,7 @@ impl prometheus::core::Collector for WorkerStateResources {
     fn collect(&self) -> Vec<prometheus::proto::MetricFamily> {
         self.refresh_native_metrics();
         let mut families = prometheus::core::Collector::collect(&self.0.metrics);
+        families.extend(prometheus::core::Collector::collect(&self.0.health));
         families.extend(prometheus::core::Collector::collect(
             &self.0.admission.refusals,
         ));
@@ -777,7 +786,7 @@ fn check_disk_reserve(available: u64, additional: u64, reserve: u64) -> Result<(
     clippy::unnecessary_cast,
     reason = "statvfs field widths vary across Unix targets"
 )]
-fn available_disk_bytes(path: &Path) -> std::io::Result<u64> {
+pub(crate) fn available_disk_bytes(path: &Path) -> std::io::Result<u64> {
     use std::os::unix::ffi::OsStrExt;
     let path = CString::new(path.as_os_str().as_bytes()).map_err(|_| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "disk path contains NUL")
@@ -792,7 +801,7 @@ fn available_disk_bytes(path: &Path) -> std::io::Result<u64> {
     Ok((stat.f_bavail as u64).saturating_mul(stat.f_frsize as u64))
 }
 #[cfg(not(unix))]
-fn available_disk_bytes(_path: &Path) -> std::io::Result<u64> {
+pub(crate) fn available_disk_bytes(_path: &Path) -> std::io::Result<u64> {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
         "live-state disk accounting requires Unix",

@@ -26,6 +26,23 @@ files; only then set In Progress. Coordinate shared sections before editing.
 STR-17 owns aggregate capture assertions in smoke_tests.rs; STR-42 owns the
 multi-epoch scenario. Compiler/capacity jobs remain serialized through cargo-dev.
 
+## STR-26 current increment
+
+2026-10-09 worker `str-26-native-health`, started 01:22 UTC, deadline 02:22 UTC:
+implementation complete and staged: logical accounting, weak cached SST/free/
+stall observations, execution refusal/reservation classes, monotonic publication/
+initialization/local readiness timings, and operating/support docs. Current-source
+repaired-Bookworm/shared-target gates passed: narrowed state/worker check,
+state health tests 2/2, worker execution/lifecycle metrics tests 7/7, required
+all-feature/all-target preflight Clippy, and workspace formatting. Independent
+source review found no issues; exact next action is final reviewed receipt and PR
+delivery. Evidence: `/home/jason/qa-evidence/streamr-str26-20261009/` (base SHA,
+staged patch/hash, image ID, commands, exit statuses and logs). Actual load/restart
+scrapes and production sizing remain STR-32; total allocated directory bytes,
+cumulative stall duration, per-resource reservation attribution and end-to-end
+outage time are explicitly unsupported. No SQL, admission or checkpoint semantics
+change; no user decision or local verification blocker remains.
+
 ## Decisions and final acceptance
 
 - STR-29's contract was approved on 2026-10-09: watermark expiry emits zero

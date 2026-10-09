@@ -5,13 +5,97 @@ use arroyo_rpc::config::ExecutionResourceConfig;
 use datafusion::execution::TaskContext;
 use datafusion::execution::context::SessionContext;
 use datafusion::execution::disk_manager::{DiskManagerBuilder, DiskManagerMode};
-use datafusion::execution::memory_pool::{FairSpillPool, MemoryPool};
+use datafusion::execution::memory_pool::{
+    FairSpillPool, MemoryConsumer, MemoryLimit, MemoryPool, MemoryReservation,
+};
 use datafusion::execution::runtime_env::{RuntimeEnv, RuntimeEnvBuilder};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 pub(crate) struct ExecutionResources {
     pub runtime: Arc<RuntimeEnv>,
     pub limits: ExecutionResourceConfig,
+    pool: Arc<InstrumentedPool>,
+}
+
+/// Delegation preserves FairSpillPool admission and consumer fairness. These
+/// counters cover cooperative reservations, not allocator or process memory.
+#[derive(Debug)]
+struct InstrumentedPool {
+    inner: FairSpillPool,
+    spillable: AtomicUsize,
+    nonspillable: AtomicUsize,
+}
+
+fn execution_refusals() -> &'static prometheus::IntCounterVec {
+    static REFUSALS: OnceLock<prometheus::IntCounterVec> = OnceLock::new();
+    REFUSALS.get_or_init(|| {
+        let counters = prometheus::IntCounterVec::new(
+            prometheus::Opts::new(
+                "arroyo_worker_execution_admission_refusals_total",
+                "Cooperative execution admission refusals, excluding untracked allocations",
+            ),
+            &["operation", "outcome"],
+        )
+        .expect("static execution refusal descriptor");
+        for operation in ["try_grow", "batch_limit"] {
+            counters.with_label_values(&[operation, "refused"]);
+        }
+        counters
+    })
+}
+
+impl InstrumentedPool {
+    fn bytes(&self, reservation: &MemoryReservation) -> &AtomicUsize {
+        if reservation.consumer().can_spill() {
+            &self.spillable
+        } else {
+            &self.nonspillable
+        }
+    }
+}
+
+impl MemoryPool for InstrumentedPool {
+    fn register(&self, consumer: &MemoryConsumer) {
+        self.inner.register(consumer);
+    }
+    fn unregister(&self, consumer: &MemoryConsumer) {
+        self.inner.unregister(consumer);
+    }
+    fn grow(&self, reservation: &MemoryReservation, additional: usize) {
+        self.inner.grow(reservation, additional);
+        self.bytes(reservation)
+            .fetch_add(additional, Ordering::Relaxed);
+    }
+    fn shrink(&self, reservation: &MemoryReservation, shrink: usize) {
+        self.inner.shrink(reservation, shrink);
+        self.bytes(reservation).fetch_sub(shrink, Ordering::Relaxed);
+    }
+    fn try_grow(
+        &self,
+        reservation: &MemoryReservation,
+        additional: usize,
+    ) -> datafusion::common::Result<()> {
+        match self.inner.try_grow(reservation, additional) {
+            Ok(()) => {
+                self.bytes(reservation)
+                    .fetch_add(additional, Ordering::Relaxed);
+                Ok(())
+            }
+            Err(error) => {
+                execution_refusals()
+                    .with_label_values(&["try_grow", "refused"])
+                    .inc();
+                Err(error)
+            }
+        }
+    }
+    fn reserved(&self) -> usize {
+        self.inner.reserved()
+    }
+    fn memory_limit(&self) -> MemoryLimit {
+        self.inner.memory_limit()
+    }
 }
 
 #[cfg(test)]
@@ -44,6 +128,9 @@ impl ExecutionResources {
     ) -> datafusion::common::Result<()> {
         let bytes = batch.get_array_memory_size();
         if bytes > self.limits.max_batch_bytes {
+            execution_refusals()
+                .with_label_values(&["batch_limit", "refused"])
+                .inc();
             return Err(datafusion::common::DataFusionError::ResourcesExhausted(
                 format!(
                     "{name} batch requires {bytes} bytes; max-batch-bytes is {}",
@@ -67,13 +154,22 @@ impl ExecutionResources {
 
     pub fn new(limits: ExecutionResourceConfig) -> anyhow::Result<Self> {
         limits.validate()?;
+        let pool = Arc::new(InstrumentedPool {
+            inner: FairSpillPool::new(limits.memory_bytes),
+            spillable: AtomicUsize::new(0),
+            nonspillable: AtomicUsize::new(0),
+        });
         let runtime = RuntimeEnvBuilder::new()
-            .with_memory_pool(Arc::new(FairSpillPool::new(limits.memory_bytes)))
+            .with_memory_pool(pool.clone())
             .with_disk_manager_builder(
                 DiskManagerBuilder::default().with_mode(DiskManagerMode::Disabled),
             )
             .build_arc()?;
-        Ok(Self { runtime, limits })
+        Ok(Self {
+            runtime,
+            limits,
+            pool,
+        })
     }
 
     pub fn task_context(&self) -> Arc<TaskContext> {
@@ -90,7 +186,7 @@ struct ExecutionPoolMetrics {
 }
 
 struct ObservedExecutionPool {
-    pool: Weak<dyn MemoryPool>,
+    pool: Weak<InstrumentedPool>,
     limits: ExecutionResourceConfig,
 }
 
@@ -103,7 +199,7 @@ impl ExecutionPoolMetrics {
             ),
             &["measurement"],
         )?;
-        for measurement in ["used", "limit", "max_batch"] {
+        for measurement in ["used", "limit", "max_batch", "spillable", "nonspillable"] {
             bytes.with_label_values(&[measurement]);
         }
         let metrics = Self {
@@ -120,7 +216,7 @@ impl ExecutionPoolMetrics {
             .lock()
             .map_err(|_| anyhow::anyhow!("execution metrics observation mutex poisoned"))?;
         *observed = Some(ObservedExecutionPool {
-            pool: Arc::downgrade(&resources.runtime.memory_pool),
+            pool: Arc::downgrade(&resources.pool),
             limits: resources.limits.clone(),
         });
         Ok(())
@@ -129,14 +225,16 @@ impl ExecutionPoolMetrics {
 
 impl prometheus::core::Collector for ExecutionPoolMetrics {
     fn desc(&self) -> Vec<&prometheus::core::Desc> {
-        prometheus::core::Collector::desc(&self.bytes)
+        let mut desc = prometheus::core::Collector::desc(&self.bytes);
+        desc.extend(prometheus::core::Collector::desc(execution_refusals()));
+        desc
     }
 
     fn collect(&self) -> Vec<prometheus::proto::MetricFamily> {
         // Serialize refresh and collection so concurrent scrapes cannot mix
         // measurements from different observed runtimes. No work is awaited.
         let observed = self.observed.lock().unwrap_or_else(|e| e.into_inner());
-        let (used, limit, max_batch) = observed
+        let (used, limit, max_batch, spillable, nonspillable) = observed
             .as_ref()
             .and_then(|observed| {
                 observed.pool.upgrade().map(|pool| {
@@ -144,16 +242,26 @@ impl prometheus::core::Collector for ExecutionPoolMetrics {
                         pool.reserved(),
                         observed.limits.memory_bytes,
                         observed.limits.max_batch_bytes,
+                        pool.spillable.load(Ordering::Relaxed),
+                        pool.nonspillable.load(Ordering::Relaxed),
                     )
                 })
             })
-            .unwrap_or((0, 0, 0));
-        for (measurement, value) in [("used", used), ("limit", limit), ("max_batch", max_batch)] {
+            .unwrap_or((0, 0, 0, 0, 0));
+        for (measurement, value) in [
+            ("used", used),
+            ("limit", limit),
+            ("max_batch", max_batch),
+            ("spillable", spillable),
+            ("nonspillable", nonspillable),
+        ] {
             self.bytes
                 .with_label_values(&[measurement])
                 .set(value.min(i64::MAX as usize) as i64);
         }
-        prometheus::core::Collector::collect(&self.bytes)
+        let mut families = prometheus::core::Collector::collect(&self.bytes);
+        families.extend(prometheus::core::Collector::collect(execution_refusals()));
+        families
     }
 }
 
@@ -179,7 +287,11 @@ pub(crate) fn configured_execution_resources() -> anyhow::Result<Option<Arc<Exec
         .worker
         .execution_resources
         .clone();
-    type CurrentRuntime = Option<(ExecutionResourceConfig, Weak<RuntimeEnv>)>;
+    type CurrentRuntime = Option<(
+        ExecutionResourceConfig,
+        Weak<RuntimeEnv>,
+        Weak<InstrumentedPool>,
+    )>;
     static RESOURCES: OnceLock<Mutex<CurrentRuntime>> = OnceLock::new();
     let mut current = RESOURCES
         .get_or_init(|| Mutex::new(None))
@@ -189,13 +301,13 @@ pub(crate) fn configured_execution_resources() -> anyhow::Result<Option<Arc<Exec
         anyhow::ensure!(
             current
                 .as_ref()
-                .and_then(|(_, runtime)| runtime.upgrade())
+                .and_then(|(_, runtime, _)| runtime.upgrade())
                 .is_none(),
             "worker execution budgets disabled while operators are active"
         );
         return Ok(None);
     };
-    if let Some((previous, runtime)) = &*current
+    if let Some((previous, runtime, pool)) = &*current
         && let Some(runtime) = runtime.upgrade()
     {
         anyhow::ensure!(
@@ -204,12 +316,19 @@ pub(crate) fn configured_execution_resources() -> anyhow::Result<Option<Arc<Exec
         );
         return Ok(Some(Arc::new(ExecutionResources {
             runtime,
+            pool: pool
+                .upgrade()
+                .expect("live runtime retains its memory pool"),
             limits: limits.clone(),
         })));
     }
     let resources = Arc::new(ExecutionResources::new(limits.clone())?);
     observe_configured_execution_pool(&resources)?;
-    *current = Some((limits.clone(), Arc::downgrade(&resources.runtime)));
+    *current = Some((
+        limits.clone(),
+        Arc::downgrade(&resources.runtime),
+        Arc::downgrade(&resources.pool),
+    ));
     Ok(Some(resources))
 }
 
@@ -260,7 +379,11 @@ mod metrics_tests {
     use std::collections::BTreeMap;
 
     fn measurements(registry: &prometheus::Registry) -> BTreeMap<String, u64> {
-        let families = registry.gather();
+        let families: Vec<_> = registry
+            .gather()
+            .into_iter()
+            .filter(|family| family.name() == "arroyo_worker_execution_memory_bytes")
+            .collect();
         assert_eq!(families.len(), 1);
         assert_eq!(families[0].name(), "arroyo_worker_execution_memory_bytes");
         let values: BTreeMap<_, _> = families[0]
@@ -276,15 +399,21 @@ mod metrics_tests {
                 )
             })
             .collect();
-        assert_eq!(values.len(), 3);
+        assert_eq!(values.len(), 5);
         values
     }
 
     fn expected(used: u64, limit: u64, max_batch: u64) -> BTreeMap<String, u64> {
-        [("used", used), ("limit", limit), ("max_batch", max_batch)]
-            .into_iter()
-            .map(|(key, value)| (key.to_owned(), value))
-            .collect()
+        [
+            ("used", used),
+            ("limit", limit),
+            ("max_batch", max_batch),
+            ("spillable", 0),
+            ("nonspillable", used),
+        ]
+        .into_iter()
+        .map(|(key, value)| (key.to_owned(), value))
+        .collect()
     }
 
     #[test]
@@ -314,6 +443,86 @@ mod metrics_tests {
         drop(reservation);
         assert!(pool.upgrade().is_none());
         assert_eq!(measurements(&registry), expected(0, 0, 0));
+    }
+
+    #[test]
+    fn reservation_classes_preserve_fairness_and_release_on_drop() {
+        let registry = prometheus::Registry::new();
+        let metrics = ExecutionPoolMetrics::register(&registry).unwrap();
+        let resources = ExecutionResources::new(ExecutionResourceConfig {
+            memory_bytes: 1024,
+            max_batch_bytes: 512,
+        })
+        .unwrap();
+        metrics.observe(&resources).unwrap();
+        let mut fixed =
+            MemoryConsumer::new("arbitrary consumer name").register(&resources.runtime.memory_pool);
+        let mut first = MemoryConsumer::new("first")
+            .with_can_spill(true)
+            .register(&resources.runtime.memory_pool);
+        let mut second = MemoryConsumer::new("second")
+            .with_can_spill(true)
+            .register(&resources.runtime.memory_pool);
+        fixed.try_grow(224).unwrap();
+        first.try_grow(400).unwrap();
+        let before = execution_refusals()
+            .with_label_values(&["try_grow", "refused"])
+            .get();
+        assert!(first.try_grow(1).is_err());
+        assert!(
+            execution_refusals()
+                .with_label_values(&["try_grow", "refused"])
+                .get()
+                > before
+        );
+        second.try_grow(300).unwrap();
+        second.grow(10);
+        second.shrink(10);
+        let values = measurements(&registry);
+        assert_eq!(values["used"], 924);
+        assert_eq!(values["spillable"], 700);
+        assert_eq!(values["nonspillable"], 224);
+        drop(first);
+        second.try_grow(100).unwrap();
+        drop(second);
+        drop(fixed);
+        assert_eq!(measurements(&registry), expected(0, 1024, 512));
+    }
+
+    #[test]
+    fn oversized_batch_counts_separately_without_pool_reservation() {
+        let resources = ExecutionResources::new(ExecutionResourceConfig {
+            memory_bytes: 1024,
+            max_batch_bytes: 1,
+        })
+        .unwrap();
+        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "value",
+            arrow_schema::DataType::Int64,
+            false,
+        )]));
+        let batch = arrow_array::RecordBatch::try_new(
+            schema,
+            vec![Arc::new(arrow_array::Int64Array::from(vec![1_i64]))],
+        )
+        .unwrap();
+        let counter = execution_refusals().with_label_values(&["batch_limit", "refused"]);
+        let before = counter.get();
+        assert!(
+            resources
+                .reserve_batch("unbounded name excluded from labels", &batch)
+                .is_err()
+        );
+        assert!(counter.get() > before);
+        assert_eq!(resources.runtime.memory_pool.reserved(), 0);
+        let families = prometheus::core::Collector::collect(execution_refusals());
+        assert_eq!(families[0].get_metric().len(), 2);
+        for metric in families[0].get_metric() {
+            assert_eq!(metric.get_label().len(), 2);
+            for label in metric.get_label() {
+                assert!(matches!(label.name(), "operation" | "outcome"));
+            }
+        }
     }
 
     #[test]

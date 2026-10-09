@@ -9,6 +9,7 @@ use std::sync::Arc;
 pub mod checkpoint;
 pub mod collections;
 pub mod encoding;
+mod health;
 pub mod lifecycle;
 pub mod memory;
 pub mod resources;

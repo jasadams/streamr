@@ -27,6 +27,7 @@ pub struct MemoryLiveState {
     resources: Option<resources::WorkerStateResources>,
     max_resident_bytes: Option<usize>,
     _database: Option<resources::ResourcePermit>,
+    health: Option<Arc<health::BackendHealth>>,
 }
 impl MemoryLiveState {
     pub fn new() -> Self {
@@ -40,8 +41,12 @@ impl MemoryLiveState {
         if max_resident_bytes == 0 {
             return Err(LiveStateError::InvalidLimit);
         }
+        let database = resources.try_database()?;
+        let health = health::BackendHealth::new("memory", true);
+        resources.observe_health(&health);
         Ok(Self {
-            _database: Some(resources.try_database()?),
+            _database: Some(database),
+            health: Some(health),
             data: RwLock::new(MemoryData::default()),
             resources: Some(resources),
             max_resident_bytes: Some(max_resident_bytes),
@@ -157,7 +162,24 @@ impl LiveStateBackend for MemoryLiveState {
             final_values.insert(key, value);
         }
         let mut bytes = data.resident_bytes;
+        let mut logical = self
+            .health
+            .as_ref()
+            .and_then(|health| *health.logical.lock().unwrap_or_else(|e| e.into_inner()));
         for (key, value) in final_values {
+            let logical_key_bytes = encoding::decode_key(key)?.key.len() as u64;
+            if let Some(size) = &mut logical {
+                if let Some(old) = data.rows.get(key) {
+                    size.keys -= 1;
+                    size.key_bytes -= logical_key_bytes;
+                    size.value_bytes -= (old.len() - 1) as u64;
+                }
+                if let Some(value) = value {
+                    size.keys += 1;
+                    size.key_bytes += logical_key_bytes;
+                    size.value_bytes += (value.len() - 1) as u64;
+                }
+            }
             if let Some(old) = data.rows.get(key) {
                 bytes -= key.len() + old.len() + 64;
             }
@@ -183,6 +205,9 @@ impl LiveStateBackend for MemoryLiveState {
             }
         }
         data.resident_bytes = bytes;
+        if let Some(health) = &self.health {
+            *health.logical.lock().unwrap_or_else(|e| e.into_inner()) = logical;
+        }
         Ok(())
     }
     async fn snapshot(&self) -> Result<StateSnapshot> {
