@@ -64,6 +64,6 @@ CI logs; they are not committed build artifacts.
 
 STR-38 can proceed to review after independent acceptance review and publication
 of the documentation correction. Keep it separate from the larger-state,
-compatibility, legacy removal and full milestone qualification tickets.
+compatibility and full milestone qualification tickets.
 No new SQL syntax, backend read-view lifetime, clock or checkpoint contract was
 approved or implemented by this audit.

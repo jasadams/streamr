@@ -1,6 +1,0 @@
-{"id":1,"key":"a","payload":"one","keep":true,"unused":101}
-{"id":2,"key":"b","payload":"two","keep":false,"unused":102}
-{"id":3,"key":"a","payload":"three","keep":true,"unused":103}
-{"id":4,"key":"","payload":"","keep":true,"unused":104}
-{"id":5,"key":"c","payload":null,"keep":true,"unused":105}
-{"id":6,"key":"a","payload":"after","keep":true,"unused":106}

@@ -165,9 +165,6 @@ fn expression(
             Expr::AggregateFunction(_) | Expr::WindowFunction(_) | Expr::ScalarSubquery(_) | Expr::Exists(_) | Expr::InSubquery(_) => {
                 return plan_err!("MERGE clauses support scalar expressions only; subqueries, aggregates and windows are unsupported");
             }
-            Expr::ScalarFunction(f) if crate::rewriters::contains_state_function(expr) || f.func.name().starts_with("sql_state_") => {
-                return plan_err!("state UDFs cannot be used inside native MERGE");
-            }
             _ => {}
         }
         Ok(TreeNodeRecursion::Continue)

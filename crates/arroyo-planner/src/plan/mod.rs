@@ -34,7 +34,7 @@ use crate::{
 };
 use crate::{
     extension::{ArroyoExtension, remote_table::RemoteTableExtension},
-    rewriters::{AsyncUdfRewriter, StatefulProcessorRewriter, contains_state_function},
+    rewriters::AsyncUdfRewriter,
 };
 
 mod aggregate;
@@ -318,15 +318,11 @@ impl TreeNodeVisitor<'_> for WindowDetectingVisitor {
 // ensuring they have _timestamp field, amongst other things.
 pub struct ArroyoRewriter<'a> {
     pub(crate) schema_provider: &'a ArroyoSchemaProvider,
-    stateful_rewriter: StatefulProcessorRewriter,
 }
 
 impl<'a> ArroyoRewriter<'a> {
     pub fn new(schema_provider: &'a ArroyoSchemaProvider) -> Self {
-        Self {
-            schema_provider,
-            stateful_rewriter: StatefulProcessorRewriter::new(),
-        }
+        Self { schema_provider }
     }
 }
 
@@ -450,15 +446,7 @@ impl TreeNodeRewriter for ArroyoRewriter<'_> {
                     projection.expr = rewritten.into_iter().map(|r| r.data).collect();
                 }
 
-                // Intercept state function calls before async UDF rewriting so
-                // that `state_get(...)` etc. are handled first.
-                // Use self.stateful_rewriter (not a fresh instance) so the counter
-                // increments globally, keeping __state_result_N names unique across CTEs.
-                let result = self.stateful_rewriter.f_up(node)?;
-                if result.transformed {
-                    return Ok(result);
-                }
-                return AsyncUdfRewriter::new(self.schema_provider).f_up(result.data);
+                return AsyncUdfRewriter::new(self.schema_provider).f_up(node);
             }
             LogicalPlan::Aggregate(aggregate) => {
                 return AggregateRewriter {
@@ -482,14 +470,6 @@ impl TreeNodeRewriter for ArroyoRewriter<'_> {
                 .f_up(LogicalPlan::TableScan(table_scan));
             }
             LogicalPlan::Filter(f) => {
-                // Reject state functions used outside SELECT projections
-                if contains_state_function(&f.predicate) {
-                    return plan_err!(
-                        "state functions (state_get, state_put, etc.) \
-                         are only supported in SELECT projections"
-                    );
-                }
-
                 // Joins with windows in the join condition can cause IS NOT NULL predicates to get
                 // pushed down to the table scan; however windows can never be null, and they can't
                 // be evaluated in filters—so we just remove them

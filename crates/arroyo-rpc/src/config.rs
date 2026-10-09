@@ -429,7 +429,7 @@ pub struct WorkerConfig {
     #[serde(default)]
     pub execution_resources: Option<ExecutionResourceConfig>,
 
-    /// SQL map storage. RocksDB requires explicit disk and worker resource budgets.
+    /// Live SQL storage. RocksDB requires explicit disk and worker resource budgets.
     #[serde(default)]
     pub sql_state_backend: SqlStateBackend,
 
