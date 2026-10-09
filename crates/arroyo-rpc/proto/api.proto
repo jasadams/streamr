@@ -127,6 +127,8 @@ message UpdatingAggregateOperator {
   uint64 ttl_micros = 8;
   // Only explicit true disables state expiry; absent/false preserves finite TTL behavior.
   optional bool retain_indefinitely = 9;
+  // Planner-proven exclusive prefix consumption, indexed by aggregate ordinal.
+  map<uint32, uint64> collection_output_limits = 10;
 }
 
 enum StateOpType {

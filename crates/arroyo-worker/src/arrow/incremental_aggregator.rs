@@ -352,6 +352,8 @@ struct Aggregator {
     index_converter: Option<Arc<RowConverter>>,
     index_columns: Vec<usize>,
     collection: bool,
+    collection_output_limit: Option<usize>,
+    collection_member_bound: usize,
     injected_timestamp: bool,
 }
 
@@ -688,9 +690,25 @@ impl IncrementalAggregatingFunc {
         // The threefold pending-output reservation is acquired before flush.
         let mut working = 0usize;
         for (index, stats) in stats {
-            let count = usize::try_from(stats.members)?;
-            let bytes = usize::try_from(stats.encoded_args_bytes)?;
-            let scalar_bytes = usize::try_from(stats.scalar_bytes)?;
+            let aggregate = &self.aggregates[index];
+            let mut count = usize::try_from(stats.members)?;
+            let mut bytes = usize::try_from(stats.encoded_args_bytes)?;
+            let mut scalar_bytes = usize::try_from(stats.scalar_bytes)?;
+            if let Some(limit) = aggregate.collection_output_limit {
+                // All members remain durable. Only the selected prefix is decoded
+                // and materialized, with worst-case per-member admission.
+                count = count.min(limit);
+                bytes = bytes.min(
+                    count
+                        .checked_mul(scope.limits().key_bytes)
+                        .context("bounded collection encoded size overflow")?,
+                );
+                scalar_bytes = scalar_bytes.min(
+                    count
+                        .checked_mul(aggregate.collection_member_bound)
+                        .context("bounded collection scalar size overflow")?,
+                );
+            }
             let scalar_slots = count
                 .checked_mul(self.aggregates[index].input_exprs.len())
                 .and_then(|n| n.checked_mul(std::mem::size_of::<ScalarValue>()))
@@ -1060,7 +1078,31 @@ impl IncrementalAggregatingFunc {
         let prefix = native_member_prefix(group, generation, aggregate_index)?;
         let mut accumulator = aggregate.func.create_accumulator()?;
         let mut after = None;
-        while let Some((key, stored)) = scope.first_from(&prefix, after.as_deref()).await? {
+        if aggregate.collection_output_limit == Some(0) {
+            let stats = CollectionStats::decode(
+                scope
+                    .get(&native_collection_totals_key(group, aggregate_index)?)
+                    .await?,
+            )?;
+            if stats.members > 0 {
+                let DataType::List(field) = aggregate.func.field().data_type().clone() else {
+                    bail!("bounded ARRAY_AGG result is not a list");
+                };
+                return Ok(ScalarValue::List(ScalarValue::new_list(
+                    &[],
+                    field.data_type(),
+                    true,
+                )));
+            }
+        }
+        let mut selected = 0usize;
+        while aggregate
+            .collection_output_limit
+            .is_none_or(|limit| selected < limit)
+        {
+            let Some((key, stored)) = scope.first_from(&prefix, after.as_deref()).await? else {
+                break;
+            };
             let args = if aggregate.collection {
                 native_collection_member(&stored)?.1
             } else {
@@ -1071,6 +1113,7 @@ impl IncrementalAggregatingFunc {
                 .row_converter
                 .convert_rows(std::iter::once(parser.parse(args)))?;
             accumulator.update_batch(&columns)?;
+            selected += 1;
             if !aggregate.collection {
                 break;
             }
@@ -2833,6 +2876,13 @@ impl IncrementalAggregatingConstructor {
         let mut identity = Sha256::new();
         identity.update(b"streamr.native-updating-aggregate.v1");
         identity.update(&config.aggregate_exec);
+        let mut bounds: Vec<_> = config.collection_output_limits.iter().collect();
+        bounds.sort_unstable_by_key(|(index, _)| **index);
+        for (index, limit) in bounds {
+            identity.update(index.to_be_bytes());
+            identity.update(limit.to_be_bytes());
+        }
+
         identity.update(&config.metadata_expr);
         identity.update(config.ttl_micros.to_be_bytes());
         identity.update([u8::from(config.retain_indefinitely == Some(true))]);
@@ -3091,6 +3141,20 @@ impl IncrementalAggregatingConstructor {
         } else {
             None
         };
+        for (index, limit) in config
+            .collection_output_limits
+            .iter()
+            .filter(|_| native_config.is_some())
+        {
+            let (agg, _, _, _, _, _, _, _, collection) = aggregates
+                .get(*index as usize)
+                .context("bounded collection aggregate ordinal is invalid")?;
+            ensure!(
+                *collection && !agg.is_distinct() && agg.order_bys().is_some(),
+                "bounded collection requires ordered non-distinct native ARRAY_AGG"
+            );
+            usize::try_from(*limit).context("bounded collection limit exceeds platform size")?;
+        }
         let aggregates: Vec<Aggregator> = aggregates
             .into_iter()
             .enumerate()
@@ -3108,20 +3172,42 @@ impl IncrementalAggregatingConstructor {
                         index_columns,
                         collection,
                     ),
-                )| Aggregator {
-                    func: agg,
-                    input_exprs,
-                    filter,
-                    accumulator_type: t,
-                    row_converter,
-                    state_cols,
-                    index_converter,
-                    index_columns,
-                    collection,
-                    injected_timestamp: Some(index) == injected_timestamp_index,
+                )|
+                 -> Result<Aggregator> {
+                    Ok(Aggregator {
+                        collection_member_bound: if collection {
+                            native_collection_decode_bound(
+                                &input_exprs
+                                    .iter()
+                                    .map(|expr| expr.data_type(&input_schema.schema))
+                                    .collect::<DFResult<Vec<_>>>()?,
+                                native_config
+                                    .context("native collection config missing")?
+                                    .key_bytes,
+                            )?
+                        } else {
+                            0
+                        },
+                        func: agg,
+                        input_exprs,
+                        filter,
+                        accumulator_type: t,
+                        row_converter,
+                        state_cols,
+                        index_converter,
+                        index_columns,
+                        collection,
+                        collection_output_limit: config
+                            .collection_output_limits
+                            .get(&(index as u32))
+                            .filter(|_| native_config.is_some())
+                            .map(|limit| usize::try_from(*limit))
+                            .transpose()?,
+                        injected_timestamp: Some(index) == injected_timestamp_index,
+                    })
                 },
             )
-            .collect();
+            .collect::<Result<_>>()?;
 
         // Only the append-only ordinary-state layout is new. Preserve existing
         // checkpoint identity for unchanged native COUNT/SUM/AVG and changelog
@@ -3430,6 +3516,7 @@ mod tests {
                 flush_interval_micros: 1_000_000,
                 ttl_micros: 3_600_000_000,
                 retain_indefinitely: None,
+                collection_output_limits: Default::default(),
             },
             Arc::new(registry),
         )
@@ -3484,6 +3571,15 @@ mod tests {
         ignore_nulls: bool,
         filtered: bool,
     ) -> IncrementalAggregatingFunc {
+        native_array_operator_with_limit(distinct, ignore_nulls, filtered, None).unwrap()
+    }
+
+    fn native_array_operator_with_limit(
+        distinct: bool,
+        ignore_nulls: bool,
+        filtered: bool,
+        limit: Option<u64>,
+    ) -> Result<IncrementalAggregatingFunc> {
         let schema = input_schema();
         let value: Arc<dyn PhysicalExpr> = Arc::new(Column::new("value", 0));
         let sequence: Arc<dyn PhysicalExpr> = Arc::new(Column::new("sequence", 1));
@@ -3572,13 +3668,13 @@ mod tests {
             flush_interval_micros: 1_000_000,
             ttl_micros: 3_600_000_000,
             retain_indefinitely: Some(true),
+            collection_output_limits: limit.map(|limit| (0, limit)).into_iter().collect(),
         };
         IncrementalAggregatingConstructor::build_with_native_config(
             config,
             Arc::new(registry),
             Some(native_test_config()),
         )
-        .unwrap()
     }
 
     fn native_test_config() -> AggregateStateConfig {
@@ -4163,6 +4259,341 @@ mod tests {
         (0..values.len())
             .map(|index| ScalarValue::try_from_array(&values, index).unwrap())
             .collect()
+    }
+
+    #[test]
+    fn native_bounded_array_refuses_distinct_plan_bounds() {
+        assert!(native_array_operator_with_limit(true, false, false, Some(1)).is_err());
+        for limit in [0, 1, 5] {
+            let operator =
+                native_array_operator_with_limit(false, false, false, Some(limit)).unwrap();
+            assert_eq!(
+                operator.aggregates[0].collection_output_limit,
+                Some(limit as usize)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn native_bounded_array_retains_all_members_and_selects_prefix_after_retraction() {
+        let mut operator = native_array_operator_with_limit(false, false, true, Some(1)).unwrap();
+        operator.native_store = Some(native_test_store());
+        let store = operator.native_store.as_ref().unwrap();
+        // Each write commits independently, so overlays remain bounded even for
+        // a group whose complete output exceeds the ordinary collection limit.
+        let input = batch(
+            &[Some("z"), Some("a"), None, Some("ignored")],
+            &[3, 1, 2, 0],
+            &[Some(true), Some(true), Some(true), Some(false)],
+        );
+        let inputs = operator.compute_inputs(&input).unwrap();
+        for row in 0..input.num_rows() {
+            let mut scope = store.begin().await.unwrap();
+            operator
+                .native_process_event(
+                    &mut scope,
+                    &GLOBAL_KEY,
+                    &inputs,
+                    row,
+                    false,
+                    Some(&test_row_id(&input, row)),
+                )
+                .await
+                .unwrap();
+            scope.commit().await.unwrap();
+        }
+        assert_eq!(
+            array_members(store, &operator).await,
+            vec![ScalarValue::Utf8(Some("a".into()))]
+        );
+        let mut fresh = native_array_operator(false, false, true);
+        fresh.native_store = operator.native_store.take();
+        let store = fresh.native_store.as_ref().unwrap();
+        fresh.aggregates[0].collection_output_limit = Some(1);
+        let mut scope = store.begin().await.unwrap();
+        fresh
+            .native_process_event(
+                &mut scope,
+                &GLOBAL_KEY,
+                &inputs,
+                1,
+                true,
+                Some(&test_row_id(&input, 1)),
+            )
+            .await
+            .unwrap();
+        scope.commit().await.unwrap();
+        assert_eq!(
+            array_members(store, &fresh).await,
+            vec![ScalarValue::Utf8(None)]
+        );
+        fresh.aggregates[0].collection_output_limit = Some(5);
+        assert_eq!(
+            array_members(store, &fresh).await,
+            vec![ScalarValue::Utf8(None), ScalarValue::Utf8(Some("z".into()))]
+        );
+        fresh.aggregates[0].collection_output_limit = Some(0);
+        assert!(array_members(store, &fresh).await.is_empty());
+        let totals = CollectionStats::decode(
+            store
+                .begin()
+                .await
+                .unwrap()
+                .get(&native_collection_totals_key(&GLOBAL_KEY, 0).unwrap())
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(totals.members, 2);
+        for row in [0, 2] {
+            let mut scope = store.begin().await.unwrap();
+            fresh
+                .native_process_event(
+                    &mut scope,
+                    &GLOBAL_KEY,
+                    &inputs,
+                    row,
+                    true,
+                    Some(&test_row_id(&input, row)),
+                )
+                .await
+                .unwrap();
+            scope.commit().await.unwrap();
+        }
+        let scope = store.begin().await.unwrap();
+        let bounded_empty = fresh
+            .native_fallback_value(&scope, &GLOBAL_KEY, 0, 0)
+            .await
+            .unwrap();
+        fresh.aggregates[0].collection_output_limit = None;
+        assert_eq!(
+            bounded_empty,
+            fresh
+                .native_fallback_value(&scope, &GLOBAL_KEY, 0, 0)
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn native_bounded_array_checkpoint_restores_all_indexes_on_both_backends() {
+        use arroyo_rpc::grpc::rpc::DiskKeyedTableConfig;
+        use arroyo_state::live::{checkpoint, lifecycle::RocksStateConfig, rocks::RocksLiveState};
+        for rocks in [false, true] {
+            let root = std::env::temp_dir().join(format!("bounded-array-{}", uuid::Uuid::new_v4()));
+            let remote = root.join("checkpoint");
+            std::fs::create_dir_all(&remote).unwrap();
+            // The production exporter requests pages up to 1 MiB; Rocks
+            // admits their copies/cursors independently of aggregate pages.
+            let resources = WorkerStateResources::new(ResourceConfig {
+                max_open_databases: 2,
+                scan_page_bytes: 16 * 1024 * 1024,
+                queued_write_bytes: 16 * 1024 * 1024,
+                decoded_value_bytes: 32 * 1024 * 1024,
+                ..native_test_store().resources().config().clone()
+            })
+            .unwrap();
+            let mut native = Vec::new();
+            let mut backends: Vec<Arc<dyn LiveStateBackend>> = Vec::new();
+            for generation in [0, 1] {
+                if rocks {
+                    let backend = Arc::new(
+                        RocksLiveState::open(
+                            RocksStateConfig {
+                                root: root.join("live"),
+                                job_id: "bounded-array".into(),
+                                operator_id: "aggregate".into(),
+                                subtask: 0,
+                                generation,
+                                attempt: 0,
+                            },
+                            resources.clone(),
+                        )
+                        .await
+                        .unwrap(),
+                    );
+                    backends.push(backend.clone());
+                    native.push(backend);
+                } else {
+                    backends.push(Arc::new(
+                        MemoryLiveState::bounded(resources.clone(), 8 * 1024 * 1024).unwrap(),
+                    ));
+                }
+            }
+            let ownership = Ownership::PartitionLocal {
+                subtask: 0,
+                parallelism: 1,
+            };
+            let mut manager =
+                LiveTableManager::new(backends[0].clone(), ownership.clone()).unwrap();
+            let table = manager.register(NATIVE_AGGREGATE_TABLE).unwrap();
+            let namespace = table.namespace().clone();
+            let limits = native_test_store().limits();
+            let store =
+                AggregateStore::new(backends[0].clone(), table, resources.clone(), limits).unwrap();
+            let mut operator = native_array_operator(false, false, false);
+            operator.aggregates[0].collection_output_limit = Some(1);
+            operator.native_store = Some(store);
+            let store = operator.native_store.as_ref().unwrap();
+            let input = batch(
+                &[Some("winner"), Some("next"), None],
+                &[1, 2, 3],
+                &[Some(true); 3],
+            );
+            let inputs = operator.compute_inputs(&input).unwrap();
+            for row in 0..input.num_rows() {
+                let mut scope = store.begin_point().await.unwrap();
+                operator
+                    .native_process_event(
+                        &mut scope,
+                        &GLOBAL_KEY,
+                        &inputs,
+                        row,
+                        false,
+                        Some(&test_row_id(&input, row)),
+                    )
+                    .await
+                    .unwrap();
+                scope.commit().await.unwrap();
+            }
+            let snapshot = backends[0].snapshot().await.unwrap();
+            let storage =
+                arroyo_state::get_storage_provider(&arroyo_state::StorageProviderFor::Controller {
+                    storage_url: Some(format!("file://{}", remote.display())),
+                })
+                .await
+                .unwrap();
+            let config = DiskKeyedTableConfig {
+                table_name: NATIVE_AGGREGATE_TABLE.into(),
+                encoding_version: 1,
+                schema_identity: operator.native_schema_identity.clone(),
+            };
+            let receipt = checkpoint::export(
+                &snapshot,
+                &namespace,
+                &config,
+                &storage,
+                "checkpoint-1/aggregate",
+                1,
+                0,
+                0,
+            )
+            .await
+            .unwrap();
+            checkpoint::restore(
+                backends[1].as_ref(),
+                &namespace,
+                &config,
+                &receipt,
+                &storage,
+            )
+            .await
+            .unwrap();
+            let mut restored_manager =
+                LiveTableManager::new(backends[1].clone(), ownership).unwrap();
+            let restored_table = restored_manager.register(NATIVE_AGGREGATE_TABLE).unwrap();
+            let restored_store = AggregateStore::new(
+                backends[1].clone(),
+                restored_table,
+                resources.clone(),
+                limits,
+            )
+            .unwrap();
+            let mut fresh = native_array_operator(false, false, false);
+            fresh.aggregates[0].collection_output_limit = Some(1);
+            fresh.native_store = Some(restored_store);
+            let restored_store = fresh.native_store.as_ref().unwrap();
+            assert_eq!(
+                array_members(restored_store, &fresh).await,
+                vec![ScalarValue::Utf8(Some("winner".into()))]
+            );
+            let mut scope = restored_store.begin().await.unwrap();
+            let totals = CollectionStats::decode(
+                scope
+                    .get(&native_collection_totals_key(&GLOBAL_KEY, 0).unwrap())
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(totals.members, 3);
+            fresh
+                .native_process_event(
+                    &mut scope,
+                    &GLOBAL_KEY,
+                    &inputs,
+                    0,
+                    true,
+                    Some(&test_row_id(&input, 0)),
+                )
+                .await
+                .unwrap();
+            scope.commit().await.unwrap();
+            assert_eq!(
+                array_members(restored_store, &fresh).await,
+                vec![ScalarValue::Utf8(Some("next".into()))]
+            );
+            drop(snapshot);
+            drop(operator);
+            drop(fresh);
+            drop(manager);
+            drop(restored_manager);
+            drop(backends);
+            for backend in native {
+                Arc::try_unwrap(backend)
+                    .unwrap_or_else(|_| panic!("retained Rocks backend"))
+                    .close_and_remove()
+                    .await
+                    .unwrap();
+            }
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn native_bounded_array_admits_high_cardinality_without_full_output() {
+        let mut operator = native_array_operator_with_limit(false, false, false, Some(1)).unwrap();
+        operator.native_store = Some(native_test_store());
+        let store = operator.native_store.as_ref().unwrap();
+        for sequence in 0..1_000 {
+            let input = batch(&[Some("member")], &[sequence], &[Some(true)]);
+            let inputs = operator.compute_inputs(&input).unwrap();
+            let mut scope = store.begin_point().await.unwrap();
+            operator
+                .native_process_event(
+                    &mut scope,
+                    &GLOBAL_KEY,
+                    &inputs,
+                    0,
+                    false,
+                    Some(&test_row_id(&input, 0)),
+                )
+                .await
+                .unwrap();
+            scope.commit().await.unwrap();
+        }
+        assert_eq!(
+            array_members(store, &operator).await,
+            vec![ScalarValue::Utf8(Some("member".into()))]
+        );
+        let scope = store.begin().await.unwrap();
+        let totals = CollectionStats::decode(
+            scope
+                .get(&native_collection_totals_key(&GLOBAL_KEY, 0).unwrap())
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(totals.members, 1_000);
+        operator
+            .native_collection_budget(&scope, std::iter::once((0, totals)))
+            .unwrap();
+        let mut ordinary = native_array_operator(false, false, false);
+        ordinary.aggregates[0].collection_output_limit = None;
+        assert!(
+            ordinary
+                .native_collection_budget(&scope, std::iter::once((0, totals)))
+                .is_err()
+        );
     }
 
     #[tokio::test]

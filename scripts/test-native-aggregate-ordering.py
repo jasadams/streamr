@@ -8,6 +8,7 @@ as a tie breaker and requires both paths to match an independent exact oracle.
 import argparse
 import json
 import os
+import re
 from pathlib import Path
 import subprocess
 
@@ -50,20 +51,45 @@ CREATE VIEW tie_result AS SELECT tenant_id,
 INSERT INTO tie_output SELECT tenant_id, events, earliest, latest FROM tie_result;
 """)
 
-def reduce(path: Path, stable: dict) -> tuple[list, dict]:
-    current, actions = {}, []
+def prefix_values(prefix, total_order=False):
+    result = {}
+    for key in {event["tenant_id"] for event in EVENTS[:prefix]}:
+        rows = [event for event in EVENTS[:prefix] if event["tenant_id"] == key]
+        first_seq = min(row["seq"] for row in rows if row["amount"] is not None)
+        earliest = next(row["amount"] for row in rows
+                        if row["seq"] == first_seq and row["amount"] is not None)
+        last_seq = max(row["seq"] for row in rows)
+        latest = {row["amount"] for row in rows if row["seq"] == last_seq}
+        if total_order and None not in latest:
+            latest = {max(latest)}
+        result[key] = [dict(tenant_id=key, events=len(rows), earliest=earliest, latest=value)
+                       for value in latest]
+    return result
+
+def reduce(path: Path, stable: dict, total_order=False, prefix_count=None) -> tuple[list, dict]:
+    current, actions, positions = {}, [], {}
+    prefixes = [prefix_values(index, total_order)
+                for index in range(1, (prefix_count or len(EVENTS)) + 1)]
     for line in path.read_text().splitlines():
         row = json.loads(line)
         row = row.get("payload", row)
         assert set(row) >= {"before", "after", "op"}, row
         before, after, op = row["before"], row["after"], row["op"]
-        assert op in {"c", "u", "d"}, row
+        # These fixtures are append-only: groups never disappear.
+        assert op in {"c", "u"}, row
         assert (before is None) == (op == "c"), row
         assert (after is None) == (op == "d"), row
         value = after if after is not None else before
         assert set(value) == {"tenant_id", "events", "earliest", "latest"}, value
         key = value["tenant_id"]
         assert current.get(key) == before, (key, current.get(key), before)
+        assert type(value["events"]) is int, value
+        if after is not None:
+            candidates = [index for index, snapshot in enumerate(prefixes)
+                          if index >= positions.get(key, -1)
+                          and after in snapshot.get(key, [])]
+            assert candidates, ("not a forward source-prefix value", after)
+            positions[key] = candidates[0]
         if after is None:
             del current[key]
         else:
@@ -89,7 +115,10 @@ def run_case(binary: Path, directory: Path, batch: int, native: bool, total_orde
         STREAMR_CAPTURE_INPUT_ROWS_BEFORE_CHECKPOINT="4",
         STREAMR_CAPTURE_EXPECTED_INITIAL_ROWS="2",
         STREAMR_CAPTURE_EXPECTED_CHECKPOINT_ROWS="2",
-        STREAMR_CAPTURE_EXPECTED_ROWS="4",
+        STREAMR_CAPTURE_EXPECTED_ROWS="2",
+        STREAMR_CAPTURE_MAX_INITIAL_ROWS=str(len(EVENTS)),
+        STREAMR_CAPTURE_MAX_CHECKPOINT_ROWS="4",
+        STREAMR_CAPTURE_MAX_ROWS=str(len(EVENTS)),
         STREAMR_CAPTURE_CHECKPOINT_EPOCH="1",
     )
     if native:
@@ -105,17 +134,26 @@ def run_case(binary: Path, directory: Path, batch: int, native: bool, total_orde
     if result.returncode or "1 passed" not in log.read_text():
         raise RuntimeError(f"{directory}: capture failed; inspect {log}")
     final_expected = FINAL_TOTAL if total_order else FINAL_STABLE
-    initial_actions, initial = reduce(directory / "output.initial.jsonl", final_expected)
-    assert len(initial_actions) == 2, initial_actions
+    initial_actions, initial = reduce(directory / "output.initial.jsonl", final_expected, total_order)
+    assert 2 <= len(initial_actions) <= len(EVENTS), initial_actions
     records = (directory / "output.jsonl").read_text().splitlines()
-    assert len(records) == 4, (directory, len(records))
+    markers = re.findall(
+        r'^CAPTURE_RESULT phase=recovered checkpoint=1 input_rows_before_checkpoint=4 '
+        r'committed_rows=(\d+) rows=(\d+) bytes=\d+ path=(.+) job=\S+$',
+        log.read_text(), re.MULTILINE)
+    assert len(markers) == 1, markers
+    committed, captured, output_path = markers[0]
+    committed, captured = int(committed), int(captured)
+    assert output_path == str(directory / "output.jsonl"), output_path
+    assert 2 <= committed <= 4, committed
+    assert committed <= len(records) == captured <= len(EVENTS), (committed, captured)
     prefix = directory / "checkpoint.prefix.jsonl"
-    prefix.write_text("\n".join(records[:2]) + "\n")
-    checkpoint_actions, checkpoint = reduce(prefix, CHECKPOINT)
-    recovered_actions, recovered = reduce(directory / "output.jsonl", final_expected)
-    assert len(checkpoint_actions) == 2, checkpoint_actions
-    assert len(recovered_actions) == 4, recovered_actions
-    assert recovered_actions[:2] == checkpoint_actions
+    prefix.write_text("\n".join(records[:committed]) + "\n")
+    checkpoint_actions, checkpoint = reduce(prefix, CHECKPOINT, total_order, prefix_count=4)
+    recovered_actions, recovered = reduce(directory / "output.jsonl", final_expected, total_order)
+    assert len(checkpoint_actions) == committed, checkpoint_actions
+    assert len(recovered_actions) == captured, recovered_actions
+    assert recovered_actions[:committed] == checkpoint_actions
     if not total_order:
         for result in (initial, recovered):
             for key, allowed in TIED_FINAL_VALUES.items():

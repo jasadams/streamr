@@ -8,6 +8,7 @@ be compared against the existing operator in the same batch configuration.
 import argparse
 import json
 import os
+import re
 from pathlib import Path
 import subprocess
 
@@ -74,22 +75,52 @@ def expected(prefix, deterministic=True):
     return result
 
 
-def strict_reduce(path, target, compare_tied_latest=True):
+def tied_latest_values(prefix):
+    """All legal LAST_VALUE members among active items with maximal sort_seq."""
+    groups = {}
+    for event in EVENTS[:prefix]:
+        groups.setdefault((event["tenant_id"], event["item_id"]), []).append(event)
+    active = {}
+    for (tenant, _), rows in groups.items():
+        amounts = [row["amount"] for row in rows if row["amount"] is not None]
+        active.setdefault(tenant, []).append((max(row["seq"] for row in rows),
+                                              max(amounts) if amounts else None))
+    return {tenant: {amount for seq, amount in members
+                     if seq == max(position for position, _ in members)}
+            for tenant, members in active.items()}
+
+
+def strict_reduce(path, target, compare_tied_latest=True, prefix_count=None):
     """Validate every Debezium transition, not just a final-row projection."""
     rows = [json.loads(line) for line in Path(path).read_text().splitlines()]
     current = {}
     actions = []
+    positions = {}
+    prefixes = [expected(index, compare_tied_latest) for index in range(1, (prefix_count or len(EVENTS)) + 1)]
+    tied = [tied_latest_values(index) for index in range(1, len(prefixes) + 1)]
     for record in rows:
         row = record.get("payload", record)
         assert set(row) >= {"before", "after", "op"}, row
         before, after, op = row["before"], row["after"], row["op"]
-        assert op in {"c", "u", "d"}, row
+        # These fixtures are append-only: groups never disappear.
+        assert op in {"c", "u"}, row
         assert (before is None) == (op == "c"), row
         assert (after is None) == (op == "d"), row
         value = after if after is not None else before
         assert set(value) == set(FIELDS), value
         key = value["tenant_id"]
         assert current.get(key) == before, (key, before, current.get(key), row)
+        if after is not None:
+            assert key in target, key
+            candidate = {field: val for field, val in after.items()
+                         if compare_tied_latest or field != "latest"}
+            candidates = [index for index, snapshot in enumerate(prefixes)
+                          if index >= positions.get(key, -1) and key in snapshot
+                          and {field: val for field, val in snapshot[key].items()
+                               if compare_tied_latest or field != "latest"} == candidate
+                          and (compare_tied_latest or after["latest"] in tied[index][key])]
+            assert candidates, ("not a forward source-prefix aggregate", after)
+            positions[key] = candidates[0]
         if after is None:
             del current[key]
         else:
@@ -103,6 +134,7 @@ def strict_reduce(path, target, compare_tied_latest=True):
             expected_other = {field: value for field, value in target[key].items() if field != "latest"}
             actual_other = {field: value for field, value in current[key].items() if field != "latest"}
             assert actual_other == expected_other, (key, actual_other, expected_other)
+            assert current[key]["latest"] in tied[-1][key], (key, current[key], tied[-1][key])
     return actions, current
 
 
@@ -156,7 +188,10 @@ def run_case(binary, directory, backend, batch, mode, equal_order, native):
         STREAMR_CAPTURE_INPUT_ROWS_BEFORE_CHECKPOINT="4",
         STREAMR_CAPTURE_EXPECTED_INITIAL_ROWS="2",
         STREAMR_CAPTURE_EXPECTED_CHECKPOINT_ROWS="2",
-        STREAMR_CAPTURE_EXPECTED_ROWS="4",
+        STREAMR_CAPTURE_EXPECTED_ROWS="2",
+        STREAMR_CAPTURE_MAX_INITIAL_ROWS=str(len(EVENTS)),
+        STREAMR_CAPTURE_MAX_CHECKPOINT_ROWS="4",
+        STREAMR_CAPTURE_MAX_ROWS=str(len(EVENTS)),
         STREAMR_CAPTURE_CHECKPOINT_EPOCH="1",
     )
     if native:
@@ -177,17 +212,26 @@ def run_case(binary, directory, backend, batch, mode, equal_order, native):
     initial_actions, initial = strict_reduce(
         directory / "output.initial.jsonl", final, compare_tie
     )
-    assert len(initial_actions) == 2, initial_actions
+    assert 2 <= len(initial_actions) <= len(EVENTS), initial_actions
     recovered_path = directory / "output.jsonl"
     records = recovered_path.read_text().splitlines()
-    assert len(records) == 4, (directory, len(records))
+    markers = re.findall(
+        r'^CAPTURE_RESULT phase=recovered checkpoint=1 input_rows_before_checkpoint=4 '
+        r'committed_rows=(\d+) rows=(\d+) bytes=\d+ path=(.+) job=\S+$',
+        log.read_text(), re.MULTILINE)
+    assert len(markers) == 1, markers
+    committed, captured, output_path = markers[0]
+    committed, captured = int(committed), int(captured)
+    assert output_path == str(directory / "output.jsonl"), output_path
+    assert 2 <= committed <= 4, committed
+    assert committed <= len(records) == captured <= len(EVENTS), (committed, captured)
     checkpoint_path = directory / "checkpoint.prefix.jsonl"
-    checkpoint_path.write_text("\n".join(records[:2]) + "\n")
-    checkpoint_actions, checkpoint_actual = strict_reduce(checkpoint_path, checkpoint, compare_tie)
-    assert len(checkpoint_actions) == 2, checkpoint_actions
+    checkpoint_path.write_text("\n".join(records[:committed]) + "\n")
+    checkpoint_actions, checkpoint_actual = strict_reduce(checkpoint_path, checkpoint, compare_tie, prefix_count=4)
+    assert len(checkpoint_actions) == committed, checkpoint_actions
     recovered_actions, recovered = strict_reduce(recovered_path, final, compare_tie)
-    assert len(recovered_actions) == 4, recovered_actions
-    assert recovered_actions[:2] == checkpoint_actions
+    assert len(recovered_actions) == captured, recovered_actions
+    assert recovered_actions[:committed] == checkpoint_actions
     print(f"PASS {directory.name}: initial={initial} checkpoint={checkpoint_actual} recovered={recovered}", flush=True)
     return initial, checkpoint_actual, recovered
 
@@ -208,7 +252,7 @@ def main():
     if not args.binary:
         write_fixture(directory, args.equal_order, True)
         if args.check:
-            print(strict_reduce(args.check, expected(args.prefix, not args.equal_order), not args.equal_order))
+            print(strict_reduce(args.check, expected(args.prefix, not args.equal_order), not args.equal_order, prefix_count=args.prefix))
         else:
             print(
                 f"Prepared {directory}; checkpoint={expected(4, not args.equal_order)}, "

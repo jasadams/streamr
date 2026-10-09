@@ -131,7 +131,22 @@ impl ArroyoExtension for UpdatingAggregateExtension {
         let updating_meta_expr =
             named_struct(vec![lit("is_retract"), lit(false), lit("id"), hash_expr]);
 
+        let collection_output_limits = self
+            .aggregate
+            .schema()
+            .metadata()
+            .iter()
+            .filter_map(|(key, value)| {
+                Some((
+                    key.strip_prefix(crate::plan::COLLECTION_LIMIT_PREFIX)?
+                        .parse::<u32>()
+                        .ok()?,
+                    value.parse::<u64>().ok()?,
+                ))
+            })
+            .collect();
         let config = UpdatingAggregateOperator {
+            collection_output_limits,
             name: "UpdatingAggregate".to_string(),
             input_schema: Some((*input_schema).clone().into()),
             final_schema: Some(self.output_schema().into()),

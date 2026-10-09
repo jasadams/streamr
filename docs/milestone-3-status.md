@@ -28,6 +28,23 @@ multi-epoch scenario. Compiler/capacity jobs remain serialized through cargo-dev
 
 ## Decisions and final acceptance
 
+STR-17 continuation: Codex `/root` and `/root/implement` started 2026-10-09
+10:31 UTC. The user removed the one-hour limit; continue through green PR CI.
+Workspace:
+`/home/jason/repos/streamr-wt-str-17-bounded-top-k`, branch
+`jason/str-17-bounded-top-k`, base `b3930c00`. The previous worktree was clean;
+no bounded top-K implementation or PR existed. Acceptance: bounded finite-K
+selection preserving SQL/CDC/recovery, exact capture assertions, focused
+regressions, affected-crate gates and independent review. Planner/runtime bounded
+selection and capture regressions are committed and independently approved.
+Seven Python capture self-tests passed. Source `29966185` passed affected-crate
+check, strict all-target Clippy, three planner tests, four worker tests and
+formatting in the documented repaired image `cdeb96c9e3e9`. The worker tests
+include actual checkpoint export/restore to memory and RocksDB. Earlier image,
+compiler and lint failures were repaired; final batch exit was 0. Next: publish
+the reviewed PR and wait for current-head CI.
+No pending product decision; full runtime/capacity qualification stays in STR-32.
+
 - STR-29's contract was approved on 2026-10-09: watermark expiry emits zero
   rolling counts for retained lifetime/key rows; complete input silence does
   not advance event time. Ordinary window behavior remains unchanged.

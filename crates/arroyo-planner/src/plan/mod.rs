@@ -8,6 +8,7 @@ use datafusion::common::{
 use std::{collections::HashSet, sync::Arc};
 
 use aggregate::AggregateRewriter;
+pub(crate) use aggregate::COLLECTION_LIMIT_PREFIX;
 use datafusion::functions::core::expr_fn::get_field;
 use datafusion::logical_expr::{
     Aggregate, Expr, Extension, Filter, LogicalPlan, Projection, SubqueryAlias, expr::Alias, lit,
@@ -332,6 +333,10 @@ impl<'a> ArroyoRewriter<'a> {
 
 impl TreeNodeRewriter for ArroyoRewriter<'_> {
     type Node = LogicalPlan;
+
+    fn f_down(&mut self, node: Self::Node) -> Result<Transformed<Self::Node>> {
+        aggregate::bound_collection_outputs(node)
+    }
 
     fn f_up(&mut self, mut node: Self::Node) -> Result<Transformed<Self::Node>> {
         match node {
