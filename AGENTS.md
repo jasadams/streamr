@@ -89,16 +89,21 @@ for required delegated work before ending the turn.
 
 ## Continuity and delivery
 
-- Work on one ticket at a time. Record its start time, acceptance criteria and
-  one-hour deadline before work begins; delegates work only on that ticket.
+- Each implementation worker owns one ticket at a time. The user authorized
+  independent milestone 3 features to run in parallel on 2026-10-09. Claim
+  separate tickets/worktrees and coordinate declared file ownership; delegates
+  work within their assigned feature. Record start, acceptance and the one-hour
+  deadline before implementation begins.
 - If the ticket remains unfinished after one hour, stop its work safely, pause
   and explain the elapsed time, completed work, blocker and remaining steps.
   Wait for user direction; do not switch tickets or restart automatically.
 - Report concrete ticket outcomes and remaining acceptance gaps, rather than
   only narrating builds/tests. Discussion takes precedence over automation.
-- Read the current task's compact status ledger before implementation or after
-  context compaction. For milestone 3, use `docs/milestone-3-status.md` and the
-  task breakdown it links; historical validation logs are supporting evidence.
+- Read the current Trakkt ticket description and compact status ledger before
+  implementation or after context compaction. For milestone 3, use
+  `docs/milestone-3-status.md` and its feature plan. Current ticket scope and the
+  user's parallel-work direction supersede old single-ticket dispatch comments;
+  historical validation logs are supporting evidence, not worker assignments.
 - Keep the ledger short: active task, acceptance check, exact next action,
   decisions awaiting the user, source-bound evidence and known blockers. Update
   it when those facts change, not with repeated status narration.

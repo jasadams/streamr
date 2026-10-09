@@ -24,10 +24,11 @@ implemented or qualified:
 | Persistent updating aggregates | [STR-17](https://trakkt.app/issues/STR-17) | Exact COUNT/SUM/extrema/ordered first-last/FILTER/NULL values, bounded retraction state and explicit retention |
 | Native TUMBLE and HOP panes and closure | [STR-19](https://trakkt.app/issues/STR-19) | Configured-backend migration, watermark/expiry/quiet-key behavior and bounded open-window recovery |
 | Native SESSION | [STR-20](https://trakkt.app/issues/STR-20) | Gap/late-input/deadline/max-duration semantics, bounded histories and closure recovery |
-| Typed aggregate/window composition, ranking and arrays | [STR-29](https://trakkt.app/issues/STR-29) | Runnable native plans, bounded values/collections and precise composition/emit behavior |
+| Bounded aggregate ranking and arrays | [STR-17](https://trakkt.app/issues/STR-17) | Existing SQL top-K without full member-array materialization, exact typed CDC and recovery |
+| Quiet-key expiry/result composition | [STR-29](https://trakkt.app/issues/STR-29) | Agreed clock/zero-or-delete contract, bounded replacement output and recovery |
 | Legacy state_* SQL function removal | [STR-43](https://trakkt.app/issues/STR-43) | Native caller migration, explicit old-plan/checkpoint handling and removal from active catalogs/examples |
 
-[STR-28](https://trakkt.app/issues/STR-28) freezes the actual native plans and
+[STR-26](https://trakkt.app/issues/STR-26) maintains the actual native plans and
 maps each required behavior to supported SQL, a demonstrated defect or a policy
 difference requiring discussion. A non-windowed GROUP BY already retains
 aggregate state; a whole-record JSON processor is not the default replacement.
@@ -56,7 +57,7 @@ external SQL is not physical-plan/native-runtime evidence.
 
 ## Native route evidence
 
-The [STR-28 native capability audit](milestone-3-native-capabilities.md) maps all
+The [historical native capability audit](milestone-3-native-capabilities.md) maps all
 external profile/session fields and lifecycle rules, records source-level
 composition restrictions, retained ownership and the STR-43 removal inventory.
 Its source review is based on an earlier implementation snapshot; current tested

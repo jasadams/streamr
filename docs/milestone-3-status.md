@@ -1,58 +1,50 @@
-# Milestone 3 — current working ledger
+# Milestone 3 — agent backlog
 
-Read this first when resuming. Historical evidence belongs in
-[milestone-3-validation.md](milestone-3-validation.md); manageable tasks are in
-[milestone-3-work-plan.md](milestone-3-work-plan.md).
+Updated 2026-10-09 at the user's request. Read the current Trakkt ticket description
+before claiming work. Historical comments and validation logs are evidence, not
+current dispatch instructions. No implementation worker is claimed by this reset.
 
-## Current ticket: STR-48 admission telemetry
+## Available features
 
-- Start: 2026-10-08 10:18 UTC; deadline: 2026-10-08 11:18 UTC.
-- Acceptance: count existing oversized/closed/exhausted budget refusals with
-  finite resource/reason labels; time async admission, preserve existing errors,
-  ordering and permit lifetimes, and cover cancelled waits without refusals.
-- Implementation: shared budget metrics and collector registration, focused
-  success/refusal/cancellation source tests, and documented duration boundaries.
-- Validation constraint: explicit user lint-only override; no cargo
-  build/check/clippy/test execution. Tests remain unexecuted and runtime behavior
-  is unqualified by this increment.
-- Next action: formatting/static diff checks, independent review and coordinator
-  delivery. No other ticket work is authorized in this increment.
+All six tickets are Todo, agent-ready and unblocked. Independent agents may work
+in parallel in separate worktrees with the file ownership in each ticket.
 
-## Frozen source and existing evidence
+| Ticket | Deliverable | Primary ownership |
+| --- | --- | --- |
+| [STR-16](https://trakkt.app/issues/STR-16) | Bounded queue/transfer ownership through slow consumers and cancellation | Shared resources, graph/network queues, checkpoint permits |
+| [STR-17](https://trakkt.app/issues/STR-17) | Bounded native SQL top-K, exact CDC and recovery | Aggregate kernels/planner/ranked collections and aggregate capture assertions |
+| [STR-19](https://trakkt.app/issues/STR-19) | Bounded TUMBLE/HOP closure and collection output | Fixed-window stores/operators/fixtures |
+| [STR-20](https://trakkt.app/issues/STR-20) | Bounded many-key/hot-key SESSION closure and recovery | Session stores/operators/fixtures |
+| [STR-26](https://trakkt.app/issues/STR-26) | Native state health metrics and usable operating limits | Collectors/metric hooks and operations/support docs |
+| [STR-42](https://trakkt.app/issues/STR-42) | Three-epoch nonempty/changed/empty state-table recovery | Conformance driver/fixtures and multi-epoch capture scenario |
 
-Implementation HEAD `9bfb7df8aa8d016cfd07e49d59ebb2112611a09e`, draft PR #6. Seven
-current-head CI checks green; both Rust workflows passed 715 library tests
-(six skipped) and 12 integrations. Local v16 five gates and 12 recovery smokes:
-`target/native-m3-reviewed-repairs-v16-validation/` (review-actual-evidence.md).
-Reuse existing exact-source evidence before launching new runs.
+One feature per worker. Claim with worker/session, start, acceptance and owned
+files; only then set In Progress. Coordinate shared sections before editing.
+STR-17 owns aggregate capture assertions in smoke_tests.rs; STR-42 owns the
+multi-epoch scenario. Compiler/capacity jobs remain serialized through cargo-dev.
 
-Recent M3 component evidence, not STR-38 completion or full M3:
-- Both large hot SESSION protocols passed 65,000 checkpoint rows / 532,480,000
-  decoded payload bytes (10.15625x50MiB): native-session-large-v16-preflight
-  and native-session-hot-controller-v16-preflight under target/.
-- Four production worker-loss and two controller-loss cases passed exact 6,000
-  rows/CDC/checkpoint restoration and 177 attributed metrics samples total.
-  Reports: target/native-production-v16-preflight-v2/review-result.md,
-  target/native-production-worker-matrix-v16/review-result.md and
-  target/native-production-controller-matrix-v16/review-result.md.
-  Processes required forced cleanup after Finished; graceful exit unqualified.
-- All-key state-table capacity wave session 51984 was canceled during controller
-  case following user's concern. Actual owned group stopped/reaped, leader never
-  started, queue released. target/native-state-table-all-key-v16-preflight/
-  root-cancellation.json; no capacity PASS or engine-failure diagnosis.
+## Decisions and final acceptance
 
-## Decisions and milestone blockers
+- STR-29 is blocked on an explicit quiet-key expiry/clock/zero-or-delete contract.
+- STR-43 is blocked on legacy SQL plan/checkpoint compatibility and native
+  replacement acceptance. Neither decision blocks the six available features.
+- STR-32 holds one shared operator/combined capacity, resource, backfill,
+  process-loss/storage-fault and actual 24-hour acceptance checklist. Heavy runs
+  require an explicitly requested shared batch; held/cancelled cases stay held.
+- STR-44 optional per-group emission remains post-MVP. Read-view lifecycle
+  redesign remains unapproved. Application schemas/parity stay external.
 
-Native RocksDB read snapshots replacing physical read checkpoints remain
-UNAPPROVED; user asked to discuss. Stable reads stay, proposed close/removal
-would wait for readers; no lifecycle change implemented. Many-key SESSION and
-large aggregate capacity remain unqualified. Rolling quiet-key count remains 1
-instead of 0; all-input-idle clock/expiry semantics remain pending. Full external
-33-field profile/session parity, bounded rankings, legacy state_* removal,
-combined capacity/backfill/slow-consumer/fault and actual 24-hour gates remain open.
-These other tickets are not this ticket's current work. STR-44 is post-MVP.
+STR-28 is folded into STR-26. STR-49/50 into STR-17; STR-51 into STR-29;
+STR-52–55 into STR-32. These are Cancelled duplicates, not another queue.
+STR-38–41 implementation is Done on its recorded own-scope acceptance;
+STR-45/47/48 repairs are also Done. Earlier STR-48-only dispatch is superseded.
 
-Previous detailed ledger is preserved at
-`target/str38-acceptance/status-before-str38.md`; historical validation is in
-[milestone-3-validation.md](milestone-3-validation.md). Task breakdown:
-[milestone-3-work-plan.md](milestone-3-work-plan.md).
+## Evidence
+
+Reuse source-specific results without presenting them as fresh qualification.
+See milestone-3-validation.md, batch-qa-2026-10-08.md and
+state-table-all-key-capacity.md. Basic native operators, merged state tables,
+strong window/hot-session and selected all-key capacity results already exist.
+Later cancelled reruns do not erase earlier passes or authorize another run.
+Full current-candidate qualification remains STR-32; no test was run by this
+backlog rewrite. Git history preserves the previous working ledger.
