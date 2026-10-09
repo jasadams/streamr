@@ -1099,6 +1099,12 @@ mod tests {
         .unwrap();
         let registry = prometheus::Registry::new();
         resources.register_metrics(&registry).unwrap();
+        // Measurement series are lazy. Admit zero bytes through each real budget
+        // so baseline and final assertions both require the same existing series.
+        // Keep resource_usage strict: a missing series after admission is a failure.
+        drop(resources.decoded_value(0).await.unwrap());
+        drop(resources.scan_page(0).await.unwrap());
+        drop(resources.queued_write(0).await.unwrap());
         let usage =
             |resource: &str, measurement: &str| resource_usage(&registry, resource, measurement);
         let directory = tempfile::tempdir().unwrap();
