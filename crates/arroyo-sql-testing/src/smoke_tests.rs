@@ -1019,7 +1019,8 @@ async fn local_program_selected(
 ) -> Program {
     if !leader_mode() {
         return Program::local_from_logical(job_id.to_owned(), graph, udfs, epoch, control_tx)
-            .await;
+            .await
+            .expect("failed to build local test program");
     }
     let pipeline_id = arroyo_types::PipelineId(Arc::new("pipe-test".into()));
     let paths = arroyo_state_protocol::ProtocolPaths::new(

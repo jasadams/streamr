@@ -129,8 +129,16 @@ datafusion-proto = {git = 'https://github.com/ArroyoSystems/arrow-datafusion', b
 datafusion-functions = {git = 'https://github.com/ArroyoSystems/arrow-datafusion', branch = '48.0.1/arroyo'}
 datafusion-functions-window = {git = 'https://github.com/ArroyoSystems/arrow-datafusion', branch = '48.0.1/arroyo'}
 
-sqlparser = { git = "https://github.com/ArroyoSystems/sqlparser-rs", branch = "0.55.0/arroyo" }
+sqlparser = { git = "https://github.com/jasadams/sqlparser-rs", branch = "0.55.0/arroyo-sql-json" }
 
 cornucopia_async = { git = "https://github.com/ArroyoSystems/cornucopia", branch = "sqlite" }
 cornucopia = { git = "https://github.com/ArroyoSystems/cornucopia", branch = "sqlite" }
 jiter = {git = "https://github.com/ArroyoSystems/jiter", branch = "disable_python" }
+
+# DataFusion's workspace depends on the Arroyo sqlparser fork directly by
+# git URL, so the sqlparser entry in [patch.crates-io] above — which only
+# redirects the crates-io source — does not reach it. This section redirects
+# that git source to the SQL/JSON fork too, keeping a single sqlparser
+# instance across the whole dependency graph.
+[patch."https://github.com/ArroyoSystems/sqlparser-rs"]
+sqlparser = { git = "https://github.com/jasadams/sqlparser-rs", branch = "0.55.0/arroyo-sql-json" }

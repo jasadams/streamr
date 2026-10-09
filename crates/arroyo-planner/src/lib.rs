@@ -10,6 +10,7 @@ pub mod physical;
 mod plan;
 mod rewriters;
 pub mod schemas;
+pub mod sql_json;
 mod state_table_fusion;
 pub mod state_tables;
 mod tables;
@@ -372,6 +373,17 @@ impl ArroyoSchemaProvider {
             );
         }
 
+        // A user UDF must never shadow a trusted SQL/JSON builtin: physical
+        // plans serialize scalar functions by name, so a same-named user UDF
+        // would otherwise be deserialized in place of the builtin on both the
+        // planner and the worker.
+        if crate::sql_json::kernels::is_reserved_sql_json_udf_name(&parsed.udf.name) {
+            bail!(
+                "function name '{}' is reserved for the built-in ANSI SQL/JSON functions and cannot be redefined",
+                parsed.udf.name
+            );
+        }
+
         self.dylib_udfs.insert(
             parsed.udf.name.clone(),
             DylibUdfConfig {
@@ -451,6 +463,14 @@ impl ArroyoSchemaProvider {
             .map_err(|e| e.context("parsing Python UDF"))?;
 
         let name = parsed.name.clone();
+
+        // As in add_rust_udf: a user UDF must never shadow a trusted
+        // SQL/JSON builtin, which is resolved by name after plan serialization.
+        if crate::sql_json::kernels::is_reserved_sql_json_udf_name(&name) {
+            bail!(
+                "function name '{name}' is reserved for the built-in ANSI SQL/JSON functions and cannot be redefined"
+            );
+        }
 
         self.python_udfs.insert(
             (*name).clone(),

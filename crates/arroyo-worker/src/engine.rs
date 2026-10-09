@@ -194,7 +194,7 @@ impl Program {
         udfs: &[LocalUdf],
         restore_epoch: Option<u64>,
         control_tx: Sender<ControlResp>,
-    ) -> Self {
+    ) -> anyhow::Result<Self> {
         let assignments = logical
             .node_weights()
             .flat_map(|weight| {
@@ -210,6 +210,9 @@ impl Program {
 
         let mut registry = new_registry();
         for udf in udfs {
+            // A user UDF must never replace a trusted SQL/JSON builtin at
+            // decode time: physical plans resolve scalar functions by name.
+            crate::udf_guard::reject_shadowing_udf_name("local", &udf.config.name)?;
             registry.add_local_udf(udf);
         }
         Self::from_logical(
@@ -223,7 +226,7 @@ impl Program {
             control_tx,
         )
         .await
-        .expect("could not load")
+        .map_err(|e| anyhow::anyhow!("could not load: {e}"))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1210,5 +1213,52 @@ mod state_table_preflight_tests {
             error.to_string().contains("STR-41 fused serial execution"),
             "{error}"
         );
+    }
+}
+
+#[cfg(test)]
+mod udf_shadowing_tests {
+    use super::*;
+    use arrow_schema::DataType;
+    use datafusion::logical_expr::{Signature, Volatility};
+    use tokio::sync::mpsc::channel;
+
+    /// A `LocalUdf` fixture with a given name; its FFI interface is never
+    /// invoked because the shadowing guard rejects the name first.
+    fn dummy_local_udf(name: &str) -> LocalUdf {
+        use arroyo_udf_common::{FfiArrays, RunResult};
+        use arroyo_udf_host::{ContainerOrLocal, UdfDylib, UdfDylibInterface, UdfInterface};
+        use std::sync::Arc;
+        unsafe extern "C-unwind" fn never_runs(_args: FfiArrays) -> RunResult {
+            unreachable!("shadowing guard must reject before invocation")
+        }
+        LocalUdf {
+            def: "",
+            config: UdfDylib::new(
+                name.to_string(),
+                Signature::exact(vec![], Volatility::Volatile),
+                DataType::Utf8,
+                UdfInterface::Sync(Arc::new(ContainerOrLocal::Local(UdfDylibInterface::new(
+                    never_runs,
+                )))),
+            ),
+            is_aggregate: false,
+            is_async: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn local_from_logical_rejects_shadowing_udf() {
+        let (control_tx, _control_rx) = channel(1);
+        let graph = DiGraph::new();
+        let udf = dummy_local_udf("json_value");
+        let error =
+            Program::local_from_logical("job".to_string(), &graph, &[udf], None, control_tx)
+                .await
+                .err()
+                .expect("reserved name must be rejected");
+        let message = error.to_string();
+        assert!(message.contains("shadows"), "{message}");
+        assert!(message.contains("json_value"), "{message}");
     }
 }

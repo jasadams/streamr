@@ -140,9 +140,13 @@ pub(crate) fn produce_optimized_plan(
     statement: &Statement,
     schema_provider: &ArroyoSchemaProvider,
 ) -> Result<LogicalPlan> {
+    // Lower ANSI SQL/JSON constructors into ordinary UDF calls before
+    // SqlToRel sees them; DataFusion rejects the sqlparser Json* variants.
+    let mut statement = statement.clone();
+    crate::sql_json::lowering::rewrite_statement(&mut statement)?;
     let sql_to_rel = SqlToRel::new(schema_provider);
 
-    let plan = sql_to_rel.sql_statement_to_plan(statement.clone())?;
+    let plan = sql_to_rel.sql_statement_to_plan(statement)?;
 
     let analyzed_plan = schema_provider.analyzer.execute_and_check(
         plan,

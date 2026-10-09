@@ -3,6 +3,7 @@ mod continuous_merge;
 mod event_clock;
 mod native_capabilities;
 mod plan_tests;
+mod sql_json;
 
 use arrow_schema::DataType;
 use arroyo_connectors::{
