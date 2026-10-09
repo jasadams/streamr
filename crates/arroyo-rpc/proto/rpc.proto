@@ -373,6 +373,8 @@ message SubtaskCheckpointMetadata {
   uint64 start_time = 2;
   uint64 finish_time = 3;
   optional uint64 watermark = 4;
+  // Exact pre-epoch progress. Mutually exclusive with legacy watermark micros.
+  optional sint64 watermark_negative_nanos = 6;
   uint64 bytes = 5;
 
   map<string, TableSubtaskCheckpointMetadata> table_metadata = 10;
@@ -499,6 +501,9 @@ message OperatorMetadata {
   uint32 epoch = 3;
   optional uint64 min_watermark = 4;
   optional uint64 max_watermark = 5;
+  // Exact pre-epoch progress; legacy nonnegative microsecond fields retain meaning.
+  optional sint64 min_watermark_negative_nanos = 7;
+  optional sint64 max_watermark_negative_nanos = 8;
   uint64 parallelism = 6;
 }
 

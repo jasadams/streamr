@@ -10,6 +10,8 @@ use std::ops::{Deref, RangeInclusive};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+pub mod event_time;
+
 // worker configuration
 pub const CLUSTER_ID_ENV: &str = "CLUSTER_ID";
 pub const JOB_ID_ENV: &str = "JOB_ID";
@@ -172,7 +174,7 @@ impl<T: Debug + Clone + Encode + Decode<()> + Hash + PartialEq + Eq + Send + 'st
 pub trait Data: Debug + Clone + Encode + Decode<()> + Send + 'static {}
 impl<T: Debug + Clone + Encode + Decode<()> + Send + 'static> Data for T {}
 
-#[derive(Debug, Copy, Clone, Encode, Decode, PartialEq, Eq)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum Watermark {
     EventTime(SystemTime),
     Idle,

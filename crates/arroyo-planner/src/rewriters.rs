@@ -26,7 +26,7 @@ use datafusion::common::tree_node::{
     Transformed, TreeNode, TreeNodeRecursion, TreeNodeRewriter, TreeNodeVisitor,
 };
 use datafusion::common::{
-    Column, DataFusionError, Result as DFResult, ScalarValue, TableReference, plan_err,
+    Column, DataFusionError, ExprSchema, Result as DFResult, ScalarValue, TableReference, plan_err,
 };
 use datafusion::logical_expr;
 use datafusion::logical_expr::expr::ScalarFunction;
@@ -719,6 +719,186 @@ impl TreeNodeRewriter for TimeWindowNullCheckRemover {
         }
 
         Ok(Transformed::no(node))
+    }
+}
+
+/// Resolve the event ordinal through wrappers that preserve input positions.
+/// A retained lookup can expose a second `_timestamp`; its event ordinal is
+/// authoritative even when a WHERE or relation alias separates the projection.
+pub(crate) fn event_timestamp_index(input: &LogicalPlan) -> Option<usize> {
+    match input {
+        LogicalPlan::Filter(filter) => return event_timestamp_index(&filter.input),
+        LogicalPlan::SubqueryAlias(alias) => return event_timestamp_index(&alias.input),
+        LogicalPlan::Extension(extension) => {
+            if let Some(access) = extension
+                .node
+                .as_any()
+                .downcast_ref::<crate::extension::state_table::StateTableAccess>()
+            {
+                return access.event_timestamp_index;
+            }
+            if let Some(remote) = extension
+                .node
+                .as_any()
+                .downcast_ref::<RemoteTableExtension>()
+            {
+                return event_timestamp_index(&remote.input);
+            }
+        }
+        _ => {}
+    }
+    let timestamps = input
+        .schema()
+        .fields()
+        .iter()
+        .enumerate()
+        .filter_map(|(index, field)| (field.name() == TIMESTAMP_FIELD).then_some(index))
+        .collect::<Vec<_>>();
+    (timestamps.len() == 1).then(|| timestamps[0])
+}
+
+/// Binds event-clock markers to the current input row, never to watermark
+/// progress or an aggregate's retained/output timestamp.
+pub(crate) struct EventClockRewriter<'a> {
+    pub input: &'a LogicalPlan,
+}
+
+// Versioned Arrow field provenance, carried by existing serialized schemas.
+// This is logical metadata, not another clock owner or persistent state table.
+pub(crate) use arroyo_rpc::EVENT_CLOCK_PROVENANCE;
+
+pub(crate) fn plan_contains_event_clock(plan: &LogicalPlan) -> DFResult<bool> {
+    let mut found = false;
+    plan.apply_with_subqueries(|node| {
+        found |= node.expressions().iter().any(|expression| {
+            depends_on_event_clock(expression, node.schema())
+                || node
+                    .inputs()
+                    .iter()
+                    .any(|input| depends_on_event_clock(expression, input.schema()))
+        });
+        Ok(if found {
+            TreeNodeRecursion::Stop
+        } else {
+            TreeNodeRecursion::Continue
+        })
+    })?;
+    Ok(found)
+}
+
+pub(crate) fn depends_on_event_clock(expr: &Expr, schema: &datafusion::common::DFSchema) -> bool {
+    expr.exists(|expr| {
+        Ok(match expr {
+            Expr::ScalarFunction(function) => {
+                matches!(function.name(), "watermark_timestamp" | "watermark_date")
+            }
+            Expr::Column(column) => schema
+                .field_from_column(column)
+                .is_ok_and(|field| field.metadata().contains_key(EVENT_CLOCK_PROVENANCE)),
+            Expr::Alias(alias) => alias
+                .metadata
+                .as_ref()
+                .is_some_and(|metadata| metadata.contains_key(EVENT_CLOCK_PROVENANCE)),
+            _ => false,
+        })
+    })
+    .expect("infallible expression visitor")
+}
+
+impl TreeNodeRewriter for EventClockRewriter<'_> {
+    type Node = Expr;
+
+    fn f_down(&mut self, node: Expr) -> DFResult<Transformed<Expr>> {
+        let Expr::ScalarFunction(function) = &node else {
+            return Ok(Transformed::no(node));
+        };
+        if !matches!(function.name(), "watermark_timestamp" | "watermark_date") {
+            return Ok(Transformed::no(node));
+        }
+
+        let mut designated_sources = 0;
+        let mut aggregate = false;
+        let mut trigger_sources = 0;
+        let mut overwritten = false;
+        self.input.exists(|plan| {
+            if let LogicalPlan::Extension(extension) = plan {
+                if let Some(source) = extension.node.as_any().downcast_ref::<TableSourceExtension>() {
+                    trigger_sources += 1;
+                    designated_sources += usize::from(source.table.event_time_field.is_some());
+                }
+                aggregate |= extension.node.as_any().is::<crate::extension::aggregate::AggregateExtension>();
+            }
+            if let LogicalPlan::Projection(projection) = plan {
+                let source_projection = matches!(projection.input.as_ref(), LogicalPlan::Extension(extension)
+                    if extension.node.as_any().is::<TableSourceExtension>()
+                        || extension.node.as_any().is::<DebeziumUnrollingExtension>());
+                if !source_projection {
+                    for (index, expression) in projection.expr.iter().enumerate() {
+                        if projection.schema.field(index).name() != TIMESTAMP_FIELD { continue; }
+                        let mut expression = expression;
+                        while let Expr::Alias(alias) = expression {
+                            expression = alias.expr.as_ref();
+                        }
+                        overwritten |= !matches!(expression, Expr::Column(column) if column.name == TIMESTAMP_FIELD);
+                    }
+                }
+            }
+            aggregate |= matches!(plan, LogicalPlan::Aggregate(_));
+            Ok(false)
+        })?;
+        if designated_sources == 0 {
+            return plan_err!(
+                "WATERMARK_TIMESTAMP()/WATERMARK_DATE() requires a source with WATERMARK FOR"
+            );
+        }
+        if designated_sources != 1 || trigger_sources != 1 {
+            return plan_err!(
+                "WATERMARK_TIMESTAMP()/WATERMARK_DATE() has ambiguous WATERMARK FOR sources; a single triggering source is required"
+            );
+        }
+        if aggregate {
+            return plan_err!(
+                "WATERMARK_TIMESTAMP()/WATERMARK_DATE() requires current-trigger clock metadata across maintained aggregates (STR-62); aggregate output time is not an event clock"
+            );
+        }
+        if overwritten {
+            return plan_err!(
+                "event clock triggering timestamp was replaced by a projection; alias the retained or calculated timestamp to a different output name"
+            );
+        }
+        let schema = self.input.schema();
+        let event_index = event_timestamp_index(self.input);
+        let column = if let Some(index) = event_index {
+            let (qualifier, field) = schema.qualified_field(index);
+            Column::new(qualifier.cloned(), field.name())
+        } else {
+            let (qualifier, field) = schema
+                .qualified_field_with_unqualified_name(TIMESTAMP_FIELD)
+                .map_err(|_| {
+                    DataFusionError::Plan(
+                        "event clock has no unambiguous triggering row timestamp".into(),
+                    )
+                })?;
+            Column::new(qualifier.cloned(), field.name())
+        };
+        let timestamp = Expr::Column(column);
+        let expression = if function.name() == "watermark_date" {
+            // FOR is validated as a timezone-free UTC TIMESTAMP. Arrow's date
+            // cast uses floor division, including timestamps before the epoch.
+            Expr::Cast(datafusion::logical_expr::expr::Cast {
+                expr: Box::new(timestamp),
+                data_type: DataType::Date32,
+            })
+        } else {
+            timestamp
+        };
+        Ok(Transformed::yes(expression.alias_with_metadata(
+            format!("{}()", function.name()),
+            Some(HashMap::from([(
+                EVENT_CLOCK_PROVENANCE.to_string(),
+                "trigger".to_string(),
+            )])),
+        )))
     }
 }
 
