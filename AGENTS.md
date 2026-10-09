@@ -114,9 +114,9 @@ for required delegated work before ending the turn.
 - Each implementation worker owns one ticket at a time. The user authorized
   independent milestone 3 features to run in parallel on 2026-10-09. Claim
   separate tickets/worktrees and coordinate declared file ownership; delegates
-  work within their assigned feature. Record start, acceptance and the one-hour
+  work within their assigned feature. Record start, acceptance and the four-hour
   deadline before implementation begins.
-- If the ticket remains unfinished after one hour, stop its work safely, pause
+- If the ticket remains unfinished after four hours, stop its work safely, pause
   and explain the elapsed time, completed work, blocker and remaining steps.
   Wait for user direction; do not switch tickets or restart automatically.
 - Report concrete ticket outcomes and remaining acceptance gaps, rather than
