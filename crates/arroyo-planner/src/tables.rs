@@ -150,6 +150,22 @@ pub(crate) fn produce_optimized_plan(
         |_plan, _rule| {},
     )?;
 
+    // Event-clock markers are stable but row-context-bound, so constant folding
+    // must wait until ArroyoRewriter binds them to their designated source.
+    if crate::rewriters::plan_contains_event_clock(&analyzed_plan)? {
+        // DISTINCT is structural lowering required by the engine, and does
+        // not evaluate or relocate the contextual expressions.
+        return Optimizer::with_rules(vec![
+            Arc::new(ReplaceDistinctWithAggregate::new()),
+            Arc::new(ExtractEquijoinPredicate::new()),
+        ])
+        .optimize(
+            analyzed_plan,
+            &OptimizerContext::default(),
+            |_plan, _rule| {},
+        );
+    }
+
     // The general optimizer may introduce null-key filters or eliminate joins
     // before the event-driven lookup rewriter can enforce complete-key reads.
     // Preserve the analyzed shape whenever retained state is a query input.
@@ -456,10 +472,6 @@ impl ConnectorTable {
         Ok(table)
     }
 
-    fn has_virtual_fields(&self) -> bool {
-        self.fields.iter().any(|f| f.is_virtual())
-    }
-
     pub(crate) fn is_updating(&self) -> bool {
         self.format
             .as_ref()
@@ -469,10 +481,6 @@ impl ConnectorTable {
 
     fn timestamp_override(&self) -> Result<Option<Expr>> {
         if let Some(field_name) = &self.event_time_field {
-            if self.is_updating() {
-                return plan_err!("can't use event_time_field with update mode.");
-            }
-
             // check that a column exists and it is a timestamp
             let field = self.get_time_field(field_name)?;
 
@@ -541,7 +549,13 @@ impl ConnectorTable {
             }
         };
 
-        if self.is_updating() && self.has_virtual_fields() {
+        // CDC images contain physical fields only. The watermark expression is
+        // evaluated after unrolling, independently for each before/after image.
+        if self.is_updating()
+            && self.fields.iter().any(|field| {
+                field.is_virtual() && Some(field.field().name()) != self.watermark_field.as_ref()
+            })
+        {
             return plan_err!("can't read from a source with virtual fields and update mode.");
         }
 

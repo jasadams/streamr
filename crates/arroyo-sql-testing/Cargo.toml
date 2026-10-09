@@ -34,6 +34,8 @@ prost = { workspace = true }
 datafusion = { workspace = true }
 
 [dev-dependencies]
+arroyo-operator = { path = "../arroyo-operator" }
+async-trait = { workspace = true }
 test-log = { version = "0.2.12", default-features = false, features = ["trace"] }
 rstest = { version = "0.25" }
 similar-asserts = "1.6.1"

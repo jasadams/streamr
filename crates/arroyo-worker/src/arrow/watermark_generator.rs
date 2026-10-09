@@ -10,8 +10,10 @@ use arroyo_rpc::df::ArroyoSchema;
 use arroyo_rpc::errors::DataflowResult;
 use arroyo_rpc::grpc::api::ExpressionWatermarkConfig;
 use arroyo_rpc::grpc::rpc::TableConfig;
-use arroyo_state::global_table_config;
-use arroyo_types::{CheckpointBarrier, SignalMessage, Watermark, from_nanos, to_millis};
+use arroyo_state::global_table_config_with_version;
+use arroyo_state::tables::MigratableState;
+use arroyo_types::event_time::{from_signed_nanos, to_signed_nanos};
+use arroyo_types::{CheckpointBarrier, SignalMessage, Watermark, from_nanos, print_time};
 use async_trait::async_trait;
 use bincode::{Decode, Encode};
 use datafusion::physical_expr::PhysicalExpr;
@@ -29,6 +31,58 @@ use tracing::{debug, info};
 pub struct WatermarkGeneratorState {
     last_watermark_emitted_at: SystemTime,
     max_watermark: SystemTime,
+}
+
+// Version 0 stored SystemTime directly, whose bincode encoding excludes dates
+// before the epoch. Version 1 preserves the Arrow timestamp domain exactly in
+// the same registered table, including an emission after an idle partition.
+#[derive(Encode, Decode, Copy, Clone, Debug, PartialEq, Default)]
+struct PersistedWatermarkGeneratorState {
+    last_watermark_emitted_at: i64,
+    max_watermark: i64,
+}
+
+impl TryFrom<WatermarkGeneratorState> for PersistedWatermarkGeneratorState {
+    type Error = arroyo_rpc::errors::StateError;
+
+    fn try_from(state: WatermarkGeneratorState) -> Result<Self, Self::Error> {
+        let encode = |time| {
+            to_signed_nanos(time).ok_or_else(|| arroyo_rpc::errors::StateError::Other {
+                table: "s".into(),
+                error: "watermark generator state exceeds signed Arrow nanosecond range".into(),
+            })
+        };
+        Ok(Self {
+            last_watermark_emitted_at: encode(state.last_watermark_emitted_at)?,
+            max_watermark: encode(state.max_watermark)?,
+        })
+    }
+}
+
+impl TryFrom<PersistedWatermarkGeneratorState> for WatermarkGeneratorState {
+    type Error = arroyo_rpc::errors::StateError;
+
+    fn try_from(state: PersistedWatermarkGeneratorState) -> Result<Self, Self::Error> {
+        let decode = |nanos| {
+            from_signed_nanos(nanos).ok_or_else(|| arroyo_rpc::errors::StateError::Other {
+                table: "s".into(),
+                error: "watermark generator state exceeds SystemTime range".into(),
+            })
+        };
+        Ok(Self {
+            last_watermark_emitted_at: decode(state.last_watermark_emitted_at)?,
+            max_watermark: decode(state.max_watermark)?,
+        })
+    }
+}
+
+impl MigratableState for PersistedWatermarkGeneratorState {
+    const VERSION: u32 = 1;
+    type PreviousVersion = WatermarkGeneratorState;
+
+    fn migrate(previous: Self::PreviousVersion) -> Result<Self, arroyo_rpc::errors::StateError> {
+        previous.try_into()
+    }
 }
 
 pub struct WatermarkGenerator {
@@ -91,7 +145,11 @@ impl OperatorConstructor for WatermarkGeneratorConstructor {
 #[async_trait]
 impl ArrowOperator for WatermarkGenerator {
     fn tables(&self) -> HashMap<String, TableConfig> {
-        global_table_config("s", "expression watermark state")
+        global_table_config_with_version(
+            "s",
+            "expression watermark state",
+            PersistedWatermarkGeneratorState::VERSION,
+        )
     }
 
     fn name(&self) -> String {
@@ -114,17 +172,17 @@ impl ArrowOperator for WatermarkGenerator {
     }
 
     async fn on_start(&mut self, ctx: &mut OperatorContext) -> DataflowResult<()> {
-        let gs = ctx.table_manager.get_global_keyed_state("s").await?;
+        let gs = ctx
+            .table_manager
+            .get_global_keyed_state_migratable::<u32, PersistedWatermarkGeneratorState>("s")
+            .await?;
         self.last_event = SystemTime::now();
 
         let state = *(gs
             .get(&ctx.task_info.task_index)
-            .unwrap_or(&WatermarkGeneratorState {
-                last_watermark_emitted_at: SystemTime::UNIX_EPOCH,
-                max_watermark: SystemTime::UNIX_EPOCH,
-            }));
+            .unwrap_or(&PersistedWatermarkGeneratorState::default()));
 
-        self.state_cache = state;
+        self.state_cache = state.try_into()?;
         Ok(())
     }
 
@@ -160,7 +218,7 @@ impl ArrowOperator for WatermarkGenerator {
         let Some(max_timestamp) = kernels::aggregate::max(timestamp_column) else {
             return Ok(());
         };
-        let max_timestamp = from_nanos(max_timestamp as u128);
+        let max_timestamp = signed_timestamp(max_timestamp)?;
 
         // calculate watermark using expression
         let watermark = self
@@ -173,7 +231,7 @@ impl ArrowOperator for WatermarkGenerator {
             .downcast_ref::<arrow::array::TimestampNanosecondArray>()
             .unwrap();
 
-        let watermark = from_nanos(kernels::aggregate::min(watermark).unwrap() as u128);
+        let watermark = signed_timestamp(kernels::aggregate::min(watermark).unwrap())?;
 
         self.state_cache.max_watermark = self.state_cache.max_watermark.max(watermark);
         if self.idle
@@ -185,7 +243,7 @@ impl ArrowOperator for WatermarkGenerator {
             debug!(
                 "[{}] Emitting expression watermark {}",
                 ctx.task_info.task_index,
-                to_millis(watermark)
+                print_time(watermark)
             );
             collector
                 .broadcast_watermark(Watermark::EventTime(watermark))
@@ -202,9 +260,13 @@ impl ArrowOperator for WatermarkGenerator {
         ctx: &mut OperatorContext,
         _: &mut dyn Collector,
     ) -> DataflowResult<()> {
-        let gs = ctx.table_manager.get_global_keyed_state("s").await?;
+        let gs = ctx
+            .table_manager
+            .get_global_keyed_state_migratable::<u32, PersistedWatermarkGeneratorState>("s")
+            .await?;
 
-        gs.insert(ctx.task_info.task_index, self.state_cache).await;
+        gs.insert(ctx.task_info.task_index, self.state_cache.try_into()?)
+            .await;
         Ok(())
     }
 
@@ -226,5 +288,71 @@ impl ArrowOperator for WatermarkGenerator {
             self.idle = true;
         }
         Ok(())
+    }
+}
+
+// Arrow timestamps are signed nanoseconds; casting pre-epoch events to u128
+// overflows SystemTime even when their independently declared progress is positive.
+fn signed_timestamp(nanos: i64) -> DataflowResult<SystemTime> {
+    from_signed_nanos(nanos).ok_or_else(|| {
+        arroyo_rpc::errors::DataflowError::ArgumentError(format!(
+            "timestamp {nanos}ns is outside the platform's SystemTime range"
+        ))
+    })
+}
+
+#[cfg(test)]
+mod signed_timestamp_tests {
+    use super::*;
+
+    #[test]
+    fn persisted_generator_state_migrates_legacy_and_preserves_negative_idle_emission() {
+        let config = bincode::config::standard();
+        // Version 0: two SystemTime values, each encoded as seconds/nanoseconds.
+        let legacy_bytes = [3, 0, 2, 0];
+        let (old, consumed) =
+            bincode::decode_from_slice::<WatermarkGeneratorState, _>(&legacy_bytes, config)
+                .unwrap();
+        assert_eq!(consumed, legacy_bytes.len());
+        let migrated = PersistedWatermarkGeneratorState::migrate(old).unwrap();
+        assert_eq!(migrated.last_watermark_emitted_at, 3_000_000_000);
+        assert_eq!(migrated.max_watermark, 2_000_000_000);
+        // The runtime can record a pre-epoch FOR after the idle branch emits.
+        let state = WatermarkGeneratorState {
+            last_watermark_emitted_at: signed_timestamp(-2_000_000_001).unwrap(),
+            max_watermark: SystemTime::UNIX_EPOCH,
+        };
+        let persisted = PersistedWatermarkGeneratorState::try_from(state).unwrap();
+        let bytes = bincode::encode_to_vec(persisted, config).unwrap();
+        let (restored, consumed) =
+            bincode::decode_from_slice::<PersistedWatermarkGeneratorState, _>(&bytes, config)
+                .unwrap();
+        assert_eq!(consumed, bytes.len());
+        assert_eq!(WatermarkGeneratorState::try_from(restored).unwrap(), state);
+    }
+
+    #[test]
+    fn pre_epoch_progress_can_be_formatted_for_logging() {
+        assert_eq!(
+            print_time(signed_timestamp(-2_000_000_000).unwrap()),
+            "1969-12-31 23:59:58.000",
+        );
+    }
+
+    #[test]
+    fn event_times_preserve_epoch_sign_and_nanoseconds() {
+        assert_eq!(
+            signed_timestamp(-1).unwrap(),
+            SystemTime::UNIX_EPOCH - Duration::from_nanos(1)
+        );
+        assert_eq!(
+            signed_timestamp(1).unwrap(),
+            SystemTime::UNIX_EPOCH + Duration::from_nanos(1)
+        );
+        assert_eq!(signed_timestamp(0).unwrap(), SystemTime::UNIX_EPOCH);
+        assert_eq!(
+            signed_timestamp(i64::MIN).unwrap(),
+            SystemTime::UNIX_EPOCH - Duration::from_nanos(1_u64 << 63)
+        );
     }
 }

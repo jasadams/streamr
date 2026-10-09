@@ -8,7 +8,7 @@ use arrow_array::RecordBatch;
 use arrow_schema::{ArrowError, SchemaRef};
 use arroyo_rpc::ControlResp;
 use arroyo_rpc::errors::{DataflowError, DataflowResult};
-use arroyo_types::ArrowMessage;
+use arroyo_types::{ArrowMessage, SignalMessage};
 use bincode::config;
 use datafusion::common::DataFusionError;
 use datafusion::execution::memory_pool::MemoryReservation;
@@ -770,12 +770,7 @@ impl OutNetworkLink {
                             let _held = held?;
                             match msg {
                                 ArrowMessage::Signal(signal) => {
-                                    let _encoded = reserve_network(self.resources.as_deref(), "network output signal", 256)?;
-                                    let data = bincode::encode_to_vec(&signal, config::standard())
-                                        .map_err(|error| DataflowError::ExternalError(error.to_string()))?;
-                                    let header = Header::from_quad(quad, data.len(), MessageType::Signal);
-                                    header.write(&mut Pin::new(&mut self.stream)).await.map_err(network_io_error)?;
-                                    self.stream.write_all(&data).await.map_err(network_io_error)?;
+                                    write_accounted_signal(&mut Pin::new(&mut self.stream), quad, &signal, self.resources.as_deref()).await?;
                                 }
                                 ArrowMessage::Data(data) => {
                                     write_accounted_batch(&mut Pin::new(&mut self.stream), quad, &data, &dictionary_tracker, self.resources.as_deref()).await?;
@@ -1007,6 +1002,21 @@ impl NetworkManager {
 #[inline]
 fn pad_to_8(len: u32) -> usize {
     (((len + 7) & !7) - len) as usize
+}
+
+async fn write_accounted_signal<W: AsyncWrite + AsyncWriteExt>(
+    writer: &mut Pin<&mut W>,
+    quad: Quad,
+    signal: &SignalMessage,
+    resources: Option<&ExecutionResources>,
+) -> DataflowResult<()> {
+    let _encoded = reserve_network(resources, "network output signal", 256)?;
+    let data = bincode::encode_to_vec(signal, config::standard())
+        .map_err(|error| DataflowError::ExternalError(error.to_string()))?;
+    let header = Header::from_quad(quad, data.len(), MessageType::Signal);
+    header.write(writer).await.map_err(network_io_error)?;
+    writer.write_all(&data).await.map_err(network_io_error)?;
+    Ok(())
 }
 
 async fn write_accounted_batch<W: AsyncWrite + AsyncWriteExt>(
@@ -1368,6 +1378,124 @@ mod test {
         assert!(timeout(Duration::from_millis(20), rx.recv()).await.is_err());
     }
 
+    #[tokio::test]
+    async fn network_accounted_delivery_cancel_close_and_success_preserve_exact_ownership() {
+        for signal in [false, true] {
+            let resources = resources(1024 * 1024);
+            let pool = resources.runtime.memory_pool.clone();
+            let batch = batch();
+            let signal_message = SignalMessage::Watermark(arroyo_types::Watermark::Idle);
+            let data = if signal {
+                bincode::encode_to_vec(&signal_message, bincode::config::standard()).unwrap()
+            } else {
+                encoded(&batch)
+            };
+            let message_type = if signal {
+                MessageType::Signal
+            } else {
+                MessageType::Data
+            };
+            let (tx, mut rx) = arroyo_operator::context::batch_bounded_accounted(
+                1,
+                resources.runtime.clone(),
+                resources.limits.max_batch_bytes,
+            )
+            .unwrap();
+            let baseline = pool.reserved();
+            let mut senders = Senders::new();
+            senders.add(quad(), batch.schema(), tx.clone());
+            senders
+                .send(
+                    Header::from_quad(quad(), data.len(), message_type),
+                    data.clone(),
+                    Some(&resources),
+                )
+                .await
+                .unwrap();
+            let queued = pool.reserved();
+            assert!(queued > baseline);
+            assert_eq!(tx.capacity(), 0);
+            {
+                let mut cancelled = Box::pin(senders.send(
+                    Header::from_quad(quad(), data.len(), message_type),
+                    data.clone(),
+                    Some(&resources),
+                ));
+                assert!(futures::poll!(&mut cancelled).is_pending());
+                assert!(pool.reserved() > queued);
+            }
+            assert_eq!(pool.reserved(), queued);
+            let received = rx.recv().await.unwrap();
+            assert_eq!(tx.capacity(), 1);
+            assert_eq!(tx.queued_bytes(), 0);
+            // Queue metadata can retain its first block high-water charge.
+            let empty = pool.reserved();
+            assert!(empty >= baseline);
+            assert!(empty < queued);
+            match received {
+                ArrowMessage::Data(received) => assert_eq!(received, batch),
+                ArrowMessage::Signal(received) => assert_eq!(received, signal_message),
+            }
+            senders
+                .send(
+                    Header::from_quad(quad(), data.len(), message_type),
+                    data.clone(),
+                    Some(&resources),
+                )
+                .await
+                .unwrap();
+            let mut blocked = Box::pin(senders.send(
+                Header::from_quad(quad(), data.len(), message_type),
+                data.clone(),
+                Some(&resources),
+            ));
+            assert!(futures::poll!(&mut blocked).is_pending());
+            drop(rx);
+            assert!(blocked.await.is_err());
+            assert_eq!(pool.reserved(), empty);
+            assert!(
+                senders
+                    .send(
+                        Header::from_quad(quad(), data.len(), message_type),
+                        data,
+                        Some(&resources)
+                    )
+                    .await
+                    .is_err()
+            );
+            assert_eq!(pool.reserved(), empty);
+            drop((senders, tx));
+            assert_eq!(pool.reserved(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn network_signal_slow_write_cancel_and_error_release_exact_charge() {
+        let resources = resources(1024 * 1024);
+        let signal = SignalMessage::Watermark(arroyo_types::Watermark::Idle);
+        let (mut writer, reader) = tokio::io::duplex(1);
+        let mut writer = Pin::new(&mut writer);
+        {
+            let mut writing = Box::pin(super::write_accounted_signal(
+                &mut writer,
+                quad(),
+                &signal,
+                Some(&resources),
+            ));
+            assert!(futures::poll!(&mut writing).is_pending());
+            // 256 signal bytes plus the existing 256-byte network envelope.
+            assert_eq!(resources.runtime.memory_pool.reserved(), 512);
+        }
+        assert_eq!(resources.runtime.memory_pool.reserved(), 0);
+        drop(reader);
+        assert!(
+            super::write_accounted_signal(&mut writer, quad(), &signal, Some(&resources),)
+                .await
+                .is_err()
+        );
+        assert_eq!(resources.runtime.memory_pool.reserved(), 0);
+    }
+
     #[test]
     fn network_decode_admission_rejects_truncated_frame_without_allocation() {
         let resources = resources(1024 * 1024);
@@ -1581,5 +1709,22 @@ mod test {
             .expect("timed out");
 
         assert_eq!(result, message);
+
+        // Exercise the actual outbound encoder and inbound signal decoder,
+        // including progress before the epoch and a partition becoming idle.
+        for watermark in [
+            arroyo_types::Watermark::EventTime(SystemTime::UNIX_EPOCH - Duration::from_secs(2)),
+            arroyo_types::Watermark::EventTime(SystemTime::UNIX_EPOCH - Duration::from_nanos(1)),
+            arroyo_types::Watermark::Idle,
+            arroyo_types::Watermark::EventTime(SystemTime::UNIX_EPOCH + Duration::from_secs(2)),
+        ] {
+            let message = ArrowMessage::Signal(SignalMessage::Watermark(watermark));
+            client_tx.send(message.clone()).await.unwrap();
+            let received = timeout(Duration::from_secs(1), server_rx.recv())
+                .await
+                .unwrap()
+                .expect("network signal channel closed");
+            assert_eq!(received, message);
+        }
     }
 }

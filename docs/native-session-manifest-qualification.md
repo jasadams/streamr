@@ -8,14 +8,14 @@ agent must run the fresh SQL test executable in the required development contain
 Preparing a fixture alone is not operator qualification.
 
 The generated fixtures use only opaque keys, event timestamps, ordinal numbers,
-numeric values and text attributes. Applications supply their own schemas,
+numeric values, text attributes and Boolean collection members. Applications supply their own schemas,
 queries and independently declared complete expected rows through a manifest.
 No external checkout is required.
 
 | Fixture | Input/checkpoint prefix | Complete output oracle | Scope |
 | --- | --- | --- | --- |
-| `ordered-reuse` | 6 / 4 | 2 rows | Nonempty ordered FIRST/LAST with FILTER, earlier timestamp arriving later, two event-time intervals for one key, both open at checkpoint |
-| `closed-reuse` | 6 / 4 | 4 rows, 1 emitted at checkpoint | Deleted earlier interval plus open reused-key state and another pending key; watermark 40 equals another session's deadline 40 |
+| `ordered-reuse` | 6 / 4 | 2 rows | Nonempty ordered FIRST/LAST with FILTER and exact ordered integer/text/Boolean arrays, earlier timestamp arriving later, two event-time intervals for one key, both open at checkpoint |
+| `closed-reuse` | 6 / 4 | 4 rows, 1 emitted at checkpoint | Exact ordered arrays and metadata after a deleted earlier interval plus open reused-key state and another pending key; watermark 40 equals another session's deadline 40 |
 | `continuous` | 9,602 / 4,801 | 1 row | Event spacing 9 seconds with gap 10; last event 86,409 seconds after first; complete scalar/ordered values and open restore |
 | `hot` | configurable rows / rows minus one | 1 row | One opaque key with independent payloads every 9 seconds; complete scalar/ordered values and open restore |
 | `many` | `2 * keys` / `2 * keys - 1` | `keys` rows | Two interleaved independent payloads per simultaneously open key, all windows/scalars/full first and last payloads before and after restore |
@@ -30,7 +30,7 @@ strict equality keeps the deadline-40 session open while the deadline-19 session
 has closed. Final rows additionally assert that the retired key's old values are
 absent from its new interval.
 
-The existing legacy equality/bridge and direct late-drop drivers remain separate
+The existing native equality/bridge and direct late-drop drivers remain separate
 prior evidence; this driver does not replace their oracles. Generated fixtures
 are candidate qualification cases until real captures pass on the current source.
 
@@ -49,12 +49,15 @@ python3 scripts/test-native-session-manifest.py /app/target/session-hot-65001 --
 python3 scripts/test-native-session-manifest.py /app/target/session-many-65000 --prepare many --keys 65000 --payload-bytes 4096 --binary BINARY --backend rocksdb
 ```
 
-Both controller and leader protocols run by default. `--protocol` limits a run
-explicitly. Omit `--binary` to prepare input/SQL/expected/manifest files only.
+Both controller and leader protocols run by default. Ordered/closed reuse also
+default to both memory and RocksDB; ordered reuse runs source batches 1 and 8.
+`--backend`, `--protocol` and repeatable `--batch-rows` limit or select a matrix.
+Capacity fixtures keep RocksDB as their default backend. Omit `--binary` to prepare input/SQL/expected/manifest files only.
 Check free disk before the large case: input plus expected payload text already
 exceed 1 GiB, before live RocksDB and checkpoint storage. The 129,999-row large
 checkpoint has a conservative raw retained-payload floor of 532,475,904 bytes,
-above 10 times the declared 50 MiB executor/backend pool sum. The floor counts
+a declared estimate above 10 times the 50 MiB executor/backend pool sum;
+this estimate alone does not qualify actual retained checkpoint state. The floor counts
 source text once per retained input, without multiplying session metadata or
 index entries. The whole child SQL-test process has a declared 512 MiB RSS limit.
 The hot fixture similarly retains every prefix payload with a watermark lag
@@ -66,7 +69,17 @@ process. Fixture preparation and Python oracle verification run outside that
 child; this is not a measurement of the verifier's memory. Ordered output
 attributes compare both independently generated full payloads for every key.
 This is stronger than checking a count and the first hot-session payload, but
-still does not expose all raw intermediate rows.
+still does not expose all raw intermediate rows. Preparation therefore also
+writes `retained-projection.json` and `expected.retained.jsonl` for the exact
+checkpoint prefix. Use the existing `native-checkpoint-inventory.py` and
+`verify-retained-checkpoint-rows.py` with the captured owner/table inventory and
+row-key prefix `52` to verify actual retained IPC rows and attribute bytes.
+The projected original columns deliberately exclude internal routing/time fields;
+the verifier validates their unique names, Arrow types and nullability in the
+actual IPC schema. Declared floors remain separate from measured payload bytes
+in `measurement.json`; payload measurement and the measured 10x verdict remain
+unset until that independent proof is run. Total checkpoint bytes and compressed
+file sizes do not establish a raw attribute-payload floor.
 
 ## Manifest contract
 
@@ -132,12 +145,29 @@ against independently declared complete row oracles. This recovers an exact
 prefix-value assertion without modifying the shared harness or checkpoint path.
 
 
-These cases do not qualify native collections, slow-output backpressure, source
-idleness/markers, sink delivery failures, or rescaling. Current native SESSION
-admits non-distinct COUNT/SUM/AVG/MIN/MAX and ordered FIRST/LAST; native arrays
-remain rejected by its explicit bounded-output admission guard. The fixture
-cannot waive that guard. Supporting collections requires a separately reviewed
-bounded aggregate contract and actual SQL/runtime evidence.
+Current native SESSION admits non-distinct COUNT/SUM/AVG/MIN/MAX, ordered
+FIRST/LAST and non-distinct ARRAY_AGG, including ordered arrays. ARRAY_AGG values
+and ordering expressions must be direct input columns; an optional FILTER must
+be a direct Boolean input column. The typed fixtures materialize their Boolean
+member in the source rather than expanding an expression during collection.
+Array ordering, element types and nulls follow DataFusion semantics.
+
+Collection admission pages all retained rows before evaluation and bounds the
+sum of decoded input memory by `window.partial_bytes`; the final aggregate must
+also fit that limit. Collection and sorting scratch is admitted separately in
+the configured execution memory pool, using checked multiplication of retained
+input memory by 16 and the sum of each collection's value and ordering column
+counts. This reservation may exceed `partial_bytes`; insufficient execution
+pool capacity returns an admission error before collection evaluation. Oversized input returns
+`native SESSION collection input exceeds configured value limit`; oversized
+output returns `native SESSION output aggregate exceeds configured value limit`.
+Limits are not increased and output is not truncated.
+
+The typed collection/reused-key cases are prepared regressions, not current-source
+runtime passes. Slow-output backpressure, source idleness/markers, sink delivery
+failures and rescaling remain separate acceptance checks. Heavy capacity, actual
+retained checkpoint measurement, RSS, protocol/resource/fault execution and soak
+qualification remain on STR-32. No new runtime qualification is claimed here.
 
 External application lifecycle parity remains unproved: minimum event timestamp
 versus first arrival, gap-added end versus last event end, strict-greater closure

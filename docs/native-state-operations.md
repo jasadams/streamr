@@ -147,11 +147,6 @@ state-table ownership and SESSION also require singleton ownership in memory.
 Larger fixed memory parallelism for another operator is not automatically
 qualified merely because its constructor admits a subtask index. Do not rescale
 or switch backend/schema/key ownership without explicit compatibility evidence.
-A persisted old plan/checkpoint containing legacy `state_*` operators is not
-converted into a native plan by changing configuration. Streamr is pre-release:
-[STR-43](https://trakkt.app/issues/STR-43) removes these paths completely, with
-no compatibility shim or migration tooling. Replan supported native SQL and use
-a separately approved replay/cutover if old state must be retained.
 
 ## Admission failures and sizing
 
@@ -393,6 +388,5 @@ config/plan/checkpoint, preserving independent outputs and source/sink guarantee
 If the pinned candidates have different checkpoint schema/ownership, do not
 restore the new checkpoint into the old executable. Use the prior candidate's
 qualified checkpoint and source/sink replay contract, or stop for a caller-owned
-cutover decision. Removed legacy plans are unsupported; swapping executables or
-renaming operators is not compatibility evidence. This runbook makes no
+cutover decision. Swapping executables or renaming operators is not compatibility evidence. This runbook makes no
 production cutover or data-retention change.

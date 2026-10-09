@@ -10,6 +10,7 @@ use arroyo_rpc::grpc::rpc::{
     TypedStateTableSubtaskCheckpointMetadata, TypedStateTableTaskCheckpointMetadata,
 };
 use arroyo_rpc::grpc::{api, rpc};
+use arroyo_rpc::progress::{decode_progress, encode_progress};
 use arroyo_rpc::{TaskEventSpans, get_event_spans, grpc, log_trace_event};
 use arroyo_state::tables::ErasedTable;
 use arroyo_state::tables::disk_keyed_map::DiskKeyedTable;
@@ -113,7 +114,8 @@ impl OperatorState {
         )>,
     > {
         self.subtasks_checkpointed += 1;
-        self.watermarks.push(c.watermark.map(from_micros));
+        self.watermarks
+            .push(decode_progress(c.watermark, c.watermark_negative_nanos)?);
         self.start_time = match self.start_time {
             Some(existing_start_time) => Some(existing_start_time.min(from_micros(c.start_time))),
             None => Some(from_micros(c.start_time)),
@@ -489,23 +491,9 @@ impl CheckpointState {
             );
 
             // watermarks are None if any subtasks are None.
-            let (min_watermark, max_watermark) =
-                if operator_state.watermarks.iter().any(|w| w.is_none()) {
-                    (None, None)
-                } else {
-                    (
-                        operator_state
-                            .watermarks
-                            .iter()
-                            .map(|w| to_micros(w.unwrap()))
-                            .min(),
-                        operator_state
-                            .watermarks
-                            .iter()
-                            .map(|w| to_micros(w.unwrap()))
-                            .max(),
-                    )
-                };
+            let (min_watermark, max_watermark) = progress_bounds(&operator_state.watermarks);
+            let (min_watermark, min_watermark_negative_nanos) = encode_progress(min_watermark)?;
+            let (max_watermark, max_watermark_negative_nanos) = encode_progress(max_watermark)?;
             for (table, checkpoint_metadata) in table_checkpoint_metadata.iter() {
                 let config = table_configs
                     .get(table)
@@ -544,6 +532,8 @@ impl CheckpointState {
                     epoch: *self.epoch as u32,
                     min_watermark,
                     max_watermark,
+                    min_watermark_negative_nanos,
+                    max_watermark_negative_nanos,
                     parallelism: operator_state.subtasks_checkpointed as u64,
                 }),
             };
@@ -619,5 +609,49 @@ impl CheckpointState {
 
     pub fn into_commit(self, checkpoint_id: CheckpointIdOrRef) -> CommittingState {
         CommittingState::new(checkpoint_id, self.subtasks_to_commit, self.commit_data)
+    }
+}
+
+// A missing partition watermark still prevents publishing operator progress.
+fn progress_bounds(watermarks: &[Option<SystemTime>]) -> (Option<SystemTime>, Option<SystemTime>) {
+    if watermarks.iter().any(Option::is_none) {
+        (None, None)
+    } else {
+        (
+            watermarks.iter().flatten().copied().min(),
+            watermarks.iter().flatten().copied().max(),
+        )
+    }
+}
+
+#[cfg(test)]
+mod signed_progress_tests {
+    use super::*;
+    use std::time::UNIX_EPOCH;
+
+    #[test]
+    fn checkpoint_progress_orders_across_epoch_and_preserves_missing_partitions() {
+        let before = UNIX_EPOCH - Duration::from_secs(2);
+        let after = UNIX_EPOCH + Duration::from_secs(1);
+        let mut state = OperatorState::new(2);
+        for time in [after, before] {
+            let (watermark, watermark_negative_nanos) = encode_progress(Some(time)).unwrap();
+            state
+                .finish_subtask(SubtaskCheckpointMetadata {
+                    watermark,
+                    watermark_negative_nanos,
+                    ..Default::default()
+                })
+                .unwrap();
+        }
+        assert_eq!(
+            progress_bounds(&state.watermarks),
+            (Some(before), Some(after))
+        );
+        assert_eq!(progress_bounds(&[Some(before), None]), (None, None));
+        assert_eq!(
+            progress_bounds(&[Some(before), Some(before)]),
+            (Some(before), Some(before))
+        );
     }
 }

@@ -53,6 +53,30 @@ macro_rules! make_udf_function {
 make_udf_function!(MultiHashFunction, MULTI_HASH, multi_hash);
 
 pub fn register_all(registry: &mut dyn FunctionRegistry) {
+    // Context-bound markers: the planner replaces these with the triggering
+    // source row's declared FOR time. They must never execute as scalar UDFs.
+    for (name, return_type) in [
+        (
+            "watermark_timestamp",
+            DataType::Timestamp(arrow_schema::TimeUnit::Nanosecond, None),
+        ),
+        ("watermark_date", DataType::Date32),
+    ] {
+        registry
+            .register_udf(Arc::new(create_udf(
+                name,
+                vec![],
+                return_type,
+                Volatility::Stable,
+                Arc::new(|_: &[ColumnarValue]| -> Result<ColumnarValue> {
+                    Err(DataFusionError::Internal(
+                        "event clock requires planner context binding".into(),
+                    ))
+                }),
+            )))
+            .unwrap();
+    }
+
     registry
         .register_udf(Arc::new(create_udf(
             "get_first_json_object",
@@ -94,83 +118,6 @@ pub fn register_all(registry: &mut dyn FunctionRegistry) {
         .unwrap();
 
     registry.register_udf(multi_hash()).unwrap();
-
-    // Stateful processor placeholder UDFs.
-    // These are intercepted by StatefulProcessorRewriter at plan time and never execute.
-    registry
-        .register_udf(Arc::new(create_udf(
-            "state_get",
-            vec![DataType::Utf8, DataType::Utf8],
-            DataType::Utf8,
-            Volatility::Volatile,
-            Arc::new(|_: &[ColumnarValue]| -> Result<ColumnarValue> {
-                Err(DataFusionError::Internal(
-                    "state_get should be rewritten by the planner".to_string(),
-                ))
-            }),
-        )))
-        .unwrap();
-
-    registry
-        .register_udf(Arc::new(create_udf(
-            "state_put",
-            vec![DataType::Utf8, DataType::Utf8, DataType::Utf8],
-            DataType::Utf8,
-            Volatility::Volatile,
-            Arc::new(|_: &[ColumnarValue]| -> Result<ColumnarValue> {
-                Err(DataFusionError::Internal(
-                    "state_put should be rewritten by the planner".to_string(),
-                ))
-            }),
-        )))
-        .unwrap();
-
-    registry
-        .register_udf(Arc::new(create_udf(
-            "state_upsert",
-            vec![DataType::Utf8, DataType::Utf8, DataType::Utf8],
-            DataType::Utf8,
-            Volatility::Volatile,
-            Arc::new(|_: &[ColumnarValue]| -> Result<ColumnarValue> {
-                Err(DataFusionError::Internal(
-                    "state_upsert should be rewritten by the planner".to_string(),
-                ))
-            }),
-        )))
-        .unwrap();
-
-    registry
-        .register_udf(Arc::new(create_udf(
-            "state_update",
-            vec![
-                DataType::Utf8,
-                DataType::Utf8,
-                DataType::Utf8,
-                DataType::Boolean,
-            ],
-            DataType::Boolean,
-            Volatility::Volatile,
-            Arc::new(|_: &[ColumnarValue]| -> Result<ColumnarValue> {
-                Err(DataFusionError::Internal(
-                    "state_update should be rewritten by the planner".to_string(),
-                ))
-            }),
-        )))
-        .unwrap();
-
-    registry
-        .register_udf(Arc::new(create_udf(
-            "state_delete",
-            vec![DataType::Utf8, DataType::Utf8],
-            DataType::Boolean,
-            Volatility::Volatile,
-            Arc::new(|_: &[ColumnarValue]| -> Result<ColumnarValue> {
-                Err(DataFusionError::Internal(
-                    "state_delete should be rewritten by the planner".to_string(),
-                ))
-            }),
-        )))
-        .unwrap();
 }
 
 fn parse_path(name: &str, path: &ScalarValue) -> Result<Arc<JsonPath>> {

@@ -10,7 +10,7 @@ interface gaps requiring discussion before further implementation.
 
 The revised milestone plan is recorded in the support matrix: native aggregates
 (STR-17), TUMBLE/HOP (STR-19), SESSION (STR-20), typed result composition
-(STR-29), state tables/MERGE (STR-38–42) and legacy state_* removal (STR-43).
+(STR-29), state tables/MERGE (STR-38–42) and obsolete SQL surface cleanup (STR-43).
 This revision does not qualify those paths or change the historical evidence
 below. Application query proposals and oracles remain in the application repo;
 they are not embedded engine implementations.
@@ -103,7 +103,7 @@ these files and use their copies of logs rather than relying on temporary paths.
 
 | Completed run | Saved evidence | Scope and limitation |
 | --- | --- | --- |
-| State-table parity: 40 cases passed | `target/native-str43-parity-admission-v14b/` | Five generic fixtures, batches 1/8, memory/RocksDB and controller/leader; finite typed values and fresh-worker recovery, not legacy checkpoint migration or full application parity. |
+| State-table parity: 40 cases passed | `target/native-str43-parity-admission-v14b/` | Five generic fixtures, batches 1/8, memory/RocksDB and controller/leader; finite typed values and fresh-worker recovery, not full application parity. |
 | MERGE export faults: four cases passed | `target/native-str43-merge-fault-admission-v14b/` | Failed export nonpublication, selected epochs, retention and exact recovery; not production process loss. |
 | Production process recovery: six cases passed | `target/native-process-recovery-admission-v14b/matrix-results.json` | Isolated packaged binary, memory/RocksDB, worker/controller loss, 6,000 rows; not large-state, full application or 24-hour qualification. |
 | Producer/consumer deltas: four pairs passed | `target/native-produced-envelope-delta-admission-v14b/` | Eight SQL captures, actual transported JSON, typed deltas and checkpoint recovery; independently audited values, frozen files and checkpoint hashes. Not full-profile parity or atomic checkpoints across jobs. |
@@ -135,8 +135,7 @@ not the rolling-zero gate. Re-running this unchanged query cannot qualify it.
 
 STR-44 tracks optional immediate-first/per-group delayed aggregate emission
 post-MVP. Existing periodic Arroyo flushing remains accepted for this milestone;
-that deferral does not defer the other gates. Legacy state functions and their
-runtime remain pending STR-43 prerequisites and checkpoint compatibility work.
+that deferral does not defer the other gates.
 
 ### Resume without repeating completed work
 
@@ -896,39 +895,13 @@ publication, source/sink progress and recreated worker. The aggregate caches
 remain in memory; STR-17's configured live-backend migration, bounded fallback
 history and resource qualification remain open. It does not qualify native MERGE.
 
-The rebuilt binary also passed the legacy capture guard and all nine earlier
-legacy stateful/stateless capture cases, with 18 complete initial/recovered
-payload comparisons. Command: the shared queue runs `python3
-/app/target/boundary-capture/run-current.py` with the executable above. This fresh
-regression replaces the warm-binary limitation for these legacy cases only.
-
 The [native capability audit](milestone-3-native-capabilities.md) records the
 2026-10-04 source review against the full STR-28 ticket and all four substantive compatibility comments.
 The revised application sketches, reference payload fields, planner guards,
-worker admission, operator retained state, connector records and legacy plan/
-checkpoint surfaces were inspected. No Cargo command or native physical-plan/
-value/recovery capture was run for this documentation slice. The coordinating
+worker admission, operator retained state and connector records were inspected.
+No Cargo command or native physical-plan/value/recovery capture was run for this documentation slice. The coordinating
 agent owns the combined Bookworm validation queue; pending results are not passes.
 
-The coordinating agent recorded this legacy harness regression command, exit 0:
-
-```sh
-/home/jason/repos/streamr/scripts/rust-build podman exec streamr-state-build \
-  python3 /app/target/boundary-capture/run.py
-```
-
-It reused the warm Bookworm binary selected by
-`/tmp/streamr-boundary-sql-build.log`, with the same direct `prost` dependency fix
-recorded at `d59124ea`; it predates the new planner/state edits. This is not an
-exact-current-head build. The guard test passed once; nine capture tests passed
-(legacy stateful cutoffs 4/epoch 7 and 9/epoch 11, stateless cutoff 4/epoch 1,
-each in memory/controller/leader modes). All 18 initial/recovered complete payload
-comparisons passed. Container logs are
-`/tmp/streamr-boundary-{stateful,stateless}-{memory,controller,leader}-{4,9}.log`
-for the selected cases; generated payloads are under
-`target/boundary-capture/{kind}/{mode}`. These outputs are local build artifacts,
-not committed fixtures. This validates the legacy scalar-map/stateless capture
-harness only; it does not validate native state tables, aggregates or windows.
 
 Remaining acceptance requires pinned application query/oracle revisions, actual
 positive/negative native plan captures, exact ordered aggregate/FILTER/NULL and
@@ -946,9 +919,8 @@ SESSION equality/next-instant deadlines, canceled/extended deadlines, old
 arrivals, pre-watermark gap splitting, reused IDs, >=24-hour continuous activity,
 quiet producers and restore around closure remain open. Idle output, calendar
 expiry-to-zero, processing-time coalescing and last-emitted changed-field deltas
-are not demonstrated by scalar sketches or timer storage tests. Old SQL callers
-and serialized plans/checkpoints need an explicit removal/migration policy before
-STR-43. Source audit is a partial STR-28 milestone, not STR-28 or M3 completion.
+are not demonstrated by scalar sketches or timer storage tests. Source audit is
+a partial STR-28 milestone, not STR-28 or M3 completion.
 
 ### Current composition and retention status
 
@@ -1375,9 +1347,9 @@ coercion or unsafe nullability tightening is authorized by this result.
 
 ## Reproduction
 
-Use the prescribed Bookworm image and migrated build database from
-[milestone 2 setup](milestone-2-validation.md#reproduction). Preserve its warm
-Cargo target. The first-slice verification command is:
+Use the prescribed Bookworm image and serialized build queue from
+[the build procedures](../.claude/build-test.md). Preserve the shared Cargo
+target. The first-slice verification command is:
 
 ```sh
 bash scripts/verify-milestone3.sh
@@ -1766,13 +1738,13 @@ rendered SQL, input/oracle files and complete artifact hashes are preserved in
 `target/native-str43-merge-fault-admission-v13/`. Child peak RSS ranged from
 187,502,592 to 188,985,344 bytes; every child cleanup completed and final
 provenance remained unchanged. These small same-process export/retention tests
-do not qualify OS process loss, large-state capacity, legacy-state migration,
-the forty-case legacy output comparison or full application readiness.
+do not qualify OS process loss, large-state capacity,
+the forty-case native output comparison or full application readiness.
 
-The v13 forty-case legacy-equivalent native SQL wave stopped after eight passing
+The v13 forty-case native SQL wave stopped after eight passing
 operation-fixture captures (memory/RocksDB, controller/leader, batch targets
 1/8). Those eight checked all 161 initial/recovered rows and the 80-row committed
-prefix against the unchanged legacy golden. The first shared-CTE case failed
+prefix against the independent declared golden. The first shared-CTE case failed
 planning with `state-table fusion: scalar function concat has unqualified purity
 or allocation bounds`; SQL exited 101 after 0.20 seconds, with child peak RSS
 144,109,568 bytes and complete cleanup. Final frozen inventories remained
@@ -1780,8 +1752,7 @@ unchanged. Evidence is retained in `target/native-str43-parity-admission-v13/`.
 This is a demonstrated limitation of Streamr's fusion admission for an existing
 SQL function, not justification for new syntax or relaxed memory checks. That
 revision did not complete the five-fixture comparison; fresh v14b results are
-recorded below. Legacy function retirement and its compatibility policy remain
-open.
+recorded below. Full milestone qualification remains open.
 
 The source-free v13 production matrix subsequently passed all six process-loss
 cases: memory/RocksDB worker loss under the worker and controller checkpoint
@@ -1862,11 +1833,11 @@ These gates qualify the repair at the unit/build level. The fresh v14b native
 state-table matrix subsequently passed all forty captures: five original fixture
 streams, each at source batch targets 1/8, memory/RocksDB and controller/leader.
 Every case independently compared complete initial and recovered ordered rows
-with the unchanged legacy golden, including exact JSON field sets, types, NULLs,
+with the independent declared golden, including exact JSON field sets, types, NULLs,
 Booleans and values. Operations/shared-CTE cases checked 161 rows and an 80-row
 committed prefix; sequential/computed/filter cases checked five rows and a
 two-row committed prefix after three input rows. Every capture reported epoch 1,
-one singleton FusedStateTable owner and no StatefulProcessor, its declared
+one singleton FusedStateTable owner, its declared
 backend/protocol and the unchanged 16 MiB execution pool. Checkpoint job/lineage
 paths and all 436 retained object hashes were checked. Child peak RSS ranged
 from 182,763,520 to 191,946,752 bytes, below 512 MiB; every child cleanup completed
@@ -1882,7 +1853,7 @@ provenance SHA-256 is
 The v13 eight-pass/shared-CTE-failure evidence remains unchanged. This qualifies
 these five finite native SQL streams and fresh-worker native-checkpoint recovery,
 not full application parity, live/capacity acceptance, production process loss,
-legacy checkpoint migration or function-removal compatibility policy. Export/
+full milestone readiness. Export/
 retention faults and production restart paths have separate source-pinned evidence;
 this value matrix does not replace those checks. No passing matrix or build
 establishes milestone readiness.

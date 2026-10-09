@@ -1,6 +1,7 @@
 pub mod api_types;
 pub mod checkpoints;
 pub mod formats;
+pub mod progress;
 pub mod public_ids;
 pub mod schema_resolver;
 pub mod var_str;
@@ -329,6 +330,16 @@ pub fn error_chain(e: anyhow::Error) -> String {
 
 pub const TIMESTAMP_FIELD: &str = "_timestamp";
 pub const UPDATING_META_FIELD: &str = "_updating_meta";
+// Versioned logical Arrow provenance, carried by existing serialized schemas.
+pub const EVENT_CLOCK_PROVENANCE: &str = "arroyo.event_clock.v1";
+
+/// Physical alias expressions may omit this logical dependency annotation.
+/// All other metadata and field attributes remain part of schema validation.
+pub fn without_event_clock_provenance(field: &Field) -> Field {
+    let mut metadata = field.metadata().clone();
+    metadata.remove(EVENT_CLOCK_PROVENANCE);
+    field.clone().with_metadata(metadata)
+}
 
 pub fn updating_meta_fields() -> Fields {
     static UPDATING_META_FIELDS: OnceLock<Fields> = OnceLock::new();

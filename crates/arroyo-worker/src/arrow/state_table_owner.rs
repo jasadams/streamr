@@ -38,17 +38,15 @@ fn scalar_schema_compatible(physical: &Schema, declared: &Schema) -> bool {
             .iter()
             .zip(declared.fields())
             .all(|(actual, expected)| {
+                let actual = arroyo_rpc::without_event_clock_provenance(actual);
+                let expected = arroyo_rpc::without_event_clock_provenance(expected);
                 if actual.is_nullable() == expected.is_nullable() {
                     return actual == expected;
                 }
                 if actual.is_nullable() {
                     return false;
                 }
-                let normalized = actual
-                    .as_ref()
-                    .clone()
-                    .with_nullable(expected.is_nullable());
-                normalized == **expected
+                actual.with_nullable(expected.is_nullable()) == expected
             })
 }
 
@@ -490,6 +488,39 @@ impl FusedEventProgram {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn scalar_clock_schema_normalization_preserves_values_and_other_metadata() {
+        let plain = Arc::new(Schema::new(vec![Field::new(
+            "clock",
+            arrow_schema::DataType::Int64,
+            false,
+        )]));
+        let declared = Arc::new(Schema::new(vec![
+            plain
+                .field(0)
+                .clone()
+                .with_nullable(true)
+                .with_metadata(HashMap::from([(
+                    arroyo_rpc::EVENT_CLOCK_PROVENANCE.into(),
+                    "trigger".into(),
+                )])),
+        ]));
+        let values: Arc<dyn arrow_array::Array> =
+            Arc::new(arrow_array::Int64Array::from(vec![20, 10, 30]));
+        let batch = RecordBatch::try_new(plain.clone(), vec![values.clone()]).unwrap();
+        let normalized = normalize_scalar_batch(batch, declared.clone()).unwrap();
+        assert_eq!(normalized.schema(), declared);
+        assert!(Arc::ptr_eq(normalized.column(0), &values));
+        assert_eq!(normalized.num_rows(), 3);
+        assert!(scalar_schema_compatible(plain.as_ref(), declared.as_ref()));
+        assert!(!scalar_schema_compatible(declared.as_ref(), plain.as_ref()));
+        let other =
+            Schema::new(vec![declared.field(0).clone().with_metadata(
+                HashMap::from([("origin".into(), "different".into())]),
+            )]);
+        assert!(!scalar_schema_compatible(plain.as_ref(), &other));
+    }
+
     #[test]
     fn scalar_schema_allows_only_outer_nullability_widening() {
         let child = Arc::new(Field::new("field", DataType::Utf8, true));

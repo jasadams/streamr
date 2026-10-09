@@ -623,7 +623,6 @@ impl RocksSnapshot {
         self.resources
             .run_blocking(move || {
                 let _latency = resources.operation_timer("scan");
-                let _permit = permit;
                 let namespace = encoding::encode_namespace(&request.range.namespace)?;
                 let bound = |logical: &[u8]| {
                     let mut encoded = namespace.clone();
@@ -719,6 +718,7 @@ impl RocksSnapshot {
                 Ok(ScanPage {
                     entries,
                     next_cursor,
+                    _reservation: Some(permit),
                 })
             })
             .await
@@ -985,6 +985,108 @@ mod tests {
             routing_hash: None,
         }
     }
+    #[tokio::test]
+    async fn decoded_scan_page_retains_admission_through_waiter_cancellation_and_drop() {
+        let config = config();
+        let resources = resources();
+        let registry = prometheus::Registry::new();
+        resources.register_metrics(&registry).unwrap();
+        let usage = |measurement: &str| {
+            registry
+                .gather()
+                .into_iter()
+                .find(|family| family.name() == "arroyo_live_state_resources")
+                .unwrap()
+                .get_metric()
+                .iter()
+                .find(|metric| {
+                    metric.get_label().iter().any(|label| {
+                        label.name() == "resource" && label.value() == "scan_page_bytes"
+                    }) && metric
+                        .get_label()
+                        .iter()
+                        .any(|label| label.name() == "measurement" && label.value() == measurement)
+                })
+                .unwrap()
+                .get_gauge()
+                .as_ref()
+                .unwrap()
+                .value() as usize
+        };
+        let state = RocksLiveState::open(config.clone(), resources.clone())
+            .await
+            .unwrap();
+        state
+            .put(key(), b"decoded-page".to_vec(), 1024)
+            .await
+            .unwrap();
+        let snapshot = state.snapshot().await.unwrap();
+        let request = ScanRequest {
+            range: ScanRange {
+                namespace: key().namespace,
+                prefix: None,
+                start: None,
+                end: None,
+            },
+            max_entries: 1,
+            max_bytes: 1024,
+            cursor: None,
+        };
+        let page = snapshot.scan(request.clone()).await.unwrap();
+        assert_eq!(page.entries[0].value, b"decoded-page");
+        let retained = usage("used");
+        assert!(retained >= 4 * request.max_bytes);
+        let remainder = resources
+            .try_scan_page(resources.config().scan_page_bytes - retained)
+            .unwrap();
+        assert!(matches!(
+            snapshot.try_scan(request.clone()).await,
+            Err(LiveStateError::Resource(
+                super::super::resources::ResourceError::ResourceExhausted {
+                    resource: "scan_page_bytes",
+                    ..
+                }
+            ))
+        ));
+        {
+            let mut waiting = Box::pin(snapshot.scan(request.clone()));
+            assert!(futures::poll!(&mut waiting).is_pending());
+            assert_eq!(usage("waiting"), 1);
+            assert_eq!(usage("used"), resources.config().scan_page_bytes);
+        }
+        assert_eq!(usage("waiting"), 0);
+        assert_eq!(usage("used"), resources.config().scan_page_bytes);
+        drop(remainder);
+        assert_eq!(usage("used"), retained);
+        // The returned data outlives its snapshot while retaining its admission.
+        drop(snapshot);
+        assert_eq!(page.entries[0].value, b"decoded-page");
+        assert_eq!(usage("used"), retained);
+        drop(page);
+        assert_eq!(usage("used"), 0);
+        let snapshot = state.snapshot().await.unwrap();
+        let mut oversized = request.clone();
+        oversized.max_bytes = resources.config().scan_page_bytes;
+        assert!(matches!(
+            snapshot.scan(oversized).await,
+            Err(LiveStateError::Resource(
+                super::super::resources::ResourceError::RequestTooLarge {
+                    resource: "scan_page_bytes",
+                    ..
+                }
+            ))
+        ));
+        assert_eq!(usage("used"), 0);
+        let retried = snapshot.scan(request).await.unwrap();
+        assert_eq!(usage("used"), retained);
+        drop(retried);
+        assert_eq!(usage("used"), 0);
+        drop(snapshot);
+        state.close_and_remove().await.unwrap();
+        drain_cleanup(&resources).await;
+        std::fs::remove_dir_all(config.root).unwrap();
+    }
+
     #[tokio::test]
     async fn worker_database_open_rejects_saturation_before_native_preparation() {
         let mut limits = resources().config().clone();

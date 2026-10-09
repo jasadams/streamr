@@ -1,0 +1,50 @@
+{
+  "epoch_prefixes": [
+    3,
+    7,
+    10
+  ],
+  "total_input_rows": 13,
+  "expected_suffix_rows": [
+    10,
+    6,
+    3
+  ],
+  "state_tables": [
+    "inventory",
+    "observed"
+  ],
+  "backends": [
+    "memory",
+    "rocksdb"
+  ],
+  "checkpoint_modes": [
+    "controller",
+    "leader"
+  ],
+  "source_batch_rows": [
+    1,
+    8
+  ],
+  "oracle": "Checked-in complete JSON rows; independent of capture output.",
+  "expected_epoch_rows": [
+    13,
+    13,
+    13
+  ],
+  "checkpoint_sink_prefix_rows": [
+    3,
+    7,
+    10
+  ],
+  "backend_switches": [
+    "memory-to-rocksdb",
+    "rocksdb-to-memory"
+  ],
+  "retained_epochs": [
+    1,
+    2,
+    3
+  ],
+  "explicit_empty_epoch": 3
+}

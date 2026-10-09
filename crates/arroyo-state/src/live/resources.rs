@@ -247,6 +247,7 @@ impl Drop for GaugeGuard {
 /// Hold until the corresponding buffers, snapshot, or blocking work are released.
 /// Admission bounds only accounted operations: returning an owned value without
 /// its permit transfers responsibility for retained memory to the caller.
+#[derive(Debug)]
 pub struct ResourcePermit {
     _permit: OwnedSemaphorePermit,
     used: prometheus::IntGauge,

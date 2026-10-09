@@ -27,12 +27,6 @@ async fn native_operator_config(sql: &str, expected: OperatorName) -> Vec<u8> {
         .flat_map(|node| node.operator_chain.iter())
         .map(|(operator, _)| operator)
         .collect();
-    assert!(
-        operators
-            .iter()
-            .all(|operator| operator.operator_name != OperatorName::StatefulProcessor),
-        "native aggregate probes must not lower to scalar state-map calls"
-    );
     let matching: Vec<_> = operators
         .iter()
         .filter(|operator| operator.operator_name == expected)

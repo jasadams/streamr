@@ -10,18 +10,16 @@ struct FaultFixture {
     job_id: Arc<String>,
     program: LogicalProgram,
     output: PathBuf,
-    golden: PathBuf,
     disk_operator: String,
     disk_node: u32,
-    expected_records: usize,
     disk_table: String,
     advances: [i32; 2],
-    native_oracles: Option<[PathBuf; 4]>,
+    native_oracles: [PathBuf; 4],
     cdc_keys: Vec<String>,
     ordered_native: bool,
 }
 
-async fn fixture(label: &str, native: bool) -> FaultFixture {
+async fn fixture(label: &str) -> FaultFixture {
     assert_eq!(env::var("STREAMR_TEST_BACKEND").as_deref(), Ok("rocksdb"));
     assert_ne!(env::var("STREAMR_TEST_CHECKPOINT_STOP").as_deref(), Ok("1"));
     configure_test_worker();
@@ -38,49 +36,8 @@ async fn fixture(label: &str, native: bool) -> FaultFixture {
         .await
         .unwrap();
     config::update(|c| c.checkpoint_url = format!("file://{}", root.join("checkpoints").display()));
-    let crate_root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let output = root.join("output.json");
-    if native {
-        return native_fixture(root, job_id, output).await;
-    }
-    let query =
-        read_to_string(crate_root.join("src/test/queries/stateful_processor_operations.sql"))
-            .await
-            .unwrap()
-            .replace("$input_dir", crate_root.join("inputs").to_str().unwrap())
-            .replace("$output_path", output.to_str().unwrap());
-    let program = get_graph(query, &get_udfs()).await.unwrap();
-    let (disk_node, disk_operator) = program
-        .graph
-        .node_weights()
-        .find_map(|node| {
-            node.operator_chain
-                .iter()
-                .find(|(op, _)| op.operator_name == OperatorName::StatefulProcessor)
-                .map(|(op, _)| (node.node_id, op.operator_id.clone()))
-        })
-        .expect("fixture must execute a real SQL state operator");
-    let expected_records =
-        read_to_string(crate_root.join("golden_outputs/stateful_processor_operations.json"))
-            .await
-            .unwrap()
-            .lines()
-            .count();
-    FaultFixture {
-        root,
-        job_id,
-        program,
-        output,
-        golden: crate_root.join("golden_outputs/stateful_processor_operations.json"),
-        disk_operator,
-        disk_node,
-        expected_records,
-        disk_table: "__sp_shared".into(),
-        advances: [40, 40],
-        native_oracles: None,
-        cdc_keys: vec![],
-        ordered_native: false,
-    }
+    native_fixture(root, job_id, output).await
 }
 
 // Dedicated-process caller fixture. Oracles are independently declared JSONL,
@@ -176,7 +133,6 @@ async fn native_fixture(root: PathBuf, job_id: Arc<String>, output: PathBuf) -> 
     for node in program.graph.node_weights() {
         assert_eq!(node.parallelism, 1);
         for (op, _) in node.operator_chain.iter() {
-            assert_ne!(op.operator_name, OperatorName::StatefulProcessor);
             if op.operator_name == owner {
                 if kind == "state_table" {
                     disk_table = state_table_fault_transport(
@@ -213,8 +169,6 @@ async fn native_fixture(root: PathBuf, job_id: Arc<String>, output: PathBuf) -> 
     );
     let (disk_node, disk_operator) = owners.pop().unwrap();
     let oracles: [PathBuf; 4] = oracles.try_into().unwrap();
-    let golden = oracles[2].clone();
-    let expected_records = expected_alternatives(&golden).await[0].len();
     let cdc_keys: Vec<String> = if kind == "aggregate" {
         let keys = manifest["cdc_key_columns"].as_array().unwrap();
         assert!(!keys.is_empty());
@@ -229,10 +183,8 @@ async fn native_fixture(root: PathBuf, job_id: Arc<String>, output: PathBuf) -> 
         job_id,
         program,
         output,
-        golden,
         disk_node,
         disk_operator,
-        expected_records,
         disk_table,
         // The source admits its first row automatically; barriers serialize
         // admitted rows. A nonstopping checkpoint also admits one next row;
@@ -241,7 +193,7 @@ async fn native_fixture(root: PathBuf, job_id: Arc<String>, output: PathBuf) -> 
             i32::try_from(first - 1).unwrap(),
             i32::try_from(second - first - 1).unwrap(),
         ],
-        native_oracles: Some(oracles),
+        native_oracles: oracles,
         cdc_keys,
         ordered_native: kind == "state_table",
     }
@@ -450,50 +402,46 @@ async fn committed_file_value<V: arroyo_types::Data + Copy>(
 }
 
 async fn check_native_prefix(fixture: &FaultFixture, epoch: usize) {
-    if let Some(oracles) = &fixture.native_oracles {
-        let expected_input = fixture.advances[0] as usize
-            + 1
-            + if epoch == 2 {
-                fixture.advances[1] as usize + 1
-            } else {
-                0
-            };
-        let rows: usize = committed_file_value(
-            fixture,
-            epoch,
-            OperatorName::ConnectorSource,
-            fixture.root.join("input.jsonl").to_str().unwrap(),
-        )
-        .await;
-        assert_eq!(rows, expected_input, "wrong committed source prefix");
-        let offset: u64 = committed_file_value(
-            fixture,
-            epoch,
-            OperatorName::ConnectorSink,
-            fixture.output.to_str().unwrap(),
-        )
-        .await;
-        let bytes = tokio::fs::read(&fixture.output).await.unwrap();
-        let offset = usize::try_from(offset).unwrap();
-        assert!(offset <= bytes.len());
-        let prefix = &bytes[..offset];
-        assert!(prefix.is_empty() || prefix.last() == Some(&b'\n'));
-        let prefix_path = fixture.root.join(format!("committed-epoch{epoch}.jsonl"));
-        tokio::fs::write(&prefix_path, prefix).await.unwrap();
-        check_native_rows(
-            fixture,
-            &oracles[epoch - 1],
-            output_rows(&prefix_path).await,
-        )
-        .await;
-        println!("NATIVE_FAULT_COMMITTED epoch={epoch} input_rows={rows} sink_offset={offset}");
-    }
+    let oracles = &fixture.native_oracles;
+    let expected_input = fixture.advances[0] as usize
+        + 1
+        + if epoch == 2 {
+            fixture.advances[1] as usize + 1
+        } else {
+            0
+        };
+    let rows: usize = committed_file_value(
+        fixture,
+        epoch,
+        OperatorName::ConnectorSource,
+        fixture.root.join("input.jsonl").to_str().unwrap(),
+    )
+    .await;
+    assert_eq!(rows, expected_input, "wrong committed source prefix");
+    let offset: u64 = committed_file_value(
+        fixture,
+        epoch,
+        OperatorName::ConnectorSink,
+        fixture.output.to_str().unwrap(),
+    )
+    .await;
+    let bytes = tokio::fs::read(&fixture.output).await.unwrap();
+    let offset = usize::try_from(offset).unwrap();
+    assert!(offset <= bytes.len());
+    let prefix = &bytes[..offset];
+    assert!(prefix.is_empty() || prefix.last() == Some(&b'\n'));
+    let prefix_path = fixture.root.join(format!("committed-epoch{epoch}.jsonl"));
+    tokio::fs::write(&prefix_path, prefix).await.unwrap();
+    check_native_rows(
+        fixture,
+        &oracles[epoch - 1],
+        output_rows(&prefix_path).await,
+    )
+    .await;
+    println!("NATIVE_FAULT_COMMITTED epoch={epoch} input_rows={rows} sink_offset={offset}");
 }
 
 async fn checkpoint_directory(fixture: &FaultFixture, logical_path: &str) -> PathBuf {
-    if fixture.native_oracles.is_none() {
-        return fixture.root.join("checkpoints").join(logical_path);
-    }
     let storage = arroyo_state::get_storage_provider(&StorageProviderFor::Worker)
         .await
         .unwrap();
@@ -565,33 +513,17 @@ async fn restore_and_check(fixture: &FaultFixture, epoch: u64) {
     )
     .await;
     finish_from_checkpoint(&fixture.job_id, program, &mut rx).await;
-    if let Some(oracles) = &fixture.native_oracles {
-        check_native_exact(fixture, &oracles[epoch as usize + 1]).await;
-        return;
-    }
-    check_output_files(
-        "fault recovery",
-        fixture.output.to_str().unwrap().into(),
-        fixture.golden.to_str().unwrap().into(),
-        None,
-    )
-    .await;
-}
-
-#[test_log(tokio::test)]
-#[ignore = "dedicated process: STREAMR_TEST_BACKEND=rocksdb; select controller or leader"]
-async fn milestone2_upload_failure_recreates_worker_from_last_published_checkpoint() {
-    upload_failure(false).await;
+    check_native_exact(fixture, &fixture.native_oracles[epoch as usize + 1]).await;
 }
 
 #[test_log(tokio::test)]
 #[ignore = "dedicated process: caller native fixture, rocksdb and native config switch"]
 async fn milestone3_native_upload_failure_restores_selected_checkpoint() {
-    upload_failure(true).await;
+    upload_failure().await;
 }
 
-async fn upload_failure(native: bool) {
-    let fixture = fixture("upload-failure", native).await;
+async fn upload_failure() {
+    let fixture = fixture("upload-failure").await;
     let (tx, mut rx) = channel(128);
     let program = local_program(
         &fixture.job_id,
@@ -618,17 +550,13 @@ async fn upload_failure(native: bool) {
     )
     .await;
     check_native_prefix(&fixture, 1).await;
-    let committed_output_bytes = if native {
-        committed_file_value::<u64>(
-            &fixture,
-            1,
-            OperatorName::ConnectorSink,
-            fixture.output.to_str().unwrap(),
-        )
-        .await
-    } else {
-        tokio::fs::metadata(&fixture.output).await.unwrap().len()
-    };
+    let committed_output_bytes = committed_file_value::<u64>(
+        &fixture,
+        1,
+        OperatorName::ConnectorSink,
+        fixture.output.to_str().unwrap(),
+    )
+    .await;
     advance(&running, fixture.advances[1]).await;
     let blocked_path = layout().table_checkpoint_path(
         &fixture.job_id,
@@ -679,17 +607,17 @@ async fn upload_failure(native: bool) {
                         Some(fixture.disk_operator.as_str()),
                         "failure did not come from the disk table exporter"
                     );
-                    if native {
-                        assert!(
-                            error.message.contains(blocker.to_str().unwrap()),
-                            "failure omitted injected upload path"
-                        );
-                        assert!(
-                            error.message.contains("NotADirectory")
-                                || error.message.contains("Not a directory"),
-                            "failure was not the injected filesystem refusal"
-                        );
-                    }
+
+                    assert!(
+                        error.message.contains(blocker.to_str().unwrap()),
+                        "failure omitted injected upload path"
+                    );
+                    assert!(
+                        error.message.contains("NotADirectory")
+                            || error.message.contains("Not a directory"),
+                        "failure was not the injected filesystem refusal"
+                    );
+
                     println!(
                         "EXPECTED_UPLOAD_FAILURE mode={} error={error:?}",
                         if leader_mode() {
@@ -744,38 +672,25 @@ async fn upload_failure(native: bool) {
     restore_and_check(&fixture, 1).await;
     println!(
         "UPLOAD_FAILURE_RECOVERY selected_epoch=1 output_records={} mode={}",
-        if native {
-            output_rows(&fixture.output).await.len()
-        } else {
-            fixture.expected_records
-        },
+        output_rows(&fixture.output).await.len(),
         if leader_mode() {
             "leader"
         } else {
             "controller"
         }
     );
-    if native {
-        println!("NATIVE_FAULT_ARTIFACT_ROOT {}", fixture.root.display());
-    } else {
-        tokio::fs::remove_dir_all(fixture.root).await.unwrap();
-    }
-}
 
-#[test_log(tokio::test)]
-#[ignore = "dedicated process: STREAMR_TEST_BACKEND=rocksdb; select controller or leader"]
-async fn milestone2_retained_checkpoint_survives_runtime_cleanup_and_worker_recreation() {
-    retained_recovery(false).await;
+    println!("NATIVE_FAULT_ARTIFACT_ROOT {}", fixture.root.display());
 }
 
 #[test_log(tokio::test)]
 #[ignore = "dedicated process: caller native fixture, rocksdb and native config switch"]
 async fn milestone3_native_retained_checkpoint_survives_cleanup() {
-    retained_recovery(true).await;
+    retained_recovery().await;
 }
 
-async fn retained_recovery(native: bool) {
-    let fixture = fixture("retained-recovery", native).await;
+async fn retained_recovery() {
+    let fixture = fixture("retained-recovery").await;
     let (tx, mut rx) = channel(128);
     let program = local_program(
         &fixture.job_id,
@@ -900,22 +815,15 @@ async fn retained_recovery(native: bool) {
     restore_and_check(&fixture, 2).await;
     println!(
         "RETAINED_CLEANUP_RECOVERY selected_epoch=2 removed_epoch=1 retries=2 output_records={} mode={}",
-        if native {
-            output_rows(&fixture.output).await.len()
-        } else {
-            fixture.expected_records
-        },
+        output_rows(&fixture.output).await.len(),
         if leader_mode() {
             "leader"
         } else {
             "controller"
         }
     );
-    if native {
-        println!("NATIVE_FAULT_ARTIFACT_ROOT {}", fixture.root.display());
-    } else {
-        tokio::fs::remove_dir_all(fixture.root).await.unwrap();
-    }
+
+    println!("NATIVE_FAULT_ARTIFACT_ROOT {}", fixture.root.display());
 }
 
 #[test]

@@ -26,7 +26,7 @@ implemented or qualified:
 | Native SESSION | [STR-20](https://trakkt.app/issues/STR-20) | Gap/late-input/deadline/max-duration semantics, bounded histories and closure recovery |
 | Bounded aggregate ranking and arrays | [STR-17](https://trakkt.app/issues/STR-17) | Existing SQL top-K without full member-array materialization, exact typed CDC and recovery |
 | Quiet-key expiry/result composition | [STR-29](https://trakkt.app/issues/STR-29) | Approved watermark-driven zero counts for retained keys; bounded replacement output/recovery, no invented idle clock |
-| Legacy state_* SQL function removal | [STR-43](https://trakkt.app/issues/STR-43) | Complete removal of legacy SQL/runtime/protocol paths and associated artifacts; no pre-release compatibility layer |
+| Obsolete SQL surface cleanup | [STR-43](https://trakkt.app/issues/STR-43) | Remove obsolete SQL/runtime/protocol paths and associated artifacts |
 
 [STR-26](https://trakkt.app/issues/STR-26) maintains the actual native plans and
 maps each required behavior to supported SQL, a demonstrated defect or a policy
@@ -39,16 +39,10 @@ milestone 4 unless a selected plan demonstrates a required narrow gap.
 All selected paths must use backend-neutral state interfaces and the configured
 live SQL backend: memory and RocksDB currently. New providers belong behind the
 construction/lifecycle/capability boundary, not in SQL operator logic. Existing
-Native aggregate, window, session and state-table owners now use one configured
-backend construction adapter in `live/worker.rs`. Legacy state-function execution
-remains a separate path until STR-43 removal; future providers belong in the
-construction adapter rather than these SQL owners.
-
-The five legacy functions are state_get, state_put, state_upsert, state_update
-and state_delete. STR-43 removes them completely, including obsolete checked-in
-artifacts. Streamr is pre-release: preserving old plans/checkpoints, shims and
-migration tooling is not required. Ordinary native table INSERT/MERGE and backend
-get/put APIs remain current infrastructure. Git history retains historical evidence.
+Native aggregate, window, session and state-table owners use one configured
+backend construction adapter in `live/worker.rs`. Future providers belong in
+that construction adapter rather than the SQL owners. Native table INSERT/MERGE
+and backend get/put APIs remain current infrastructure.
 
 No new SQL timer/callback API is preselected. Native windows already schedule
 their own closure. Application emission/deadline requirements must be tested
@@ -95,9 +89,6 @@ event time. Updating aggregate TTL provides retention, not a general wall-clock
 emission service. [STR-29](https://trakkt.app/issues/STR-29) owns the approved
 watermark-driven zero rolling counts for retained lifetime/key rows; pending
 implementation must not be described as ordinary TUMBLE/HOP empty-window output.
-[STR-43](https://trakkt.app/issues/STR-43) owns complete removal of legacy
-`state_*` SQL/runtime artifacts. Old serialized plans/checkpoints are not promised
-compatibility, and no migration shim is required by the pre-release policy.
 
 [STR-32](https://trakkt.app/issues/STR-32) owns current-candidate combined capacity,
 fault/restart and actual 24-hour qualification, actual production `/metrics`
@@ -110,7 +101,7 @@ transfer bytes and RSS separate when selecting deployment limits.
 
 The [historical native capability audit](milestone-3-native-capabilities.md) maps all
 external profile/session fields and lifecycle rules, records source-level
-composition restrictions, retained ownership and the STR-43 removal inventory.
+composition restrictions, retained ownership and backend ownership.
 Its source review is based on an earlier implementation snapshot; current tested
 routes and limitations are in the [validation record](milestone-3-validation.md).
 Generic ordered FIRST_VALUE/LAST_VALUE value and recovery cases now pass on the
@@ -182,10 +173,9 @@ full profile/session, lifetime ranking and broader milestone gates remain open.
 
 | Path / node | Retained working state | Current support and limitation |
 | --- | --- | --- |
-| `crates/arroyo-worker/src/arrow/stateful_processor.rs` / `StatefulProcessor` | Singleton ordered named scalar maps; one RocksDB execution owner | Disk working state and full logical checkpoints are supported. Reads return complete bounded values. The disk SQL path supports primitive and UTF-8 rows and a bounded function set; it does not expose native collection outputs or durable callback scheduling. |
 | `crates/arroyo-state/src/live/{mod,rocks,memory,table}.rs` | Namespaced key/value state, atomic multi-key batches and stable snapshots | Reusable backend interfaces with owned bounded reads and cursor scans. `LiveTable::write_batch` rejects cross-table operations; cross-namespace atomic batches require the shared backend and caller serialization/admission. |
 | `crates/arroyo-state/src/live/timers.rs` / `DurableTimers` | Primary timer records and deadline indexes inside one namespace | Atomic replacement/cancellation, separate clock kinds, bounded due pages and stale-entry revalidation. This is storage support; no worker callback scheduler or SQL timer functions are supplied. |
-| `crates/arroyo-state/src/live/collections.rs` / `RankedCounts` | Separate member counters and ranking records inside one namespace | Checked counters, atomic prepared updates, bounded member/rank scans, exact bounded top-K and incremental cleanup. Collection values are not growing serialized blobs. Existing SQL map functions do not automatically expose these APIs. |
+| `crates/arroyo-state/src/live/collections.rs` / `RankedCounts` | Separate member counters and ranking records inside one namespace | Checked counters, atomic prepared updates, bounded member/rank scans, exact bounded top-K and incremental cleanup. Collection values are not growing serialized blobs. SQL exposure requires a native operator adapter. |
 | `crates/arroyo-state/src/live/time.rs` / `ArrowHistory` | Chunked Arrow history and timestamp-first expiry records in derived namespaces | Bounded chunks, history pages and expiry batches. This is not a timer scheduler or a migrated window operator. Its derived namespaces need explicit checkpoint integration; creating a history from a registered table does not automatically register/export those namespaces. |
 | `crates/arroyo-state/src/tables/table_manager.rs`, `live/checkpoint.rs` | Registered disk namespaces, shared barrier snapshots and exclusive logical page files | Restores selected remote state into a fresh attempt and exports full registered namespaces with checksums/schema/ownership. Sharing a database does not make unregistered namespaces durable. |
 | `crates/arroyo-worker/src/arrow/execution.rs`, `arrow/sync/streams.rs`, `StatelessPhysicalExecutor` | Shared DataFusion runtime, input/output reservations and bounded batch delivery | Opt-in cooperative execution accounting and per-batch checks. Spilling is disabled. Arbitrary UDF allocations, queues and legacy retained structures are not universally covered. |
@@ -198,12 +188,13 @@ full profile/session, lifetime ranking and broader milestone gates remain open.
 
 ## Generic API contracts and limits
 
-### SQL maps and checkpoints
+### Native SQL owners and checkpoints
 
-Disk SQL maps currently require singleton parallelism, subtask 0 and one fresh
-backend per execution owner. All registered live tables in an operator share that
-backend. There are at most 32 maps and 65,536 exclusive page files per operator
-checkpoint, also subject to a 3 MiB serialized whole-subtask metadata limit below
+Configured native SQL owners use one fresh backend per execution owner.
+State-table ownership currently requires singleton parallelism. All registered
+live tables in an operator share its backend. Checkpoints admit at most 65,536
+exclusive page files per operator, also subject to a 3 MiB serialized whole-subtask
+metadata limit below
 the existing 4 MiB RPC receive limit. The extra 3 MiB cap applies to disk-enabled
 subtasks, including their legacy metadata; memory-only metadata retains existing
 behavior. Encoded disk namespaces are limited to 512 bytes and schema identities

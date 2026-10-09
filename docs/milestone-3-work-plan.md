@@ -45,7 +45,7 @@ removing the retaining key removes its composed result. Complete input silence
 without watermark progress does not advance event time. Ordinary window
 outputs remain unchanged. No new public timer callback API is preapproved.
 
-STR-43 is ready: remove legacy state_* SQL and its implementation, serialized
+STR-43 is ready: remove the obsolete scalar SQL surface and its implementation, serialized
 types, tests, fixtures, examples, scripts and documentation completely. Streamr
 is pre-release; old plans/checkpoints need no compatibility or migration layer.
 Preserve reusable infrastructure required by the current native engine.

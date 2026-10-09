@@ -1,0 +1,72 @@
+[
+  [
+    "+",
+    {
+      "session_id": 1,
+      "duration": 10,
+      "event_reference": "2026-10-10T00:00:03",
+      "date_reference": "2026-10-10",
+      "progress_expression": "2026-10-09T23:59:58"
+    }
+  ],
+  [
+    "+",
+    {
+      "session_id": 2,
+      "duration": 10,
+      "event_reference": "2026-10-10T00:00:03",
+      "date_reference": "2026-10-10",
+      "progress_expression": "2026-10-09T23:59:45"
+    }
+  ],
+  [
+    "+",
+    {
+      "session_id": 3,
+      "duration": 10,
+      "event_reference": "1969-12-31T23:59:59.999999999",
+      "date_reference": "1969-12-31",
+      "progress_expression": "1970-01-01T00:00:00"
+    }
+  ],
+  [
+    "+",
+    {
+      "session_id": 4,
+      "duration": 10,
+      "event_reference": "2026-10-10T00:00:03.123456789",
+      "date_reference": "2026-10-10",
+      "progress_expression": "2026-10-10T00:00:05"
+    }
+  ],
+  [
+    "+",
+    {
+      "session_id": 5,
+      "duration": 10,
+      "event_reference": "2026-10-10T00:00:20",
+      "date_reference": "2026-10-10",
+      "progress_expression": "2026-10-10T00:00:25"
+    }
+  ],
+  [
+    "+",
+    {
+      "session_id": 6,
+      "duration": 10,
+      "event_reference": "2026-10-10T00:00:10",
+      "date_reference": "2026-10-10",
+      "progress_expression": "2026-10-10T00:00:26"
+    }
+  ],
+  [
+    "+",
+    {
+      "session_id": 7,
+      "duration": 10,
+      "event_reference": "2026-10-10T00:00:30",
+      "date_reference": "2026-10-10",
+      "progress_expression": "2026-10-10T00:00:27"
+    }
+  ]
+]
