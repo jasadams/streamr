@@ -108,7 +108,6 @@ physical-plan probes and exact failures remain a validation gate.
 | Ranking / analytic expressions | `plan/window_fn.rs` requires already windowed input, rejects SESSION, requires exactly one expression and exactly one window field in PARTITION BY. The lifetime rank sketches do not meet that input contract. |
 | Nested aggregation | `plan/aggregate.rs` requires matching windows; SESSION cannot be reinvoked in nested aggregates and must carry its window struct. Shared assignment must be proved before filtering collections. |
 | RocksDB live SQL | At this audit snapshot, admission was described by a narrow operator allowlist. Since then, native aggregates, TUMBLE/HOP, SESSION and state tables use the common configured-backend construction path; current memory/RocksDB runtime evidence is recorded in the validation document. Ranking and general joins/composition remain path-specific planner restrictions; a memory pass alone is not RocksDB evidence. |
-| Legacy disk map projection | `arrow/stateful_processor.rs` validates primitive/UTF-8 row types and a scalar allowlist. Lists/maps and arbitrary profile/session UDFs are not qualified by this path. |
 
 Native aggregate, window, SESSION and state-table owners now share the configured
 backend construction adapter (STR-39), with one SQL semantics implementation.
@@ -133,7 +132,7 @@ key/value/collection/channel/output allocation are not established.
 | Legacy TUMBLE/HOP computation holders | `execs` BTreeMaps, bins/panes, record-batch holders, DataFusion aggregate state, and unbounded internal input channels describe the pre-migration route. The selected paged native path and its capacity limits are in the support matrix and validation record; generic channel-byte bounds remain open. |
 | Legacy SESSION computations and start/deadline indexes | `key_computations`, start/deadline indexes, raw batches and legacy `e`/`s` tables describe the pre-migration route. The selected native paged SESSION state and tested hot-session checkpoint shape are summarized in the support matrix and validation record; broader cardinality and channel-byte bounds remain open. |
 | Ranking/array composition | Window-function `execs` BTreeMap, pending futures, raw batches, unbounded channels and sort/window executor state; registers legacy `input` timestamp table. Selected plan capacity remains unqualified. Lifetime member counts need separately addressable entries, bounds on active cache, exact tie ordering, rank maintenance and admitted array construction. Existing `RankedCounts` is storage evidence only. |
-| Native typed tables and carried event results | STR-38–42 now supplies a tested typed-table/ordered-owner route; every durable namespace/schema/index must register for export/restore. The current state-table captures cover named MERGE effects, lookup values and fresh-worker recovery. Broader OLD/source/NEW buffers, cancellation/output admission and old scalar-map checkpoint migration policy remain separate concerns. |
+| Native typed tables and carried event results | STR-38–42 now supplies a tested typed-table/ordered-owner route; every durable namespace/schema/index must register for export/restore. The current state-table captures cover named MERGE effects, lookup values and fresh-worker recovery. Broader OLD/source/NEW buffers, cancellation/output admission remain separate concerns. |
 | Generic timers / ranked collections | Primary and deadline/rank indexes stay in one registered live namespace. Prepared buffers, retained pages, scans and composed batches need reservations through commit. One serial owner excludes competing writers; storage atomicity is not output atomicity. |
 | Arrow history | Chunk and expiry namespaces are derived. Every namespace must explicitly register in checkpoint metadata; factory construction alone does not register/export it. Appending chunks can commit a prefix. |
 | Graph and operator channels | Message counts are bounded for graph queues; byte admission remains STR-16. Legacy window channels were unbounded; the selected native window path uses a one-slot final reader. Graph-wide byte admission, slow-sink behavior and cancellation with retained batches remain to be qualified; stateless executor tests do not establish them. |
@@ -147,27 +146,3 @@ occurs after output allocation. Arbitrary expression/UDF allocations and legacy
 retained structures are not universally admitted. Large values require declared
 failure behavior; neither RAM residency nor output size is bounded merely by
 placing records on disk.
-
-## STR-43 removal inventory
-
-The removal target is the SQL surface `state_get`, `state_put`, `state_upsert`,
-`state_update`, `state_delete`. Ordinary backend get/put, table INSERT/MERGE and
-generic storage/checkpoint support are not automatically removal targets.
-
-| Surface | Current locations / decision needed |
-| --- | --- |
-| Active registration and lowering | `arroyo-planner/src/functions.rs`, `plan/mod.rs`, `rewriters.rs`, `extension/stateful_processor.rs`; registration, expression detection, map ownership and guarded CASE lowering must migrate together. |
-| Worker dispatch and row evaluation | `arroyo-worker/src/arrow/stateful_processor.rs`, `worker/src/engine.rs`; map construction, ordered operations, allowlist/type checks and worker admission are coupled to old serialized plans. |
-| Planner callers | `test/mod.rs` and query fixtures `stateful_processor_{get,put,upsert,delete,multi_ops}.sql`, `error_stateful_processor_{non_literal_map,in_filter}.sql`; migrate equivalent generic native regressions before deletion. |
-| Native runtime callers | `arroyo-sql-testing/src/smoke_tests.rs` and `src/test/queries/stateful_processor_{operations,shared_ctes,sequential_ctes,computed_cte,qualified_filter}.sql`; associated inputs and golden outputs also belong to the migration inventory. |
-| Serialized physical plans | `api.proto`: `StateOpType`, `StateOperation`, `StatefulProcessorOperator`; `arroyo-datastream/src/logical.rs`: `OperatorName::StatefulProcessor` and its name mapping. Persisted programs include opaque physical expression bytes and old function/operator references. Specify versioned rejection or explicit conversion; do not silently reuse enum tags. |
-| Checkpoint formats | Memory scalar maps use legacy global keyed state; disk uses `TableEnum::DiskKeyedMap` (tag 3), `DiskKeyedTableConfig`, subtask/task metadata, `DISK_CHECKPOINT_VERSION` (1), logical page files and registered namespace/schema ownership validation. New typed-table schemas must not silently decode these old bytes. Preserve/reject/migrate with explicit version/ownership rules and restore tests. |
-| Historical evidence | `docs/milestone-2-{validation,handoff}.md`, historical review logs and milestone 3 provenance document the prior path. Keep provenance clearly historical; they do not qualify the replacement or require deleting generic disk snapshot storage. |
-| External consumers | Application legacy SQL and capture fixtures require application-side inventory/migration; engine search cannot certify all deployed callers. Proposed sketches are not migrated callers. |
-
-Reproduce the engine SQL-token inventory with
-`rg -l 'state_(get|put|upsert|update|delete)' --hidden --glob '!.git/**' --glob '!Cargo.lock'`.
-Also search operator/protocol names, registered table dispatch, generated plan
-bytes and fixture/golden names; SQL-token search alone misses serialized callers.
-Do not remove catalog/decoder support before native prerequisites and the explicit
-old-plan/checkpoint policy pass.

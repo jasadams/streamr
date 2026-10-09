@@ -39,7 +39,6 @@ pub enum OperatorName {
     SlidingWindowAggregate,
     SessionWindowAggregate,
     UpdatingAggregate,
-    StatefulProcessor,
     StateTable,
     FusedStateTable,
     StateTableCapture,
@@ -423,7 +422,6 @@ impl LogicalProgram {
                         "sql-session-window-aggregate".to_string()
                     }
                     OperatorName::UpdatingAggregate => "sql-updating-aggregate".to_string(),
-                    OperatorName::StatefulProcessor => "sql-stateful-processor".to_string(),
                     OperatorName::StateTable => "sql-state-table".to_string(),
                     OperatorName::FusedStateTable => "sql-fused-state-table".to_string(),
                     OperatorName::StateTableCapture => "sql-state-table-capture".to_string(),

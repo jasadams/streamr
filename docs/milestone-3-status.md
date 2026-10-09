@@ -6,8 +6,10 @@ current dispatch instructions. No implementation worker is claimed by this reset
 
 ## Available features
 
-All eight tickets are Todo, agent-ready and unblocked. Independent agents may work
-in parallel in separate worktrees with the file ownership in each ticket.
+At the 2026-10-09 reset, all eight tickets were Todo, agent-ready and unblocked.
+STR-16 now has [PR #15](https://github.com/jasadams/streamr/pull/15) open awaiting
+final CI and merge. Independent agents may work in parallel in separate worktrees
+with the file ownership in each ticket.
 
 | Ticket | Deliverable | Primary ownership |
 | --- | --- | --- |
@@ -25,6 +27,23 @@ One feature per worker. Claim with worker/session, start, acceptance and owned
 files; only then set In Progress. Coordinate shared sections before editing.
 STR-17 owns aggregate capture assertions in smoke_tests.rs; STR-42 owns the
 multi-epoch scenario. Compiler/capacity jobs remain serialized through cargo-dev.
+
+## Active STR-16 increment
+
+- Worker `/root` on `jason/str-16-ownership-cancellation`, start 2026-10-09
+  00:39 UTC; deadline 01:39 UTC. Owned queue/network and checkpoint admission paths.
+- Repair: RocksDB decoded scan pages retain their existing scan reservation until
+  page consumption/drop. Regressions cover retained pages, data/signal queue
+  cancellation/drop, checkpoint export/restore cancellation and fresh retry.
+- Independent review approved. Affected-crate compile and Clippy checks passed
+  (exit 0) using documented immutable dev image `cdeb96c9e3e`. At `6bb22ee7`,
+  `cargo-dev test --locked -p arroyo-state -p arroyo-operator -p arroyo-worker cancel`
+  passed (exit 0): 3 operator, 10 state and 15 worker tests. Source-bound log:
+  `/tmp/str16-cancellation-tests-final.log`.
+- [PR #15](https://github.com/jasadams/streamr/pull/15) is open awaiting final CI
+  and merge. Heavy slow-consumer/RSS/storage-fault/soak qualification stays with
+  STR-32. No user decision or read-view redesign is required. Next action: finish
+  final PR CI and merge review.
 
 ## Decisions and final acceptance
 
@@ -53,3 +72,58 @@ strong window/hot-session and selected all-key capacity results already exist.
 Later cancelled reruns do not erase earlier passes or authorize another run.
 Full current-candidate qualification remains STR-32; no test was run by this
 backlog rewrite. Git history preserves the previous working ledger.
+
+## STR-20 implementation ready — 2026-10-09
+
+Worker `jason/str-20-session-bounds`, started 08:22 UTC; deadline 09:22 UTC.
+The session operators/store and fixture increment passed the focused verification
+below. Current independent review, PR and CI outcomes are recorded on STR-20.
+
+Acknowledged closure is persisted before paged retirement. Cancellation before
+acknowledgment retains complete history; cancellation afterward resumes deletion
+without re-emission, including full checkpoint restore into a fresh backend.
+One bounded in-worker acknowledgment is flushed before checkpoint capture.
+IPC rows are compacted within the existing reader admission to avoid shared-body
+memory overcounting. Native ARRAY_AGG accepts direct source value/order/filter
+columns, uses paged input/value admission and separately reserved execution
+scratch. Its planner Final/Partial pair is locally normalized with original order,
+filters and unchanged output schema. Oversized values error without truncation or
+budget increases. Session format/identity is version 2; disk encoding stays 1.
+
+Executed in verified Bookworm image `cdeb96c9` on final source:
+- `scripts/cargo-dev check --locked -p arroyo-worker` — exit 0.
+- `scripts/preflight-clippy.sh -p arroyo-worker` — exit 0.
+- `scripts/cargo-dev fmt --all -- --check` — exit 0.
+- `scripts/cargo-dev test --locked -p arroyo-worker --lib arrow::session -- --test-threads=1`
+  — exit 0; all 21 tests pass. Coverage includes actual planner/constructor typed
+  integer/text/Boolean arrays and filtered first/last metadata, expanded-expression
+  rejection, slow collection, cancellation before/after acknowledgment, full
+  checkpoint/fresh-backend partial retirement, remaining open state, reused keys,
+  24-key one-entry-page closure and oversized hot-collection history preservation.
+
+Earlier Clippy exited 1 on new test helper visibility/storage-access errors; fixed.
+Earlier focused tests exited 101 (18/21 then 20/21 passes): IPC backing-memory
+admission, fresh database ownership, and physical-schema alias assertions were
+repaired without increasing limits. These failures do not establish passing results.
+Prepared SQL backend/protocol/reused-key fixtures are not runtime matrix passes.
+Historical 12 normal/late and hot capacity results stay source-specific. Full
+fixture matrix and heavy capacity/RSS/fault/soak qualification remain STR-32.
+Read-view lifetime and stopped-input event-time semantics are unchanged.
+
+## Active STR-61 integration repair — 2026-10-09
+
+- Published branch `jason/str-61-event-clock-092033`, head `3686be4`, integrates
+  current main `811433d1` without rewriting history. Start 21:00 UTC; deadline 22:00.
+- Acceptance: resolved conflicts, independent review, affected-crate locked check,
+  strict Clippy, focused event-clock regressions and repaired-head CI.
+- Conflict: planner filter rewrite retains row event-clock binding and removes
+  obsolete scalar-state function handling as required by current main.
+- Current-source eight-crate locked check and strict Clippy passed (exit 0);
+  16 focused regressions passed. Logs: `/tmp/str61-integration-check.log`,
+  `/tmp/str61-integration-clippy.log` and `/tmp/str61-integration-*-tests.log`.
+- Independent integration review found no new issues. Next action: publish the
+  reviewed repair, finish two focused tests and the fresh SQL recovery matrix,
+  then verify repaired-head CI. Pending runs are not acceptance evidence.
+  Prior 48-case runtime results remain historical.
+- STR-62 maintained aggregates and STR-67 signed window cutoffs stay deferred.
+  No new semantics or user decision is introduced by this integration.

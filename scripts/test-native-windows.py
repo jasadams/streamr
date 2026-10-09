@@ -86,9 +86,13 @@ def assert_rows(path, wanted):
         raise AssertionError((path, actual, wanted))
 
 
-def run_case(binary, directory, kind, backend, batch, mode, native):
+def run_case(binary, directory, kind, backend, batch, mode, native,
+             checkpoint_input_rows=4, checkpoint_expected=None):
     write_fixture(directory, kind)
     wanted = expected(kind)
+    checkpoint_expected = checkpoint_expected or []
+    (directory / 'expected.checkpoint.json').write_text(
+        json.dumps(checkpoint_expected, indent=2) + '\n')
     env = dict(os.environ)
     env.pop('STREAMR_TEST_TYPED_SQL', None)
     env.pop('STREAMR_TEST_NATIVE_AGGREGATES', None)
@@ -100,9 +104,9 @@ def run_case(binary, directory, kind, backend, batch, mode, native):
         STREAMR_TEST_EXECUTION_BYTES='16777216',
         STREAMR_CAPTURE_QUERY=str(directory / 'query.sql'),
         STREAMR_CAPTURE_OUTPUT=str(directory / 'output.jsonl'),
-        STREAMR_CAPTURE_INPUT_ROWS_BEFORE_CHECKPOINT='4',
+        STREAMR_CAPTURE_INPUT_ROWS_BEFORE_CHECKPOINT=str(checkpoint_input_rows),
         STREAMR_CAPTURE_EXPECTED_INITIAL_ROWS=str(len(wanted)),
-        STREAMR_CAPTURE_EXPECTED_CHECKPOINT_ROWS='0',
+        STREAMR_CAPTURE_EXPECTED_CHECKPOINT_ROWS=str(len(checkpoint_expected)),
         STREAMR_CAPTURE_EXPECTED_ROWS=str(len(wanted)),
         STREAMR_CAPTURE_CHECKPOINT_EPOCH='1',
     )
@@ -119,12 +123,15 @@ def run_case(binary, directory, kind, backend, batch, mode, native):
         raise RuntimeError(f'capture failed: {log}')
     assert_rows(directory / 'output.initial.jsonl', wanted)
     assert_rows(directory / 'output.jsonl', wanted)
-    # The capture harness itself asserts zero rows at the stopping checkpoint.
-    # The sink opens an empty file before the stopping checkpoint. A nonempty
-    # prefix would mean these first four same-time events closed a window.
-    if (directory / 'output.jsonl').read_text() == '':
-        raise AssertionError((directory, 'recovered output is empty'))
-    print(f'PASS {directory.name}: {len(wanted)} exact windows, checkpoint prefix 0', flush=True)
+    # The sink restores its committed prefix and appends continuation. Compare
+    # the exact prefix, including its typed values, after fresh-worker recovery.
+    lines = (directory / 'output.jsonl').read_text().splitlines()
+    prefix = directory / 'output.checkpoint.jsonl'
+    prefix.write_text(''.join(line + '\n' for line in lines[:len(checkpoint_expected)]))
+    assert_rows(prefix, checkpoint_expected)
+    print(f'PASS {directory.name}: {len(wanted)} exact windows, '
+          f'checkpoint prefix {len(checkpoint_expected)}', flush=True)
+
 
 
 def main():

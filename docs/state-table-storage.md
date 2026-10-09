@@ -3,9 +3,8 @@
 `arroyo_state::live::typed_table` implements keyed Arrow rows using
 `Arc<dyn LiveStateBackend>`. Construction and shutdown belong to adapters;
 `worker::construct_backend` selects bounded memory or attempt-scoped RocksDB.
-The table kernel does not inspect or downcast the concrete backend. Memory SQL
-maps keep their existing checkpoint representation until their separate migration.
-RocksDB SQL maps now reuse generic construction and admitted writes.
+The table kernel does not inspect or downcast the concrete backend. Native SQL
+owners reuse generic construction and admitted writes.
 
 A caller supplies `TableDescriptor`: the complete Arrow schema, primary-key
 column indices, stable table identity and schema identity. The catalog descriptor
@@ -68,7 +67,7 @@ release or explicitly budget retained results. Construction validates combined
 scope/read/page workspace headroom. Typed reads, scans and scope construction
 use fail-fast resource admission, including nested backend workspace and queue
 admission. Exhausted capacity returns an explicit resource error instead of
-waiting while holding another pool's permits; legacy map admission is preserved.
+waiting while holding another pool's permits.
 IPC reads preflight every framed message and verify signed metadata/body lengths,
 remaining input, exact supported field types, row/node/buffer bounds and EOS
 before invoking Arrow's allocating decoder. Compressed, dictionary, nested or

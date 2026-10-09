@@ -57,9 +57,7 @@ State-table ownership and native SESSION currently reject parallelism other
 than one. Larger fixed parallelism for another operator is not automatically
 qualified merely because its constructor admits a subtask index. Do not rescale
 or switch backend/schema/key ownership without explicit compatibility evidence.
-A persisted old plan/checkpoint containing legacy `state_*` operators is not
-converted into a native plan by changing configuration; freeze a supported plan
-and establish migration or explicit incompatibility before restart.
+
 
 ## Admission failures and sizing
 
@@ -221,7 +219,7 @@ qualification; this bundle does not inject them.
 
 Rollback means restarting the pinned prior candidate with its proven compatible
 config/plan/checkpoint, preserving independent outputs and source/sink guarantees.
-If native and prior legacy plans have different checkpoint schema/ownership,
-rollback needs an application-approved replay/migration path; swapping executables
+If the selected plans have different checkpoint schema/ownership,
+rollback needs an application-approved replay path; swapping executables
 or renaming operators is not compatibility evidence. This runbook makes no
 production cutover or data-retention change.

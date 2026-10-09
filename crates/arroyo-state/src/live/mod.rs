@@ -183,10 +183,15 @@ pub struct ScanEntry {
     pub key: StateKey,
     pub value: Vec<u8>,
 }
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Owns the backend scan reservation through consumption of the decoded page.
+/// Callers transferring entries into another retained representation must admit
+/// that representation separately before releasing this page. Pages deliberately
+/// cannot be cloned: a deep copy needs its own byte admission.
+#[derive(Debug)]
 pub struct ScanPage {
     pub entries: Vec<ScanEntry>,
     pub next_cursor: Option<ScanCursor>,
+    pub(crate) _reservation: Option<resources::ResourcePermit>,
 }
 
 #[async_trait]
