@@ -2,7 +2,7 @@
 """Prepare and compare a generic two-stage updating top-five ARRAY_AGG probe.
 
 This script never starts Streamr. `array_slice` limits the output to five items;
-the native ARRAY_AGG still retains/materializes all distinct items per key.
+the planner may use bounded ranked materialization for the ordered slice.
 """
 import argparse
 import hashlib
@@ -273,10 +273,20 @@ def compare(host):
             raise ValueError(f'{name}: capture phase, checkpoint or output path differs')
         initial = reduce_cdc(directory / 'output.initial.jsonl', allowed, states)
         recovered = reduce_cdc(directory / 'output.jsonl', allowed, states)
+        # The checkpoint file must contain only values obtainable before the
+        # source barrier, even when flushes coalesce intermediate updates.
+        records = arrays.read_jsonl(directory / 'output.jsonl')
+        checkpoint_path = directory / 'output.checkpoint.jsonl'
+        checkpoint_path.write_text(''.join(json.dumps(row) + '\n'
+                                           for row in records[:committed]))
+        checkpoint_states = reduce_cdc(checkpoint_path, allowed, states[:CHECKPOINT])
         if (not initial or len(initial) != int(initial_count)
-                or committed < 1 or committed > len(recovered)
+                or len(initial) > 128 or len(recovered) > 128
+                or committed < 1 or committed > 128 or committed > len(recovered)
                 or len(recovered) != recovered_count
                 or canonical(initial[-1]) != canonical(states[-1])
+                or not checkpoint_states
+                or canonical(checkpoint_states[-1]) != canonical(states[CHECKPOINT - 1])
                 or canonical(recovered[committed - 1]) != canonical(states[CHECKPOINT - 1])
                 or canonical(recovered[-1]) != canonical(states[-1])):
             raise ValueError(f'{name}: initial/checkpoint/recovered top-five values differ')
