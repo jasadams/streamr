@@ -1,0 +1,13 @@
+{"seq": 1, "scope_key": "a", "item_id": 1, "mode": "write", "quantity": 10, "label": "α", "enabled": true}
+{"seq": 2, "scope_key": "b", "item_id": 1, "mode": "write", "quantity": 20, "label": null, "enabled": false}
+{"seq": 3, "scope_key": "c", "item_id": 1, "mode": "write", "quantity": 30, "label": "", "enabled": null}
+{"seq": 4, "scope_key": "a", "item_id": 1, "mode": "write", "quantity": 11, "label": "updated", "enabled": false}
+{"seq": 5, "scope_key": "b", "item_id": 1, "mode": "noop", "quantity": 99, "label": "ignored", "enabled": true}
+{"seq": 6, "scope_key": "c", "item_id": 1, "mode": "delete", "quantity": 0, "label": null, "enabled": null}
+{"seq": 7, "scope_key": "c", "item_id": 1, "mode": "write", "quantity": 31, "label": "再挿入", "enabled": true}
+{"seq": 8, "scope_key": "a", "item_id": 1, "mode": "delete", "quantity": 0, "label": null, "enabled": null}
+{"seq": 9, "scope_key": "b", "item_id": 1, "mode": "delete", "quantity": 0, "label": null, "enabled": null}
+{"seq": 10, "scope_key": "c", "item_id": 1, "mode": "delete", "quantity": 0, "label": null, "enabled": null}
+{"seq": 11, "scope_key": "a", "item_id": 1, "mode": "noop", "quantity": 0, "label": null, "enabled": null}
+{"seq": 12, "scope_key": "b", "item_id": 1, "mode": "noop", "quantity": 0, "label": null, "enabled": null}
+{"seq": 13, "scope_key": "c", "item_id": 1, "mode": "noop", "quantity": 0, "label": null, "enabled": null}
