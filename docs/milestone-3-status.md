@@ -41,8 +41,9 @@ Seven Python capture self-tests passed. Source `29966185` passed affected-crate
 check, strict all-target Clippy, three planner tests, four worker tests and
 formatting in the documented repaired image `cdeb96c9e3e9`. The worker tests
 include actual checkpoint export/restore to memory and RocksDB. Earlier image,
-compiler and lint failures were repaired; final batch exit was 0. Next: publish
-the reviewed PR and wait for current-head CI.
+compiler and lint failures were repaired; final batch exit was 0.
+[PR #21](https://github.com/jasadams/streamr/pull/21) is open; `/merge-sweeper`
+owns the merge after current-head CI passes.
 No pending product decision; full runtime/capacity qualification stays in STR-32.
 
 - STR-29's contract was approved on 2026-10-09: watermark expiry emits zero
