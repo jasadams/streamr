@@ -110,20 +110,25 @@ Historical 12 normal/late and hot capacity results stay source-specific. Full
 fixture matrix and heavy capacity/RSS/fault/soak qualification remain STR-32.
 Read-view lifetime and stopped-input event-time semantics are unchanged.
 
-## Active STR-61 integration repair — 2026-10-09
+## STR-61 reviewed integration repair — 2026-10-09
 
-- Published branch `jason/str-61-event-clock-092033`, head `3686be4`, integrates
-  current main `811433d1` without rewriting history. Start 21:00 UTC; deadline 22:00.
+- Published branch `jason/str-61-event-clock-092033`, repaired source `e4ad163b`,
+  integrates main `811433d1` without rewriting history. Start 21:00 UTC; deadline 22:00.
 - Acceptance: resolved conflicts, independent review, affected-crate locked check,
   strict Clippy, focused event-clock regressions and repaired-head CI.
 - Conflict: planner filter rewrite retains row event-clock binding and removes
   obsolete scalar-state function handling as required by current main.
 - Current-source eight-crate locked check and strict Clippy passed (exit 0);
-  16 focused regressions passed. Logs: `/tmp/str61-integration-check.log`,
+  all 18 focused regressions passed. Logs: `/tmp/str61-integration-check.log`,
   `/tmp/str61-integration-clippy.log` and `/tmp/str61-integration-*-tests.log`.
-- Independent integration review found no new issues. Next action: publish the
-  reviewed repair, finish two focused tests and the fresh SQL recovery matrix,
-  then verify repaired-head CI. Pending runs are not acceptance evidence.
-  Prior 48-case runtime results remain historical.
+- Fresh SQL worker recovery passed all 48 cases on `e4ad163b` (exit 0), with
+  memory/RocksDB, batches 1/8 and controller/leader checkpoints. Preserved executable
+  SHA256: `ac282bfa24b5f59ccc8fdcd2d26d33766145037efbb580f25496276151572395`.
+  Source receipt, build/runtime logs and captures:
+  `/home/jason/qa-evidence/str61-integration-20261009T2100Z/`.
+- Independent integration review found no new issues; all six CI checks passed
+  on `e4ad163b`. PR #22 is mergeable. Next action: verify CI after this evidence-only
+  ledger commit, then hand the open PR to merge-sweeper. Full server/browser QA
+  remains batch verification; STR-32 owns combined capacity/fault qualification.
 - STR-62 maintained aggregates and STR-67 signed window cutoffs stay deferred.
   No new semantics or user decision is introduced by this integration.
