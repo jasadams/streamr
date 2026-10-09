@@ -6,8 +6,10 @@ current dispatch instructions. No implementation worker is claimed by this reset
 
 ## Available features
 
-All eight tickets are Todo, agent-ready and unblocked. Independent agents may work
-in parallel in separate worktrees with the file ownership in each ticket.
+At the 2026-10-09 reset, all eight tickets were Todo, agent-ready and unblocked.
+STR-16 now has [PR #15](https://github.com/jasadams/streamr/pull/15) open awaiting
+final CI and merge. Independent agents may work in parallel in separate worktrees
+with the file ownership in each ticket.
 
 | Ticket | Deliverable | Primary ownership |
 | --- | --- | --- |
@@ -31,12 +33,17 @@ multi-epoch scenario. Compiler/capacity jobs remain serialized through cargo-dev
 - Worker `/root` on `jason/str-16-ownership-cancellation`, start 2026-10-09
   00:39 UTC; deadline 01:39 UTC. Owned queue/network and checkpoint admission paths.
 - Repair: RocksDB decoded scan pages retain their existing scan reservation until
-  page consumption/drop. Prepared regressions cover retained pages, data/signal
-  queue cancellation/drop, checkpoint export/restore cancellation and fresh retry.
-- Acceptance pending: independent review and current-source finite checks. Heavy
-  slow-consumer/RSS/storage-fault qualification stays with STR-32. No user decision
-  or read-view redesign is required. Next action: finish foreground state check,
-  affected-crate Clippy and focused regressions, then record exact outcomes.
+  page consumption/drop. Regressions cover retained pages, data/signal queue
+  cancellation/drop, checkpoint export/restore cancellation and fresh retry.
+- Independent review approved. Affected-crate compile and Clippy checks passed
+  (exit 0) using documented immutable dev image `cdeb96c9e3e`. At `6bb22ee7`,
+  `cargo-dev test --locked -p arroyo-state -p arroyo-operator -p arroyo-worker cancel`
+  passed (exit 0): 3 operator, 10 state and 15 worker tests. Source-bound log:
+  `/tmp/str16-cancellation-tests-final.log`.
+- [PR #15](https://github.com/jasadams/streamr/pull/15) is open awaiting final CI
+  and merge. Heavy slow-consumer/RSS/storage-fault/soak qualification stays with
+  STR-32. No user decision or read-view redesign is required. Next action: finish
+  final PR CI and merge review.
 
 ## Decisions and final acceptance
 
