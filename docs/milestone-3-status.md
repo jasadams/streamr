@@ -26,6 +26,18 @@ files; only then set In Progress. Coordinate shared sections before editing.
 STR-17 owns aggregate capture assertions in smoke_tests.rs; STR-42 owns the
 multi-epoch scenario. Compiler/capacity jobs remain serialized through cargo-dev.
 
+## Active STR-16 increment
+
+- Worker `/root` on `jason/str-16-ownership-cancellation`, start 2026-10-09
+  00:39 UTC; deadline 01:39 UTC. Owned queue/network and checkpoint admission paths.
+- Repair: RocksDB decoded scan pages retain their existing scan reservation until
+  page consumption/drop. Prepared regressions cover retained pages, data/signal
+  queue cancellation/drop, checkpoint export/restore cancellation and fresh retry.
+- Acceptance pending: independent review and current-source finite checks. Heavy
+  slow-consumer/RSS/storage-fault qualification stays with STR-32. No user decision
+  or read-view redesign is required. Next action: finish foreground state check,
+  affected-crate Clippy and focused regressions, then record exact outcomes.
+
 ## Decisions and final acceptance
 
 - STR-29's contract was approved on 2026-10-09: watermark expiry emits zero
