@@ -1,6 +1,6 @@
 {
   "format_version": 1,
-  "scope": "Independent original input/golden references; not generated native results or a legacy checkpoint migration mapping",
+  "scope": "Independent native state-table fixture inputs and declared value oracles; not generated from captures",
   "cases": [
     {
       "name": "operations",
@@ -55,9 +55,9 @@
         "deleted": "boolean_never_null",
         "after": "string_or_null"
       },
-      "reference_input": "crates/arroyo-sql-testing/inputs/stateful_processor_operations.json",
+      "reference_input": "scripts/fixtures/native-state-table-parity/operations/input.jsonl",
       "reference_input_sha256": "eea30cec744a53c9098fb7e7cf978f61e5d7392c5b23ff1bf37137036480215d",
-      "reference_golden": "crates/arroyo-sql-testing/golden_outputs/stateful_processor_operations.json",
+      "reference_golden": "scripts/fixtures/native-state-table-parity/operations/expected.jsonl",
       "reference_golden_sha256": "4ea94c2c0373c05ec71c6d7a91d92bacdd3da058564dc1b93c6097b333ea5885"
     },
     {
@@ -95,9 +95,9 @@
         "after": "string_or_null",
         "read_back": "string_or_null"
       },
-      "reference_input": "crates/arroyo-sql-testing/inputs/stateful_processor_operations.json",
+      "reference_input": "scripts/fixtures/native-state-table-parity/shared_ctes/input.jsonl",
       "reference_input_sha256": "eea30cec744a53c9098fb7e7cf978f61e5d7392c5b23ff1bf37137036480215d",
-      "reference_golden": "crates/arroyo-sql-testing/golden_outputs/stateful_processor_shared_ctes.json",
+      "reference_golden": "scripts/fixtures/native-state-table-parity/shared_ctes/expected.jsonl",
       "reference_golden_sha256": "af829bc9777ae1ca3de99c5482dfe44613775b12ef489615a2903d7c328d8be8"
     },
     {
@@ -135,9 +135,9 @@
         "second_value": "string_or_null",
         "final_value": "string_or_null"
       },
-      "reference_input": "crates/arroyo-sql-testing/inputs/stateful_processor.json",
+      "reference_input": "scripts/fixtures/native-state-table-parity/sequential_ctes/input.jsonl",
       "reference_input_sha256": "8c5dbf4ece38503e134983e1182da8c488d4580273389d2cd90aa5b8bb874e69",
-      "reference_golden": "crates/arroyo-sql-testing/golden_outputs/stateful_processor_sequential_ctes.json",
+      "reference_golden": "scripts/fixtures/native-state-table-parity/sequential_ctes/expected.jsonl",
       "reference_golden_sha256": "270e07d51e2f4d7882cc00c24abc643d74022a10ddd686735e32e91f022dce45"
     },
     {
@@ -175,9 +175,9 @@
         "stored": "string_or_null",
         "retrieved": "string_or_null"
       },
-      "reference_input": "crates/arroyo-sql-testing/inputs/stateful_processor.json",
+      "reference_input": "scripts/fixtures/native-state-table-parity/computed_cte/input.jsonl",
       "reference_input_sha256": "8c5dbf4ece38503e134983e1182da8c488d4580273389d2cd90aa5b8bb874e69",
-      "reference_golden": "crates/arroyo-sql-testing/golden_outputs/stateful_processor_computed_cte.json",
+      "reference_golden": "scripts/fixtures/native-state-table-parity/computed_cte/expected.jsonl",
       "reference_golden_sha256": "315668aee53de15169058fcaa49c4324d4339e864676fa9b110bc74ad890ce87"
     },
     {
@@ -215,9 +215,9 @@
         "stored": "string_or_null",
         "retrieved": "string_or_null"
       },
-      "reference_input": "crates/arroyo-sql-testing/inputs/stateful_processor.json",
+      "reference_input": "scripts/fixtures/native-state-table-parity/qualified_filter/input.jsonl",
       "reference_input_sha256": "8c5dbf4ece38503e134983e1182da8c488d4580273389d2cd90aa5b8bb874e69",
-      "reference_golden": "crates/arroyo-sql-testing/golden_outputs/stateful_processor_qualified_filter.json",
+      "reference_golden": "scripts/fixtures/native-state-table-parity/qualified_filter/expected.jsonl",
       "reference_golden_sha256": "0fc7c9b5ee7a70398ffef3d552de48d7125f74feaa27363d0ae793ab50b539b4"
     }
   ]

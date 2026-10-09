@@ -1,5 +1,0 @@
-{"id":1,"first_value":"one","second_value":"one:second","final_value":"one:second:final"}
-{"id":3,"first_value":"three","second_value":"three:second","final_value":"three:second:final"}
-{"id":4,"first_value":"missing","second_value":"missing:second","final_value":"missing:second:final"}
-{"id":5,"first_value":"missing","second_value":"missing:second","final_value":"missing:second:final"}
-{"id":6,"first_value":"after","second_value":"after:second","final_value":"after:second:final"}

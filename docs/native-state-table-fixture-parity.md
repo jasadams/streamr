@@ -1,10 +1,9 @@
 # Native state-table fixture parity
 
 These five caller-defined fixtures use native state tables, named MERGE,
-RETURNING and same-event LEFT lookups. They contain no legacy function SQL.
-The complete input and ordered golden streams are byte-identical to the existing
-repository reference files recorded in `reference.json`. They are independent
-expectations, not outputs captured from the native query. Each checkpoint oracle
+RETURNING and same-event LEFT lookups. `reference.json` inventories each native
+fixture input and its independently declared ordered value oracle, including
+content hashes. These expectations are not outputs captured from the query. Each checkpoint oracle
 is an explicitly declared prefix of that full stream, with filtered events
 accounted for. No stored state or checkpoint is rewritten by preparing these assets.
 
@@ -111,7 +110,7 @@ the existing simple child supervisor. An interrupted Python runner is not by
 itself proof that its SQL child was reaped. Execute through the reviewed owning
 foreground supervisor and retain its cleanup evidence. The independent 40-case
 qualification wave additionally checks actual configuration, exactly one native
-fused owner with no legacy owner, selected checkpoint metadata identity/path,
+fused owner, selected checkpoint metadata identity/path,
 source prefix, epoch, retained object hashes, strict JSON parsing and full
 source/build/binary/helper stability. These assets add no new harness API and
 do not silently substitute standalone reproduction for that stronger evidence.
@@ -120,10 +119,9 @@ Only label an exact source/build revision qualified after its full matrix has
 completed. Original SQL comments retaining the proposal status are preserved
 byte-for-byte as preparation history; the completed qualification below applies
 only to its recorded source/build and finite fixture scope.
-These fixtures restore new native checkpoints in the SQL-test process. They do
-not establish production process-loss recovery, conversion of old saved plans,
-legacy checkpoint migration, automatic state reset, function-removal policy,
-or milestone completion. Existing reference goldens stay in place.
+These fixtures restore native checkpoints in the SQL-test process. They do not
+establish production process-loss recovery, capacity or milestone completion.
+The independent inputs and expected values are retained in each native fixture.
 
 ## Recorded v14b qualification
 
@@ -142,7 +140,7 @@ targets, both live backends and both checkpoint protocols. Complete initial and
 recovered rows match the independent original goldens in order, including JSON
 field sets/types, NULLs and Booleans. All declared checkpoint prefixes match.
 Actual logs report epoch 1, the declared backend/protocol, one singleton native
-fused owner and no legacy owner. Job/lineage checkpoint paths and all 436 retained
+fused owner. Job/lineage checkpoint paths and all 436 retained
 object hashes were checked. The 16 MiB execution pool and 120-second/512 MiB
 SQL-child limits are unchanged; no queue override is present. Child peak RSS
 ranges from 182,763,520 to 191,946,752 bytes. Every child cleanup completed, with
@@ -161,5 +159,5 @@ the reproduction commands alone do not supply its stronger ownership/witness
 checks. This was repo-mounted SQL-test fresh-worker native recovery, not physical
 source-free isolation or production process loss. No independent raw-IPC typed
 descriptor or persisted sink-offset decode is claimed by this matrix. The
-reference-stream coverage limits above, legacy upgrade/migration decision,
-full external application parity, capacity and live/fault gates remain open.
+reference-stream coverage limits above, full external application parity,
+capacity and live/fault gates remain open.

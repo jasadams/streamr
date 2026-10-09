@@ -19,7 +19,6 @@ use prost::Message;
 use watermark_node::WatermarkNode;
 
 use self::debezium::{DebeziumUnrollingExtension, ToDebeziumExtension};
-use self::stateful_processor::StatefulProcessorExtension;
 use self::updating_aggregate::UpdatingAggregateExtension;
 use self::{
     aggregate::AggregateExtension, key_calculation::KeyCalculationExtension,
@@ -42,7 +41,6 @@ pub(crate) mod projection;
 pub(crate) mod remote_table;
 pub(crate) mod sink;
 pub(crate) mod state_table;
-pub(crate) mod stateful_processor;
 pub(crate) mod table_source;
 pub(crate) mod updating_aggregate;
 pub(crate) mod watermark_node;
@@ -98,7 +96,6 @@ impl<'a> TryFrom<&'a dyn UserDefinedLogicalNode> for &'a dyn ArroyoExtension {
             .or_else(|_| try_from_t::<ToDebeziumExtension>(node))
             .or_else(|_| try_from_t::<DebeziumUnrollingExtension>(node))
             .or_else(|_| try_from_t::<UpdatingAggregateExtension>(node))
-            .or_else(|_| try_from_t::<StatefulProcessorExtension>(node))
             .or_else(|_| try_from_t::<state_table::StateTableAccess>(node))
             .or_else(|_| try_from_t::<LookupJoin>(node))
             .or_else(|_| try_from_t::<ProjectionExtension>(node))

@@ -49,7 +49,6 @@ pub mod state_table;
 mod state_table_concat;
 pub mod state_table_owner;
 pub mod state_table_runtime;
-pub mod stateful_processor;
 pub(crate) mod sync;
 pub mod tumbling_aggregating_window;
 mod updating_cache;
