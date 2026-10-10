@@ -423,7 +423,8 @@ impl NativeSession {
             .schema
             .fields()
             .len();
-        output_allowance(self.finish.schema().as_ref(), output_fields, self.limits)?;
+        let output_bytes =
+            output_allowance(self.finish.schema().as_ref(), output_fields, self.limits)?;
         // Bound retained collection values before the final aggregate reads them.
         if self.collection_output {
             let mut after = None;
@@ -521,7 +522,7 @@ impl NativeSession {
         )?;
         ensure!(
             output.get_array_memory_size() <= output_bytes,
-            "native SESSION output exceeds admitted allowance"
+            "native SESSION output exceeds backend value allowance"
         );
         collector.collect(output).await?;
         Ok(())
