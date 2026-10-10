@@ -1,5 +1,5 @@
 use arrow::{
-    array::{AsArray, BooleanBuilder, TimestampNanosecondBuilder, UInt32Builder},
+    array::{AsArray, BooleanBuilder, TimestampNanosecondBuilder, UInt32Builder, UInt64Builder},
     buffer::NullBuffer,
     compute::{concat, take},
 };
@@ -837,6 +837,11 @@ impl DebeziumUnrollingExec {
             false,
         )));
 
+        fields.push(Arc::new(arrow::datatypes::Field::new(
+            arroyo_rpc::SOURCE_ENVELOPE_FIELD,
+            DataType::UInt64,
+            false,
+        )));
         let schema = Arc::new(Schema::new(fields));
         Ok(Self {
             input,
@@ -969,6 +974,7 @@ impl DebeziumUnrollingStream {
         let mut take_indices = UInt32Builder::with_capacity(num_rows);
         let mut is_retract_builder = BooleanBuilder::with_capacity(num_rows);
 
+        let mut envelope_builder = UInt64Builder::with_capacity(2 * num_rows);
         let mut timestamp_builder = TimestampNanosecondBuilder::with_capacity(2 * num_rows);
         for i in 0..num_rows {
             let op = op.value(i);
@@ -977,19 +983,23 @@ impl DebeziumUnrollingStream {
                     take_indices.append_value((i + num_rows) as u32);
                     is_retract_builder.append_value(false);
                     timestamp_builder.append_value(timestamp.value(i));
+                    envelope_builder.append_value(i as u64);
                 }
                 "u" => {
                     take_indices.append_value(i as u32);
                     is_retract_builder.append_value(true);
                     timestamp_builder.append_value(timestamp.value(i));
+                    envelope_builder.append_value(i as u64);
                     take_indices.append_value((i + num_rows) as u32);
                     is_retract_builder.append_value(false);
                     timestamp_builder.append_value(timestamp.value(i));
+                    envelope_builder.append_value(i as u64);
                 }
                 "d" => {
                     take_indices.append_value(i as u32);
                     is_retract_builder.append_value(true);
                     timestamp_builder.append_value(timestamp.value(i));
+                    envelope_builder.append_value(i as u64);
                 }
                 _ => {
                     return Err(DataFusionError::Internal(format!(
@@ -1020,6 +1030,7 @@ impl DebeziumUnrollingStream {
         )?;
         columns.push(Arc::new(meta));
         columns.push(Arc::new(timestamp_builder.finish()));
+        columns.push(Arc::new(envelope_builder.finish()));
         Ok(RecordBatch::try_new(self.schema.clone(), columns)?)
     }
 }
@@ -1494,6 +1505,75 @@ mod debezium_declared_schema_tests {
     use arrow::array::new_empty_array;
     use arrow_schema::Field;
     use std::collections::HashMap;
+
+    #[test]
+    fn source_unrolling_marks_envelopes_independently_of_primary_key() {
+        let fields = arrow_schema::Fields::from(vec![Field::new("id", DataType::Int64, false)]);
+        let before = StructArray::new(
+            fields.clone(),
+            vec![Arc::new(arrow_array::Int64Array::from(vec![7, 7, 7]))],
+            None,
+        );
+        let after = StructArray::new(
+            fields.clone(),
+            vec![Arc::new(arrow_array::Int64Array::from(vec![7, 7, 7]))],
+            None,
+        );
+        let timestamp_type = DataType::Timestamp(TimeUnit::Nanosecond, None);
+        let input_schema = Arc::new(Schema::new(vec![
+            Field::new("before", DataType::Struct(fields.clone()), true),
+            Field::new("after", DataType::Struct(fields.clone()), true),
+            Field::new("op", DataType::Utf8, false),
+            Field::new(TIMESTAMP_FIELD, timestamp_type.clone(), false),
+        ]));
+        let batch = RecordBatch::try_new(
+            input_schema.clone(),
+            vec![
+                Arc::new(before),
+                Arc::new(after),
+                Arc::new(StringArray::from(vec!["u", "d", "c"])),
+                Arc::new(arrow_array::TimestampNanosecondArray::from(vec![
+                    10, 11, 12,
+                ])),
+            ],
+        )
+        .unwrap();
+        let schema = Arc::new(Schema::new(vec![
+            fields[0].clone(),
+            updating_meta_field(),
+            Arc::new(Field::new(TIMESTAMP_FIELD, timestamp_type, false)),
+            Arc::new(Field::new(
+                arroyo_rpc::SOURCE_ENVELOPE_FIELD,
+                DataType::UInt64,
+                false,
+            )),
+        ]));
+        // Exercise the physical constructor used by the extension planner;
+        // constructing only the stream can hide logical/physical schema drift.
+        let physical = DebeziumUnrollingExec::try_new(
+            Arc::new(ArroyoMemExec::new("source".into(), input_schema.clone())),
+            vec![0],
+        )
+        .unwrap();
+        assert_eq!(physical.schema(), schema);
+        let input = Box::pin(MemoryStream::try_new(vec![], input_schema, None).unwrap());
+        let stream = DebeziumUnrollingStream::try_new(input, physical.schema(), vec![0]).unwrap();
+        let result = stream.unroll_batch(&batch).unwrap();
+        let marker = result
+            .column(3)
+            .as_any()
+            .downcast_ref::<arrow_array::UInt64Array>()
+            .unwrap();
+        assert_eq!(marker.values().as_ref(), &[0, 0, 1, 2]);
+        let meta = result.column(1).as_struct();
+        let retract = meta.column(0).as_boolean();
+        assert_eq!(
+            retract.values().iter().collect::<Vec<_>>(),
+            vec![true, false, true, false]
+        );
+        let ids = meta.column(1).as_fixed_size_binary();
+        assert!(ids.iter().all(|id| id == Some(ids.value(0))));
+    }
 
     #[test]
     fn logical_clock_provenance_does_not_change_debezium_value_type() {

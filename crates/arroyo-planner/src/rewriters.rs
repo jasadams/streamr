@@ -15,8 +15,8 @@ use crate::{
 };
 
 use arrow_schema::DataType;
-use arroyo_rpc::TIMESTAMP_FIELD;
 use arroyo_rpc::UPDATING_META_FIELD;
+use arroyo_rpc::{SOURCE_ENVELOPE_FIELD, TIMESTAMP_FIELD};
 use datafusion::logical_expr::UserDefinedLogicalNode;
 
 use crate::extension::AsyncUDFExtension;
@@ -145,6 +145,10 @@ impl SourceRewriter<'_> {
             )))
         }
         if table.is_updating() {
+            expressions.push(Expr::Column(Column::new(
+                Some(qualifier.clone()),
+                SOURCE_ENVELOPE_FIELD,
+            )));
             expressions.push(Expr::Column(Column::new(
                 Some(qualifier.clone()),
                 UPDATING_META_FIELD,

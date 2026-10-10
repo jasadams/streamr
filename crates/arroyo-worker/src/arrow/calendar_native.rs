@@ -1,9 +1,11 @@
 //! Calendar membership inside the existing native aggregate owner. Each bucket
 //! is ordinary typed DataFusion COUNT/SUM state; lifetime state stays in G.
-//! Buckets are retained until group retirement. Raw references may move backwards,
-//! so an arrival date alone never authorizes deleting contribution history.
+//! Real source watermark progress bounds retained days. Raw references never
+//! authorize pruning; original correction metadata and lifetime survive expiry.
 use super::*;
-use crate::arrow::aggregate_codec::{decode_calendar_contribution, encode_calendar_contribution};
+use crate::arrow::aggregate_codec::{
+    CalendarCleanup, CalendarProgress, decode_calendar_contribution, encode_calendar_contribution,
+};
 use arrow_array::Date32Array;
 use arroyo_rpc::grpc::api::CalendarAggregateDescriptor;
 
@@ -55,6 +57,18 @@ impl CalendarAggregate {
             ScalarValue::Date32(Some(reference)),
         ));
     }
+    #[cfg(test)]
+    pub(super) fn test_clock_reference(&mut self) {
+        self.reference = Arc::new(datafusion::physical_expr::expressions::CastExpr::new(
+            Arc::new(datafusion::physical_expr::expressions::Column::new(
+                TIMESTAMP_FIELD,
+                3,
+            )),
+            DataType::Date32,
+            None,
+        ));
+    }
+
     pub fn decode(
         descriptors: &[CalendarAggregateDescriptor],
         aggregates: &[Aggregator],
@@ -171,6 +185,202 @@ pub(super) fn calendar_due_key(deadline: i64, group: &[u8]) -> Result<Vec<u8>> {
 }
 
 impl IncrementalAggregatingFunc {
+    fn calendar_progress_for(&self, watermark_nanos: i64) -> Result<CalendarProgress> {
+        let horizon = self
+            .calendars
+            .iter()
+            .map(|calendar| calendar.horizon)
+            .max()
+            .context("calendar horizon is missing")?;
+        let day = i32::try_from(watermark_nanos.div_euclid(86_400_000_000_000))?;
+        Ok(CalendarProgress {
+            watermark_nanos,
+            first_retained_day: day
+                .checked_sub(horizon - 1)
+                .context("calendar pruning boundary exceeds Date32 range")?,
+        })
+    }
+
+    async fn calendar_progress(
+        &self,
+        scope: &AggregateScope<'_>,
+    ) -> Result<Option<CalendarProgress>> {
+        scope
+            .get(b"W")
+            .await?
+            .map(|bytes| {
+                let progress = CalendarProgress::decode(&bytes)?;
+                ensure!(
+                    progress == self.calendar_progress_for(progress.watermark_nanos)?,
+                    "calendar pruning boundary does not match compiled horizon"
+                );
+                Ok(progress)
+            })
+            .transpose()
+    }
+
+    fn validate_calendar_reference(progress: CalendarProgress, reference: i32) -> Result<()> {
+        let admitted_day = i32::try_from(progress.watermark_nanos.div_euclid(86_400_000_000_000))?;
+        ensure!(
+            reference >= admitted_day,
+            "calendar recalculation reference precedes admitted watermark context"
+        );
+        Ok(())
+    }
+
+    pub(super) async fn validate_calendar_inputs(&self, inputs: &[CalendarInput]) -> Result<()> {
+        if inputs.is_empty() {
+            return Ok(());
+        }
+        let store = self
+            .native_store
+            .as_ref()
+            .context("calendar aggregate store missing")?;
+        let scope = store.begin().await?;
+        if let Some(progress) = self.calendar_progress(&scope).await? {
+            for input in inputs {
+                for reference in input.reference.values() {
+                    Self::validate_calendar_reference(progress, *reference)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) async fn calendar_watermark(
+        &self,
+        watermark: arroyo_types::Watermark,
+    ) -> Result<()> {
+        if self.calendars.is_empty() {
+            return Ok(());
+        }
+        let arroyo_types::Watermark::EventTime(time) = watermark else {
+            return Ok(());
+        };
+        // EOF is a drain signal outside Arrow's signed domain, never progress
+        // authorizing history deletion. Idle similarly carries no event time.
+        if time == arroyo_types::from_nanos(u64::MAX as u128) {
+            return Ok(());
+        }
+        let nanos = arroyo_types::event_time::to_signed_nanos(time)
+            .context("calendar watermark exceeds timestamp range")?;
+        let store = self
+            .native_store
+            .as_ref()
+            .context("calendar aggregate store missing")?;
+        let mut scope = store.begin().await?;
+        let prior = self.calendar_progress(&scope).await?;
+        if prior.is_none_or(|prior| nanos > prior.watermark_nanos) {
+            let progress = self.calendar_progress_for(nanos)?;
+            scope.put(b"W", &progress.encode())?;
+            let day = i32::try_from(nanos.div_euclid(86_400_000_000_000))?;
+            if prior.is_none_or(|prior| {
+                prior.watermark_nanos.div_euclid(86_400_000_000_000) < i64::from(day)
+            }) {
+                let cleanup = CalendarCleanup {
+                    watermark_day: day,
+                    after: None,
+                    complete: false,
+                };
+                scope.put(b"V", &cleanup.encode(scope.limits().value_bytes)?)?;
+            }
+            scope.commit().await?;
+        } else {
+            drop(scope);
+        }
+        self.prune_calendar_buckets().await
+    }
+
+    fn calendar_family_floor(&self, progress: CalendarProgress, family: usize) -> Result<i32> {
+        let horizon = self
+            .calendars
+            .iter()
+            .filter(|calendar| calendar.storage_index == family)
+            .map(|calendar| calendar.horizon)
+            .max()
+            .context("unknown calendar bucket family")?;
+        i32::try_from(progress.watermark_nanos.div_euclid(86_400_000_000_000))?
+            .checked_sub(horizon - 1)
+            .context("calendar family pruning boundary exceeds Date32 range")
+    }
+
+    fn calendar_bucket_identity(key: &[u8]) -> Result<(usize, i32)> {
+        ensure!(
+            key.len() >= 21 && key[0] == b'B',
+            "invalid calendar bucket key"
+        );
+        let group_bytes = usize::try_from(u32::from_be_bytes(key[1..5].try_into()?))?;
+        ensure!(
+            group_bytes.checked_add(21) == Some(key.len()),
+            "invalid calendar bucket key width"
+        );
+        let family = usize::try_from(u32::from_be_bytes(
+            key[key.len() - 8..key.len() - 4].try_into()?,
+        ))?;
+        let day = (u32::from_be_bytes(key[key.len() - 4..].try_into()?) ^ (1 << 31)) as i32;
+        Ok((family, day))
+    }
+
+    /// Resume one bounded deletion page, including after checkpoint/recovery.
+    /// V advances atomically with deletions; G and J remain untouched.
+    pub(super) async fn prune_calendar_buckets(&self) -> Result<()> {
+        if self.calendars.is_empty() {
+            return Ok(());
+        }
+        let store = self
+            .native_store
+            .as_ref()
+            .context("calendar aggregate store missing")?;
+        let mut scope = store.begin().await?;
+        let Some(progress) = self.calendar_progress(&scope).await? else {
+            return Ok(());
+        };
+        let day = i32::try_from(progress.watermark_nanos.div_euclid(86_400_000_000_000))?;
+        let mut cleanup = scope
+            .get(b"V")
+            .await?
+            .map(|bytes| CalendarCleanup::decode(&bytes))
+            .transpose()?
+            .context("calendar watermark is missing cleanup frontier")?;
+        ensure!(
+            cleanup.watermark_day == day,
+            "calendar cleanup frontier does not match watermark"
+        );
+        if cleanup.complete {
+            return Ok(());
+        }
+        if let Some(after) = &cleanup.after {
+            Self::calendar_bucket_identity(after)?;
+        }
+        let limits = scope.limits();
+        // Reserve one operation and one maximum entry for persisted V progress.
+        let page_entries = limits
+            .page_entries
+            .min(limits.write_operations.saturating_sub(1))
+            .min((limits.write_bytes / store.max_encoded_entry_bytes()).saturating_sub(1))
+            .min(
+                (limits.overlay_bytes / (limits.key_bytes + limits.value_bytes)).saturating_sub(1),
+            );
+        ensure!(
+            page_entries > 0,
+            "calendar pruning cannot admit bucket and cursor progress"
+        );
+        for _ in 0..page_entries {
+            let Some((key, _)) = scope.first_from(b"B", cleanup.after.as_deref()).await? else {
+                cleanup.complete = true;
+                cleanup.after = None;
+                break;
+            };
+            let (family, contribution) = Self::calendar_bucket_identity(&key)?;
+            if contribution < self.calendar_family_floor(progress, family)? {
+                scope.delete(&key)?;
+            }
+            cleanup.after = Some(key);
+        }
+        scope.put(b"V", &cleanup.encode(limits.value_bytes)?)?;
+        scope.commit().await
+    }
+
     pub(super) fn calendar_write_operations(&self) -> usize {
         if self.calendars.is_empty() {
             return 0;
@@ -333,6 +543,13 @@ impl IncrementalAggregatingFunc {
             retract,
             ..
         } = change;
+        if let Some(progress) = self.calendar_progress(scope).await?
+            && day < self.calendar_family_floor(progress, calendar.storage_index)?
+        {
+            // Original J still supplies the lifetime delta. Expired recent
+            // membership must neither be resurrected nor require a lost bucket.
+            return Ok(());
+        }
         let aggregate = &self.aggregates[calendar.aggregate_index];
         let key = bucket_key(group, generation, calendar.storage_index, day)?;
         let mut accumulator = aggregate.func.create_sliding_accumulator()?;
@@ -395,6 +612,9 @@ impl IncrementalAggregatingFunc {
         calendar: &CalendarAggregate,
         reference: i32,
     ) -> Result<IncrementalState> {
+        if let Some(progress) = self.calendar_progress(scope).await? {
+            Self::validate_calendar_reference(progress, reference)?;
+        }
         let aggregate = &self.aggregates[calendar.aggregate_index];
         let mut accumulator = aggregate.func.create_sliding_accumulator()?;
         let first_day = reference
@@ -469,7 +689,6 @@ impl IncrementalAggregatingFunc {
         if self.calendars.is_empty() {
             return Ok(false);
         }
-        let reference = i32::try_from(watermark_nanos.div_euclid(86_400_000_000_000))?;
         let store = self
             .native_store
             .as_ref()
@@ -491,6 +710,17 @@ impl IncrementalAggregatingFunc {
             "native aggregate budget cannot recalculate one calendar group"
         );
         let mut scope = store.begin().await?;
+        // W is the checkpointed admission frontier. Regressing or restored
+        // notifications cannot recalculate against an older date after its
+        // history has been pruned. Direct callers without W retain their
+        // supplied finite progress for existing focused operator probes.
+        let watermark_nanos = self
+            .calendar_progress(&scope)
+            .await?
+            .map_or(watermark_nanos, |progress| {
+                progress.watermark_nanos.max(watermark_nanos)
+            });
+        let reference = i32::try_from(watermark_nanos.div_euclid(86_400_000_000_000))?;
         let Some((due, generation_bytes)) = scope.first(b"H").await? else {
             return Ok(false);
         };
@@ -549,6 +779,16 @@ impl IncrementalAggregatingFunc {
     ) -> Result<Option<i64>> {
         if self.calendars.is_empty() {
             return Ok(None);
+        }
+        // Validate the entire callback context before Q/G/due-index writes.
+        if let Some(progress) = self.calendar_progress(scope).await? {
+            Self::validate_calendar_reference(progress, reference)?;
+        }
+        Self::calendar_next_boundary(reference)?;
+        for calendar in &self.calendars {
+            reference
+                .checked_sub(calendar.horizon - 1)
+                .context("calendar reference horizon exceeds Date32 range")?;
         }
         let key = native_group_key(b'G', group_key)?;
         let Some(bytes) = scope.get(&key).await? else {

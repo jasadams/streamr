@@ -32,10 +32,10 @@ QUIET_EVENTS = (
     ("keyA", 1, 1), ("keyA", 3, 2), ("keyA", 7, 3),
     ("keyB", 11, 4), ("keyB", 13, 5),
 )
-# keyC is removed from the retaining key relation; keyD stays. Update-mode
-# sources reject event-time fields, so the retractable key relation is a
-# separate changelog source while the rolling windows keep event time on the
-# append source. Removing the retaining key must delete its composed result.
+# keyC is removed from the retaining key relation; keyD stays. This fixture
+# uses a separate retaining-key changelog and event-time append source to test
+# independent relation ownership. Final STR-62 supports update-mode event time;
+# removing the retaining key must still delete its composed result.
 DELETE_EVENTS = (("keyC", 1, 1), ("keyC", 3, 2), ("keyD", 5, 6), ("keyD", 9, 7))
 DELETE_KEYS = ("keyC", "keyD")
 DELETE_KEY_REMOVAL = "keyC"

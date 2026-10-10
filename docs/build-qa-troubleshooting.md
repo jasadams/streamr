@@ -163,23 +163,33 @@ Never stop containers or builds merely because their names resemble this run.
 Use the shared build queue, preserve unrelated work and retain successful
 build caches when further validation is expected.
 
-## Generated protobuf output across shared-target worktrees — 2026-10-10
 
-STR-29 at `2d780f3`, with its reviewed planner/test repairs, failed strict Clippy
-with missing `EventTimeExpiry`, `CalendarAggregateDescriptor` and aggregate
-fields despite those definitions being present in its `api.proto`. The same
-source had previously compiled. Different worktrees mount their source at `/app`
-and reuse one target, so generated outputs can survive a switch to a checkout
-whose protobuf input timestamps are older. This is build-artifact evidence, not
-a reason to remove valid source fields or change operator semantics.
+## Shared-target generated RPC schema after switching worktrees
 
-Inside the same shared queue reservation, refreshing this checkout's
-`crates/arroyo-rpc/proto/api.proto` and `rpc.proto` timestamps before Cargo forced
-fresh generation without changing file contents or clearing caches. With image
-`a95d0ca27fc16ae428c9b0df8d02b603dacab71ebf3a915aad85c94b422cf9ab`, the
-retry passed formatting, strict Clippy, affected-crate check, calendar tests
-12/12, expiry tests 8/8 and capture test 1/1. Logs and exact source patch are
-under `/home/jason/qa-evidence/str29-continuation-20261010/`; `attempt-5`
-preserves the failed Clippy output and `validate-worker-repair.sh` records the
-queued regeneration workaround. Local evidence is source-specific. This does
-not establish final STR-62 integration or the STR-32 runtime/resource matrix.
+Observed in STR-62 on main `48ceb3fe` with prebuilt development image
+`a95d0ca27fc1`. A shared `/app/target` can contain generated RPC output from a
+newer build of another worktree while the selected worktree's proto file has
+an older modification time. Cargo then treats the build script as fresh even
+though the schema contents differ. The symptom is missing generated fields or
+types that visibly exist in `crates/arroyo-rpc/proto/api.proto`.
+
+The RPC build script already declares both proto files and their directory as
+rerun inputs. Preserve the failed log and inspect generated `out/api.rs` before
+changing schemas or build dependencies. Within the same serialized build
+reservation, refresh the changed proto's timestamp with
+`touch crates/arroyo-rpc/proto/api.proto`, then run the normal check/test gates.
+This changes no source contents and forces the existing generator to use this
+worktree. Do not delete the shared target or edit generated Rust files.
+
+Evidence: `/home/jason/qa-evidence/streamr-str62-2147/optimized-pruning/check.log`
+(exit 101). Corrected current-source retry and its results are preserved in
+`optimized-pruning-retry1/` under the same receipt root.
+
+STR-29 independently observed the same stale-output failure on its reviewed
+`2d780f3` continuation, then refreshed both `api.proto` and `rpc.proto` inside
+the queue reservation. Its unchanged source passed strict Clippy, affected
+check, calendar 12/12, expiry 8/8 and capture 1/1 with image `a95d0ca27fc1`.
+Evidence: `/home/jason/qa-evidence/str29-continuation-20261010/attempt-5/`
+contains the failure; `validate-worker-repair.sh` and final logs record the
+successful workaround. These receipts precede final STR-62 integration and
+do not qualify the STR-32 runtime/resource matrix.

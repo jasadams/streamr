@@ -132,10 +132,10 @@ async fn ordinary_finalized_window_reaggregation_has_no_expiry() {
 #[test(tokio::test)]
 async fn retaining_key_deletion_composition_over_a_retracting_source_plans() {
     // The ownership rule (HAVING on the lifetime contribution) needs a
-    // lifetime relation whose keys can actually be removed. Update-mode
-    // sources reject event-time fields, so the retaining key relation is a
-    // separate changelog source while the rolling windows keep event time on
-    // the append source.
+    // lifetime relation whose keys can actually be removed. This fixture uses
+    // a separate changelog key relation and append-only event-time windows to
+    // isolate retaining-key deletion from rolling-source updates. CDC sources
+    // can also carry event time through common watermark admission.
     let sql = "
 CREATE TABLE events (timestamp TIMESTAMP NOT NULL, k TEXT NOT NULL, v BIGINT,
   WATERMARK FOR timestamp)

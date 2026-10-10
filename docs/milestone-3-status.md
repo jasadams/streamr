@@ -8,52 +8,52 @@ current dispatch instructions. No implementation worker is claimed by this reset
 
 ## Active STR-29 continuation
 
-- Codex `/root`, resumed 2026-10-10 from reviewed local commit `d7b9dbf2`
-  in `jason/str-29-watermark-zero-084313`. Current main integration is `8cbd443d`;
-  published STR-62 core `2afd82c8` is the calendar dependency. No time limit.
-- Acceptance: watermark-driven quiet retained-key zero, silence unchanged,
-  retaining-key deletion, exact typed CDC and persistent bounded maintenance.
-- Fresh audit findings are repaired: scoped private current-result owners
-  preserve shared historical consumers, fixture rows and required silence/CDC
-  prefixes are exact, and bounded calendar due traversal is implemented.
-  Independent source review is clean, including signed/zero-deadline index
-  repairs. Source-bound gates pass: fmt/strict Clippy/locked check, planner
-  15/15, calendar 12/12, expiry 8/8, capture 1/1; Python comparator 9/9.
-  Evidence: `/home/jason/qa-evidence/str29-continuation-20261010/`.
-- Ownership: planner proof (`planner`), native due scheduler (`implement`),
-  generic fixtures/capture harness (`fixtures`). Builds remain serialized.
-- Resumed on user direction after build-process optimization. Use the updated
-  dev wrapper/shared target and pinned prebuilt-RocksDB image. Optimization
-  source is now integrated from upstream; no separate dirty tooling retained.
-- Next: integrate final published
-  STR-62 pruning/admission source, re-review and validate combined source, publish
-  with explicit PR #23 dependency, await active CI.
-  Full runtime/resource matrix remains STR-32; no prepared test is a pass.
-- No product decision is pending. STR-62's active pruning/admission changes
-  remain in its own worktree; this branch uses only its published core.
+- Codex `/root` resumed `d7b9dbf2` in `jason/str-29-watermark-zero-084313`;
+  main `8cbd443d`, final published STR-62 dependency `405f71c7`. No time limit.
+- Implemented finite-watermark quiet retained-key zero, unchanged silence,
+  scoped current-result owners, exact typed CDC, signed/zero deadlines and
+  bounded persistent maintenance. W/V pruning and H/U due work restore together;
+  regressing notifications use persisted real progress without lifetime loss.
+- Current combined gates pass: fmt, strict Clippy, locked check; composition
+  planner 15/15, event-clock 14/14, admission 7/7, calendar 18/18, expiry 8/8,
+  capture 1/1 and Python comparator 9/9. Evidence:
+  `/home/jason/qa-evidence/str29-continuation-20261010/final-integration/`.
+- Source review is clean; final tested receipt/publication review pending.
+  Next: commit and publish a PR stacked on #23, verify current-head active CI;
+  merge #23 before retargeting/merging STR-29. No product decision is pending.
+- Full runtime/resource matrix stays STR-32. Prepared fixtures are not runtime
+  passes; external application parity remains outside this engine.
 
 ## Active STR-62
 
 - Worker: Codex `/root`; branch `jason/str-62-calendar-2147`, base `67c242f5`.
-  Started 2026-10-09 21:47 UTC; resumed on explicit user direction.
-  Automatic time limits disabled. Core increment reviewed/tested; [draft PR #23](https://github.com/jasadams/streamr/pull/23).
-- Acceptance: maintained inclusive UTC COUNT/SUM FILTERs, raw event reference,
-  independent lifetime, exact CDC, bounded registered state and recovery.
-- Evidence: affected check and strict Clippy exit 0; planner 13/13, worker 6/6;
-  actual SQL 32/32 default/shape configurations passed memory/RocksDB × batches
-  1/8 × controller/leader with live prefixes, checkpoint and fresh-worker restore.
-  Exact source/harness/binary receipts: `docs/str-62-calendar-filters.md`.
-- Next: resolve remaining retention acceptance before full-ticket completion;
-  draft PR keeps the reviewed core available and prevents automatic merge.
-  Active CI is Lint/tooling; the full GitHub CI workflow is disabled manually.
-- Remaining: no existing nonwindowed admission history floor justifies age
-  pruning. Buckets retain history under configured limits until group retirement;
-  no new cutoff implemented. Pruning/history-boundary acceptance remains STR-62;
-  quiet traversal/output belongs to STR-29; shared full qualification STR-32.
-- Reuse investigation: ten actual native SQL probes; completed append windows
-  pass, ordinary FILTER differs from maintained result, three relational patterns
-  reject, existing window CDC defect tracked separately as STR-68. Source traces
-  and reviewed receipts are recorded; do not repeat without new evidence.
+  Started 2026-10-09 21:47 UTC; no automatic time limit.
+  [PR #23](https://github.com/jasadams/streamr/pull/23) delivers the reviewed feature;
+  current-head CI and merge handoff remain publication gates.
+- Decision: user instructed acceptance revision and implementation of common
+  watermark finality. Existing AS is the sole control: drop late source changes
+  atomically, preserve admitted CDC trigger context, prune recent buckets from
+  finite real progress, retain lifetime/correction metadata. No calendar-only rule.
+  Optional additional lateness/corrections is separate STR-69.
+- Implementation: source-only envelope marker consumed at common watermark
+  admission; signed optional emitted boundary checkpoints in existing state.
+  Calendar W/V progress and cursor prune one bounded page at a time, with
+  per-family horizon floors; equality/future buckets and G/J survive.
+- Publication: reviewed source is pushed in ready PR #23. Next: current-head
+  active CI gate, then `/merge-sweeper` owns merge and the Done transition.
+  Executable qualification used optimized main `48ceb3fe`; integration onto
+  `8cbd443d` preserves every recorded engine/harness hash (`post-rebase-audit.json`).
+  No build remains in flight.
+- Evidence: locked affected check, formatting and strict Clippy passed; planner
+  162/162, calendar worker 12/12 and admission 7/7 passed. Actual SQL 40/40 passed:
+  pruning 8, default calendar 16 and expression shapes 16, with 40 fresh-worker
+  recovery receipts and 136 live observations. Receipts and pinned binary:
+  `/home/jason/qa-evidence/streamr-str62-2147/optimized-pruning-retry3/`.
+  `final-matrix-audit.json` and exact test-only patch audit link current passes.
+  Independent source/evidence review approved; failed/cancelled attempts preserved.
+- Composition: STR-29 retains quiet-key traversal/output ownership; shared full
+  capacity/fault qualification remains STR-32, external parity ARC-15/16.
+  Separate window CDC deficiency remains STR-68. No remaining retention decision.
 
 At the 2026-10-09 reset, all eight tickets were Todo, agent-ready and unblocked.
 STR-16 now has [PR #15](https://github.com/jasadams/streamr/pull/15) open awaiting

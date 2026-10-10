@@ -461,9 +461,10 @@ window outputs and queries outside the pattern are unchanged. The generic
 oracle (`scripts/test-native-result-composition.py`) covers the quiet-key
 3/1-to-3/0 replacement, the silence hold and the two-source retaining-key
 deletion composition; executing that matrix is the shared STR-32 batch.
-Update-mode sources reject event-time fields ("can't use event_time_field with
-update mode"), so the retractable retaining key relation is a separate
-changelog source from the event-time rolling source.
+The deletion fixture keeps the retractable retaining-key relation as a separate
+changelog source from its event-time rolling source. Final STR-62 supports
+update-mode event time through common watermark admission; the fixture does
+not depend on the earlier source-planning restriction.
 
 ## Remaining output contracts
 
