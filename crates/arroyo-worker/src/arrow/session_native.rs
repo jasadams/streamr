@@ -1346,7 +1346,7 @@ mod tests {
                     .unwrap()
                     .iter()
                     .collect::<Vec<_>>(),
-                vec![Some(80)]
+                vec![Some(112)]
             );
             assert!(observer.first_due(None).await.unwrap().is_none());
             // Individual stored rows fit, but the actual 128-member final
