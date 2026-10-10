@@ -145,6 +145,88 @@ pub(crate) fn decode_group(
     })
 }
 
+/// Calendar pruning progress belongs to the same checkpoint as buckets and
+/// original correction metadata. The boundary advances only with real progress.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CalendarProgress {
+    pub watermark_nanos: i64,
+    pub first_retained_day: i32,
+}
+
+impl CalendarProgress {
+    pub fn encode(self) -> [u8; 13] {
+        let mut bytes = [0; 13];
+        bytes[0] = 1;
+        bytes[1..9].copy_from_slice(&self.watermark_nanos.to_be_bytes());
+        bytes[9..13].copy_from_slice(&self.first_retained_day.to_be_bytes());
+        bytes
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        ensure!(
+            bytes.len() == 13 && bytes[0] == 1,
+            "invalid calendar progress codec"
+        );
+        Ok(Self {
+            watermark_nanos: i64::from_be_bytes(bytes[1..9].try_into()?),
+            first_retained_day: i32::from_be_bytes(bytes[9..13].try_into()?),
+        })
+    }
+}
+
+/// One resumable bucket-cleanup frontier. `after` advances atomically with its
+/// deletion page; completion suppresses rescans until the watermark day changes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CalendarCleanup {
+    pub watermark_day: i32,
+    pub after: Option<Vec<u8>>,
+    pub complete: bool,
+}
+
+impl CalendarCleanup {
+    pub fn encode(&self, max_bytes: usize) -> Result<Vec<u8>> {
+        ensure!(
+            !self.complete || self.after.is_none(),
+            "completed calendar cleanup retains cursor"
+        );
+        let mut bytes = vec![1];
+        bytes.extend_from_slice(&self.watermark_day.to_be_bytes());
+        bytes.push(if self.complete {
+            2
+        } else if self.after.is_some() {
+            1
+        } else {
+            0
+        });
+        if let Some(after) = &self.after {
+            bytes.extend_from_slice(after);
+        }
+        ensure!(
+            bytes.len() <= max_bytes,
+            "calendar cleanup cursor exceeds configured limit"
+        );
+        Ok(bytes)
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        ensure!(
+            bytes.len() >= 6 && bytes[0] == 1,
+            "invalid calendar cleanup codec"
+        );
+        let (after, complete) = match bytes[5] {
+            0 if bytes.len() == 6 => (None, false),
+            1 if bytes.len() > 6 && bytes[6] == b'B' => (Some(bytes[6..].to_vec()), false),
+            2 if bytes.len() == 6 => (None, true),
+            _ => bail!("invalid calendar cleanup cursor"),
+        };
+        Ok(Self {
+            watermark_day: i32::from_be_bytes(bytes[1..5].try_into()?),
+            after,
+            complete,
+        })
+    }
+}
+
 /// Typed correction metadata is independent of recent membership. The ordinary
 /// state codec validates column counts and types before values can be retracted.
 pub(crate) fn encode_calendar_contribution(
@@ -217,6 +299,47 @@ pub(crate) fn decode_calendar_contribution(
 mod tests {
     use super::*;
     use arrow_schema::{DataType, TimeUnit};
+
+    #[test]
+    fn calendar_cleanup_round_trips_cursor_completion_and_limits() {
+        for cleanup in [
+            CalendarCleanup {
+                watermark_day: -1,
+                after: None,
+                complete: false,
+            },
+            CalendarCleanup {
+                watermark_day: 200,
+                after: Some(b"B-cursor".to_vec()),
+                complete: false,
+            },
+            CalendarCleanup {
+                watermark_day: 201,
+                after: None,
+                complete: true,
+            },
+        ] {
+            let bytes = cleanup.encode(256).unwrap();
+            assert_eq!(CalendarCleanup::decode(&bytes).unwrap(), cleanup);
+            assert!(cleanup.encode(5).is_err());
+            assert!(CalendarCleanup::decode(&bytes[..5]).is_err());
+        }
+        assert!(CalendarCleanup::decode(&[1, 0, 0, 0, 0, 3]).is_err());
+    }
+
+    #[test]
+    fn calendar_progress_round_trips_and_rejects_invalid_codec() {
+        let progress = CalendarProgress {
+            watermark_nanos: -1,
+            first_retained_day: -7,
+        };
+        let bytes = progress.encode();
+        assert_eq!(CalendarProgress::decode(&bytes).unwrap(), progress);
+        assert!(CalendarProgress::decode(&bytes[..12]).is_err());
+        let mut wrong_version = bytes;
+        wrong_version[0] = 2;
+        assert!(CalendarProgress::decode(&wrong_version).is_err());
+    }
 
     #[test]
     fn calendar_contribution_retains_null_and_gate_and_rejects_changed_types() {

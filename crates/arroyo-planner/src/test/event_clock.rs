@@ -453,3 +453,58 @@ async fn calendar_filter_serializes_coerced_numeric_aggregate_arguments() {
         );
     }
 }
+
+#[test(tokio::test)]
+async fn cdc_source_envelope_marker_is_consumed_at_watermark_boundary() {
+    use arroyo_rpc::grpc::api::{ExpressionWatermarkConfig, UpdatingAggregateOperator};
+    let source = SOURCE.replace("format='json'", "format='debezium_json'");
+    let compiled = compile(&format!(
+        "{source} SELECT id, COUNT(*) FROM events GROUP BY id"
+    ))
+    .await;
+    let mut watermarks = 0;
+    let mut aggregates = 0;
+    for node in compiled.program.graph.node_weights() {
+        for (operator, _) in node.operator_chain.iter() {
+            match operator.operator_name {
+                OperatorName::ExpressionWatermark => {
+                    let config =
+                        ExpressionWatermarkConfig::decode(operator.operator_config.as_slice())
+                            .unwrap();
+                    let schema: arroyo_rpc::df::ArroyoSchema =
+                        config.input_schema.unwrap().try_into().unwrap();
+                    let marker = config
+                        .source_envelope_index
+                        .expect("CDC admission requires explicit envelope provenance")
+                        as usize;
+                    assert_eq!(
+                        schema.schema.field(marker).name(),
+                        arroyo_rpc::SOURCE_ENVELOPE_FIELD
+                    );
+                    assert_eq!(
+                        schema.schema.field(marker).data_type(),
+                        &arrow_schema::DataType::UInt64
+                    );
+                    watermarks += 1;
+                }
+                OperatorName::UpdatingAggregate => {
+                    let config =
+                        UpdatingAggregateOperator::decode(operator.operator_config.as_slice())
+                            .unwrap();
+                    let schema: arroyo_rpc::df::ArroyoSchema =
+                        config.input_schema.unwrap().try_into().unwrap();
+                    assert!(
+                        schema
+                            .schema
+                            .index_of(arroyo_rpc::SOURCE_ENVELOPE_FIELD)
+                            .is_err()
+                    );
+                    aggregates += 1;
+                }
+                _ => {}
+            }
+        }
+    }
+    assert_eq!(watermarks, 1);
+    assert_eq!(aggregates, 1);
+}

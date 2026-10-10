@@ -1453,6 +1453,7 @@ impl IncrementalAggregatingFunc {
         };
         let inputs = self.compute_inputs(batch)?;
         let calendar_inputs = self.calendar_inputs(batch)?;
+        self.validate_calendar_inputs(&calendar_inputs).await?;
         let input_working_bytes = inputs.iter().try_fold(0usize, |total, input| {
             let total = input.values.iter().try_fold(total, |total, value| {
                 total.checked_add(value.get_array_memory_size())
@@ -1788,6 +1789,7 @@ impl IncrementalAggregatingFunc {
         ctx: &mut OperatorContext,
         collector: &mut dyn Collector,
     ) -> DataflowResult<()> {
+        self.prune_calendar_buckets().await?;
         // Existing dirty groups are emitted before expiration, matching the
         // legacy flush order (updates first, then TTL retractions).
         self.drain_native_dirty(ctx, collector).await?;
@@ -2875,6 +2877,18 @@ impl ArrowOperator for IncrementalAggregatingFunc {
         Ok(())
     }
 
+    async fn handle_watermark(
+        &mut self,
+        watermark: arroyo_types::Watermark,
+        _ctx: &mut OperatorContext,
+        _collector: &mut dyn Collector,
+    ) -> DataflowResult<Option<arroyo_types::Watermark>> {
+        if self.native_config.is_some() {
+            self.calendar_watermark(watermark).await?;
+        }
+        Ok(Some(watermark))
+    }
+
     async fn handle_checkpoint(
         &mut self,
         _: CheckpointBarrier,
@@ -2974,6 +2988,7 @@ impl ArrowOperator for IncrementalAggregatingFunc {
     async fn on_start(&mut self, ctx: &mut OperatorContext) -> DataflowResult<()> {
         if self.native_config.is_some() {
             self.initialize_native(ctx).await?;
+            self.prune_calendar_buckets().await?;
         } else {
             self.initialize(ctx).await?;
         }
@@ -3074,7 +3089,7 @@ impl IncrementalAggregatingConstructor {
             identity.update(schema.encode_to_vec());
         }
         if !config.calendar_aggregates.is_empty() {
-            identity.update(b"\0calendar-day-state.v1");
+            identity.update(b"\0calendar-day-state.v2");
             identity.update(u64::try_from(config.calendar_aggregates.len())?.to_be_bytes());
             for descriptor in &config.calendar_aggregates {
                 let encoded = descriptor.encode_to_vec();
@@ -3882,6 +3897,10 @@ mod tests {
     }
 
     fn native_calendar_operator() -> IncrementalAggregatingFunc {
+        native_calendar_operator_with_filters(true)
+    }
+
+    fn native_calendar_operator_with_filters(shared: bool) -> IncrementalAggregatingFunc {
         use arroyo_rpc::grpc::api::CalendarAggregateDescriptor;
         let (mut config, registry) = native_config();
         let mut plan = PhysicalPlanNode::decode(config.aggregate_exec.as_slice()).unwrap();
@@ -3891,10 +3910,18 @@ mod tests {
         aggregate.aggr_expr[7] = aggregate.aggr_expr[6].clone();
         aggregate.aggr_expr_name[7] = "selected_week".into();
         aggregate.filter_expr[7] = aggregate.filter_expr[6].clone();
-        let static_filter = aggregate.filter_expr[6]
-            .expr
-            .as_ref()
-            .map(|expression| expression.encode_to_vec());
+        if !shared {
+            aggregate.filter_expr[7].expr = None;
+        }
+        let static_filters: Vec<_> = [6, 7]
+            .into_iter()
+            .map(|index| {
+                aggregate.filter_expr[index]
+                    .expr
+                    .as_ref()
+                    .map(|expression| expression.encode_to_vec())
+            })
+            .collect();
         config.aggregate_exec = plan.encode_to_vec();
         let schema: ArroyoSchema = config.final_schema.take().unwrap().try_into().unwrap();
         let mut fields = schema.schema.fields().to_vec();
@@ -3907,7 +3934,7 @@ mod tests {
         let codec = DefaultPhysicalExtensionCodec {};
         let date: Arc<dyn PhysicalExpr> = Arc::new(Literal::new(ScalarValue::Date32(Some(200))));
         let one: Arc<dyn PhysicalExpr> = Arc::new(Literal::new(ScalarValue::Int64(Some(1))));
-        for (index, horizon) in [(6, 1), (7, 7)] {
+        for (position, (index, horizon)) in [(6, 1), (7, 7)].into_iter().enumerate() {
             config
                 .calendar_aggregates
                 .push(CalendarAggregateDescriptor {
@@ -3916,7 +3943,7 @@ mod tests {
                     argument: serialize_physical_expr(&one, &codec)
                         .unwrap()
                         .encode_to_vec(),
-                    static_filter: static_filter.clone(),
+                    static_filter: static_filters[position].clone(),
                     contribution_date: serialize_physical_expr(&date, &codec)
                         .unwrap()
                         .encode_to_vec(),
@@ -4088,6 +4115,253 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn calendar_pruning_uses_only_real_progress_and_preserves_correction_history() {
+        use arroyo_types::{Watermark, event_time::from_signed_nanos};
+        let mut operator = native_calendar_operator();
+        operator.native_store = Some(native_test_store_with_limits(AggregateStoreLimits {
+            page_entries: 1,
+            ..native_test_store().limits()
+        }));
+        for (id, day) in [193, 194, 200, 201].into_iter().enumerate() {
+            calendar_test_event(&mut operator, day, 200, Some(true), false, &[id as u8; 16]).await;
+        }
+        let progress = Watermark::EventTime(from_signed_nanos(200 * 86_400_000_000_000).unwrap());
+        operator.calendar_watermark(progress).await.unwrap();
+        let store = operator.native_store.as_ref().unwrap();
+        let scope = store.begin().await.unwrap();
+        let boundary = scope.get(b"W").await.unwrap().unwrap();
+        // The seven-day shared family retains D-6 inclusively, plus future D+1.
+        let mut after = None;
+        let mut days = Vec::new();
+        while let Some((key, _)) = scope.first_from(b"B", after.as_deref()).await.unwrap() {
+            days.push(
+                (u32::from_be_bytes(key[key.len() - 4..].try_into().unwrap()) ^ (1 << 31)) as i32,
+            );
+            after = Some(key);
+        }
+        assert_eq!(days, vec![194, 200, 201]);
+        assert!(scope.first(b"J").await.unwrap().is_some());
+        drop(scope);
+        for ignored in [
+            Watermark::Idle,
+            Watermark::EventTime(arroyo_types::from_nanos(u64::MAX as u128)),
+            Watermark::EventTime(from_signed_nanos(199 * 86_400_000_000_000).unwrap()),
+        ] {
+            operator.calendar_watermark(ignored).await.unwrap();
+            let scope = store.begin().await.unwrap();
+            assert_eq!(scope.get(b"W").await.unwrap(), Some(boundary.clone()));
+        }
+        // An admitted correction with current reference removes the original
+        // expired day from lifetime without requiring or resurrecting its bucket.
+        calendar_test_event(&mut operator, 200, 200, Some(false), true, &[0; 16]).await;
+        assert_eq!(
+            calendar_test_values(&operator).await,
+            vec![
+                ScalarValue::Int64(Some(3)),
+                ScalarValue::Int64(Some(1)),
+                ScalarValue::Int64(Some(2)),
+            ]
+        );
+        // Independent old contribution dates remain valid for lifetime, while
+        // no recent state is stored for days below the persisted cutoff.
+        calendar_test_event(&mut operator, 193, 200, Some(true), false, &[9; 16]).await;
+        assert_eq!(
+            calendar_test_values(&operator).await,
+            vec![
+                ScalarValue::Int64(Some(4)),
+                ScalarValue::Int64(Some(1)),
+                ScalarValue::Int64(Some(2)),
+            ]
+        );
+        let store = operator.native_store.as_ref().unwrap();
+        let reservation = store
+            .resources()
+            .try_decoded_value(store.resources().config().decoded_value_bytes)
+            .unwrap();
+        drop(reservation);
+    }
+
+    #[tokio::test]
+    async fn calendar_pruning_resumes_persisted_pages_and_uses_family_horizons() {
+        use crate::arrow::aggregate_codec::CalendarCleanup;
+        let mut operator = native_calendar_operator_with_filters(false);
+        operator.native_store = Some(native_test_store_with_limits(AggregateStoreLimits {
+            page_entries: 1,
+            ..native_test_store().limits()
+        }));
+        for (id, day) in [193, 194, 199, 200, 201].into_iter().enumerate() {
+            calendar_test_event(&mut operator, day, 200, Some(true), false, &[id as u8; 16]).await;
+        }
+        operator
+            .calendar_watermark(arroyo_types::Watermark::EventTime(
+                arroyo_types::event_time::from_signed_nanos(200 * 86_400_000_000_000).unwrap(),
+            ))
+            .await
+            .unwrap();
+        let store = operator.native_store.as_ref().unwrap();
+        let scope = store.begin().await.unwrap();
+        let first_page = CalendarCleanup::decode(&scope.get(b"V").await.unwrap().unwrap()).unwrap();
+        assert!(!first_page.complete);
+        assert!(first_page.after.is_some());
+        let mut bucket_count = 0;
+        let mut after = None;
+        while let Some((key, _)) = scope.first_from(b"B", after.as_deref()).await.unwrap() {
+            bucket_count += 1;
+            after = Some(key);
+        }
+        assert_eq!(bucket_count, 9); // one deletion, never an unbounded drain
+        drop(scope);
+        // A new watermark while cleanup is unfinished replaces the frontier
+        // and restarts the cursor for its stricter family boundaries.
+        operator
+            .calendar_watermark(arroyo_types::Watermark::EventTime(
+                arroyo_types::event_time::from_signed_nanos(201 * 86_400_000_000_000).unwrap(),
+            ))
+            .await
+            .unwrap();
+        let scope = store.begin().await.unwrap();
+        let second_page =
+            CalendarCleanup::decode(&scope.get(b"V").await.unwrap().unwrap()).unwrap();
+        assert_eq!(second_page.watermark_day, 201);
+        assert!(second_page.after > first_page.after);
+        drop(scope);
+        // Simulate another owner resuming the same persisted live state.
+        let mut resumed = native_calendar_operator_with_filters(false);
+        std::mem::swap(&mut resumed.native_store, &mut operator.native_store);
+        for _ in 0..12 {
+            resumed.prune_calendar_buckets().await.unwrap();
+        }
+        let store = resumed.native_store.as_ref().unwrap();
+        let scope = store.begin().await.unwrap();
+        let complete_bytes = scope.get(b"V").await.unwrap().unwrap();
+        assert!(CalendarCleanup::decode(&complete_bytes).unwrap().complete);
+        let mut retained = Vec::new();
+        let mut after = None;
+        while let Some((key, _)) = scope.first_from(b"B", after.as_deref()).await.unwrap() {
+            retained.push((
+                u32::from_be_bytes(key[key.len() - 8..key.len() - 4].try_into().unwrap()),
+                (u32::from_be_bytes(key[key.len() - 4..].try_into().unwrap()) ^ (1 << 31)) as i32,
+            ));
+            after = Some(key);
+        }
+        assert_eq!(retained, vec![(6, 201), (7, 199), (7, 200), (7, 201)]);
+        drop(scope);
+        resumed.prune_calendar_buckets().await.unwrap();
+        let mut scope = store.begin().await.unwrap();
+        assert_eq!(scope.get(b"V").await.unwrap(), Some(complete_bytes));
+        let (reference_key, reference_before) = scope.first(b"Q").await.unwrap().unwrap();
+        let group_key = native_group_key(b'G', &GLOBAL_KEY).unwrap();
+        let group_before = scope.get(&group_key).await.unwrap();
+        let error = resumed
+            .recalculate_calendar_group(&mut scope, &GLOBAL_KEY, 200)
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("precedes admitted watermark context")
+        );
+        assert_eq!(
+            scope.get(&reference_key).await.unwrap(),
+            Some(reference_before)
+        );
+        assert_eq!(scope.get(&group_key).await.unwrap(), group_before);
+        scope.commit().await.unwrap();
+        let permit = store
+            .resources()
+            .try_decoded_value(store.resources().config().decoded_value_bytes)
+            .unwrap();
+        drop(permit);
+    }
+
+    #[tokio::test]
+    async fn calendar_pruned_group_move_uses_admitted_envelope_clock_for_both_images() {
+        let mut operator = native_calendar_operator();
+        let mut fields = operator.schema_without_metadata.fields().to_vec();
+        fields.insert(0, Arc::new(Field::new("group_key", DataType::Utf8, false)));
+        operator.schema_without_metadata = Arc::new(Schema::new(fields));
+        for (step, (group, id, contribution, retract, trigger)) in [
+            (&b"A"[..], 1, 194, false, 199),
+            (&b"A"[..], 2, 193, false, 199),
+            (&b"A"[..], 2, 193, true, 200),
+            (&b"B"[..], 2, 200, false, 200),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            if step == 2 {
+                operator
+                    .calendar_watermark(arroyo_types::Watermark::EventTime(
+                        arroyo_types::event_time::from_signed_nanos(200 * 86_400_000_000_000)
+                            .unwrap(),
+                    ))
+                    .await
+                    .unwrap();
+            }
+            // The original business FOR field remains old on the before row;
+            // common admission supplies current envelope _timestamp on BOTH
+            // images. WATERMARK_DATE binds that internal trigger context.
+            let input = batch_at(
+                &[Some("original-business-for-day-199")],
+                &[1],
+                &[i64::from(trigger) * 86_400_000_000_000],
+            );
+            for calendar in &mut operator.calendars {
+                calendar.test_dates(contribution, trigger);
+                calendar.test_clock_reference();
+            }
+            let dates = operator.calendar_inputs(&input).unwrap();
+            operator.validate_calendar_inputs(&dates).await.unwrap();
+            let inputs = operator.compute_inputs(&input).unwrap();
+            let store = operator.native_store.as_ref().unwrap();
+            let mut scope = store.begin().await.unwrap();
+            operator
+                .native_process_calendar_event(
+                    &mut scope,
+                    NativeCalendarEvent {
+                        group_key: group,
+                        inputs: &inputs,
+                        row: 0,
+                        retract,
+                        row_id: Some(&[id; 16]),
+                        calendar_inputs: &dates,
+                    },
+                )
+                .await
+                .unwrap();
+            scope.commit().await.unwrap();
+        }
+        let store = operator.native_store.as_ref().unwrap();
+        let scope = store.begin().await.unwrap();
+        for (group, expected) in [(&b"A"[..], [1, 0, 1]), (&b"B"[..], [1, 1, 1])] {
+            let bytes = scope
+                .get(&native_group_key(b'G', group).unwrap())
+                .await
+                .unwrap()
+                .unwrap();
+            let group = decode_group(
+                &bytes,
+                &operator.native_state_types(),
+                &operator.native_output_types(),
+                scope.limits().value_bytes,
+            )
+            .unwrap();
+            let mut state = operator.native_accumulators(Some(&group)).unwrap();
+            let actual: Vec<_> = [5, 6, 7]
+                .into_iter()
+                .map(|index| state[index].evaluate().unwrap())
+                .collect();
+            assert_eq!(
+                actual,
+                expected
+                    .into_iter()
+                    .map(|value| ScalarValue::Int64(Some(value)))
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn calendar_correction_uses_persisted_day_gate_and_original_value() {
         let mut operator = native_calendar_operator();
         calendar_test_event(&mut operator, 200, 200, Some(true), false, &[1; 16]).await;
@@ -4210,14 +4484,66 @@ mod tests {
         operator.native_store = Some(native_test_store());
         // Retractions deliberately carry a different amount. The persisted NULL
         // flag/value must remove the original contribution, never the envelope.
-        for (retract, value, expected) in [
-            (false, None, (1, 0, None)),
-            (true, Some(99), (0, 0, None)),
-            (false, Some(7), (1, 1, Some(7))),
-            (true, None, (0, 0, None)),
-            (false, None, (1, 0, None)),
-            (true, Some(99), (0, 0, None)),
+        for (retract, value, expected, prune) in [
+            (false, None, (1, 0, None), false),
+            (true, Some(99), (0, 0, None), false),
+            (false, Some(7), (1, 1, Some(7)), false),
+            (true, None, (0, 0, None), false),
+            (false, None, (1, 0, None), false),
+            (true, Some(99), (0, 0, None), false),
+            (false, Some(7), (1, 1, Some(7)), false),
+            (true, Some(99), (0, 0, None), true),
         ] {
+            if prune {
+                operator
+                    .calendar_watermark(arroyo_types::Watermark::EventTime(
+                        arroyo_types::event_time::from_signed_nanos(207 * 86_400_000_000_000)
+                            .unwrap(),
+                    ))
+                    .await
+                    .unwrap();
+                for calendar in &mut operator.calendars {
+                    calendar.test_dates(207, 207);
+                }
+                let store = operator.native_store.as_ref().unwrap();
+                let mut scope = store.begin().await.unwrap();
+                operator
+                    .recalculate_calendar_group(&mut scope, &GLOBAL_KEY, 207)
+                    .await
+                    .unwrap();
+                scope.commit().await.unwrap();
+                let scope = store.begin().await.unwrap();
+                assert!(scope.first(b"B").await.unwrap().is_none());
+                assert!(scope.first(b"J").await.unwrap().is_some());
+                let bytes = scope
+                    .get(&native_group_key(b'G', &GLOBAL_KEY).unwrap())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let group = decode_group(
+                    &bytes,
+                    &operator.native_state_types(),
+                    &operator.native_output_types(),
+                    scope.limits().value_bytes,
+                )
+                .unwrap();
+                let mut state = operator.native_accumulators(Some(&group)).unwrap();
+                let actual: Vec<_> = state[..6]
+                    .iter_mut()
+                    .map(|state| state.evaluate().unwrap())
+                    .collect();
+                assert_eq!(
+                    actual,
+                    vec![
+                        ScalarValue::Int64(Some(1)),
+                        ScalarValue::Int64(Some(1)),
+                        ScalarValue::Int64(Some(7)),
+                        ScalarValue::Int64(Some(0)),
+                        ScalarValue::Int64(Some(0)),
+                        ScalarValue::Int64(None),
+                    ]
+                );
+            }
             let input = RecordBatch::try_new(
                 schema.clone(),
                 vec![
@@ -5086,6 +5412,190 @@ mod tests {
                 .await
                 .unwrap()
         );
+    }
+
+    #[tokio::test]
+    async fn calendar_pruning_checkpoint_restores_boundary_and_original_corrections() {
+        use arroyo_rpc::grpc::rpc::DiskKeyedTableConfig;
+        use arroyo_state::live::{checkpoint, lifecycle::RocksStateConfig, rocks::RocksLiveState};
+        for rocks in [false, true] {
+            let root =
+                std::env::temp_dir().join(format!("calendar-pruning-{}", uuid::Uuid::new_v4()));
+            let remote = root.join("checkpoint");
+            std::fs::create_dir_all(&remote).unwrap();
+            // The production exporter requests pages up to 1 MiB; Rocks
+            // admits their copies/cursors independently of aggregate pages.
+            let resources = WorkerStateResources::new(ResourceConfig {
+                max_open_databases: 2,
+                scan_page_bytes: 16 * 1024 * 1024,
+                queued_write_bytes: 16 * 1024 * 1024,
+                decoded_value_bytes: 32 * 1024 * 1024,
+                ..native_test_store().resources().config().clone()
+            })
+            .unwrap();
+            let mut native = Vec::new();
+            let mut backends: Vec<Arc<dyn LiveStateBackend>> = Vec::new();
+            for generation in [0, 1] {
+                if rocks {
+                    let backend = Arc::new(
+                        RocksLiveState::open(
+                            RocksStateConfig {
+                                root: root.join("live"),
+                                job_id: "calendar-pruning".into(),
+                                operator_id: "aggregate".into(),
+                                subtask: 0,
+                                generation,
+                                attempt: 0,
+                            },
+                            resources.clone(),
+                        )
+                        .await
+                        .unwrap(),
+                    );
+                    backends.push(backend.clone());
+                    native.push(backend);
+                } else {
+                    backends.push(Arc::new(
+                        MemoryLiveState::bounded(resources.clone(), 8 * 1024 * 1024).unwrap(),
+                    ));
+                }
+            }
+            let ownership = Ownership::PartitionLocal {
+                subtask: 0,
+                parallelism: 1,
+            };
+            let mut manager =
+                LiveTableManager::new(backends[0].clone(), ownership.clone()).unwrap();
+            let table = manager.register(NATIVE_AGGREGATE_TABLE).unwrap();
+            let namespace = table.namespace().clone();
+            let limits = AggregateStoreLimits {
+                page_entries: 1,
+                ..native_test_store().limits()
+            };
+            let store =
+                AggregateStore::new(backends[0].clone(), table, resources.clone(), limits).unwrap();
+            let mut operator = native_calendar_operator();
+            operator.native_store = Some(store);
+            calendar_test_event(&mut operator, 193, 200, Some(true), false, &[1; 16]).await;
+            calendar_test_event(&mut operator, 194, 200, Some(true), false, &[2; 16]).await;
+            // Checkpoint after the first committed cleanup page; the pending
+            // cursor must survive and resume beyond the already deleted bucket.
+            operator
+                .calendar_watermark(arroyo_types::Watermark::EventTime(
+                    arroyo_types::event_time::from_signed_nanos(200 * 86_400_000_000_000).unwrap(),
+                ))
+                .await
+                .unwrap();
+            let store = operator.native_store.as_ref().unwrap();
+            let scope = store.begin().await.unwrap();
+            let pending = crate::arrow::aggregate_codec::CalendarCleanup::decode(
+                &scope.get(b"V").await.unwrap().unwrap(),
+            )
+            .unwrap();
+            assert!(!pending.complete);
+            assert!(pending.after.is_some());
+            drop(scope);
+            let snapshot = backends[0].snapshot().await.unwrap();
+            let storage =
+                arroyo_state::get_storage_provider(&arroyo_state::StorageProviderFor::Controller {
+                    storage_url: Some(format!("file://{}", remote.display())),
+                })
+                .await
+                .unwrap();
+            let config = DiskKeyedTableConfig {
+                table_name: NATIVE_AGGREGATE_TABLE.into(),
+                encoding_version: 1,
+                schema_identity: operator.native_schema_identity.clone(),
+            };
+            let receipt = checkpoint::export(
+                &snapshot,
+                &namespace,
+                &config,
+                &storage,
+                "checkpoint-1/aggregate",
+                1,
+                0,
+                0,
+            )
+            .await
+            .unwrap();
+            checkpoint::restore(
+                backends[1].as_ref(),
+                &namespace,
+                &config,
+                &receipt,
+                &storage,
+            )
+            .await
+            .unwrap();
+            let mut restored_manager =
+                LiveTableManager::new(backends[1].clone(), ownership).unwrap();
+            let restored_table = restored_manager.register(NATIVE_AGGREGATE_TABLE).unwrap();
+            let restored_store = AggregateStore::new(
+                backends[1].clone(),
+                restored_table,
+                resources.clone(),
+                limits,
+            )
+            .unwrap();
+            let mut fresh = native_calendar_operator();
+            fresh.native_store = Some(restored_store);
+            fresh.prune_calendar_buckets().await.unwrap();
+            assert_eq!(
+                calendar_test_values(&fresh).await,
+                vec![
+                    ScalarValue::Int64(Some(2)),
+                    ScalarValue::Int64(Some(0)),
+                    ScalarValue::Int64(Some(1)),
+                ]
+            );
+            let restored_store = fresh.native_store.as_ref().unwrap();
+            let scope = restored_store.begin().await.unwrap();
+            let progress = crate::arrow::aggregate_codec::CalendarProgress::decode(
+                &scope.get(b"W").await.unwrap().unwrap(),
+            )
+            .unwrap();
+            assert_eq!(progress.first_retained_day, 194);
+            let resumed = crate::arrow::aggregate_codec::CalendarCleanup::decode(
+                &scope.get(b"V").await.unwrap().unwrap(),
+            )
+            .unwrap();
+            assert!(resumed.after > pending.after);
+            drop(scope);
+            fresh.prune_calendar_buckets().await.unwrap();
+            calendar_test_event(&mut fresh, 200, 200, Some(false), true, &[1; 16]).await;
+            assert_eq!(
+                calendar_test_values(&fresh).await,
+                vec![
+                    ScalarValue::Int64(Some(1)),
+                    ScalarValue::Int64(Some(0)),
+                    ScalarValue::Int64(Some(1)),
+                ]
+            );
+            calendar_test_event(&mut fresh, 201, 201, Some(true), false, &[1; 16]).await;
+            assert_eq!(
+                calendar_test_values(&fresh).await,
+                vec![
+                    ScalarValue::Int64(Some(2)),
+                    ScalarValue::Int64(Some(1)),
+                    ScalarValue::Int64(Some(1)),
+                ]
+            );
+            drop(snapshot);
+            drop(operator);
+            drop(fresh);
+            drop(manager);
+            drop(restored_manager);
+            drop(backends);
+            for backend in native {
+                Arc::try_unwrap(backend)
+                    .unwrap_or_else(|_| panic!("retained Rocks backend"))
+                    .close_and_remove()
+                    .await
+                    .unwrap();
+            }
+            std::fs::remove_dir_all(root).unwrap();
+        }
     }
 
     #[tokio::test]

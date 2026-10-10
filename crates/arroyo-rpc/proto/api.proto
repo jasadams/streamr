@@ -261,6 +261,7 @@ message SessionWindow {
 }
 
 message ExpressionWatermarkConfig {
+  optional uint32 source_envelope_index = 5;
   uint64 period_micros = 1;
   optional uint64 idle_time_micros = 2;
   ArroyoSchema input_schema = 3;

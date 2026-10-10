@@ -165,6 +165,7 @@ def oracle(inputs, updating):
     current, references, snapshots, envelope_ends = {}, {}, [], []
     for record in inputs:
         images = [(-1, record['before']), (1, record['after'])] if updating else [(1, record)]
+        trigger = (record['after'] or record['before']) if updating else record
         for sign, row in images:
             if row is None:
                 continue
@@ -177,7 +178,10 @@ def oracle(inputs, updating):
                 if identity in current:
                     raise ValueError(f'fixture duplicate identity {identity}')
                 current[identity] = dict(row)
-            references[(row['tenant'], row['group_id'])] = utc_date(row['reference_time'])
+            # Both images belong to the same current source change; the
+            # original payload stays intact while its trigger uses the final
+            # image's declared clock.
+            references[(row['tenant'], row['group_id'])] = utc_date(trigger['reference_time'])
             snapshots.append(snapshot(current, references))
         envelope_ends.append(len(snapshots))
     return snapshots, envelope_ends

@@ -162,3 +162,25 @@ timed out. Preserve both the original compiler error and cleanup result.
 Never stop containers or builds merely because their names resemble this run.
 Use the shared build queue, preserve unrelated work and retain successful
 build caches when further validation is expected.
+
+
+## Shared-target generated RPC schema after switching worktrees
+
+Observed in STR-62 on main `48ceb3fe` with prebuilt development image
+`a95d0ca27fc1`. A shared `/app/target` can contain generated RPC output from a
+newer build of another worktree while the selected worktree's proto file has
+an older modification time. Cargo then treats the build script as fresh even
+though the schema contents differ. The symptom is missing generated fields or
+types that visibly exist in `crates/arroyo-rpc/proto/api.proto`.
+
+The RPC build script already declares both proto files and their directory as
+rerun inputs. Preserve the failed log and inspect generated `out/api.rs` before
+changing schemas or build dependencies. Within the same serialized build
+reservation, refresh the changed proto's timestamp with
+`touch crates/arroyo-rpc/proto/api.proto`, then run the normal check/test gates.
+This changes no source contents and forces the existing generator to use this
+worktree. Do not delete the shared target or edit generated Rust files.
+
+Evidence: `/home/jason/qa-evidence/streamr-str62-2147/optimized-pruning/check.log`
+(exit 101). Corrected current-source retry and its results are preserved in
+`optimized-pruning-retry1/` under the same receipt root.

@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use arrow_schema::{DataType, Schema};
 use arroyo_rpc::{
-    TIMESTAMP_FIELD, UPDATING_META_FIELD,
+    SOURCE_ENVELOPE_FIELD, TIMESTAMP_FIELD, UPDATING_META_FIELD,
     df::{ArroyoSchema, ArroyoSchemaRef},
     updating_meta_field,
 };
@@ -155,6 +155,11 @@ impl DebeziumUnrollingExtension {
         };
 
         fields.push(Arc::new(input_schema.field(input_timestamp_field).clone()));
+        fields.push(Arc::new(arrow_schema::Field::new(
+            SOURCE_ENVELOPE_FIELD,
+            DataType::UInt64,
+            false,
+        )));
         let arrow_schema = Schema::new(fields);
 
         let schema = match qualifier {
