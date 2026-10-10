@@ -52,7 +52,10 @@ pub struct KafkaState {
 }
 
 impl KafkaSourceFunc {
-    async fn get_consumer(&mut self, ctx: &mut SourceContext) -> anyhow::Result<StreamConsumer> {
+    async fn get_consumer(
+        &mut self,
+        ctx: &mut SourceContext,
+    ) -> anyhow::Result<(StreamConsumer, HashMap<i32, i64>)> {
         info!("Creating kafka consumer for {}", self.bootstrap_servers);
         let mut client_config = ClientConfig::new();
 
@@ -147,7 +150,16 @@ impl KafkaSourceFunc {
 
         consumer.assign(&topic_partitions)?;
 
-        Ok(consumer)
+        // Global offset tables are regenerated at every checkpoint. Carry
+        // restored progress for our assigned partitions even if this run is
+        // idle; a fresh Beginning/End assignment has no numeric progress yet.
+        let next_offsets = our_partitions
+            .keys()
+            .filter_map(|(_, partition)| {
+                state.get(partition).map(|saved| (*partition, saved.offset))
+            })
+            .collect();
+        Ok((consumer, next_offsets))
     }
 
     async fn run_int(
@@ -155,14 +167,12 @@ impl KafkaSourceFunc {
         ctx: &mut SourceContext,
         collector: &mut SourceCollector,
     ) -> DataflowResult<SourceFinishType> {
-        let consumer = self
+        let (consumer, mut next_offsets) = self
             .get_consumer(ctx)
             .await
             .context("creating kafka consumer")?;
 
         let rate_limiter = GovernorRateLimiter::direct(Quota::per_second(self.messages_per_second));
-        let mut offsets = HashMap::new();
-
         if consumer.assignment().unwrap().count() == 0 {
             warn!(
                 "Kafka Consumer {}-{} is subscribed to no partitions, as there are more subtasks than partitions... setting idle",
@@ -227,7 +237,7 @@ impl KafkaSourceFunc {
                                     collector.flush_buffer().await?;
                                 }
 
-                                offsets.insert(msg.partition(), msg.offset());
+                                next_offsets.insert(msg.partition(), msg.offset() + 1);
                                 rate_limiter.until_ready().await;
                             }
                         },
@@ -247,13 +257,13 @@ impl KafkaSourceFunc {
                             debug!("starting checkpointing {}", ctx.task_info.task_index);
                             let mut topic_partitions = TopicPartitionList::new();
                             let s = ctx.table_manager.get_global_keyed_state("k").await?;
-                            for (partition, offset) in &offsets {
+                            for (partition, next_offset) in &next_offsets {
                                 s.insert(*partition, KafkaState {
                                     partition: *partition,
-                                    offset: *offset + 1,
+                                    offset: *next_offset,
                                 }).await;
                                 topic_partitions.add_partition_offset(
-                                    &self.topic, *partition, Offset::Offset(*offset)).unwrap();
+                                    &self.topic, *partition, Offset::Offset(*next_offset - 1)).unwrap();
                             }
 
                             if let Err(e) = consumer.commit(&topic_partitions, CommitMode::Async) {
