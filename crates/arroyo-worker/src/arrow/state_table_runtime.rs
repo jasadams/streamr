@@ -1,6 +1,7 @@
 //! One serial owner for all related typed state-table accesses in an event.
-//! Input batches are bounded before processing; a shared working scope commits
-//! a chunk once, then its captured branches are emitted under backpressure.
+//! Per-event working and capture values retain their backend bounds. A shared
+//! working scope commits a chunk once, then captured branches are emitted under
+//! row-based backpressure.
 use std::{collections::HashMap, sync::Arc};
 
 use anyhow::{Context, Result, anyhow, ensure};
