@@ -1301,13 +1301,13 @@ mod tests {
                 let snapshot = operator.store().unwrap().snapshot().await.unwrap();
                 let mut collector = RecordedCollector::default();
                 operator.limits.partial_bytes = 128;
+                let refusal = operator
+                    .emit_interval(&snapshot, 0, 0, &mut collector)
+                    .await
+                    .unwrap_err();
                 assert!(
-                    operator
-                        .emit_interval(&snapshot, 0, 1, &mut collector)
-                        .await
-                        .unwrap_err()
-                        .to_string()
-                        .contains("configured partial limit")
+                    refusal.to_string().contains("configured partial limit"),
+                    "unexpected preflight refusal: {refusal:#}"
                 );
                 assert!(collector.0.is_empty());
                 assert_eq!(
@@ -1317,7 +1317,7 @@ mod tests {
                 assert_eq!(execution.runtime.memory_pool.reserved(), 0);
                 operator.limits.partial_bytes = 8192;
                 operator
-                    .emit_interval(&snapshot, 0, 1, &mut collector)
+                    .emit_interval(&snapshot, 0, 0, &mut collector)
                     .await
                     .unwrap();
                 assert_eq!(collector.0.len(), 1);
