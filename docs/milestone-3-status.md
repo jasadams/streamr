@@ -18,9 +18,10 @@ current dispatch instructions. No implementation worker is claimed by this reset
   planner 15/15, event-clock 14/14, admission 7/7, calendar 18/18, expiry 8/8,
   capture 1/1 and Python comparator 9/9. Evidence:
   `/home/jason/qa-evidence/str29-continuation-20261010/final-integration/`.
-- Source review is clean; final tested receipt/publication review pending.
-  Next: commit and publish a PR stacked on #23, verify current-head active CI;
-  merge #23 before retargeting/merging STR-29. No product decision is pending.
+- Independent source/evidence review approved with zero findings.
+  [PR #30](https://github.com/jasadams/streamr/pull/30) is stacked on #23;
+  next: verify current-head active CI and hand off to merge-sweeper. Merge #23
+  before retargeting/merging #30. No product decision is pending.
 - Full runtime/resource matrix stays STR-32. Prepared fixtures are not runtime
   passes; external application parity remains outside this engine.
 
