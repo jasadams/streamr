@@ -36,13 +36,25 @@ volumes and `target/milestone2-runtime` remain in use. Rebuild the image with
 `scripts/cargo-dev --build` before using these changes; changing the compiler
 and linker flags requires an initial rebuild of existing artifacts.
 
-Dev/test profiles use line-table debug information and disable incremental
-compilation to allow sccache reuse. Full debugger type/variable information is
-reduced. The wrapper stops the cache server before its disposable container
-exits so pending writes finish while preserving Cargo's exit status.
+Dev/test profiles use line-table debug information and enable incremental
+compilation for repeated edits to workspace crates. Unchanged dependencies remain
+eligible for sccache; incremental Rust compilations run through rustc instead.
+The wrapper supplies these profile defaults even with an existing dev image.
+Full debugger type/variable information is reduced. The wrapper stops the cache
+server before its disposable container exits so pending writes finish while
+preserving Cargo's exit status.
 `scripts/cargo-dev --stats` reports persisted cache size; request/hit counters
 are per container and reset on each run. Use Cargo's `--timings` to measure
 build performance. The machine-wide build queue and four-job default remain.
+
+To compare against the previous non-incremental mode, run
+`CARGO_INCREMENTAL=0 scripts/cargo-dev build --locked -p arroyo-worker --lib --timings`.
+Explicit `CARGO_INCREMENTAL` values are forwarded to the container; this global
+override also affects release builds. Without that override, release profiles
+are unchanged. `CARGO_PROFILE_DEV_INCREMENTAL=false` and
+`CARGO_PROFILE_TEST_INCREMENTAL=false` disable only the respective profile.
+Keep the selected mode stable during normal development. Warm each mode before
+timing the same source edit, excluding the initial build and queue wait.
 
 ## Crates that build natively on Fedora 44
 
@@ -75,7 +87,7 @@ scripts/cargo-dev test -p <crate>
 
 ## Notes
 - Reuse `target/milestone2-runtime` for container builds, including `podman exec`
-  commands, and disable incremental compilation as shown above. Avoid creating
+  commands, and use the dev/test profile defaults above. Avoid creating
   a second default `target/debug` cache or separate caches per ticket. Serialize
   builds and capacity tests through the shared build queue.
 - Check free disk space before large builds or fixtures. Remove unused build

@@ -37,6 +37,9 @@ class CargoDevTest(unittest.TestCase):
         self.env.pop("RUST_BUILD_QUEUE_HELD", None)
         self.env.pop("STREAMR_DEV_IMAGE", None)
         self.env.pop("CARGO_BUILD_JOBS", None)
+        self.env.pop("CARGO_INCREMENTAL", None)
+        self.env.pop("CARGO_PROFILE_DEV_INCREMENTAL", None)
+        self.env.pop("CARGO_PROFILE_TEST_INCREMENTAL", None)
         self.write_stub("podman", """
 record = {'command': 'podman', 'args': sys.argv[1:], 'cwd': os.getcwd(),
           'queue': os.environ.get('RUST_BUILD_QUEUE_HELD')}
@@ -78,7 +81,8 @@ sys.exit(int(os.environ.get('COMMAND_STATUS', '0')))
         self.assertEqual(image['args'], ['image', 'exists', 'arroyo-dev'])
         self.assertEqual(run['args'], [
             'run', '--rm', '-w', '/app', '-e', 'CARGO_TARGET_DIR=/app/target/milestone2-runtime',
-            '-e', 'CARGO_INCREMENTAL=0', '-e', 'CARGO_BUILD_JOBS=4',
+            '-e', 'CARGO_PROFILE_DEV_INCREMENTAL=true',
+            '-e', 'CARGO_PROFILE_TEST_INCREMENTAL=true', '-e', 'CARGO_BUILD_JOBS=4',
             '-v', f'{self.root}:/app:z',
             '-v', 'streamr-cargo-registry:/usr/local/cargo/registry',
             '-v', 'streamr-cargo-git:/usr/local/cargo/git',
@@ -96,6 +100,17 @@ sys.exit(int(os.environ.get('COMMAND_STATUS', '0')))
                          ['arroyo-dev', 'sh', '-c', CONTAINER_SHELL, 'sh',
                           'sccache', '--show-stats'])
         self.assertIn('streamr-sccache:/var/cache/sccache', run['args'])
+
+    def test_incremental_overrides_are_forwarded_without_changing_release_profile(self):
+        result = self.run_wrapper('build', '--release', CARGO_INCREMENTAL='0',
+                                  CARGO_PROFILE_DEV_INCREMENTAL='false',
+                                  CARGO_PROFILE_TEST_INCREMENTAL='false')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        _, run = self.records()
+        self.assertIn('CARGO_INCREMENTAL=0', run['args'])
+        self.assertIn('CARGO_PROFILE_DEV_INCREMENTAL=false', run['args'])
+        self.assertIn('CARGO_PROFILE_TEST_INCREMENTAL=false', run['args'])
+        self.assertFalse(any(arg.startswith('CARGO_PROFILE_RELEASE_') for arg in run['args']))
 
     def test_rust_only_cache_shim_preserves_arguments_and_failure(self):
         self.write_stub('sccache', """
