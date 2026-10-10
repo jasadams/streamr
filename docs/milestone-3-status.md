@@ -30,13 +30,14 @@
   cleanup; source protocol was unchanged.
 - Latest main `8cbd443d` integrated by clean rebase; its unrelated preservation
   tooling/build guidance was reread. Final independent verdict approved publication.
-- Next action: publish the open PR and verify current-head CI.
+- Published [PR #29](https://github.com/jasadams/streamr/pull/29); ticket In Review.
+  Next action: verify current-head CI, then hand the open PR to merge-sweeper.
   Prior evidence is preserved
   in `/home/jason/qa-evidence/str56-20261010/`; resumed receipts go to
   `/home/jason/qa-evidence/str56-delivery-20261010/` and
   `docs/str-56-validation.md`. STR-70 tracks non-blocking parser naming cleanup;
   STR-73 tracks shared-target generated RPC artifact invalidation.
-  No PR or push; ticket In Progress. No pending user decision.
+  No pending user decision.
 
 Updated 2026-10-09 at the user's request. Read the current Trakkt ticket description
 before claiming work. Historical comments and validation logs are evidence, not
