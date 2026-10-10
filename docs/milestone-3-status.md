@@ -1,5 +1,13 @@
 # Milestone 3 — agent backlog
 
+## Active STR-101 — exact-timestamp backend parity
+
+- Codex run `codex-str101-20261010`; branch `jason/str-101-instant-window-20261010`, workspace `/home/jason/repos/streamr-worktrees/str-101-instant-window-20261010`; fetched base `130f43a2`. Instructions: `AGENTS.md`, `.claude/build-test.md`, this ledger, `milestone-3-work-plan.md`, current Trakkt ticket and canonical backlog-fast skill. No elapsed-time limit or signing requirement.
+- Acceptance: bounded shared exact-timestamp grouping preserving strict watermark closure, lateness, output values/types and existing checkpoint/recovery; generic nested SESSION fixtures, boundary/recovery/resource/cancellation regressions; independent review, affected-crate gates and green open PR.
+- Prior diagnosis: `/home/jason/qa-evidence/str32-20261010-52391450/arcstream-integration/profile-session/session-instant-rocks-gap-review.md`. Upstream supports width-zero grouping; the current bounded adapter excludes it. Existing memory functional passes do not prove bounded resources.
+- Implementation source review passed. Window tests 16/16, shared admission filters 3/3, affected worker/SQL-testing locked checks, strict all-target Clippy and formatting passed. Final normal SQL matrix 8/8 (five rows, committed prefix3) and late matrix 4/4 (six rows, committed prefix4) passed exact scalar types/values and fresh-worker continuation. Test-harness cleanup-permit wait resolves native close overlap without extra slots.
+- Evidence: `/home/jason/qa-evidence/str101-20261010/`; failed attempts retained. Pinned executable SHA256 `f9b0028b9e7eebccfb794c58aa3d96581351306b48b92b45b169e221314afb93`, source/config receipts retained; queue reservation `318d3019bbbf` exited0. Next: final independent evidence verdict, publish reviewed increment and wait for current-head CI. No SQL rewrite or product budget change; nested fixture declares its three-owner scan/write profile. Beyond-RAM/RSS/resource qualification remains STR-32 batch evidence, not established by unit tests or the finite matrix. No pending user decision.
+
 ## Active STR-32 recovery admission repair
 
 - Base fetched `52391450bc055704c38112967c73265e9bafe015`; branch `agent/str-32-recovery-admission-20261010`, coordinator Codex `/root`, delegated checkpoint-only implementation and independent review.

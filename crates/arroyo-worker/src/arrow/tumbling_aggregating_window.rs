@@ -157,7 +157,6 @@ impl OperatorConstructor for TumblingAggregateWindowConstructor {
         let native = arroyo_rpc::config::config()
             .worker
             .window_state
-            .filter(|_| width > Duration::ZERO)
             .map(|limits| {
                 NativeWindow::new(
                     width,
