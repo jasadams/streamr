@@ -1,5 +1,13 @@
 # Milestone 3 — agent backlog
 
+## Active STR-32 recovery admission repair
+
+- Base fetched `52391450bc055704c38112967c73265e9bafe015`; branch `agent/str-32-recovery-admission-20261010`, coordinator Codex `/root`, delegated checkpoint-only implementation and independent review.
+- User approved bounded cancellable checksum memory admission after production combined worker loss produced repeated scan-pool refusals. Same 64 KiB allowance, same shared byte budgets/formats/ownership; no SQL semantic change.
+- Acceptance: real Parquet contention/cancellation/fresh-retry regression and all-four-branch production recovery on controller/leader with verified checkpoint/source/sink prefixes; no unexpected scan refusals.
+- Implementation and independent source/evidence reviews passed. All 92 live-state tests, locked check, strict Clippy and format passed. Fresh combined RocksDB controller/leader × batch targets 1/8 passed exact all-four outputs and selected epoch 2 recovery with one replacement generation and no scan refusals. Exact next action: publish reviewed repair increment and continue remaining STR-32 functional coverage. User directed no queue and no automatic elapsed-time limit.
+- Evidence: `/home/jason/qa-evidence/str32-20261010-52391450/combined-production-functional/` and `recovery-admission-repair/`. Original failures/retries retained. Full capacity/backfill/fault/24-hour qualification remains open; no decision pending for this repair.
+
 ## Active STR-56 continuation — 2026-10-10
 
 - Codex `/root`, start 00:21 UTC; branch
