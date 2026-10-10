@@ -42,6 +42,7 @@ use crate::{
 };
 
 mod aggregate;
+pub(crate) mod current_result;
 mod join;
 mod window_fn;
 

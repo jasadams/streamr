@@ -116,6 +116,15 @@ message AsyncUdfOperator {
   uint64 timeout_micros = 7;
 }
 
+// Event-time validity of a retained current result. Each input row stamps
+// the group's expiry deadline at its result timestamp plus delay_nanos (the
+// upstream window slide). When an event-time watermark passes the deadline,
+// the retained result is retracted; there is no processing-time fallback.
+message EventTimeExpiry {
+  bytes result_timestamp_expr = 1;
+  int64 delay_nanos = 2;
+}
+
 message UpdatingAggregateOperator {
   string name = 1;
   ArroyoSchema input_schema = 2;
@@ -129,6 +138,9 @@ message UpdatingAggregateOperator {
   optional bool retain_indefinitely = 9;
   // Planner-proven exclusive prefix consumption, indexed by aggregate ordinal.
   map<uint32, uint64> collection_output_limits = 10;
+  // Present only on the selected rolling-result composition path, where the
+  // aggregate retains one current result per key over finalized window rows.
+  optional EventTimeExpiry event_time_expiry = 12;
   repeated CalendarAggregateDescriptor calendar_aggregates = 11;
 }
 

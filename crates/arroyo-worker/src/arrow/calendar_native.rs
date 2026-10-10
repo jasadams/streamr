@@ -582,6 +582,7 @@ impl IncrementalAggregatingFunc {
             last_update_nanos: 0,
             generation,
             next_ordinal: 0,
+            validity_deadline_nanos: 0,
             accumulator_state: accumulator.state()?,
             last_emitted: None,
         };
@@ -681,13 +682,95 @@ impl IncrementalAggregatingFunc {
         Ok(())
     }
 
+    /// Recalculate at most one due group in an admitted scope. H and U are
+    /// persisted together with G/D, so cancellation before commit leaves the
+    /// pending boundary intact and checkpoint restore resumes the same work.
+    pub(super) async fn advance_calendar_watermark(&self, watermark_nanos: i64) -> Result<bool> {
+        if self.calendars.is_empty() {
+            return Ok(false);
+        }
+        let store = self
+            .native_store
+            .as_ref()
+            .context("native aggregate store missing")?;
+        // Each reference plus old H deletion, new H/U and G/D. Reserve for
+        // the entire owner mutation before starting; one group never spans
+        // scopes and output remains in the existing bounded D drain.
+        let operations = self
+            .calendars
+            .len()
+            .checked_add(5)
+            .context("calendar expiry operation budget overflow")?;
+        ensure!(
+            operations <= store.limits().write_operations
+                && operations <= store.limits().write_bytes / store.max_encoded_entry_bytes()
+                && operations
+                    <= store.limits().overlay_bytes
+                        / (store.limits().key_bytes + store.limits().value_bytes),
+            "native aggregate budget cannot recalculate one calendar group"
+        );
+        let mut scope = store.begin().await?;
+        // W is the checkpointed admission frontier. Regressing or restored
+        // notifications cannot recalculate against an older date after its
+        // history has been pruned. Direct callers without W retain their
+        // supplied finite progress for existing focused operator probes.
+        let watermark_nanos = self
+            .calendar_progress(&scope)
+            .await?
+            .map_or(watermark_nanos, |progress| {
+                progress.watermark_nanos.max(watermark_nanos)
+            });
+        let reference = i32::try_from(watermark_nanos.div_euclid(86_400_000_000_000))?;
+        let Some((due, generation_bytes)) = scope.first(b"H").await? else {
+            return Ok(false);
+        };
+        ensure!(
+            due.len() >= 13 && generation_bytes.len() == 8,
+            "invalid calendar due entry"
+        );
+        let deadline = (u64::from_be_bytes(due[1..9].try_into()?) ^ (1 << 63)) as i64;
+        if deadline > watermark_nanos {
+            return Ok(false);
+        }
+        let group_len = usize::try_from(u32::from_be_bytes(due[9..13].try_into()?))?;
+        ensure!(
+            group_len == due.len() - 13,
+            "invalid calendar due group key"
+        );
+        let group_key = &due[13..];
+        let generation = u64::from_be_bytes(generation_bytes.as_slice().try_into()?);
+        let pointer = native_generation_prefix(b'U', group_key, generation)?;
+        let owns_boundary = scope
+            .get(&pointer)
+            .await?
+            .is_some_and(|value| value == deadline.to_be_bytes());
+        let current = scope
+            .get(&native_group_key(b'G', group_key)?)
+            .await?
+            .map(|bytes| {
+                decode_group(
+                    &bytes,
+                    &self.native_state_types(),
+                    &self.native_output_types(),
+                    scope.limits().value_bytes,
+                )
+            })
+            .transpose()?;
+        if owns_boundary && current.is_some_and(|group| group.generation == generation) {
+            self.recalculate_calendar_group(&mut scope, group_key, reference)
+                .await?;
+        } else {
+            // Stale generations never recalculate a replacement key. Leave
+            // reverse-pointer cleanup with its existing generation owner.
+            scope.delete(&due)?;
+        }
+        scope.commit().await?;
+        Ok(true)
+    }
+
     /// STR-29's quiet-key traversal invokes this with the real progress UTC day.
     /// This callback never evaluates row-context functions using invented rows.
     /// The caller commits this owner's scope and drains D through normal output.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "STR-29 owns quiet-key scheduler integration")
-    )]
     pub(crate) async fn recalculate_calendar_group(
         &self,
         scope: &mut AggregateScope<'_>,

@@ -6,6 +6,25 @@ current dispatch instructions. No implementation worker is claimed by this reset
 
 ## Available features
 
+## Active STR-29 continuation
+
+- Codex `/root` resumed `d7b9dbf2` in `jason/str-29-watermark-zero-084313`;
+  main `8cbd443d`, final published STR-62 dependency `405f71c7`. No time limit.
+- Implemented finite-watermark quiet retained-key zero, unchanged silence,
+  scoped current-result owners, exact typed CDC, signed/zero deadlines and
+  bounded persistent maintenance. W/V pruning and H/U due work restore together;
+  regressing notifications use persisted real progress without lifetime loss.
+- Current combined gates pass: fmt, strict Clippy, locked check; composition
+  planner 15/15, event-clock 14/14, admission 7/7, calendar 18/18, expiry 8/8,
+  capture 1/1 and Python comparator 9/9. Evidence:
+  `/home/jason/qa-evidence/str29-continuation-20261010/final-integration/`.
+- Independent source/evidence review approved with zero findings.
+  [PR #30](https://github.com/jasadams/streamr/pull/30) is stacked on #23;
+  next: verify current-head active CI and hand off to merge-sweeper. Merge #23
+  before retargeting/merging #30. No product decision is pending.
+- Full runtime/resource matrix stays STR-32. Prepared fixtures are not runtime
+  passes; external application parity remains outside this engine.
+
 ## Active STR-62
 
 - Worker: Codex `/root`; branch `jason/str-62-calendar-2147`, base `67c242f5`.

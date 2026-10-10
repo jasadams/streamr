@@ -1,16 +1,19 @@
 use crate::extension::aggregate::AggregateExtension;
 use crate::extension::key_calculation::{KeyCalculationExtension, KeysOrExprs};
-use crate::extension::updating_aggregate::UpdatingAggregateExtension;
-use crate::plan::WindowDetectingVisitor;
+use crate::extension::remote_table::RemoteTableExtension;
+use crate::extension::updating_aggregate::{CurrentResultExpiry, UpdatingAggregateExtension};
+use crate::plan::{WindowDetectingVisitor, extract_column};
 use crate::{
     ArroyoSchemaProvider, DFField, WindowBehavior, fields_with_qualifiers, find_window,
     schema_from_df_fields_with_metadata,
 };
+use arroyo_datastream::WindowType;
 use arroyo_rpc::TIMESTAMP_FIELD;
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion, TreeNodeRewriter};
 use datafusion::common::{DFSchema, DataFusionError, Result, not_impl_err, plan_err};
 use datafusion::functions_aggregate::expr_fn::max;
 use datafusion::logical_expr;
+use datafusion::logical_expr::expr::{AggregateFunction, Alias, ScalarFunction, Sort};
 use datafusion::logical_expr::{Aggregate, Expr, Extension, LogicalPlan};
 use datafusion::prelude::col;
 use itertools::Itertools;
@@ -192,6 +195,188 @@ pub struct AggregateRewriter<'a> {
     pub schema_provider: &'a ArroyoSchemaProvider,
 }
 
+fn strip_alias(expr: &Expr) -> &Expr {
+    match expr {
+        Expr::Alias(Alias { expr, .. }) => strip_alias(expr),
+        other => other,
+    }
+}
+
+/// Identifies `LAST_VALUE(result ORDER BY window_end ASC)` over finalized
+/// window results — the current-result stage of the selected rolling-result
+/// composition. Returns the result timestamp column of the single ordered
+/// last-value aggregate, or None for any other aggregate shape.
+fn last_value_result_timestamp(aggr_expr: &[Expr]) -> Option<&datafusion::common::Column> {
+    let [expr] = aggr_expr else {
+        return None;
+    };
+    let Expr::AggregateFunction(AggregateFunction { func, params }) = strip_alias(expr) else {
+        return None;
+    };
+    if !func.name().eq_ignore_ascii_case("last_value")
+        || params.args.len() != 1
+        || params.filter.is_some()
+        || params.distinct
+        || params.null_treatment.is_some()
+    {
+        return None;
+    }
+    let [
+        Sort {
+            expr: order,
+            asc: true,
+            ..
+        },
+    ] = params.order_by.as_deref()?
+    else {
+        return None;
+    };
+    extract_column(order)
+}
+
+/// Resolves which upstream finalized HOP/TUMBLE window stamped the projected
+/// scalar at `target`, by walking the linear projection/alias/materialization
+/// chain down to the window definition. Any other plan shape returns None.
+fn finalized_window_at(node: &LogicalPlan, target: usize) -> Option<WindowType> {
+    match node {
+        LogicalPlan::SubqueryAlias(alias) => finalized_window_at(&alias.input, target),
+        LogicalPlan::Projection(projection) => {
+            let expr = strip_alias(projection.expr.get(target)?);
+            match expr {
+                Expr::ScalarFunction(ScalarFunction { func, args })
+                    if func.name() == "get_field" && args.len() == 2 =>
+                {
+                    let Expr::Literal(datafusion::common::ScalarValue::Utf8(Some(field)), _) =
+                        &args[1]
+                    else {
+                        return None;
+                    };
+                    if field != "end" {
+                        return None;
+                    }
+                    let Expr::Column(struct_column) = strip_alias(&args[0]) else {
+                        return None;
+                    };
+                    window_struct_definition(&projection.input, struct_column)
+                }
+                Expr::Column(column) => {
+                    let index = projection.input.schema().index_of_column(column).ok()?;
+                    finalized_window_at(&projection.input, index)
+                }
+                _ => None,
+            }
+        }
+        LogicalPlan::Extension(Extension { node })
+            if node.as_any().is::<RemoteTableExtension>() && !node.inputs().is_empty() =>
+        {
+            finalized_window_at(node.inputs()[0], target)
+        }
+        _ => None,
+    }
+}
+
+/// The window struct field `column` is produced by a windowed aggregate and
+/// renamed by its projection (the aggregate's window field carries the raw
+/// window expression text). Lineage translates the name through projections
+/// and materialization boundaries down to that window.
+fn window_struct_definition(
+    node: &LogicalPlan,
+    column: &datafusion::common::Column,
+) -> Option<WindowType> {
+    match node {
+        LogicalPlan::SubqueryAlias(alias) => window_struct_definition(&alias.input, column),
+        LogicalPlan::Projection(projection) => {
+            let index = projection
+                .schema
+                .fields()
+                .iter()
+                .position(|field| field.name() == &column.name)?;
+            match strip_alias(&projection.expr[index]) {
+                Expr::Column(next) => window_struct_definition(&projection.input, next),
+                expr => {
+                    let Ok(Some(window)) = find_window(expr) else {
+                        return None;
+                    };
+                    // Only a finalized window result counts: the projection
+                    // names a window produced by the windowed aggregate below.
+                    windowed_aggregate_window(&projection.input).filter(|found| *found == window)
+                }
+            }
+        }
+        LogicalPlan::Extension(Extension { node })
+            if node.as_any().is::<RemoteTableExtension>() && !node.inputs().is_empty() =>
+        {
+            window_struct_definition(node.inputs()[0], column)
+        }
+        LogicalPlan::Extension(Extension { node }) => {
+            let aggregate_extension = node.as_any().downcast_ref::<AggregateExtension>()?;
+            match &aggregate_extension.window_behavior {
+                WindowBehavior::FromOperator {
+                    window,
+                    window_field,
+                    ..
+                } if window_field.name() == &column.name => Some(window.clone()),
+                WindowBehavior::FromOperator { .. } | WindowBehavior::InData => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+fn windowed_aggregate_window(node: &LogicalPlan) -> Option<WindowType> {
+    match node {
+        LogicalPlan::SubqueryAlias(alias) => windowed_aggregate_window(&alias.input),
+        LogicalPlan::Projection(projection) => windowed_aggregate_window(&projection.input),
+        LogicalPlan::Extension(Extension { node })
+            if node.as_any().is::<RemoteTableExtension>() && !node.inputs().is_empty() =>
+        {
+            windowed_aggregate_window(node.inputs()[0])
+        }
+        LogicalPlan::Extension(Extension { node }) => {
+            let aggregate_extension = node.as_any().downcast_ref::<AggregateExtension>()?;
+            match &aggregate_extension.window_behavior {
+                WindowBehavior::FromOperator { window, .. } => Some(window.clone()),
+                WindowBehavior::InData => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// The selected rolling-result composition path retains one current result per
+/// key over finalized HOP/TUMBLE window rows and stamps its event-time validity
+/// at the result timestamp plus one window slide (the first empty closed
+/// boundary). Watermarks past the deadline retract the retained result so the
+/// composition can express zero; aggregates outside this pattern are
+/// unchanged.
+pub(super) fn current_result_expiry(
+    input: &LogicalPlan,
+    aggr_expr: &[Expr],
+) -> Result<Option<CurrentResultExpiry>> {
+    let Some(order_column) = last_value_result_timestamp(aggr_expr) else {
+        return Ok(None);
+    };
+    let target = input.schema().index_of_column(order_column).map_err(|_| {
+        DataFusionError::Plan(
+            "LAST_VALUE ORDER BY column is not an input field of its aggregate".to_string(),
+        )
+    })?;
+    let Some(window) = finalized_window_at(input, target) else {
+        return Ok(None);
+    };
+    let delay = match window {
+        WindowType::Sliding { slide, .. } => slide,
+        WindowType::Tumbling { width } => width,
+        WindowType::Instant | WindowType::Session { .. } => return Ok(None),
+    };
+    Ok(Some(CurrentResultExpiry {
+        // Operator input schemas are unqualified Arrow schemas; the planned
+        // column qualifier only identifies the field in the logical input.
+        result_timestamp: col(&order_column.name),
+        delay,
+    }))
+}
+
 impl AggregateRewriter<'_> {
     pub fn rewrite_non_windowed_aggregate(
         input: Arc<LogicalPlan>,
@@ -201,6 +386,10 @@ impl AggregateRewriter<'_> {
         schema: Arc<DFSchema>,
         schema_provider: &ArroyoSchemaProvider,
     ) -> Result<Transformed<LogicalPlan>> {
+        // Expiry requires whole-program composition and shared-consumer proof.
+        // Views are rewritten before their consumers, so attach it only after
+        // all sink inputs have been assembled.
+        let event_time_expiry = None;
         let calendar_aggregates = calendar_filters(&mut aggr_expr, &input)?;
         let key_count = key_fields.len();
         key_fields.extend(fields_with_qualifiers(input.schema()));
@@ -282,6 +471,7 @@ impl AggregateRewriter<'_> {
             (0..key_count).collect(),
             column.relation,
             schema_provider.planning_options.ttl,
+            event_time_expiry,
             calendar_aggregates,
         )?;
         let final_plan = LogicalPlan::Extension(Extension {

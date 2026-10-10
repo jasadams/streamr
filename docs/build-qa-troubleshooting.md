@@ -184,3 +184,12 @@ worktree. Do not delete the shared target or edit generated Rust files.
 Evidence: `/home/jason/qa-evidence/streamr-str62-2147/optimized-pruning/check.log`
 (exit 101). Corrected current-source retry and its results are preserved in
 `optimized-pruning-retry1/` under the same receipt root.
+
+STR-29 independently observed the same stale-output failure on its reviewed
+`2d780f3` continuation, then refreshed both `api.proto` and `rpc.proto` inside
+the queue reservation. Its unchanged source passed strict Clippy, affected
+check, calendar 12/12, expiry 8/8 and capture 1/1 with image `a95d0ca27fc1`.
+Evidence: `/home/jason/qa-evidence/str29-continuation-20261010/attempt-5/`
+contains the failure; `validate-worker-repair.sh` and final logs record the
+successful workaround. These receipts precede final STR-62 integration and
+do not qualify the STR-32 runtime/resource matrix.

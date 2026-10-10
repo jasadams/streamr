@@ -8,14 +8,17 @@ use arrow_schema::{Field, Schema};
 use datafusion::common::ScalarValue;
 use std::{io::Cursor, sync::Arc};
 
-const MAGIC: &[u8; 8] = b"STRAGG02";
-const HEADER_BYTES: usize = 8 + 8 + 8 + 8 + 4 + 4;
+const MAGIC: &[u8; 8] = b"STRAGG03";
+const HEADER_BYTES: usize = 8 + 8 + 8 + 8 + 8 + 4 + 4;
 
 #[derive(Debug)]
 pub(crate) struct EncodedGroup {
     pub last_update_nanos: i64,
     pub generation: u64,
     pub next_ordinal: u64,
+    /// Event-time deadline of the retained current result; unused when the
+    /// operator has no event-time expiry.
+    pub validity_deadline_nanos: i64,
     pub accumulator_state: Vec<ScalarValue>,
     pub last_emitted: Option<Vec<ScalarValue>>,
 }
@@ -67,6 +70,7 @@ pub(crate) fn encode_group(group: &EncodedGroup, max_bytes: usize) -> Result<Vec
     output.extend_from_slice(&group.last_update_nanos.to_be_bytes());
     output.extend_from_slice(&group.generation.to_be_bytes());
     output.extend_from_slice(&group.next_ordinal.to_be_bytes());
+    output.extend_from_slice(&group.validity_deadline_nanos.to_be_bytes());
     output.extend_from_slice(&state_len.to_be_bytes());
     output.extend_from_slice(&emitted_len.to_be_bytes());
     output.extend_from_slice(&body);
@@ -90,8 +94,9 @@ pub(crate) fn decode_group(
     let last_update_nanos = i64::from_be_bytes(bytes[8..16].try_into()?);
     let generation = u64::from_be_bytes(bytes[16..24].try_into()?);
     let next_ordinal = u64::from_be_bytes(bytes[24..32].try_into()?);
-    let state_len = u32::from_be_bytes(bytes[32..36].try_into()?) as usize;
-    let emitted_len = u32::from_be_bytes(bytes[36..40].try_into()?) as usize;
+    let validity_deadline_nanos = i64::from_be_bytes(bytes[32..40].try_into()?);
+    let state_len = u32::from_be_bytes(bytes[40..44].try_into()?) as usize;
+    let emitted_len = u32::from_be_bytes(bytes[44..48].try_into()?) as usize;
     ensure!(
         state_len == expected_state_types.len(),
         "aggregate accumulator schema changed"
@@ -140,6 +145,7 @@ pub(crate) fn decode_group(
         last_update_nanos,
         generation,
         next_ordinal,
+        validity_deadline_nanos,
         accumulator_state: accumulator_state.to_vec(),
         last_emitted: (emitted_len > 0).then(|| emitted.to_vec()),
     })
@@ -255,6 +261,7 @@ pub(crate) fn encode_calendar_contribution(
             last_update_nanos: 0,
             generation: 1,
             next_ordinal: 0,
+            validity_deadline_nanos: 0,
             accumulator_state: state,
             last_emitted: None,
         },
@@ -366,6 +373,7 @@ mod tests {
             last_update_nanos: 1234,
             generation: 7,
             next_ordinal: 29,
+            validity_deadline_nanos: 42_000,
             accumulator_state: vec![ScalarValue::Int64(Some(12))],
             last_emitted: Some(vec![
                 ScalarValue::Utf8(Some("α".into())),
@@ -388,6 +396,10 @@ mod tests {
         assert_eq!(restored.last_update_nanos, original.last_update_nanos);
         assert_eq!(restored.generation, original.generation);
         assert_eq!(restored.next_ordinal, original.next_ordinal);
+        assert_eq!(
+            restored.validity_deadline_nanos,
+            original.validity_deadline_nanos
+        );
         assert!(decode_group(&encoded, &[DataType::Utf8], &[], 8192).is_err());
     }
 
@@ -397,6 +409,7 @@ mod tests {
             last_update_nanos: 0,
             generation: 0,
             next_ordinal: 0,
+            validity_deadline_nanos: 0,
             accumulator_state: vec![],
             last_emitted: None,
         };

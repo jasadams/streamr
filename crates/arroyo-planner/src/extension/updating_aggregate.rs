@@ -4,8 +4,11 @@ use crate::functions::multi_hash;
 use crate::physical::ArroyoPhysicalExtensionCodec;
 use arroyo_datastream::logical::{LogicalEdge, LogicalEdgeType, LogicalNode, OperatorName};
 use arroyo_rpc::config::config;
-use arroyo_rpc::{df::ArroyoSchema, grpc::api::UpdatingAggregateOperator};
-use datafusion::common::{DFSchemaRef, Result, TableReference, ToDFSchema, plan_err};
+use arroyo_rpc::df::ArroyoSchema;
+use arroyo_rpc::grpc::api::{EventTimeExpiry, UpdatingAggregateOperator};
+use datafusion::common::{
+    DFSchemaRef, DataFusionError, Result, TableReference, ToDFSchema, plan_err,
+};
 use datafusion::logical_expr::expr::ScalarFunction;
 use datafusion::logical_expr::{
     Expr, Extension, LogicalPlan, UserDefinedLogicalNodeCore, col, lit,
@@ -22,6 +25,16 @@ use std::time::Duration;
 
 pub(crate) const UPDATING_AGGREGATE_EXTENSION_NAME: &str = "UpdatingAggregateExtension";
 
+/// Event-time validity of a retained current result on the selected
+/// rolling-result composition path. Each result stamps its expiry deadline at
+/// `result_timestamp` plus `delay` (the upstream window slide); an event-time
+/// watermark past the deadline retracts the retained result.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd)]
+pub(crate) struct CurrentResultExpiry {
+    pub(crate) result_timestamp: Expr,
+    pub(crate) delay: Duration,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd)]
 pub(crate) struct UpdatingAggregateExtension {
     pub(crate) aggregate: LogicalPlan,
@@ -29,6 +42,7 @@ pub(crate) struct UpdatingAggregateExtension {
     pub(crate) final_calculation: LogicalPlan,
     pub(crate) timestamp_qualifier: Option<TableReference>,
     pub(crate) ttl: Option<Duration>,
+    pub(crate) event_time_expiry: Option<CurrentResultExpiry>,
     pub(crate) calendar_aggregates: Vec<crate::plan::CalendarAggregate>,
 }
 
@@ -38,6 +52,7 @@ impl UpdatingAggregateExtension {
         key_fields: Vec<usize>,
         timestamp_qualifier: Option<TableReference>,
         ttl: Option<Duration>,
+        event_time_expiry: Option<CurrentResultExpiry>,
         calendar_aggregates: Vec<crate::plan::CalendarAggregate>,
     ) -> Result<Self> {
         let final_calculation = LogicalPlan::Extension(Extension {
@@ -53,6 +68,7 @@ impl UpdatingAggregateExtension {
             final_calculation,
             timestamp_qualifier,
             ttl,
+            event_time_expiry,
             calendar_aggregates,
         })
     }
@@ -89,6 +105,7 @@ impl UserDefinedLogicalNodeCore for UpdatingAggregateExtension {
             self.key_fields.clone(),
             self.timestamp_qualifier.clone(),
             self.ttl,
+            self.event_time_expiry.clone(),
             self.calendar_aggregates.clone(),
         )
     }
@@ -151,6 +168,19 @@ impl ArroyoExtension for UpdatingAggregateExtension {
                 ))
             })
             .collect();
+        let event_time_expiry = self
+            .event_time_expiry
+            .as_ref()
+            .map(|expiry| -> Result<EventTimeExpiry> {
+                Ok(EventTimeExpiry {
+                    result_timestamp_expr: planner
+                        .serialize_as_physical_expr(&expiry.result_timestamp, &input_dfschema)?,
+                    delay_nanos: i64::try_from(expiry.delay.as_nanos()).map_err(|_| {
+                        DataFusionError::Plan("event-time expiry delay overflow".into())
+                    })?,
+                })
+            })
+            .transpose()?;
         // Calendar expressions retain source qualifiers through aliases and
         // projections. Arrow wire schemas have no relation qualifiers; resolve
         // these columns against the logical aggregate input to preserve their
@@ -230,6 +260,7 @@ impl ArroyoExtension for UpdatingAggregateExtension {
                 .as_micros() as u64,
             ttl_micros: self.ttl.map(|ttl| ttl.as_micros() as u64).unwrap_or(0),
             retain_indefinitely: self.ttl.is_none().then_some(true),
+            event_time_expiry,
         };
 
         let node = LogicalNode::single(
