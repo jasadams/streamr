@@ -1713,7 +1713,7 @@ mod tests {
             let serialized = PhysicalPlanNode::try_from_physical_plan(planning, &codec).unwrap();
             let receiver = Arc::new(RwLock::new(None));
             let codec = ArroyoPhysicalExtensionCodec { context: DecodingContext::BoundedBatchStream(receiver.clone()) };
-            let finish = serialized.try_into_physical_plan(registry.as_ref(), &execution.runtime, &codec).unwrap();
+            let finish = serialized.try_into_physical_plan(&registry, &execution.runtime, &codec).unwrap();
             let partial_plan = PhysicalPlanNode::try_from_physical_plan(input, &ArroyoPhysicalExtensionCodec {
                 context: DecodingContext::Planning,
             }).unwrap().encode_to_vec();
