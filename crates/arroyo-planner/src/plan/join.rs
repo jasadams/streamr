@@ -67,22 +67,6 @@ impl JoinRewriter<'_> {
         }
     }
 
-    fn check_updating(left: &LogicalPlan, right: &LogicalPlan) -> Result<()> {
-        if left
-            .schema()
-            .has_column_with_unqualified_name(UPDATING_META_FIELD)
-        {
-            return plan_err!("can't handle updating left side of join");
-        }
-        if right
-            .schema()
-            .has_column_with_unqualified_name(UPDATING_META_FIELD)
-        {
-            return plan_err!("can't handle updating right side of join");
-        }
-        Ok(())
-    }
-
     fn create_join_key_plan(
         input: Arc<LogicalPlan>,
         join_expressions: Vec<Expr>,
@@ -118,7 +102,11 @@ impl JoinRewriter<'_> {
         }))
     }
 
-    fn post_join_timestamp_projection(&mut self, input: LogicalPlan) -> Result<LogicalPlan> {
+    fn post_join_timestamp_projection(
+        &mut self,
+        input: LogicalPlan,
+        updating: bool,
+    ) -> Result<LogicalPlan> {
         let schema = input.schema().clone();
         let mut schema_with_timestamp = fields_with_qualifiers(&schema);
         let timestamp_fields = schema_with_timestamp
@@ -131,7 +119,16 @@ impl JoinRewriter<'_> {
             return not_impl_err!("join must have two timestamp fields");
         }
 
-        schema_with_timestamp.retain(|field| field.name() != "_timestamp");
+        let mut found_metadata = false;
+        schema_with_timestamp.retain(|field| {
+            if updating && field.name() == UPDATING_META_FIELD {
+                let keep = !found_metadata;
+                found_metadata = true;
+                keep
+            } else {
+                field.name() != "_timestamp"
+            }
+        });
         let mut projection_expr = schema_with_timestamp
             .iter()
             .map(|field| {
@@ -322,7 +319,38 @@ impl TreeNodeRewriter for JoinRewriter<'_> {
             return Ok(Transformed::yes(plan));
         }
 
-        let is_instant = Self::check_join_windowing(&join)?;
+        let left_updating = join
+            .left
+            .schema()
+            .has_column_with_unqualified_name(UPDATING_META_FIELD);
+        let right_updating = join
+            .right
+            .schema()
+            .has_column_with_unqualified_name(UPDATING_META_FIELD);
+        let updating = left_updating || right_updating;
+        let is_instant = if updating {
+            if !left_updating || !right_updating {
+                return not_impl_err!(
+                    "updating equijoins require changelog metadata on both inputs"
+                );
+            }
+            if !matches!(join.join_type, JoinType::Inner | JoinType::Left) || join.filter.is_some()
+            {
+                return not_impl_err!(
+                    "updating equijoins support INNER/LEFT with equality conditions only"
+                );
+            }
+            if WindowDetectingVisitor::get_window(&join.left)?.is_some()
+                || WindowDetectingVisitor::get_window(&join.right)?.is_some()
+            {
+                return not_impl_err!(
+                    "updating equijoins currently require non-windowed changelogs"
+                );
+            }
+            false
+        } else {
+            Self::check_join_windowing(&join)?
+        };
 
         let Join {
             left,
@@ -337,7 +365,6 @@ impl TreeNodeRewriter for JoinRewriter<'_> {
         else {
             return not_impl_err!("can't handle join constraint other than ON");
         };
-        Self::check_updating(&left, &right)?;
 
         if on.is_empty() && !is_instant {
             return not_impl_err!("Updating joins must include an equijoin condition");
@@ -363,13 +390,16 @@ impl TreeNodeRewriter for JoinRewriter<'_> {
             filter,
         });
 
-        let final_logical_plan = self.post_join_timestamp_projection(rewritten_join)?;
+        let final_logical_plan = self.post_join_timestamp_projection(rewritten_join, updating)?;
 
         let join_extension = JoinExtension {
             rewritten_join: final_logical_plan,
             is_instant,
+            updating,
+            left_outer: join_type == JoinType::Left,
             // only non-instant (updating) joins have a TTL
-            ttl: (!is_instant).then_some(self.schema_provider.planning_options.join_ttl),
+            ttl: (!is_instant && !updating)
+                .then_some(self.schema_provider.planning_options.join_ttl),
         };
 
         Ok(Transformed::yes(LogicalPlan::Extension(Extension {

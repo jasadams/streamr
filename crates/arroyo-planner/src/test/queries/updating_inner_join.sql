@@ -1,4 +1,3 @@
---fail=Error during planning: can't handle updating left side of join
 CREATE TABLE nexmark (
     auction bigint,
     bidder bigint,
@@ -18,4 +17,4 @@ CREATE TABLE nexmark (
 
 CREATE TABLE counts as (SELECT count(*) as counts, bidder FROM nexmark GROUP BY 2);
 
-SELECT a.counts, b.counts FROM counts A join counts B on A.bidder = b.bidder
+SELECT a.counts AS left_count, b.counts AS right_count FROM counts A join counts B on A.bidder = b.bidder

@@ -1,0 +1,151 @@
+{
+  "name": "left-composite",
+  "join": "LEFT",
+  "checkpoint": 8,
+  "events": [
+    {
+      "side": "l",
+      "item_id": "l1",
+      "k1": "a",
+      "k2": 1,
+      "amount": 2,
+      "seq": 1
+    },
+    {
+      "side": "r",
+      "item_id": "r1",
+      "k1": "a",
+      "k2": 1,
+      "amount": 3,
+      "seq": 2
+    },
+    {
+      "side": "l",
+      "item_id": "l1",
+      "k1": "a",
+      "k2": 1,
+      "amount": 5,
+      "seq": 3
+    },
+    {
+      "side": "r",
+      "item_id": "r1",
+      "k1": "a",
+      "k2": 1,
+      "amount": 7,
+      "seq": 4
+    },
+    {
+      "side": "r",
+      "item_id": "r2",
+      "k1": "a",
+      "k2": 1,
+      "amount": 11,
+      "seq": 5
+    },
+    {
+      "side": "l",
+      "item_id": "l2",
+      "k1": "a",
+      "k2": 1,
+      "amount": 13,
+      "seq": 6
+    },
+    {
+      "side": "r",
+      "item_id": "r1",
+      "k1": "b",
+      "k2": 1,
+      "amount": 17,
+      "seq": 7
+    },
+    {
+      "side": "r",
+      "item_id": "r2",
+      "k1": "b",
+      "k2": 1,
+      "amount": 19,
+      "seq": 8
+    },
+    {
+      "side": "l",
+      "item_id": "l1",
+      "k1": "b",
+      "k2": 1,
+      "amount": 23,
+      "seq": 9
+    },
+    {
+      "side": "r",
+      "item_id": "r1",
+      "k1": "a",
+      "k2": 1,
+      "amount": 29,
+      "seq": 10
+    },
+    {
+      "side": "l",
+      "item_id": "ln",
+      "k1": null,
+      "k2": 1,
+      "amount": 31,
+      "seq": 11
+    },
+    {
+      "side": "r",
+      "item_id": "rn",
+      "k1": null,
+      "k2": 1,
+      "amount": 37,
+      "seq": 12
+    },
+    {
+      "side": "l",
+      "item_id": "lt",
+      "k1": "a",
+      "k2": 2,
+      "amount": 41,
+      "seq": 13
+    },
+    {
+      "side": "r",
+      "item_id": "rt",
+      "k1": "a",
+      "k2": 2,
+      "amount": 43,
+      "seq": 14
+    },
+    {
+      "side": "l",
+      "item_id": "l2",
+      "k1": "a",
+      "k2": 1,
+      "amount": 0,
+      "seq": 15
+    },
+    {
+      "side": "r",
+      "item_id": "rt",
+      "k1": "a",
+      "k2": null,
+      "amount": 47,
+      "seq": 16
+    },
+    {
+      "side": "l",
+      "item_id": "lt",
+      "k1": "a",
+      "k2": null,
+      "amount": 53,
+      "seq": 17
+    },
+    {
+      "side": "r",
+      "item_id": "r2",
+      "k1": "a",
+      "k2": 1,
+      "amount": 59,
+      "seq": 18
+    }
+  ]
+}

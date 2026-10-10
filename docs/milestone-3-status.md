@@ -1,5 +1,41 @@
 # Milestone 3 — agent backlog
 
+## Active STR-102 — 2026-10-10
+
+- Coordinator Codex `/root`, implementer `/root/implement`; branch
+  `jason/str-102-updating-joins-20261010`, fetched base
+  `130f43a265551883e8a13c1d55d51697e27e7f9f`; start 11:57 UTC.
+- Instructions: `AGENTS.md`, `.claude/team.md`, `.claude/build-test.md`,
+  this ledger and `milestone-3-work-plan.md`; current Trakkt STR-102 scope.
+  No automatic elapsed-time limit or signing requirement.
+- Acceptance: existing ANSI updating aggregate INNER/LEFT joins, exact bag/CDC
+  identities and transitions, bounded generic state/probes/output, both backends,
+  checkpoint/fresh-worker regressions, affected-crate gates, independent review
+  and green open PR. STR-65 retained-table feeds/bootstrap and STR-21 historical
+  joins remain separate.
+- Native planner/runtime support and configured row/probe/output bounds are
+  implemented; seven physical-plan worker regressions and a 32-case SQL matrix
+  are prepared. Upstream PR420 supplies the changelog/LEFT transition reference;
+  old execution paths are not restored.
+- All current gates passed: affected four-crate locked check/strict Clippy/fmt;
+  seven physical-plan worker regressions, one serialized loader-admission test;
+  planner library 219 passed/one existing ignored; Python oracle 16 passed.
+- All 32 actual SQL configurations passed independent complete-value/CDC oracles
+  and checkpoint/fresh-worker continuation: direct INNER/LEFT, chained INNER,
+  downstream updating aggregate × memory/RocksDB × controller/leader × batches
+  1/8. Source/build/configuration receipts and failed attempts are preserved in
+  `/home/jason/qa-evidence/str102-20261010/`; see `str-102-validation.md`.
+- Existing test overrides provide scan 16 MiB and queued writes 64 MiB for the
+  declared graph; product limits/checkpoint contracts are unchanged. Independent
+  source reviews approved all material repairs; pre-rebase evidence approval passed.
+- Rebased onto main `4e881205`; integration source review passed. Fresh affected
+  gates and all 32 SQL cases passed on committed source `e8e7c82c`; receipts in
+  `sql-matrix-rebased/`. Next: final evidence approval, publish and current-head
+  CI. Heavy capacity/RSS,
+  slow-consumer/fault/soak qualification remains the existing STR-32 shared batch;
+  this feature increment does not establish milestone qualification. No user
+  decision pending.
+
 ## Active STR-101 — exact-timestamp backend parity
 
 - Codex run `codex-str101-20261010`; branch `jason/str-101-instant-window-20261010`, workspace `/home/jason/repos/streamr-worktrees/str-101-instant-window-20261010`; fetched base `130f43a2`. Instructions: `AGENTS.md`, `.claude/build-test.md`, this ledger, `milestone-3-work-plan.md`, current Trakkt ticket and canonical backlog-fast skill. No elapsed-time limit or signing requirement.

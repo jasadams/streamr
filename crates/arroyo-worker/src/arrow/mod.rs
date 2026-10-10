@@ -52,6 +52,7 @@ pub mod state_table_runtime;
 pub(crate) mod sync;
 pub mod tumbling_aggregating_window;
 mod updating_cache;
+pub mod updating_join;
 pub mod watermark_generator;
 pub mod window_fn;
 mod window_native;

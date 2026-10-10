@@ -1,0 +1,2 @@
+CREATE VIEW joined_values AS SELECT l.item_id AS left_id, r.item_id AS right_id, l.k1, l.k2, l.total AS left_total, r.total AS right_total, l.events AS left_count, r.events AS right_count FROM left_values l INNER JOIN right_values r ON l.k1 = r.k1 AND l.k2 = r.k2;
+INSERT INTO join_output SELECT left_id, right_id, k1, k2, SUM(left_total) AS left_total, SUM(right_total) AS right_total, SUM(left_count) AS left_count, SUM(right_count) AS right_count FROM joined_values GROUP BY left_id, right_id, k1, k2;

@@ -444,6 +444,10 @@ pub struct WorkerConfig {
     #[serde(default)]
     pub aggregate_state: Option<AggregateStateConfig>,
 
+    /// Bounded updating-input equijoin state, shared by both live backends.
+    #[serde(default)]
+    pub join_state: Option<JoinStateConfig>,
+
     /// Opt-in bounded native TUMBLE/HOP partial state on the configured live backend.
     #[serde(default)]
     pub window_state: Option<WindowStateConfig>,
@@ -565,6 +569,48 @@ impl AggregateStateConfig {
             bail!(
                 "worker.aggregate-state requires positive limits, two output rows/write operations, and room for one maximum key/value in page, write, and overlay budgets"
             );
+        }
+        Ok(())
+    }
+}
+
+/// Updating joins stream fanout one result at a time; retained rows and indexes
+/// use the existing live-state/checkpoint contract.
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct JoinStateConfig {
+    pub max_retained_rows: usize,
+    pub max_probe_rows: usize,
+    pub key_bytes: usize,
+    pub value_bytes: usize,
+    pub page_bytes: usize,
+    pub page_entries: usize,
+    pub write_bytes: usize,
+    pub write_operations: usize,
+    pub overlay_bytes: usize,
+    pub max_pending_output_bytes: usize,
+    pub max_resident_bytes: usize,
+}
+
+impl JoinStateConfig {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if [
+            self.max_retained_rows,
+            self.max_probe_rows,
+            self.key_bytes,
+            self.value_bytes,
+            self.page_bytes,
+            self.page_entries,
+            self.write_bytes,
+            self.write_operations,
+            self.overlay_bytes,
+            self.max_pending_output_bytes,
+            self.max_resident_bytes,
+        ]
+        .contains(&0)
+            || self.write_operations < 3
+        {
+            bail!("worker.join-state requires positive limits and three write operations");
         }
         Ok(())
     }

@@ -63,6 +63,78 @@ fn native_fixed_window_enabled(name: &OperatorName, bytes: &[u8], configured: bo
     }
 }
 
+fn native_updating_join_enabled(
+    name: &OperatorName,
+    bytes: &[u8],
+    limits: Option<&arroyo_rpc::config::JoinStateConfig>,
+) -> bool {
+    matches!(name, OperatorName::Join)
+        && limits.is_some_and(|limits| limits.validate().is_ok())
+        && api::JoinOperator::decode(bytes).is_ok_and(|join| join.updating)
+}
+
+#[cfg(test)]
+mod native_join_admission_tests {
+    use super::*;
+
+    #[test]
+    fn serialized_updating_join_requires_valid_bounded_state() {
+        let limits = arroyo_rpc::config::JoinStateConfig {
+            max_retained_rows: 100,
+            max_probe_rows: 10,
+            key_bytes: 256,
+            value_bytes: 8192,
+            page_bytes: 32768,
+            page_entries: 1,
+            write_bytes: 65536,
+            write_operations: 8,
+            overlay_bytes: 65536,
+            max_pending_output_bytes: 65536,
+            max_resident_bytes: 8 * 1024 * 1024,
+        };
+        let bytes = api::JoinOperator {
+            updating: true,
+            ..Default::default()
+        }
+        .encode_to_vec();
+        assert!(native_updating_join_enabled(
+            &OperatorName::Join,
+            &bytes,
+            Some(&limits)
+        ));
+        assert!(!native_updating_join_enabled(
+            &OperatorName::Join,
+            &bytes,
+            None
+        ));
+        assert!(!native_updating_join_enabled(
+            &OperatorName::InstantJoin,
+            &bytes,
+            Some(&limits)
+        ));
+        assert!(!native_updating_join_enabled(
+            &OperatorName::Join,
+            &[255],
+            Some(&limits)
+        ));
+        let historical = api::JoinOperator::default().encode_to_vec();
+        assert!(!native_updating_join_enabled(
+            &OperatorName::Join,
+            &historical,
+            Some(&limits)
+        ));
+        let invalid = arroyo_rpc::config::JoinStateConfig {
+            max_retained_rows: 0,
+            ..limits
+        };
+        assert!(!native_updating_join_enabled(
+            &OperatorName::Join,
+            &bytes,
+            Some(&invalid)
+        ));
+    }
+}
+
 pub struct SubtaskNode {
     pub node_id: u32,
     pub subtask_idx: usize,
@@ -313,6 +385,10 @@ impl Program {
                                     &operator.operator_name,
                                     &operator.operator_config,
                                     worker_config.window_state.is_some(),
+                                ) || native_updating_join_enabled(
+                                    &operator.operator_name,
+                                    &operator.operator_config,
+                                    worker_config.join_state.as_ref(),
                                 )
                             })
                             .count(),
@@ -366,6 +442,10 @@ impl Program {
                         &operator.operator_name,
                         &operator.operator_config,
                         worker_config.window_state.is_some(),
+                    ) && !native_updating_join_enabled(
+                        &operator.operator_name,
+                        &operator.operator_config,
+                        worker_config.join_state.as_ref(),
                     ) {
                         return Err(StateError::Other {
                             table: operator.operator_id.clone(),

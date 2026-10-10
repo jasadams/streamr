@@ -18,6 +18,8 @@ pub(crate) const JOIN_NODE_NAME: &str = "JoinNode";
 pub struct JoinExtension {
     pub(crate) rewritten_join: LogicalPlan,
     pub(crate) is_instant: bool,
+    pub(crate) updating: bool,
+    pub(crate) left_outer: bool,
     pub(crate) ttl: Option<Duration>,
 }
 
@@ -57,6 +59,8 @@ impl ArroyoExtension for JoinExtension {
             output_schema: Some(self.output_schema().into()),
             join_plan: physical_plan_node.encode_to_vec(),
             ttl_micros: self.ttl.map(|t| t.as_micros() as u64),
+            updating: self.updating,
+            left_outer: self.left_outer,
         };
 
         let logical_node = LogicalNode::single(
@@ -108,6 +112,8 @@ impl UserDefinedLogicalNodeCore for JoinExtension {
         Ok(Self {
             rewritten_join: inputs[0].clone(),
             is_instant: self.is_instant,
+            updating: self.updating,
+            left_outer: self.left_outer,
             ttl: self.ttl,
         })
     }
