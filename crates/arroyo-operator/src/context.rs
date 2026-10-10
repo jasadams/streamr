@@ -133,11 +133,10 @@ impl BatchSender {
                         self.queued_bytes
                             .fetch_add(message_bytes(&item), Ordering::AcqRel);
                         let bytes = message_bytes(&item);
-                        return self.tx.send(item).map_err(|error| {
+                        return self.tx.send(item).inspect_err(|_| {
                             // No receiver accepted this item; undo its diagnostic counters.
                             self.queued_messages.fetch_sub(count, Ordering::SeqCst);
                             self.queued_bytes.fetch_sub(bytes, Ordering::AcqRel);
-                            error
                         });
                     }
                     Err(_) => {
@@ -940,7 +939,7 @@ mod tests {
 
         async fn run(
             &mut self,
-            ctx: &mut SourceContext,
+            _ctx: &mut SourceContext,
             collector: &mut SourceCollector,
         ) -> DataflowResult<crate::SourceFinishType> {
             collector.initialize_deserializer(Format::Json(Default::default()), None, None, &[]);
