@@ -1,3 +1,7 @@
+#[path = "calendar_native.rs"]
+mod calendar_native;
+use calendar_native::{CalendarAggregate, CalendarContributionChange, CalendarInput};
+
 use crate::arrow::aggregate_codec::{EncodedGroup, decode_group, encode_group};
 use crate::arrow::aggregate_store::{AggregateScope, AggregateStore, AggregateStoreLimits};
 use crate::arrow::decode_aggregate;
@@ -65,6 +69,17 @@ use tracing::log::warn;
 struct BatchData {
     count: u64,
     generation: u64,
+}
+
+/// One accepted contribution with its raw row clock and calendar inputs.
+struct NativeCalendarEvent<'a> {
+    group_key: &'a [u8],
+    inputs: &'a [AggregateInput],
+    row: usize,
+    retract: bool,
+    row_id: Option<&'a [u8]>,
+    calendar_inputs: &'a [CalendarInput],
+    result_timestamp_nanos: Option<i64>,
 }
 
 /// One indexed aggregate member change within an admitted state scope.
@@ -386,6 +401,7 @@ pub struct IncrementalAggregatingFunc {
     native_schema_identity: Vec<u8>,
     native_append_only: bool,
     event_time_expiry: Option<EventTimeExpiryRuntime>,
+    calendars: Vec<CalendarAggregate>,
 }
 
 const GLOBAL_KEY: Vec<u8> = vec![];
@@ -538,8 +554,8 @@ fn native_expiry_key(deadline_nanos: i64, group: &[u8]) -> Result<Vec<u8>> {
 /// deadline so due expirations drain in bounded pages.
 fn native_validity_key(deadline_nanos: i64, group: &[u8]) -> Result<Vec<u8>> {
     let mut key = Vec::with_capacity(9 + group.len() + 4);
-    key.push(b'V');
-    key.extend_from_slice(&deadline_nanos.to_be_bytes());
+    key.push(b'Y');
+    key.extend_from_slice(&((deadline_nanos as u64) ^ (1 << 63)).to_be_bytes());
     key.extend_from_slice(&u32::try_from(group.len())?.to_be_bytes());
     key.extend_from_slice(group);
     Ok(key)
@@ -1145,6 +1161,7 @@ impl IncrementalAggregatingFunc {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[cfg(test)]
     async fn native_process_event(
         &self,
         scope: &mut AggregateScope<'_>,
@@ -1155,6 +1172,35 @@ impl IncrementalAggregatingFunc {
         row_id: Option<&[u8]>,
         result_timestamp_nanos: Option<i64>,
     ) -> Result<()> {
+        self.native_process_calendar_event(
+            scope,
+            NativeCalendarEvent {
+                group_key,
+                inputs,
+                row,
+                retract,
+                row_id,
+                calendar_inputs: &[],
+                result_timestamp_nanos,
+            },
+        )
+        .await
+    }
+
+    async fn native_process_calendar_event(
+        &self,
+        scope: &mut AggregateScope<'_>,
+        event: NativeCalendarEvent<'_>,
+    ) -> Result<()> {
+        let NativeCalendarEvent {
+            group_key,
+            inputs,
+            row,
+            retract,
+            row_id,
+            calendar_inputs,
+            result_timestamp_nanos,
+        } = event;
         ensure!(
             !retract || !self.native_append_only,
             "append-only native aggregate received a retraction",
@@ -1238,6 +1284,15 @@ impl IncrementalAggregatingFunc {
                 }
             }
         }
+        // Index presence distinguishes an absent deadline from the valid
+        // Unix-epoch boundary zero. G alone cannot make that distinction.
+        let mut validity_deadline = None;
+        if !expired && self.event_time_expiry.is_some()
+            && let Some(group) = &previous
+            && scope.get(&native_validity_key(group.validity_deadline_nanos, group_key)?).await?.is_some()
+        {
+            validity_deadline = Some(group.validity_deadline_nanos);
+        }
         if let Some(group) = &previous {
             if !self.retain_indefinitely {
                 let old_deadline = group.last_update_nanos.saturating_add(ttl_nanos);
@@ -1253,8 +1308,78 @@ impl IncrementalAggregatingFunc {
                 scope.put(&native_cleanup_key(group_key, group.generation)?, b"M")?;
             }
         }
+        let mut calendar_families = HashMap::new();
         for (index, (input, state)) in inputs.iter().zip(accumulators.iter_mut()).enumerate() {
-            let Some(values) = input.selected_values(Some(row))? else {
+            let calendar = self
+                .calendars
+                .iter()
+                .enumerate()
+                .find(|(_, calendar)| calendar.aggregate_index == index);
+            let contribution_day = calendar
+                .map(|(position, _)| calendar_inputs[position].contribution_day(row))
+                .transpose()?
+                .flatten();
+            let selected = input.selected_values(Some(row))?;
+            let storage_index = calendar.map_or(index, |(_, calendar)| calendar.storage_index);
+            let family_already_changed =
+                calendar.is_some() && calendar_families.contains_key(&storage_index);
+            let (selected, contribution_day) =
+                if let Some(original) = calendar_families.get(&storage_index) {
+                    let original: &(Option<Vec<ArrayRef>>, Option<i32>) = original;
+                    original.clone()
+                } else if !self.calendars.is_empty()
+                    && self.aggregates[index].accumulator_type == AccumulatorType::Sliding
+                {
+                    self.calendar_original_input(
+                        scope,
+                        CalendarContributionChange {
+                            group: group_key,
+                            generation,
+                            index: storage_index,
+                            row_id,
+                            retract,
+                            selected,
+                            day: contribution_day,
+                            argument_types: input
+                                .values
+                                .iter()
+                                .map(|value| value.data_type().clone())
+                                .collect(),
+                        },
+                    )
+                    .await?
+                } else {
+                    (selected, contribution_day)
+                };
+            if let Some((position, calendar)) = calendar {
+                if !family_already_changed {
+                    if let (Some(values), Some(day)) = (&selected, contribution_day) {
+                        self.calendar_bucket_delta(
+                            scope,
+                            calendar,
+                            day,
+                            NativeMemberChange {
+                                group: group_key,
+                                generation,
+                                aggregate_index: index,
+                                values,
+                                retract,
+                                ordinal,
+                                row_id,
+                            },
+                        )
+                        .await?;
+                    }
+                    calendar_families.insert(storage_index, (selected.clone(), contribution_day));
+                }
+                let reference = calendar_inputs[position].reference_day(row)?;
+                self.calendar_set_reference(scope, group_key, generation, calendar, reference)?;
+                *state = self
+                    .calendar_recalculate(scope, group_key, generation, calendar, reference)
+                    .await?;
+                continue;
+            }
+            let Some(values) = selected else {
                 continue;
             };
             match state {
@@ -1305,22 +1430,27 @@ impl IncrementalAggregatingFunc {
                 }
             }
         }
-        let mut validity_deadline_nanos = if expired {
-            0
-        } else {
-            previous
-                .as_ref()
-                .map_or(0, |group| group.validity_deadline_nanos)
-        };
         if let Some(expiry) = &self.event_time_expiry
             && let Some(stamp) = result_timestamp_nanos
             && !retract
         {
-            // The retained result stays valid until the first empty closed
-            // boundary after its window: one slide past its result timestamp.
-            // Later results extend validity to their own boundary.
-            validity_deadline_nanos =
-                validity_deadline_nanos.max(stamp.saturating_add(expiry.delay_nanos));
+            let stamped = stamp.saturating_add(expiry.delay_nanos);
+            validity_deadline = Some(validity_deadline.map_or(stamped, |prior: i64| prior.max(stamped)));
+        }
+        if next_group_rows == Some(0) {
+            validity_deadline = None;
+        }
+        let validity_deadline_nanos = validity_deadline.unwrap_or(0);
+        if !self.calendars.is_empty() {
+            let reference = calendar_inputs
+                .iter()
+                .map(|input| input.reference_day(row))
+                .collect::<Result<Vec<_>>>()?
+                .into_iter()
+                .min()
+                .context("calendar aggregate reference is missing")?;
+            self.calendar_schedule(scope, group_key, generation, reference)
+                .await?;
         }
         let next = EncodedGroup {
             last_update_nanos: now,
@@ -1339,9 +1469,9 @@ impl IncrementalAggregatingFunc {
                 &[1],
             )?;
         }
-        if self.event_time_expiry.is_some() && validity_deadline_nanos != 0 {
+        if self.event_time_expiry.is_some() && let Some(deadline) = validity_deadline {
             scope.put(
-                &native_validity_key(validity_deadline_nanos, group_key)?,
+                &native_validity_key(deadline, group_key)?,
                 &[1],
             )?;
         }
@@ -1382,6 +1512,7 @@ impl IncrementalAggregatingFunc {
             vec![GLOBAL_KEY; batch.num_rows()]
         };
         let inputs = self.compute_inputs(batch)?;
+        let calendar_inputs = self.calendar_inputs(batch)?;
         let input_working_bytes = inputs.iter().try_fold(0usize, |total, input| {
             let total = input.values.iter().try_fold(total, |total, value| {
                 total.checked_add(value.get_array_memory_size())
@@ -1393,7 +1524,13 @@ impl IncrementalAggregatingFunc {
                     .map_or(0, |filter| filter.get_array_memory_size()),
             )
         });
+        let calendar_bytes = calendar_inputs.iter().fold(0usize, |bytes, input| {
+            bytes
+                .saturating_add(input.contribution.get_array_memory_size())
+                .saturating_add(input.reference.get_array_memory_size())
+        });
         let input_working_bytes = input_working_bytes
+            .and_then(|bytes| bytes.checked_add(calendar_bytes))
             .and_then(|total| {
                 keys.iter()
                     .try_fold(total, |total, key| total.checked_add(key.len()))
@@ -1448,6 +1585,7 @@ impl IncrementalAggregatingFunc {
             .checked_add(fallback.saturating_mul(2))
             .and_then(|value| value.checked_add(collections.saturating_mul(2)))
             .and_then(|value| value.checked_add(3 * usize::from(!self.retain_indefinitely)))
+            .and_then(|value| value.checked_add(self.calendar_write_operations()))
             .ok_or_else(|| anyhow!("native aggregate operation count overflow"))?;
         let worst_overlay_bytes = worst_operations
             .checked_mul(limits.key_bytes.saturating_add(limits.value_bytes))
@@ -1469,7 +1607,7 @@ impl IncrementalAggregatingFunc {
             // and TTL rollover) also use only keyed reads and this owner's overlay.
             let has_retracts =
                 changelog.is_some_and(|(flags, _)| (start..end).any(|row| flags.value(row)));
-            let mut scope = if fallback == 0 || !has_retracts {
+            let mut scope = if self.calendars.is_empty() && (fallback == 0 || !has_retracts) {
                 store.begin_point().await?
             } else {
                 store.begin().await?
@@ -1480,14 +1618,17 @@ impl IncrementalAggregatingFunc {
                 let result_timestamp_nanos = expiry_stamps
                     .as_ref()
                     .and_then(|stamps| stamps.is_valid(row).then(|| stamps.value(row)));
-                self.native_process_event(
+                self.native_process_calendar_event(
                     &mut scope,
-                    key,
-                    &inputs,
-                    row,
-                    retract,
-                    row_id,
-                    result_timestamp_nanos,
+                    NativeCalendarEvent {
+                        group_key: key,
+                        inputs: &inputs,
+                        row,
+                        retract,
+                        row_id,
+                        calendar_inputs: &calendar_inputs,
+                        result_timestamp_nanos,
+                    },
                 )
                 .await?;
             }
@@ -1626,11 +1767,11 @@ impl IncrementalAggregatingFunc {
         let mut scope = store.begin().await?;
         let mut processed = 0usize;
         while processed < rows_per_chunk {
-            let Some((key, _)) = scope.first_from(b"V", after.as_deref()).await? else {
+            let Some((key, _)) = scope.first_from(b"Y", after.as_deref()).await? else {
                 break;
             };
             ensure!(key.len() >= 13, "invalid aggregate validity key");
-            let deadline = i64::from_be_bytes(key[1..9].try_into()?);
+            let deadline = (u64::from_be_bytes(key[1..9].try_into()?) ^ (1 << 63)) as i64;
             if deadline > watermark_nanos {
                 break;
             }
@@ -1694,7 +1835,13 @@ impl IncrementalAggregatingFunc {
         let group = &cleanup_key[5..group_end];
         let generation = u64::from_be_bytes(cleanup_key[group_end..].try_into()?);
         ensure!(
-            phase == b"M" || phase == b"R" || phase == b"T",
+            phase == b"M"
+                || phase == b"R"
+                || phase == b"B"
+                || phase == b"J"
+                || phase == b"Q"
+                || phase == b"U"
+                || phase == b"T",
             "invalid aggregate cleanup phase"
         );
         if phase == b"T" {
@@ -1746,25 +1893,46 @@ impl IncrementalAggregatingFunc {
         let prefix = native_generation_prefix(phase[0], group, generation)?;
         let mut after = None;
         let mut exhausted = false;
+        let operations_per_entry = if phase == b"U" { 2 } else { 1 };
         let max_entries = store
             .limits()
             .page_entries
-            .min(store.limits().write_operations.saturating_sub(1))
-            .min((store.limits().write_bytes / store.max_encoded_entry_bytes()).saturating_sub(1))
+            .min(store.limits().write_operations.saturating_sub(1) / operations_per_entry)
+            .min(
+                (store.limits().write_bytes / store.max_encoded_entry_bytes()).saturating_sub(1)
+                    / operations_per_entry,
+            )
             .min(
                 (store.limits().overlay_bytes
                     / (store.limits().key_bytes + store.limits().value_bytes))
-                    .saturating_sub(1),
+                    .saturating_sub(1)
+                    / operations_per_entry,
             );
         ensure!(
             max_entries > 0,
-            "native aggregate cleanup requires two write operations"
+            "native aggregate cleanup cannot admit one entry and progress marker"
         );
         for _ in 0..max_entries {
             let Some((key, _)) = scope.first_from(&prefix, after.as_deref()).await? else {
                 exhausted = true;
                 break;
             };
+            if phase == b"U" {
+                let value = scope
+                    .get(&key)
+                    .await?
+                    .context("calendar due pointer is missing")?;
+                ensure!(value.len() == 8, "invalid calendar due pointer");
+                let deadline = i64::from_be_bytes(value.as_slice().try_into()?);
+                let due_key = calendar_native::calendar_due_key(deadline, group)?;
+                if scope
+                    .get(&due_key)
+                    .await?
+                    .is_some_and(|value| value == generation.to_be_bytes())
+                {
+                    scope.delete(&due_key)?;
+                }
+            }
             scope.delete(&key)?;
             after = Some(key);
         }
@@ -1772,7 +1940,14 @@ impl IncrementalAggregatingFunc {
             if phase == b"M" {
                 scope.put(&cleanup_key, b"R")?;
             } else {
-                scope.put(&cleanup_key, b"T")?;
+                let next = match phase.as_slice() {
+                    b"R" if !self.calendars.is_empty() => b"B",
+                    b"B" => b"J",
+                    b"J" => b"Q",
+                    b"Q" => b"U",
+                    _ => b"T",
+                };
+                scope.put(&cleanup_key, next)?;
             }
         }
         scope.commit().await?;
@@ -2045,6 +2220,7 @@ impl IncrementalAggregatingFunc {
             )
             .and_then(|count| count.checked_add(collections.saturating_mul(2)))
             .and_then(|count| count.checked_add(3 * usize::from(!self.retain_indefinitely)))
+            .and_then(|count| count.checked_add(self.calendar_write_operations()))
             .context("aggregate operation count overflow")?;
         ensure!(
             limits.write_operations >= required_operations
@@ -2887,11 +3063,11 @@ impl ArrowOperator for IncrementalAggregatingFunc {
             && self.event_time_expiry.is_some()
             && let Watermark::EventTime(time) = watermark
         {
-            let watermark_nanos = to_nanos(time);
-            let watermark_nanos = if watermark_nanos >= i64::MAX as u128 {
+            let watermark_nanos = if time == arroyo_types::from_nanos(u64::MAX as u128) {
                 i64::MAX
             } else {
-                watermark_nanos as i64
+                arroyo_types::event_time::to_signed_nanos(time)
+                    .context("event-time result watermark exceeds timestamp range")?
             };
             // Same-watermark ordering: preceding data batches have already
             // refreshed group state and deadlines; emit those refreshes first,
@@ -2903,6 +3079,22 @@ impl ArrowOperator for IncrementalAggregatingFunc {
             }
             while self.cleanup_native().await? {
                 tokio::task::yield_now().await;
+            }
+        }
+        if self.native_config.is_some()
+            && !self.calendars.is_empty()
+            && let Watermark::EventTime(time) = watermark
+        {
+            // Terminal infinity closes ordinary windows but cannot invent a
+            // calendar date. Idle carries no event-time progress either.
+            if time != arroyo_types::from_nanos(u64::MAX as u128) {
+                let nanos = arroyo_types::event_time::to_signed_nanos(time)
+                    .context("calendar watermark exceeds timestamp range")?;
+                self.flush_native(ctx, collector).await?;
+                while self.advance_calendar_watermark(nanos).await? {
+                    self.drain_native_dirty(ctx, collector).await?;
+                    tokio::task::yield_now().await;
+                }
             }
         }
         Ok(Some(watermark))
@@ -3106,6 +3298,7 @@ impl IncrementalAggregatingConstructor {
         match &config.event_time_expiry {
             Some(expiry) => {
                 identity.update([1u8]);
+                identity.update(b"current-result-deadline.signed-y.v1");
                 identity.update(&expiry.result_timestamp_expr);
                 identity.update(expiry.delay_nanos.to_be_bytes());
             }
@@ -3117,6 +3310,19 @@ impl IncrementalAggregatingConstructor {
         if let Some(schema) = &config.final_schema {
             identity.update(schema.encode_to_vec());
         }
+        if !config.calendar_aggregates.is_empty() {
+            identity.update(b"\0calendar-day-state.v1");
+            identity.update(u64::try_from(config.calendar_aggregates.len())?.to_be_bytes());
+            for descriptor in &config.calendar_aggregates {
+                let encoded = descriptor.encode_to_vec();
+                identity.update(u64::try_from(encoded.len())?.to_be_bytes());
+                identity.update(encoded);
+            }
+        }
+        ensure!(
+            config.calendar_aggregates.is_empty() || native_config.is_some(),
+            "maintained calendar FILTER requires worker.aggregate-state native backend limits"
+        );
         let ttl = Duration::from_micros(if config.ttl_micros == 0 {
             warn!("ttl was not set for updating aggregate");
             24 * 60 * 60 * 1000 * 1000
@@ -3448,6 +3654,13 @@ impl IncrementalAggregatingConstructor {
             )
             .collect::<Result<_>>()?;
 
+        let calendars = CalendarAggregate::decode(
+            &config.calendar_aggregates,
+            &aggregates,
+            &input_schema.schema,
+            registry.as_ref(),
+        )?;
+
         // Only the append-only ordinary-state layout is new. Preserve existing
         // checkpoint identity for unchanged native COUNT/SUM/AVG and changelog
         // index formats while rejecting old indexed checkpoints for this layout.
@@ -3544,6 +3757,7 @@ impl IncrementalAggregatingConstructor {
             native_schema_identity,
             native_append_only,
             event_time_expiry,
+            calendars,
         })
     }
 }
@@ -3758,6 +3972,7 @@ mod tests {
                 retain_indefinitely: None,
                 collection_output_limits: Default::default(),
                 event_time_expiry: None,
+                calendar_aggregates: Vec::new(),
             },
             Arc::new(registry),
         )
@@ -3911,12 +4126,972 @@ mod tests {
             retain_indefinitely: Some(true),
             collection_output_limits: limit.map(|limit| (0, limit)).into_iter().collect(),
             event_time_expiry: None,
+            calendar_aggregates: Vec::new(),
         };
         IncrementalAggregatingConstructor::build_with_native_config(
             config,
             Arc::new(registry),
             Some(native_test_config()),
         )
+    }
+
+    fn native_calendar_operator() -> IncrementalAggregatingFunc {
+        use arroyo_rpc::grpc::api::CalendarAggregateDescriptor;
+        let (mut config, registry) = native_config();
+        let mut plan = PhysicalPlanNode::decode(config.aggregate_exec.as_slice()).unwrap();
+        let Some(PhysicalPlanType::Aggregate(aggregate)) = &mut plan.physical_plan_type else {
+            panic!("expected aggregate");
+        };
+        aggregate.aggr_expr[7] = aggregate.aggr_expr[6].clone();
+        aggregate.aggr_expr_name[7] = "selected_week".into();
+        aggregate.filter_expr[7] = aggregate.filter_expr[6].clone();
+        let static_filter = aggregate.filter_expr[6]
+            .expr
+            .as_ref()
+            .map(|expression| expression.encode_to_vec());
+        config.aggregate_exec = plan.encode_to_vec();
+        let schema: ArroyoSchema = config.final_schema.take().unwrap().try_into().unwrap();
+        let mut fields = schema.schema.fields().to_vec();
+        fields[7] = Arc::new(fields[6].as_ref().clone().with_name("selected_week"));
+        config.final_schema = Some(
+            ArroyoSchema::from_schema_unkeyed(Arc::new(Schema::new(fields)))
+                .unwrap()
+                .into(),
+        );
+        let codec = DefaultPhysicalExtensionCodec {};
+        let date: Arc<dyn PhysicalExpr> = Arc::new(Literal::new(ScalarValue::Date32(Some(200))));
+        let one: Arc<dyn PhysicalExpr> = Arc::new(Literal::new(ScalarValue::Int64(Some(1))));
+        for (index, horizon) in [(6, 1), (7, 7)] {
+            config
+                .calendar_aggregates
+                .push(CalendarAggregateDescriptor {
+                    aggregate_index: index,
+                    horizon_days: horizon,
+                    argument: serialize_physical_expr(&one, &codec)
+                        .unwrap()
+                        .encode_to_vec(),
+                    static_filter: static_filter.clone(),
+                    contribution_date: serialize_physical_expr(&date, &codec)
+                        .unwrap()
+                        .encode_to_vec(),
+                    reference_date: serialize_physical_expr(&date, &codec)
+                        .unwrap()
+                        .encode_to_vec(),
+                    context_id: "generic-test-clock".into(),
+                });
+        }
+        config.retain_indefinitely = Some(true);
+        let mut input_fields = SchemaBuilder::from(input_schema().as_ref().clone());
+        input_fields.push(Field::new(
+            UPDATING_META_FIELD,
+            DataType::Struct(updating_meta_fields()),
+            false,
+        ));
+        config.input_schema = Some(
+            ArroyoSchema::from_schema_unkeyed(Arc::new(input_fields.finish()))
+                .unwrap()
+                .into(),
+        );
+        let mut operator = IncrementalAggregatingConstructor::build_with_native_config(
+            config,
+            registry,
+            Some(native_test_config()),
+        )
+        .unwrap();
+        operator.native_store = Some(native_test_store());
+        operator
+    }
+
+    async fn calendar_test_event(
+        operator: &mut IncrementalAggregatingFunc,
+        day: i32,
+        reference: i32,
+        include: Option<bool>,
+        retract: bool,
+        id: &[u8],
+    ) {
+        let input = batch(&[Some("value")], &[1], &[include]);
+        for calendar in &mut operator.calendars {
+            calendar.test_dates(day, reference);
+        }
+        let calendar_inputs = operator.calendar_inputs(&input).unwrap();
+        let inputs = operator.compute_inputs(&input).unwrap();
+        let store = operator.native_store.as_ref().unwrap();
+        let mut scope = store.begin().await.unwrap();
+        operator
+            .native_process_calendar_event(
+                &mut scope,
+                NativeCalendarEvent {
+                    group_key: &GLOBAL_KEY,
+                    inputs: &inputs,
+                    row: 0,
+                    retract,
+                    row_id: Some(id),
+                    calendar_inputs: &calendar_inputs,
+                    result_timestamp_nanos: None,
+                },
+            )
+            .await
+            .unwrap();
+        scope.commit().await.unwrap();
+    }
+
+    async fn calendar_test_values(operator: &IncrementalAggregatingFunc) -> Vec<ScalarValue> {
+        let scope = operator
+            .native_store
+            .as_ref()
+            .unwrap()
+            .begin()
+            .await
+            .unwrap();
+        let bytes = scope
+            .get(&native_group_key(b'G', &GLOBAL_KEY).unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        let group = decode_group(
+            &bytes,
+            &operator.native_state_types(),
+            &operator.native_output_types(),
+            scope.limits().value_bytes,
+        )
+        .unwrap();
+        let mut state = operator.native_accumulators(Some(&group)).unwrap();
+        [5, 6, 7]
+            .into_iter()
+            .map(|index| state[index].evaluate().unwrap())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn calendar_due_many_keys_use_single_entry_pages_and_cleanup_deleted_owner() {
+        let mut operator = native_calendar_operator();
+        let mut limits = native_test_store().limits();
+        limits.page_entries = 1;
+        operator.native_store = Some(native_test_store_with_limits(limits));
+        let input = batch(&[Some("value")], &[1], &[Some(true)]);
+        let inputs = operator.compute_inputs(&input).unwrap();
+        let dates = operator.calendar_inputs(&input).unwrap();
+        let store = operator.native_store.as_ref().unwrap();
+        for index in 0_u8..24 {
+            let mut scope = store.begin().await.unwrap();
+            operator
+                .native_process_calendar_event(
+                    &mut scope,
+                    NativeCalendarEvent {
+                        group_key: &[index],
+                        inputs: &inputs,
+                        row: 0,
+                        retract: false,
+                        row_id: Some(&[index; 16]),
+                        calendar_inputs: &dates,
+                        result_timestamp_nanos: None,
+                    },
+                )
+                .await
+                .unwrap();
+            scope.commit().await.unwrap();
+        }
+        // Retiring one owner uses the existing generation cleanup, including
+        // its reverse U pointer and global H deadline entry.
+        {
+            let mut scope = store.begin().await.unwrap();
+            let bytes = scope
+                .get(&native_group_key(b'G', &[0]).unwrap())
+                .await
+                .unwrap()
+                .unwrap();
+            let group = decode_group(
+                &bytes,
+                &operator.native_state_types(),
+                &operator.native_output_types(),
+                scope.limits().value_bytes,
+            )
+            .unwrap();
+            scope
+                .delete(&native_group_key(b'G', &[0]).unwrap())
+                .unwrap();
+            scope
+                .put(&native_cleanup_key(&[0], group.generation).unwrap(), b"M")
+                .unwrap();
+            scope.commit().await.unwrap();
+        }
+        while operator.cleanup_native().await.unwrap() {}
+        {
+            let scope = store.begin().await.unwrap();
+            assert!(
+                scope
+                    .get(
+                        &calendar_native::calendar_due_key(201 * 86_400_000_000_000, &[0]).unwrap()
+                    )
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        let mut processed = 0;
+        while operator
+            .advance_calendar_watermark(201 * 86_400_000_000_000)
+            .await
+            .unwrap()
+        {
+            processed += 1;
+            assert!(processed <= 23);
+        }
+        assert_eq!(processed, 23);
+        let scope = store.begin().await.unwrap();
+        for index in 1_u8..24 {
+            let bytes = scope
+                .get(&native_group_key(b'G', &[index]).unwrap())
+                .await
+                .unwrap()
+                .unwrap();
+            let group = decode_group(
+                &bytes,
+                &operator.native_state_types(),
+                &operator.native_output_types(),
+                scope.limits().value_bytes,
+            )
+            .unwrap();
+            let mut accumulators = operator.native_accumulators(Some(&group)).unwrap();
+            assert_eq!(
+                accumulators[5].evaluate().unwrap(),
+                ScalarValue::Int64(Some(1))
+            );
+            assert_eq!(
+                accumulators[6].evaluate().unwrap(),
+                ScalarValue::Int64(Some(0))
+            );
+            assert_eq!(
+                accumulators[7].evaluate().unwrap(),
+                ScalarValue::Int64(Some(1))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn calendar_watermark_recalculates_quiet_horizons_and_preserves_lifetime() {
+        let mut operator = native_calendar_operator();
+        calendar_test_event(&mut operator, 200, 200, Some(true), false, &[1; 16]).await;
+        let day = 86_400_000_000_000_i64;
+        assert!(
+            !operator
+                .advance_calendar_watermark(201 * day - 1)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            calendar_test_values(&operator).await,
+            vec![ScalarValue::Int64(Some(1)); 3]
+        );
+        assert!(
+            operator
+                .advance_calendar_watermark(201 * day)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !operator
+                .advance_calendar_watermark(201 * day)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            calendar_test_values(&operator).await,
+            vec![
+                ScalarValue::Int64(Some(1)),
+                ScalarValue::Int64(Some(0)),
+                ScalarValue::Int64(Some(1))
+            ]
+        );
+        assert!(
+            operator
+                .advance_calendar_watermark(207 * day)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            calendar_test_values(&operator).await,
+            vec![
+                ScalarValue::Int64(Some(1)),
+                ScalarValue::Int64(Some(0)),
+                ScalarValue::Int64(Some(0))
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn calendar_due_cancellation_and_stale_generation_do_not_lose_pending_state() {
+        let mut operator = native_calendar_operator();
+        calendar_test_event(&mut operator, 200, 200, Some(true), false, &[1; 16]).await;
+        let day = 86_400_000_000_000_i64;
+        let store = operator.native_store.as_ref().unwrap();
+        {
+            let mut scope = store.begin().await.unwrap();
+            operator
+                .recalculate_calendar_group(&mut scope, &GLOBAL_KEY, 201)
+                .await
+                .unwrap();
+            // Cancellation drops the uncommitted owner mutation and its H/U changes.
+        }
+        assert_eq!(
+            calendar_test_values(&operator).await,
+            vec![ScalarValue::Int64(Some(1)); 3]
+        );
+        {
+            let mut scope = store.begin().await.unwrap();
+            scope
+                .put(
+                    &calendar_native::calendar_due_key(199 * day, &GLOBAL_KEY).unwrap(),
+                    &999_u64.to_be_bytes(),
+                )
+                .unwrap();
+            scope.commit().await.unwrap();
+        }
+        assert!(
+            operator
+                .advance_calendar_watermark(201 * day)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            calendar_test_values(&operator).await,
+            vec![ScalarValue::Int64(Some(1)); 3]
+        );
+        assert!(
+            operator
+                .advance_calendar_watermark(201 * day)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !operator
+                .advance_calendar_watermark(201 * day)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            calendar_test_values(&operator).await,
+            vec![
+                ScalarValue::Int64(Some(1)),
+                ScalarValue::Int64(Some(0)),
+                ScalarValue::Int64(Some(1))
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn calendar_idle_and_terminal_watermarks_leave_pending_calendar_date_unchanged() {
+        let mut operator = native_calendar_operator();
+        calendar_test_event(&mut operator, 200, 200, Some(true), false, &[1; 16]).await;
+        let mut ctx = native_input_context(input_schema()).await;
+        let mut collector = AggregateCollector::default();
+        for watermark in [
+            Watermark::Idle,
+            Watermark::EventTime(arroyo_types::from_nanos(u64::MAX as u128)),
+        ] {
+            operator
+                .handle_watermark(watermark, &mut ctx, &mut collector)
+                .await
+                .unwrap();
+        }
+        assert!(collector.batches.is_empty());
+        assert_eq!(
+            calendar_test_values(&operator).await,
+            vec![ScalarValue::Int64(Some(1)); 3]
+        );
+        let mut fields = operator.schema_without_metadata.fields().to_vec();
+        fields.push(Arc::new(Field::new(
+            UPDATING_META_FIELD,
+            DataType::Struct(updating_meta_fields()),
+            false,
+        )));
+        ctx.out_schema = Some(Arc::new(
+            ArroyoSchema::from_schema_unkeyed(Arc::new(Schema::new(fields))).unwrap(),
+        ));
+        let progress = Watermark::EventTime(
+            SystemTime::UNIX_EPOCH + Duration::from_nanos(201 * 86_400_000_000_000),
+        );
+        operator
+            .handle_watermark(progress, &mut ctx, &mut collector)
+            .await
+            .unwrap();
+        assert_eq!(
+            collector.batches.len(),
+            2,
+            "refresh precedes quiet calendar replacement"
+        );
+        let (retracts, _) = native_changelog_columns(&collector.batches[1]).unwrap();
+        assert_eq!(retracts.len(), 2);
+        assert!(retracts.value(0) && !retracts.value(1));
+        assert_eq!(
+            collector.batches[1]
+                .column(6)
+                .as_primitive::<arrow_array::types::Int64Type>()
+                .values(),
+            &[1, 0]
+        );
+        let mut repeated = AggregateCollector::default();
+        operator
+            .handle_watermark(progress, &mut ctx, &mut repeated)
+            .await
+            .unwrap();
+        assert!(repeated.batches.is_empty());
+    }
+
+    #[tokio::test]
+    async fn calendar_pre_epoch_finite_watermark_recalculates_without_unsigned_clock() {
+        let mut operator = native_calendar_operator();
+        calendar_test_event(&mut operator, -2, -2, Some(true), false, &[1; 16]).await;
+        let mut ctx = native_input_context(input_schema()).await;
+        let mut fields = operator.schema_without_metadata.fields().to_vec();
+        fields.push(Arc::new(Field::new(UPDATING_META_FIELD,
+            DataType::Struct(updating_meta_fields()), false)));
+        ctx.out_schema = Some(Arc::new(ArroyoSchema::from_schema_unkeyed(
+            Arc::new(Schema::new(fields))).unwrap()));
+        let mut collector = AggregateCollector::default();
+        operator.handle_watermark(Watermark::EventTime(
+            arroyo_types::event_time::from_signed_nanos(-86_400_000_000_000).unwrap()),
+            &mut ctx, &mut collector).await.unwrap();
+        assert_eq!(calendar_test_values(&operator).await, vec![
+            ScalarValue::Int64(Some(1)), ScalarValue::Int64(Some(0)), ScalarValue::Int64(Some(1)),
+        ]);
+        assert_eq!(collector.batches.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn calendar_due_checkpoint_restores_pending_expiry_on_both_backends() {
+        use arroyo_rpc::grpc::rpc::DiskKeyedTableConfig;
+        use arroyo_state::live::{checkpoint, lifecycle::RocksStateConfig, rocks::RocksLiveState};
+        for rocks in [false, true] {
+            let root = std::env::temp_dir().join(format!("calendar-due-{}", uuid::Uuid::new_v4()));
+            let remote = root.join("checkpoint");
+            std::fs::create_dir_all(&remote).unwrap();
+            // The production exporter requests pages up to 1 MiB; Rocks
+            // admits their copies/cursors independently of aggregate pages.
+            let resources = WorkerStateResources::new(ResourceConfig {
+                max_open_databases: 2,
+                scan_page_bytes: 16 * 1024 * 1024,
+                queued_write_bytes: 16 * 1024 * 1024,
+                decoded_value_bytes: 32 * 1024 * 1024,
+                ..native_test_store().resources().config().clone()
+            })
+            .unwrap();
+            let mut native = Vec::new();
+            let mut backends: Vec<Arc<dyn LiveStateBackend>> = Vec::new();
+            for generation in [0, 1] {
+                if rocks {
+                    let backend = Arc::new(
+                        RocksLiveState::open(
+                            RocksStateConfig {
+                                root: root.join("live"),
+                                job_id: "calendar-due".into(),
+                                operator_id: "aggregate".into(),
+                                subtask: 0,
+                                generation,
+                                attempt: 0,
+                            },
+                            resources.clone(),
+                        )
+                        .await
+                        .unwrap(),
+                    );
+                    backends.push(backend.clone());
+                    native.push(backend);
+                } else {
+                    backends.push(Arc::new(
+                        MemoryLiveState::bounded(resources.clone(), 8 * 1024 * 1024).unwrap(),
+                    ));
+                }
+            }
+            let ownership = Ownership::PartitionLocal {
+                subtask: 0,
+                parallelism: 1,
+            };
+            let mut manager =
+                LiveTableManager::new(backends[0].clone(), ownership.clone()).unwrap();
+            let table = manager.register(NATIVE_AGGREGATE_TABLE).unwrap();
+            let namespace = table.namespace().clone();
+            let limits = native_test_store().limits();
+            let store =
+                AggregateStore::new(backends[0].clone(), table, resources.clone(), limits).unwrap();
+            let mut operator = native_calendar_operator();
+            operator.native_store = Some(store);
+            calendar_test_event(&mut operator, 200, 200, Some(true), false, &[1; 16]).await;
+            let snapshot = backends[0].snapshot().await.unwrap();
+            let storage =
+                arroyo_state::get_storage_provider(&arroyo_state::StorageProviderFor::Controller {
+                    storage_url: Some(format!("file://{}", remote.display())),
+                })
+                .await
+                .unwrap();
+            let config = DiskKeyedTableConfig {
+                table_name: NATIVE_AGGREGATE_TABLE.into(),
+                encoding_version: 1,
+                schema_identity: operator.native_schema_identity.clone(),
+            };
+            let receipt = checkpoint::export(
+                &snapshot,
+                &namespace,
+                &config,
+                &storage,
+                "checkpoint-1/aggregate",
+                1,
+                0,
+                0,
+            )
+            .await
+            .unwrap();
+            checkpoint::restore(
+                backends[1].as_ref(),
+                &namespace,
+                &config,
+                &receipt,
+                &storage,
+            )
+            .await
+            .unwrap();
+            let mut restored_manager =
+                LiveTableManager::new(backends[1].clone(), ownership).unwrap();
+            let restored_table = restored_manager.register(NATIVE_AGGREGATE_TABLE).unwrap();
+            let restored_store = AggregateStore::new(
+                backends[1].clone(),
+                restored_table,
+                resources.clone(),
+                limits,
+            )
+            .unwrap();
+            let mut fresh = native_calendar_operator();
+            fresh.native_store = Some(restored_store);
+            assert_eq!(
+                calendar_test_values(&fresh).await,
+                vec![ScalarValue::Int64(Some(1)); 3]
+            );
+            assert!(
+                !fresh
+                    .advance_calendar_watermark(201 * 86_400_000_000_000 - 1)
+                    .await
+                    .unwrap()
+            );
+            assert!(
+                fresh
+                    .advance_calendar_watermark(201 * 86_400_000_000_000)
+                    .await
+                    .unwrap()
+            );
+            assert!(
+                !fresh
+                    .advance_calendar_watermark(201 * 86_400_000_000_000)
+                    .await
+                    .unwrap()
+            );
+            assert_eq!(
+                calendar_test_values(&fresh).await,
+                vec![
+                    ScalarValue::Int64(Some(1)),
+                    ScalarValue::Int64(Some(0)),
+                    ScalarValue::Int64(Some(1))
+                ]
+            );
+            drop(snapshot);
+            drop(operator);
+            drop(fresh);
+            drop(manager);
+            drop(restored_manager);
+            drop(backends);
+            for backend in native {
+                Arc::try_unwrap(backend)
+                    .unwrap_or_else(|_| panic!("retained Rocks backend"))
+                    .close_and_remove()
+                    .await
+                    .unwrap();
+            }
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn calendar_shared_day_buckets_use_raw_reference_and_keep_lifetime() {
+        let mut operator = native_calendar_operator();
+        assert_eq!(
+            operator.calendars[0].storage_index,
+            operator.calendars[1].storage_index
+        );
+        for (ordinal, day) in [194, 193, 200, 201].into_iter().enumerate() {
+            calendar_test_event(
+                &mut operator,
+                day,
+                200,
+                Some(true),
+                false,
+                &[ordinal as u8; 16],
+            )
+            .await;
+        }
+        assert_eq!(
+            calendar_test_values(&operator).await,
+            vec![
+                ScalarValue::Int64(Some(4)),
+                ScalarValue::Int64(Some(1)),
+                ScalarValue::Int64(Some(2))
+            ]
+        );
+        // A static false row advances D without contributing to gated horizons.
+        calendar_test_event(&mut operator, 202, 201, Some(false), false, &[9; 16]).await;
+        assert_eq!(
+            calendar_test_values(&operator).await,
+            vec![
+                ScalarValue::Int64(Some(5)),
+                ScalarValue::Int64(Some(1)),
+                ScalarValue::Int64(Some(2))
+            ]
+        );
+        calendar_test_event(&mut operator, 202, 200, None, false, &[10; 16]).await;
+        assert_eq!(
+            calendar_test_values(&operator).await,
+            vec![
+                ScalarValue::Int64(Some(6)),
+                ScalarValue::Int64(Some(1)),
+                ScalarValue::Int64(Some(2))
+            ]
+        );
+        calendar_test_event(&mut operator, 300, 300, Some(false), false, &[11; 16]).await;
+        assert_eq!(
+            calendar_test_values(&operator).await,
+            vec![
+                ScalarValue::Int64(Some(7)),
+                ScalarValue::Int64(Some(0)),
+                ScalarValue::Int64(Some(0))
+            ]
+        );
+        // Callback uses real progress, leaves lifetime intact and persists due work.
+        let mut scope = operator
+            .native_store
+            .as_ref()
+            .unwrap()
+            .begin()
+            .await
+            .unwrap();
+        let next = operator
+            .recalculate_calendar_group(&mut scope, &GLOBAL_KEY, 201)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(next, 202 * 86_400_000_000_000);
+        scope.commit().await.unwrap();
+        assert_eq!(
+            calendar_test_values(&operator).await,
+            vec![
+                ScalarValue::Int64(Some(7)),
+                ScalarValue::Int64(Some(1)),
+                ScalarValue::Int64(Some(2))
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn calendar_correction_uses_persisted_day_gate_and_original_value() {
+        let mut operator = native_calendar_operator();
+        calendar_test_event(&mut operator, 200, 200, Some(true), false, &[1; 16]).await;
+        // Envelope date/gate differ; signed removal still uses original metadata.
+        calendar_test_event(&mut operator, 300, 300, Some(false), true, &[1; 16]).await;
+        assert_eq!(
+            calendar_test_values(&operator).await,
+            vec![
+                ScalarValue::Int64(Some(0)),
+                ScalarValue::Int64(Some(0)),
+                ScalarValue::Int64(Some(0))
+            ]
+        );
+        calendar_test_event(&mut operator, 201, 201, Some(true), false, &[1; 16]).await;
+        assert_eq!(
+            calendar_test_values(&operator).await,
+            vec![
+                ScalarValue::Int64(Some(1)),
+                ScalarValue::Int64(Some(1)),
+                ScalarValue::Int64(Some(1))
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn calendar_nullable_count_sum_corrections_preserve_recent_and_lifetime() {
+        use arroyo_rpc::grpc::api::CalendarAggregateDescriptor;
+        use datafusion::functions_aggregate::sum::sum_udaf;
+
+        let mut fields = input_schema().fields().to_vec();
+        fields[1] = Arc::new(fields[1].as_ref().clone().with_nullable(true));
+        let schema = Arc::new(Schema::new(fields));
+        let one: Arc<dyn PhysicalExpr> = Arc::new(Literal::new(ScalarValue::Int64(Some(1))));
+        let amount: Arc<dyn PhysicalExpr> = Arc::new(Column::new("sequence", 1));
+        let timestamp: Arc<dyn PhysicalExpr> = Arc::new(Column::new(TIMESTAMP_FIELD, 3));
+        let codec = DefaultPhysicalExtensionCodec {};
+        let expressions: Vec<_> = [
+            ("lifetime_rows", count_udaf(), one.clone()),
+            ("lifetime_nonnull", count_udaf(), amount.clone()),
+            ("lifetime_sum", sum_udaf(), amount.clone()),
+            ("recent_rows", count_udaf(), one.clone()),
+            ("recent_nonnull", count_udaf(), amount.clone()),
+            ("recent_sum", sum_udaf(), amount.clone()),
+            (TIMESTAMP_FIELD, max_udaf(), timestamp),
+        ]
+        .into_iter()
+        .map(|(name, function, argument)| {
+            Arc::new(
+                AggregateExprBuilder::new(function, vec![argument])
+                    .schema(schema.clone())
+                    .alias(name)
+                    .build()
+                    .unwrap(),
+            )
+        })
+        .collect();
+        let aggregate = AggregateExecNode {
+            aggr_expr: expressions
+                .iter()
+                .map(|expr| serialize_physical_aggr_expr(expr.clone(), &codec).unwrap())
+                .collect(),
+            aggr_expr_name: expressions
+                .iter()
+                .map(|expr| expr.name().to_string())
+                .collect(),
+            filter_expr: vec![MaybeFilter { expr: None }; expressions.len()],
+            ..Default::default()
+        };
+        let (mut config, _) = native_config();
+        config.aggregate_exec = PhysicalPlanNode {
+            physical_plan_type: Some(PhysicalPlanType::Aggregate(Box::new(aggregate))),
+        }
+        .encode_to_vec();
+        let metadata = Arc::new(Field::new(
+            UPDATING_META_FIELD,
+            DataType::Struct(updating_meta_fields()),
+            false,
+        ));
+        let mut input_fields = schema.fields().to_vec();
+        input_fields.push(metadata.clone());
+        config.input_schema = Some(
+            ArroyoSchema::from_schema_unkeyed(Arc::new(Schema::new(input_fields)))
+                .unwrap()
+                .into(),
+        );
+        let mut output_fields: Vec<_> = expressions.iter().map(|expr| expr.field()).collect();
+        output_fields.push(metadata);
+        config.final_schema = Some(
+            ArroyoSchema::from_schema_unkeyed(Arc::new(Schema::new(output_fields)))
+                .unwrap()
+                .into(),
+        );
+        config.retain_indefinitely = Some(true);
+        let date: Arc<dyn PhysicalExpr> = Arc::new(Literal::new(ScalarValue::Date32(Some(200))));
+        for (index, argument) in [(3, one), (4, amount.clone()), (5, amount)] {
+            config
+                .calendar_aggregates
+                .push(CalendarAggregateDescriptor {
+                    aggregate_index: index,
+                    horizon_days: 7,
+                    argument: serialize_physical_expr(&argument, &codec)
+                        .unwrap()
+                        .encode_to_vec(),
+                    static_filter: None,
+                    contribution_date: serialize_physical_expr(&date, &codec)
+                        .unwrap()
+                        .encode_to_vec(),
+                    reference_date: serialize_physical_expr(&date, &codec)
+                        .unwrap()
+                        .encode_to_vec(),
+                    context_id: "nullable-test-clock".into(),
+                });
+        }
+        let mut operator = IncrementalAggregatingConstructor::build_with_native_config(
+            config,
+            Arc::new(arroyo_planner::physical::new_registry()),
+            Some(native_test_config()),
+        )
+        .unwrap();
+        operator.native_store = Some(native_test_store());
+        // Retractions deliberately carry a different amount. The persisted NULL
+        // flag/value must remove the original contribution, never the envelope.
+        for (retract, value, expected) in [
+            (false, None, (1, 0, None)),
+            (true, Some(99), (0, 0, None)),
+            (false, Some(7), (1, 1, Some(7))),
+            (true, None, (0, 0, None)),
+            (false, None, (1, 0, None)),
+            (true, Some(99), (0, 0, None)),
+        ] {
+            let input = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(StringArray::from(vec![Some("row")])),
+                    Arc::new(Int64Array::from(vec![value])),
+                    Arc::new(BooleanArray::from(vec![Some(true)])),
+                    Arc::new(TimestampNanosecondArray::from(vec![1])),
+                ],
+            )
+            .unwrap();
+            let inputs = operator.compute_inputs(&input).unwrap();
+            let dates = operator.calendar_inputs(&input).unwrap();
+            let store = operator.native_store.as_ref().unwrap();
+            let mut scope = store.begin().await.unwrap();
+            operator
+                .native_process_calendar_event(
+                    &mut scope,
+                    NativeCalendarEvent {
+                        group_key: &GLOBAL_KEY,
+                        inputs: &inputs,
+                        row: 0,
+                        retract,
+                        row_id: Some(&[1; 16]),
+                        calendar_inputs: &dates,
+                        result_timestamp_nanos: None,
+                    },
+                )
+                .await
+                .unwrap();
+            scope.commit().await.unwrap();
+            let scope = store.begin().await.unwrap();
+            let bytes = scope
+                .get(&native_group_key(b'G', &GLOBAL_KEY).unwrap())
+                .await
+                .unwrap()
+                .unwrap();
+            let group = decode_group(
+                &bytes,
+                &operator.native_state_types(),
+                &operator.native_output_types(),
+                scope.limits().value_bytes,
+            )
+            .unwrap();
+            let mut state = operator.native_accumulators(Some(&group)).unwrap();
+            let actual: Vec<_> = state[..6]
+                .iter_mut()
+                .map(|state| state.evaluate().unwrap())
+                .collect();
+            let (rows, nonnull, sum) = expected;
+            let expected = vec![
+                ScalarValue::Int64(Some(rows)),
+                ScalarValue::Int64(Some(nonnull)),
+                ScalarValue::Int64(sum),
+            ];
+            assert_eq!(actual, [expected.clone(), expected].concat());
+            drop(scope);
+            // Every event scope and decoded evaluation has released its budget.
+            let reservation = store
+                .resources()
+                .try_decoded_value(store.resources().config().decoded_value_bytes)
+                .unwrap();
+            drop(reservation);
+        }
+    }
+
+    #[test]
+    fn calendar_descriptor_rejects_argument_and_filter_mismatch() {
+        use arroyo_rpc::grpc::api::CalendarAggregateDescriptor;
+        let operator = native_calendar_operator();
+        let codec = DefaultPhysicalExtensionCodec {};
+        let date: Arc<dyn PhysicalExpr> = Arc::new(Literal::new(ScalarValue::Date32(Some(200))));
+        let aggregate = &operator.aggregates[6];
+        let mut descriptor = CalendarAggregateDescriptor {
+            aggregate_index: 6,
+            horizon_days: 7,
+            argument: serialize_physical_expr(&aggregate.input_exprs[0], &codec)
+                .unwrap()
+                .encode_to_vec(),
+            static_filter: aggregate.filter.as_ref().map(|filter| {
+                serialize_physical_expr(filter, &codec)
+                    .unwrap()
+                    .encode_to_vec()
+            }),
+            contribution_date: serialize_physical_expr(&date, &codec)
+                .unwrap()
+                .encode_to_vec(),
+            reference_date: serialize_physical_expr(&date, &codec)
+                .unwrap()
+                .encode_to_vec(),
+            context_id: "generic-test-clock".into(),
+        };
+        let registry = arroyo_planner::physical::new_registry();
+        assert!(
+            CalendarAggregate::decode(
+                &[descriptor.clone()],
+                &operator.aggregates,
+                &input_schema(),
+                &registry
+            )
+            .is_ok()
+        );
+        descriptor.argument = serialize_physical_expr(
+            &(Arc::new(Literal::new(ScalarValue::Int64(Some(2)))) as Arc<dyn PhysicalExpr>),
+            &codec,
+        )
+        .unwrap()
+        .encode_to_vec();
+        let error = CalendarAggregate::decode(
+            &[descriptor.clone()],
+            &operator.aggregates,
+            &input_schema(),
+            &registry,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("argument does not match"));
+        descriptor.argument = serialize_physical_expr(&aggregate.input_exprs[0], &codec)
+            .unwrap()
+            .encode_to_vec();
+        descriptor.static_filter = None;
+        let error = CalendarAggregate::decode(
+            &[descriptor],
+            &operator.aggregates,
+            &input_schema(),
+            &registry,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("static filter does not match"));
+    }
+
+    #[tokio::test]
+    async fn calendar_capacity_error_discards_contribution_and_releases_scope() {
+        let mut operator = native_calendar_operator();
+        operator.native_store = Some(native_test_store_with_limits(AggregateStoreLimits {
+            key_bytes: 256,
+            value_bytes: 256,
+            page_bytes: 8192,
+            page_entries: 4,
+            write_bytes: 64 * 1024,
+            write_operations: 64,
+            overlay_bytes: 64 * 1024,
+        }));
+        let input = batch(&[Some("value")], &[1], &[Some(true)]);
+        let inputs = operator.compute_inputs(&input).unwrap();
+        let dates = operator.calendar_inputs(&input).unwrap();
+        let store = operator.native_store.as_ref().unwrap();
+        let mut scope = store.begin().await.unwrap();
+        let error = operator
+            .native_process_calendar_event(
+                &mut scope,
+                NativeCalendarEvent {
+                    group_key: &GLOBAL_KEY,
+                    inputs: &inputs,
+                    row: 0,
+                    retract: false,
+                    row_id: Some(&[1; 16]),
+                    calendar_inputs: &dates,
+                    result_timestamp_nanos: None,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("exceeds configured limit"));
+        drop(scope);
+        let decoded = store
+            .resources()
+            .try_decoded_value(store.resources().config().decoded_value_bytes)
+            .unwrap();
+        drop(decoded);
+        let scope = store.begin().await.unwrap();
+        for prefix in [b"G", b"J", b"B", b"H", b"Q", b"U", b"M", b"R"] {
+            assert!(scope.first(prefix).await.unwrap().is_none());
+        }
     }
 
     fn native_test_config() -> AggregateStateConfig {
@@ -6390,6 +7565,40 @@ mod tests {
             error.to_string().contains("event-time result expiry"),
             "received {error}"
         );
+    }
+
+    #[tokio::test]
+    async fn event_time_expiry_orders_negative_zero_and_positive_deadlines() {
+        let (operator, _) = event_time_expiry_operator();
+        let input = batch_at(&[Some("past"), Some("epoch"), Some("future")], &[1, 2, 3], &[-4, -2, 10]);
+        let inputs = operator.compute_inputs(&input).unwrap();
+        let groups = operator.key_converter.convert_columns(&[
+            Arc::new(StringArray::from(vec!["past", "epoch", "future"]))
+        ]).unwrap();
+        let store = operator.native_store.as_ref().unwrap();
+        for (row, stamp) in [-4, -2, 10].into_iter().enumerate() {
+            let mut scope = store.begin().await.unwrap();
+            operator.native_process_event(&mut scope, groups.row(row).as_ref(), &inputs,
+                row, false, Some(&test_row_id(&input, row)), Some(stamp)).await.unwrap();
+            scope.commit().await.unwrap();
+        }
+        {
+            let mut scope = store.begin().await.unwrap();
+            // Calendar's independent singleton frontier cannot be scanned as
+            // a current-result deadline, even in the same native namespace.
+            scope.put(b"V", b"independent-cleanup-frontier").unwrap();
+            assert!(scope.get(&native_validity_key(-2, groups.row(0).as_ref()).unwrap()).await.unwrap().is_some());
+            assert!(scope.get(&native_validity_key(0, groups.row(1).as_ref()).unwrap()).await.unwrap().is_some());
+            scope.commit().await.unwrap();
+        }
+        assert!(!operator.expire_native_event_time(-3).await.unwrap());
+        assert!(operator.expire_native_event_time(-2).await.unwrap());
+        assert!(!operator.expire_native_event_time(-1).await.unwrap());
+        assert!(operator.expire_native_event_time(0).await.unwrap());
+        assert!(!operator.expire_native_event_time(0).await.unwrap());
+        let scope = store.begin().await.unwrap();
+        assert!(scope.get(&native_validity_key(12, groups.row(2).as_ref()).unwrap()).await.unwrap().is_some());
+        assert!(scope.get(b"V").await.unwrap().is_some());
     }
 
     #[tokio::test]

@@ -1059,6 +1059,7 @@ pub async fn parse_and_get_arrow_program(
 
     // rewrite sink's inputs, and remove duplicated sink
     let extensions = rewrite_sinks(extensions)?;
+    let extensions = plan::current_result::attach_expiry(extensions, &retained_mutations)?;
 
     let mut plan_to_graph_visitor = PlanToGraphVisitor::new(&schema_provider, &session_state);
     for extension in extensions {

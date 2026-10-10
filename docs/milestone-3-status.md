@@ -6,6 +6,53 @@ current dispatch instructions. No implementation worker is claimed by this reset
 
 ## Available features
 
+## Active STR-29 continuation
+
+- Codex `/root`, resumed 2026-10-10 from reviewed local commit `d7b9dbf2`
+  in `jason/str-29-watermark-zero-084313`. Fetched main remains `67c242f5`;
+  published STR-62 core `2afd82c8` is the calendar dependency. No time limit.
+- Acceptance: watermark-driven quiet retained-key zero, silence unchanged,
+  retaining-key deletion, exact typed CDC and persistent bounded maintenance.
+- Fresh audit findings are repaired: scoped private current-result owners
+  preserve shared historical consumers, fixture rows and required silence/CDC
+  prefixes are exact, and bounded calendar due traversal is implemented.
+  Independent source review is clean, including signed/zero-deadline index
+  repairs; current-source Rust gates pending.
+- Ownership: planner proof (`planner`), native due scheduler (`implement`),
+  generic fixtures/capture harness (`fixtures`). Builds remain serialized.
+- Resumed on user direction after build-process optimization. Use the updated
+  dev wrapper/shared target and pinned prebuilt-RocksDB image; optimization
+  edits remain separately owned and are excluded from this feature commit.
+- Next after resume: complete current-source container gates, integrate final published
+  STR-62 pruning/admission source, re-review and validate combined source, publish
+  with explicit PR #23 dependency, await active CI.
+  Full runtime/resource matrix remains STR-32; no prepared test is a pass.
+- No product decision is pending. STR-62's active pruning/admission changes
+  remain in its own worktree; this branch uses only its published core.
+
+## Active STR-62
+
+- Worker: Codex `/root`; branch `jason/str-62-calendar-2147`, base `67c242f5`.
+  Started 2026-10-09 21:47 UTC; resumed on explicit user direction.
+  Automatic time limits disabled. Core increment reviewed/tested; [draft PR #23](https://github.com/jasadams/streamr/pull/23).
+- Acceptance: maintained inclusive UTC COUNT/SUM FILTERs, raw event reference,
+  independent lifetime, exact CDC, bounded registered state and recovery.
+- Evidence: affected check and strict Clippy exit 0; planner 13/13, worker 6/6;
+  actual SQL 32/32 default/shape configurations passed memory/RocksDB × batches
+  1/8 × controller/leader with live prefixes, checkpoint and fresh-worker restore.
+  Exact source/harness/binary receipts: `docs/str-62-calendar-filters.md`.
+- Next: resolve remaining retention acceptance before full-ticket completion;
+  draft PR keeps the reviewed core available and prevents automatic merge.
+  Active CI is Lint/tooling; the full GitHub CI workflow is disabled manually.
+- Remaining: no existing nonwindowed admission history floor justifies age
+  pruning. Buckets retain history under configured limits until group retirement;
+  no new cutoff implemented. Pruning/history-boundary acceptance remains STR-62;
+  quiet traversal/output belongs to STR-29; shared full qualification STR-32.
+- Reuse investigation: ten actual native SQL probes; completed append windows
+  pass, ordinary FILTER differs from maintained result, three relational patterns
+  reject, existing window CDC defect tracked separately as STR-68. Source traces
+  and reviewed receipts are recorded; do not repeat without new evidence.
+
 At the 2026-10-09 reset, all eight tickets were Todo, agent-ready and unblocked.
 STR-16 now has [PR #15](https://github.com/jasadams/streamr/pull/15) open awaiting
 final CI and merge. Independent agents may work in parallel in separate worktrees

@@ -151,10 +151,98 @@ pub(crate) fn decode_group(
     })
 }
 
+/// Typed correction metadata is independent of recent membership. The ordinary
+/// state codec validates column counts and types before values can be retracted.
+pub(crate) fn encode_calendar_contribution(
+    selected: Option<&[arrow_array::ArrayRef]>,
+    day: Option<i32>,
+    argument_types: &[arrow_schema::DataType],
+    max_bytes: usize,
+) -> Result<Vec<u8>> {
+    let mut state = vec![
+        ScalarValue::Boolean(Some(selected.is_some())),
+        ScalarValue::Date32(day),
+    ];
+    for (index, data_type) in argument_types.iter().enumerate() {
+        state.push(if let Some(values) = selected {
+            ensure!(
+                values.len() == argument_types.len(),
+                "calendar contribution argument width changed"
+            );
+            ScalarValue::try_from_array(&values[index], 0)?
+        } else {
+            ScalarValue::try_from(data_type)?
+        });
+    }
+    encode_group(
+        &EncodedGroup {
+            last_update_nanos: 0,
+            generation: 1,
+            next_ordinal: 0,
+            validity_deadline_nanos: 0,
+            accumulator_state: state,
+            last_emitted: None,
+        },
+        max_bytes,
+    )
+}
+
+pub(crate) fn decode_calendar_contribution(
+    bytes: &[u8],
+    argument_types: &[arrow_schema::DataType],
+    max_bytes: usize,
+) -> Result<(Option<Vec<arrow_array::ArrayRef>>, Option<i32>)> {
+    let mut types = vec![
+        arrow_schema::DataType::Boolean,
+        arrow_schema::DataType::Date32,
+    ];
+    types.extend_from_slice(argument_types);
+    let group = decode_group(bytes, &types, &[], max_bytes)?;
+    ensure!(
+        group.generation == 1 && group.next_ordinal == 0 && group.last_update_nanos == 0,
+        "invalid calendar contribution codec version"
+    );
+    let selected = match group.accumulator_state[0] {
+        ScalarValue::Boolean(Some(value)) => value,
+        _ => bail!("invalid calendar contribution eligibility"),
+    };
+    let ScalarValue::Date32(day) = group.accumulator_state[1] else {
+        bail!("invalid calendar contribution day");
+    };
+    let values = selected
+        .then(|| {
+            group.accumulator_state[2..]
+                .iter()
+                .map(ScalarValue::to_array)
+                .collect::<datafusion::common::Result<Vec<_>>>()
+        })
+        .transpose()?;
+    Ok((values, day))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use arrow_schema::{DataType, TimeUnit};
+
+    #[test]
+    fn calendar_contribution_retains_null_and_gate_and_rejects_changed_types() {
+        let types = [DataType::Int64];
+        let values = vec![ScalarValue::Int64(None).to_array().unwrap()];
+        let bytes =
+            encode_calendar_contribution(Some(&values), Some(-7), &types, 16 * 1024).unwrap();
+        let (decoded, day) = decode_calendar_contribution(&bytes, &types, 16 * 1024).unwrap();
+        assert_eq!(day, Some(-7));
+        assert!(decoded.unwrap()[0].is_null(0));
+        assert!(decode_calendar_contribution(&bytes, &[DataType::Float64], 16 * 1024).is_err());
+        assert!(
+            decode_calendar_contribution(&bytes[..bytes.len() / 2], &types, 16 * 1024).is_err()
+        );
+        let bytes = encode_calendar_contribution(None, Some(12), &types, 16 * 1024).unwrap();
+        let (decoded, day) = decode_calendar_contribution(&bytes, &types, 16 * 1024).unwrap();
+        assert!(decoded.is_none());
+        assert_eq!(day, Some(12));
+    }
 
     #[test]
     fn typed_state_and_last_emitted_survive_a_fresh_decode() {

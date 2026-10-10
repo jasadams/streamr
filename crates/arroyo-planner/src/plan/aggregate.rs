@@ -20,6 +20,177 @@ use itertools::Itertools;
 use std::sync::Arc;
 use tracing::debug;
 
+/// Logical contract for an aggregate whose FILTER moves with the trigger date.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd)]
+pub(crate) struct CalendarAggregate {
+    pub aggregate_index: usize,
+    pub argument: Expr,
+    pub static_filter: Option<Expr>,
+    pub contribution_date: Expr,
+    pub reference_date: Expr,
+    pub horizon_days: u32,
+}
+
+fn unalias(mut expression: &Expr) -> &Expr {
+    while let Expr::Alias(alias) = expression {
+        expression = alias.expr.as_ref();
+    }
+    expression
+}
+
+fn watermark_date(expression: &Expr) -> bool {
+    matches!(unalias(expression), Expr::ScalarFunction(function)
+        if function.name() == "watermark_date" && function.args.is_empty())
+}
+
+fn horizon_lower(expression: &Expr) -> Option<u32> {
+    use datafusion::logical_expr::Operator;
+    use datafusion::scalar::ScalarValue;
+    let Expr::BinaryExpr(binary) = unalias(expression) else {
+        return None;
+    };
+    if binary.op != Operator::Minus || !watermark_date(&binary.left) {
+        return None;
+    }
+    let days = match unalias(&binary.right) {
+        Expr::Literal(ScalarValue::IntervalDayTime(Some(value)), _) if value.milliseconds == 0 => {
+            value.days
+        }
+        Expr::Literal(ScalarValue::IntervalMonthDayNano(Some(value)), _)
+            if value.months == 0 && value.nanoseconds == 0 =>
+        {
+            value.days
+        }
+        _ => return None,
+    };
+    u32::try_from(days).ok()?.checked_add(1)
+}
+
+fn temporal_clause(expression: &Expr) -> Option<(Expr, u32)> {
+    use datafusion::logical_expr::Operator;
+    match unalias(expression) {
+        Expr::BinaryExpr(binary) if binary.op == Operator::Eq => {
+            if watermark_date(&binary.right) {
+                Some((*binary.left.clone(), 1))
+            } else if watermark_date(&binary.left) {
+                Some((*binary.right.clone(), 1))
+            } else {
+                None
+            }
+        }
+        Expr::Between(between) if !between.negated && watermark_date(&between.high) => {
+            Some((*between.expr.clone(), horizon_lower(&between.low)?))
+        }
+        _ => None,
+    }
+}
+
+fn split_conjunction(expression: &Expr, clauses: &mut Vec<Expr>) {
+    if let Expr::BinaryExpr(binary) = unalias(expression)
+        && binary.op == datafusion::logical_expr::Operator::And
+    {
+        split_conjunction(&binary.left, clauses);
+        split_conjunction(&binary.right, clauses);
+        return;
+    }
+    clauses.push(expression.clone());
+}
+
+fn calendar_filters(
+    expressions: &mut [Expr],
+    input: &LogicalPlan,
+) -> Result<Vec<CalendarAggregate>> {
+    use crate::rewriters::{EventClockRewriter, depends_on_event_clock};
+    use datafusion::logical_expr::ExprSchemable;
+    let mut calendars = Vec::new();
+    for (aggregate_index, expression) in expressions.iter_mut().enumerate() {
+        if !depends_on_event_clock(expression, input.schema()) {
+            continue;
+        }
+        let mut inner = expression;
+        while let Expr::Alias(alias) = inner {
+            inner = alias.expr.as_mut();
+        }
+        let Expr::AggregateFunction(function) = inner else {
+            return plan_err!(
+                "unsupported clock-dependent aggregate: expected COUNT/SUM calendar FILTER"
+            );
+        };
+        if !matches!(function.func.name(), "count" | "sum")
+            || function.params.distinct
+            || function.params.order_by.is_some()
+            || function.params.args.len() != 1
+            || function
+                .params
+                .args
+                .iter()
+                .any(|argument| depends_on_event_clock(argument, input.schema()))
+        {
+            return plan_err!(
+                "unsupported clock-dependent aggregate: calendar FILTER requires non-distinct COUNT/SUM with one clock-independent argument"
+            );
+        }
+        let Some(filter) = &function.params.filter else {
+            return plan_err!("unsupported clock-dependent aggregate: expected calendar FILTER");
+        };
+        let mut clauses = Vec::new();
+        split_conjunction(filter, &mut clauses);
+        let mut temporal = None;
+        let mut static_clauses = Vec::new();
+        for clause in clauses {
+            if depends_on_event_clock(&clause, input.schema()) {
+                let Some(candidate) = temporal_clause(&clause) else {
+                    return plan_err!(
+                        "unsupported clock-dependent FILTER: expected DATE = WATERMARK_DATE() or DATE BETWEEN WATERMARK_DATE() - constant DAY AND WATERMARK_DATE(); retained contribution time is a distinct input"
+                    );
+                };
+                if temporal.replace(candidate).is_some() {
+                    return plan_err!(
+                        "unsupported clock-dependent FILTER: exactly one calendar clause is required"
+                    );
+                }
+            } else {
+                static_clauses.push(clause);
+            }
+        }
+        let Some((contribution_date, horizon_days)) = temporal else {
+            return plan_err!("unsupported clock-dependent FILTER: missing calendar clause");
+        };
+        if depends_on_event_clock(&contribution_date, input.schema())
+            || contribution_date.get_type(input.schema().as_ref())?
+                != arrow::datatypes::DataType::Date32
+        {
+            return plan_err!(
+                "unsupported clock-dependent FILTER: contribution must be a clock-independent DATE expression"
+            );
+        }
+        let mut reference = None;
+        filter.apply(|expression| {
+            if watermark_date(expression) {
+                reference = Some(unalias(expression).clone());
+            }
+            Ok(TreeNodeRecursion::Continue)
+        })?;
+        let reference_date = reference
+            .expect("temporal clause has reference date")
+            .rewrite(&mut EventClockRewriter { input })?
+            .data;
+        let static_filter = static_clauses
+            .into_iter()
+            .reduce(|left, right| left.and(right));
+        function.params.filter = static_filter.clone().map(Box::new);
+        calendars.push(CalendarAggregate {
+            aggregate_index,
+            argument: function.params.args[0].clone(),
+            static_filter,
+            contribution_date,
+            reference_date,
+            horizon_days,
+        });
+    }
+    Ok(calendars)
+}
+
 pub struct AggregateRewriter<'a> {
     pub schema_provider: &'a ArroyoSchemaProvider,
 }
@@ -36,26 +207,31 @@ fn strip_alias(expr: &Expr) -> &Expr {
 /// composition. Returns the result timestamp column of the single ordered
 /// last-value aggregate, or None for any other aggregate shape.
 fn last_value_result_timestamp(aggr_expr: &[Expr]) -> Option<&datafusion::common::Column> {
-    for expr in aggr_expr {
-        let Expr::AggregateFunction(AggregateFunction { func, params }) = strip_alias(expr) else {
-            continue;
-        };
-        if !func.name().eq_ignore_ascii_case("last_value") {
-            continue;
-        }
-        let [
-            Sort {
-                expr: order,
-                asc: true,
-                ..
-            },
-        ] = params.order_by.as_deref()?
-        else {
-            return None;
-        };
-        return extract_column(order);
+    let [expr] = aggr_expr else {
+        return None;
+    };
+    let Expr::AggregateFunction(AggregateFunction { func, params }) = strip_alias(expr) else {
+        return None;
+    };
+    if !func.name().eq_ignore_ascii_case("last_value")
+        || params.args.len() != 1
+        || params.filter.is_some()
+        || params.distinct
+        || params.null_treatment.is_some()
+    {
+        return None;
     }
-    None
+    let [
+        Sort {
+            expr: order,
+            asc: true,
+            ..
+        },
+    ] = params.order_by.as_deref()?
+    else {
+        return None;
+    };
+    extract_column(order)
 }
 
 /// Resolves which upstream finalized HOP/TUMBLE window stamped the projected
@@ -173,7 +349,7 @@ fn windowed_aggregate_window(node: &LogicalPlan) -> Option<WindowType> {
 /// boundary). Watermarks past the deadline retract the retained result so the
 /// composition can express zero; aggregates outside this pattern are
 /// unchanged.
-fn current_result_expiry(
+pub(super) fn current_result_expiry(
     input: &LogicalPlan,
     aggr_expr: &[Expr],
 ) -> Result<Option<CurrentResultExpiry>> {
@@ -210,7 +386,11 @@ impl AggregateRewriter<'_> {
         schema: Arc<DFSchema>,
         schema_provider: &ArroyoSchemaProvider,
     ) -> Result<Transformed<LogicalPlan>> {
-        let event_time_expiry = current_result_expiry(input.as_ref(), &aggr_expr)?;
+        // Expiry requires whole-program composition and shared-consumer proof.
+        // Views are rewritten before their consumers, so attach it only after
+        // all sink inputs have been assembled.
+        let event_time_expiry = None;
+        let calendar_aggregates = calendar_filters(&mut aggr_expr, &input)?;
         let key_count = key_fields.len();
         key_fields.extend(fields_with_qualifiers(input.schema()));
 
@@ -292,6 +472,7 @@ impl AggregateRewriter<'_> {
             column.relation,
             schema_provider.planning_options.ttl,
             event_time_expiry,
+            calendar_aggregates,
         )?;
         let final_plan = LogicalPlan::Extension(Extension {
             node: Arc::new(updating_aggregate_extension),
@@ -314,6 +495,14 @@ impl TreeNodeRewriter for AggregateRewriter<'_> {
         else {
             return Ok(Transformed::no(node));
         };
+        if group_expr
+            .iter()
+            .any(|expression| crate::rewriters::depends_on_event_clock(expression, input.schema()))
+        {
+            return plan_err!(
+                "unsupported clock-dependent GROUP BY: calendar FILTER requires clock-independent grouping keys"
+            );
+        }
         let mut window_group_expr: Vec<_> = group_expr
             .iter()
             .enumerate()
@@ -407,6 +596,14 @@ impl TreeNodeRewriter for AggregateRewriter<'_> {
             }
         };
 
+        if aggr_expr
+            .iter()
+            .any(|expression| crate::rewriters::depends_on_event_clock(expression, input.schema()))
+        {
+            return plan_err!(
+                "unsupported clock-dependent window aggregate: calendar FILTER requires a maintained non-windowed aggregate"
+            );
+        }
         let key_count = key_fields.len();
         key_fields.extend(fields_with_qualifiers(input.schema()));
 

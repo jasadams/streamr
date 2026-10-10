@@ -481,3 +481,40 @@ STR-32 batch. None of this authorizes application-specific operators,
 callbacks or output policies in Streamr. See the
 [native capability audit](milestone-3-native-capabilities.md) and
 [validation record](milestone-3-validation.md) for the wider acceptance limits.
+
+### STR-29 fixture and capture repairs (prepared, runtime pending)
+
+The generic driver now compares full keyed rows in both uninterrupted and restored
+CDC chains, including exact before images and exactly one keyA 3/1-to-3/0
+transition. It requires the checkpoint receipt's declared input prefix and reduces
+exactly its committed sink rows against the independent checkpoint snapshot.
+All four silence artifacts are mandatory; both holds must preserve the complete
+pending-expiry materialization byte for byte.
+
+The HOP checkpoint stops after source row 2 (watermark offset 3): keyA has
+lifetime 2 and recent 0 because the first end-4 window has not closed. The silence
+hold releases through row 4 (keyB at offset 11), where keyA is 3/1 and keyB is
+1/0; keyA's end-10 result expires at offset 12. Restore automatically reads
+row 3, then one NoOp reaches the same hold. KeyB's offset-13 input applies the
+pending expiry. The hold does not rely on an EOF watermark.
+
+The calendar fixture uses real keyA rows on UTC dates D-2, D-1 and D, with a
+one-day COUNT FILTER and an independent lifetime COUNT. At checkpoint row 2,
+keyA is 2/1. Initial and restored holds after row 3 require keyA 3/1. Other-key
+rows on D+1 and D+2 expire keyA to 3/0 exactly once, with final keyB 2/1.
+Terminal EOF does not substitute for those real advancing watermarks.
+
+The test-only external capture accepts 1..=8 control-waiting single-file sources.
+Its stopping checkpoint applies the same declared row prefix independently to
+each source; schedule and idle capture retain their single-source restriction.
+The retaining-key deletion fixture checkpoints after two rows per source,
+with both retaining keys present and recent counts zero, then deletes keyC from
+the separate changelog source after restore. This bounded harness change uses
+existing source controls and checkpoint barriers.
+
+`python3 scripts/tests/native-result-composition-self-test.py` exercises synthetic
+correct HOP/calendar captures and rejects incorrect keys/counts/before images,
+missing idle artifacts, changed or premature idle snapshots, wrong checkpoint
+prefixes, missing receipts and missing initial/restored expiry transitions.
+These are comparator tests, not engine runtime evidence. The full backend and
+checkpoint matrices remain unexecuted STR-32 acceptance.

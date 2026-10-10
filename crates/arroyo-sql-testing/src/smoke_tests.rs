@@ -1815,6 +1815,29 @@ async fn external_sql_checkpoint_capture() {
 #[path = "smoke_schedule_tests.rs"]
 mod smoke_schedule_tests;
 
+fn validate_capture_source_count(count: usize, requires_single: bool) -> Result<()> {
+    anyhow::ensure!((1..=8).contains(&count), "capture requires 1..=8 sources");
+    anyhow::ensure!(
+        count == 1 || !requires_single,
+        "idle and schedule capture require exactly one source"
+    );
+    Ok(())
+}
+
+#[test]
+fn capture_source_count_is_bounded_and_idle_schedule_remain_single_source() {
+    for count in [1, 2, 8] {
+        validate_capture_source_count(count, false).unwrap();
+    }
+    for count in [0, 9, usize::MAX] {
+        assert!(validate_capture_source_count(count, false).is_err());
+    }
+    validate_capture_source_count(1, true).unwrap();
+    for count in [0, 2, 8] {
+        assert!(validate_capture_source_count(count, true).is_err());
+    }
+}
+
 async fn external_sql_checkpoint_capture_inner() {
     let capture = CaptureCounts::from_env().expect("invalid external SQL capture configuration");
     let idle = CaptureIdle::from_env(&capture).expect("invalid external SQL idle configuration");
@@ -1878,34 +1901,44 @@ async fn external_sql_checkpoint_capture_inner() {
         .flat_map(|node| node.operator_chain.iter())
         .filter(|(operator, _)| operator.operator_name == OperatorName::ConnectorSource)
         .collect();
-    assert_eq!(sources.len(), 1, "capture requires one connector source");
-    let source: arroyo_rpc::grpc::api::ConnectorOp =
-        prost::Message::decode(sources[0].0.operator_config.as_slice())
-            .expect("capture source config must decode");
-    assert_eq!(
-        source.connector, "single_file",
-        "capture requires a single-file source"
+    validate_capture_source_count(sources.len(), idle.is_some() || schedule.is_some())
+        .expect("invalid capture source count");
+    println!(
+        "CAPTURE_SOURCE_PREFIX sources={} rows_per_source={}",
+        sources.len(),
+        capture.input_rows_before_checkpoint
     );
-    let source_config: arroyo_rpc::OperatorConfig =
-        serde_json::from_str(&source.config).expect("capture source connector config must decode");
-    assert!(
-        source_config
-            .table
-            .get("wait_for_control")
-            .is_none_or(|value| value.is_null() || value.as_bool() == Some(true)),
-        "capture source must wait for control after each input row"
-    );
-    if let Some(schedule) = &schedule {
-        schedule
-            .validate_input(
-                source_config
-                    .table
-                    .get("path")
-                    .and_then(Value::as_str)
-                    .expect("scheduled single-file source must have a path"),
-            )
-            .await
-            .expect("invalid scheduled source input");
+    // The checkpoint prefix is applied independently to every source. All
+    // sources must remain control-waiting until the common stopping barrier.
+    for (operator, _) in &sources {
+        let source: arroyo_rpc::grpc::api::ConnectorOp =
+            prost::Message::decode(operator.operator_config.as_slice())
+                .expect("capture source config must decode");
+        assert_eq!(
+            source.connector, "single_file",
+            "capture requires a single-file source"
+        );
+        let source_config: arroyo_rpc::OperatorConfig = serde_json::from_str(&source.config)
+            .expect("capture source connector config must decode");
+        assert!(
+            source_config
+                .table
+                .get("wait_for_control")
+                .is_none_or(|value| value.is_null() || value.as_bool() == Some(true)),
+            "capture source must wait for control after each input row"
+        );
+        if let Some(schedule) = &schedule {
+            schedule
+                .validate_input(
+                    source_config
+                        .table
+                        .get("path")
+                        .and_then(Value::as_str)
+                        .expect("scheduled single-file source must have a path"),
+                )
+                .await
+                .expect("invalid scheduled source input");
+        }
     }
     let job_id = format!(
         "external-sql-capture-{}-{}",
@@ -2021,11 +2054,7 @@ async fn external_sql_checkpoint_capture_inner() {
     // A control-waiting single-file source reads its first row immediately;
     // configured NoOps advance the remaining input rows. The barrier flushes
     // a partial source batch; output cardinality need not match input cardinality.
-    assert_eq!(
-        running.source_controls().len(),
-        1,
-        "capture requires one source"
-    );
+    assert_eq!(running.source_controls().len(), sources.len());
     advance(&running, capture.input_rows_before_checkpoint - 1).await;
     // Stop at the barrier: a normal checkpoint resumes the source and reads
     // another line, which could flush beyond the captured checkpoint prefix.

@@ -14,6 +14,7 @@ import argparse
 from datetime import datetime, timedelta
 import json
 import os
+import re
 from pathlib import Path
 import subprocess
 
@@ -44,6 +45,8 @@ SCENARIOS = {
     "quiet-key": QUIET_EVENTS,
     "quiet-key-silence": QUIET_EVENTS,
     "delete-key": DELETE_EVENTS,
+    "calendar-quiet-key": (("keyA", 1, 1), ("keyA", 86401, 2), ("keyA", 172801, 3),
+                           ("keyB", 259201, 4), ("keyB", 345601, 5)),
 }
 
 
@@ -96,6 +99,16 @@ def independent_oracle(scenario: str) -> None:
         # keyA's quiet result [6,10) expires at 12, before keyB's offset-13
         # event is observed at a batch-1 watermark; keyB retires at 18.
         assert deadlines == {"keyA": 12, "keyB": 18}
+    if scenario == "calendar-quiet-key":
+        reference = (BASE + timedelta(seconds=events[-1][1])).date()
+        recent = {key: sum(event_key == key and
+                  (BASE + timedelta(seconds=second)).date() == reference
+                  for event_key, second, _ in events) for key in totals}
+        assert totals == {"keyA": 3, "keyB": 2}
+        assert recent == {"keyA": 0, "keyB": 1}
+        hold_reference = (BASE + timedelta(seconds=events[2][1])).date()
+        assert sum((BASE + timedelta(seconds=second)).date() == hold_reference
+                   for _, second, _ in events[:3]) == 1
     if scenario == "main":
         assert totals == {"x": 3} and latest == {"x": 1} and deadlines == {"x": 12}
     if scenario == "delete-key":
@@ -130,6 +143,22 @@ CREATE VIEW normalized AS
 INSERT INTO composed_out SELECT k, MAX(lifetime_count) AS lifetime_count,
   COALESCE(MAX(recent_count), 0) AS recent_count FROM normalized GROUP BY k
   HAVING MAX(lifetime_count) IS NOT NULL;
+"""
+
+
+def calendar_query_sql(directory: Path) -> str:
+    return f"""
+SET updating_ttl = NULL;
+CREATE TABLE events (timestamp TIMESTAMP NOT NULL, k TEXT NOT NULL, v BIGINT,
+ WATERMARK FOR timestamp AS timestamp)
+WITH (connector='single_file', path='{directory}/input.jsonl', format='json',
+ type='source', wait_for_control='true');
+CREATE TABLE composed_out (k TEXT, lifetime_count BIGINT, recent_count BIGINT)
+WITH (connector='single_file', path='{directory}/output.jsonl',
+ format='debezium_json', type='sink');
+INSERT INTO composed_out SELECT k, COUNT(*) AS lifetime_count,
+ COUNT(*) FILTER (WHERE CAST(timestamp AS DATE) = WATERMARK_DATE()) AS recent_count
+ FROM events GROUP BY k;
 """
 
 
@@ -197,7 +226,9 @@ def write_fixture(directory: Path, scenario: str) -> None:
         (directory / "input.jsonl").write_text(
             "".join(json.dumps(row) + "\n" for row in rows)
         )
-    if scenario == "delete-key":
+    if scenario == "calendar-quiet-key":
+        sql = calendar_query_sql(directory)
+    elif scenario == "delete-key":
         sql = deletion_query_sql(directory)
     else:
         watermark = (
@@ -207,7 +238,7 @@ def write_fixture(directory: Path, scenario: str) -> None:
         sql = query_sql(directory, watermark)
     (directory / "query.sql").write_text(sql)
     finals = {
-        "main": {"x": {"lifetime_count": 3, "recent_count": 0}},
+        "main": {"x": {"lifetime_count": 3, "recent_count": 1 if scenario == "calendar-quiet-key" else 0}},
         "quiet-key": {
             "keyA": {"lifetime_count": 3, "recent_count": 0},
             "keyB": {"lifetime_count": 2, "recent_count": 0},
@@ -216,20 +247,40 @@ def write_fixture(directory: Path, scenario: str) -> None:
             "keyA": {"lifetime_count": 3, "recent_count": 0},
             "keyB": {"lifetime_count": 2, "recent_count": 0},
         },
-        "delete-key": {"keyD": {"lifetime_count": 1, "recent_count": 0}},
+        "calendar-quiet-key": {
+            "keyA": {"lifetime_count": 3, "recent_count": 0},
+            "keyB": {"lifetime_count": 2, "recent_count": 1},
+        },
+        "delete-key": {"keyD": {"lifetime_count": 1, "recent_count": 1 if scenario == "calendar-quiet-key" else 0}},
     }[scenario]
+    finals = {key: {"k": key, **row} for key, row in finals.items()}
+    if scenario != "delete-key":
+        key = "x" if scenario == "main" else "keyA"
+        checkpoint = {key: {"k": key, "lifetime_count": 1 if scenario == "main" else 2,
+                            "recent_count": 1 if scenario == "calendar-quiet-key" else 0}}
+        (directory / "expected.checkpoint.json").write_text(
+            json.dumps(checkpoint, indent=2, sort_keys=True) + "\n"
+        )
+    if scenario == "delete-key":
+        checkpoint = {key: {"k": key, "lifetime_count": 1, "recent_count": 0}
+                      for key in DELETE_KEYS}
+        (directory / "expected.checkpoint.json").write_text(
+            json.dumps(checkpoint, indent=2, sort_keys=True) + "\n"
+        )
     (directory / "expected.final.json").write_text(
         json.dumps(finals, indent=2, sort_keys=True) + "\n"
     )
 
 
-def reduce_cdc(path: Path, scenario: str, allow_deletes: bool):
+def reduce_cdc(path: Path, scenario: str, allow_deletes: bool, limit: int | None = None):
     """Strict per-key CDC reduce; returns the per-key row chains."""
     chains: dict[str, list[dict]] = {}
     current: dict[str, dict] = {}
     count = 0
     with path.open() as source:
         for line in source:
+            if limit is not None and count == limit:
+                break
             count += 1
             record = json.loads(line)
             assert isinstance(record, dict), (path, count, record)
@@ -243,7 +294,8 @@ def reduce_cdc(path: Path, scenario: str, allow_deletes: bool):
             else:
                 assert after is not None, (path, count, row)
             key = (after or before)["k"]
-            assert set(after or before) == FIELDS, (path, count, row)
+            assert key in lifetime_counts(SCENARIOS[scenario]), (path, count, key)
+            assert all(image is None or set(image) == FIELDS for image in (before, after)), (path, count, row)
             assert before == current.get(key), (path, count, before, current.get(key))
             if op == "u":
                 assert before != after, (path, count, row)
@@ -261,12 +313,14 @@ def reduce_cdc(path: Path, scenario: str, allow_deletes: bool):
                     assert lifetime >= before["lifetime_count"], (path, count, after)
                 # Recent is the zero-extended current result: 0 once the
                 # retained result expired or before the first closed window.
-                allowed = set(window_counts(SCENARIOS[scenario])[key].values()) | {0}
+                allowed = {0, 1} if scenario == "calendar-quiet-key" else set(window_counts(SCENARIOS[scenario])[key].values()) | {0}
                 assert recent in allowed, (path, count, after)
                 current[key] = after
             else:
                 del current[key]
             chains.setdefault(key, []).append(row)
+    if limit is not None:
+        assert count == limit, (path, count, limit)
     return chains, current, count
 
 
@@ -286,14 +340,65 @@ def assert_quiet_key_zero(chains: dict[str, list[dict]], scenario: str) -> None:
         "k": "keyA", "lifetime_count": 3, "recent_count": 0,
     }, (scenario, chains["keyA"][-1])
     assert chains["keyB"][-1]["after"] == {
-        "k": "keyB", "lifetime_count": 2, "recent_count": 0,
+        "k": "keyB", "lifetime_count": 2, "recent_count": 1 if scenario == "calendar-quiet-key" else 0,
     }, (scenario, chains["keyB"][-1])
 
 
-def assert_silence_hold(pre: Path, post: Path) -> None:
+def assert_silence_hold(pre: Path, post: Path, scenario: str = "quiet-key-silence") -> None:
     # Wall-clock waiting without watermark progress must not advance the
     # event-time result; the snapshots around the hold are identical.
+    assert pre.is_file() and post.is_file(), ("missing silence capture", pre, post)
     assert pre.read_text() == post.read_text(), (pre, post)
+    _, current, count = reduce_cdc(pre, scenario, False)
+    expected = {
+        "keyA": {"k": "keyA", "lifetime_count": 3, "recent_count": 1},
+        "keyB": {"k": "keyB", "lifetime_count": 1, "recent_count": 0},
+    }
+    if scenario == "calendar-quiet-key":
+        del expected["keyB"]
+    assert count and current == expected, ("silence hold requires pending quiet-key expiry", pre, current)
+
+
+def validate_captures(directory: Path, scenario: str) -> None:
+    """Check initial/recovered streams, committed prefix and required hold artifacts."""
+    allow_deletes = scenario == "delete-key"
+    finals = json.loads((directory / "expected.final.json").read_text())
+    for name in ("output.initial.jsonl", "output.jsonl"):
+        path = directory / name
+        chains, current, count = reduce_cdc(path, scenario, allow_deletes)
+        assert count and current == finals, (path, current, finals)
+        if scenario.startswith("quiet-key") or scenario == "calendar-quiet-key":
+            assert_quiet_key_zero(chains, scenario)
+        if scenario == "delete-key":
+            assert "keyC" not in current and any(
+                row["op"] == "d" for row in chains.get("keyC", [])
+            ), (path, chains)
+    # The restored output retains its committed checkpoint prefix. Use the
+    # harness receipt's exact row count, not the first arbitrary CDC record.
+    receipts = re.findall(
+        r"CAPTURE_RESULT phase=recovered checkpoint=1 input_rows_before_checkpoint=(\d+) "
+        r"committed_rows=(\d+) rows=(\d+)",
+        (directory / "capture.log").read_text(),
+    )
+    assert len(receipts) == 1, ("missing/ambiguous checkpoint receipt", receipts)
+    source_prefixes = re.findall(
+        r"CAPTURE_SOURCE_PREFIX sources=(\d+) rows_per_source=(\d+)",
+        (directory / "capture.log").read_text(),
+    )
+    assert source_prefixes == [("2" if scenario == "delete-key" else "1",
+                                "1" if scenario == "main" else "2")], source_prefixes
+    input_prefix, prefix_count, total_count = map(int, receipts[0])
+    assert input_prefix == (1 if scenario == "main" else 2), ("wrong input prefix", input_prefix)
+    assert prefix_count > 0 and total_count == count, (prefix_count, total_count, count)
+    _, prefix, _ = reduce_cdc(directory / "output.jsonl", scenario, allow_deletes, prefix_count)
+    expected = json.loads((directory / "expected.checkpoint.json").read_text())
+    assert prefix == expected, ("checkpoint prefix", prefix, expected)
+    if scenario in {"quiet-key-silence", "calendar-quiet-key"}:
+        for phase in ("initial", "recovered"):
+            assert_silence_hold(
+                directory / f"output.idle-{phase}-before.jsonl",
+                directory / f"output.idle-{phase}-after.jsonl", scenario,
+            )
 
 
 def run_case(binary: Path, directory: Path, scenario: str, backend: str, batch: int,
@@ -325,7 +430,7 @@ def run_case(binary: Path, directory: Path, scenario: str, backend: str, batch: 
         STREAMR_TEST_SOURCE_BATCH_ROWS=str(batch),
         STREAMR_CAPTURE_QUERY=str(directory / "query.sql"),
         STREAMR_CAPTURE_OUTPUT=str(directory / "output.jsonl"),
-        STREAMR_CAPTURE_INPUT_ROWS_BEFORE_CHECKPOINT="3"
+        STREAMR_CAPTURE_INPUT_ROWS_BEFORE_CHECKPOINT="2"
         if scenario != "main" else "1",
         STREAMR_CAPTURE_EXPECTED_CHECKPOINT_ROWS="1",
         STREAMR_CAPTURE_EXPECTED_INITIAL_ROWS="1",
@@ -336,14 +441,16 @@ def run_case(binary: Path, directory: Path, scenario: str, backend: str, batch: 
         STREAMR_CAPTURE_MAX_ROWS="16",
         STREAMR_CAPTURE_CHECKPOINT_EPOCH="1",
     )
-    if scenario == "quiet-key-silence":
+    if scenario in {"quiet-key-silence", "calendar-quiet-key"}:
         env.update(
-            STREAMR_CAPTURE_IDLE_SOURCE_ROW_TARGET="3",
+            STREAMR_CAPTURE_IDLE_SOURCE_ROW_TARGET="3" if scenario == "calendar-quiet-key" else "4",
             STREAMR_CAPTURE_IDLE_SECONDS="8",
             STREAMR_CAPTURE_IDLE_MIN_PRE_ROWS="1",
             STREAMR_CAPTURE_IDLE_MAX_BYTES="262144",
-            STREAMR_CAPTURE_IDLE_PRE_MATCH_POINTER="/after/k",
-            STREAMR_CAPTURE_IDLE_PRE_MATCH_VALUE=json.dumps("keyA"),
+            STREAMR_CAPTURE_IDLE_PRE_MATCH_POINTER="/after",
+            STREAMR_CAPTURE_IDLE_PRE_MATCH_VALUE=json.dumps(
+                {"k": "keyA", "lifetime_count": 3, "recent_count": 1}
+            ),
         )
     log = directory / "capture.log"
     with log.open("w") as output:
@@ -354,26 +461,7 @@ def run_case(binary: Path, directory: Path, scenario: str, backend: str, batch: 
         )
     if result.returncode or "1 passed" not in log.read_text():
         raise RuntimeError(f"capture failed: {log}")
-    allow_deletes = scenario == "delete-key"
-    initial = directory / "output.initial.jsonl"
-    chains, current, count = reduce_cdc(initial, scenario, allow_deletes)
-    finals = json.loads((directory / "expected.final.json").read_text())
-    if initial.exists() and count:
-        assert current == finals, (initial, current, finals)
-    chains, current, count = reduce_cdc(directory / "output.jsonl", scenario, allow_deletes)
-    assert current == finals, (directory, current, finals)
-    if scenario.startswith("quiet-key"):
-        assert_quiet_key_zero(chains, scenario)
-    if scenario == "delete-key":
-        assert "keyC" not in current and any(
-            row["op"] == "d" for row in chains["keyC"]
-        ), chains["keyC"]
-    if scenario == "quiet-key-silence":
-        for phase in ("initial", "recovered"):
-            pre = directory / f"output.idle-{phase}-before.jsonl"
-            post = directory / f"output.idle-{phase}-after.jsonl"
-            if pre.exists() and post.exists():
-                assert_silence_hold(pre, post)
+    validate_captures(directory, scenario)
     print(f"PASS {directory.name}: {scenario} lifetime/current CDC and expiry", flush=True)
 
 
@@ -399,7 +487,7 @@ def main() -> None:
     for scenario in scenarios:
         for backend in ("memory", "rocksdb"):
             # The harness idle hold only supports one-row source batches.
-            batches = (1,) if scenario == "quiet-key-silence" else (1, 8)
+            batches = (1,) if scenario in {"quiet-key-silence", "calendar-quiet-key", "delete-key"} else (1, 8)
             for batch in batches:
                 for mode in ("controller", "leader"):
                     run_case(
