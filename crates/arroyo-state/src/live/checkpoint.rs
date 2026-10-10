@@ -1114,7 +1114,7 @@ mod tests {
             .put(key(1), b"checkpoint-owner".to_vec(), 1024)
             .await
             .unwrap();
-        let snapshot = source.snapshot().await.unwrap();
+        let snapshot = source.checkpoint_snapshot().await.unwrap();
         let namespace = namespace();
         let config = config();
         let export_observation = CheckpointObservation::new(None, CheckpointDirection::Export);
@@ -1351,7 +1351,7 @@ mod tests {
         }
         let observation = CheckpointObservation::new(None, CheckpointDirection::Export);
         let metadata = export_snapshot_inner(
-            &source.snapshot().await.unwrap(),
+            &source.checkpoint_snapshot().await.unwrap(),
             &namespace(),
             &config().table_name,
             config().table_name.as_bytes(),
@@ -1447,7 +1447,7 @@ mod tests {
             source.put(key(number), value.clone(), 1024).await.unwrap();
             expected.push(value);
         }
-        let snapshot = source.snapshot().await.unwrap();
+        let snapshot = source.checkpoint_snapshot().await.unwrap();
         let observation = CheckpointObservation::new(None, CheckpointDirection::Export);
         let metadata = export_snapshot_inner(
             &snapshot,
@@ -1563,7 +1563,7 @@ mod tests {
                 .unwrap();
         }
         let metadata = export(
-            &source.snapshot().await.unwrap(),
+            &source.checkpoint_snapshot().await.unwrap(),
             &namespace(),
             &config(),
             &storage,
@@ -1617,7 +1617,7 @@ mod tests {
             *byte = seed as u8;
         }
         source.put(key(1), value.clone(), PAGE_BYTES).await.unwrap();
-        let snapshot = source.snapshot().await.unwrap();
+        let snapshot = source.checkpoint_snapshot().await.unwrap();
         let namespace = namespace();
         let config = config();
         let first = CheckpointObservation::new(None, CheckpointDirection::Export);
@@ -1709,7 +1709,7 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let snapshot = source.snapshot().await.unwrap();
+        let snapshot = source.checkpoint_snapshot().await.unwrap();
         let observation = CheckpointObservation::new(None, CheckpointDirection::Export);
         let config = config();
         let namespace = namespace();
@@ -1776,7 +1776,7 @@ mod tests {
                 .unwrap();
         }
         let result = export_with_file_limit(
-            &source.snapshot().await.unwrap(),
+            &source.checkpoint_snapshot().await.unwrap(),
             &namespace(),
             &config(),
             &storage,
@@ -1874,7 +1874,7 @@ mod tests {
             .put(key(0), b"value".to_vec(), PAGE_BYTES)
             .await
             .unwrap();
-        let snapshot = source.snapshot().await.unwrap();
+        let snapshot = source.checkpoint_snapshot().await.unwrap();
         let config = config();
         let mut export =
             CheckpointObservation::new(Some(resources.clone()), CheckpointDirection::Export);
@@ -2080,7 +2080,7 @@ mod tests {
             "P/J/generations/2/checkpoints/checkpoint-0000003/operator-o/table-{transport_name}-000"
         );
         let metadata = export_typed(
-            &source.snapshot().await.unwrap(),
+            &source.checkpoint_snapshot().await.unwrap(),
             &namespace,
             &config,
             &storage,
@@ -2221,17 +2221,17 @@ mod tests {
                     .await
                     .unwrap();
             }
-            let first = source.snapshot().await.unwrap();
+            let first = source.checkpoint_snapshot().await.unwrap();
             source.delete(key(1), PAGE_BYTES).await.unwrap();
             source
                 .put(key(0), b"updated".to_vec(), PAGE_BYTES)
                 .await
                 .unwrap();
-            let second = source.snapshot().await.unwrap();
+            let second = source.checkpoint_snapshot().await.unwrap();
             for number in 0..64 {
                 source.delete(key(number), PAGE_BYTES).await.unwrap();
             }
-            let empty = source.snapshot().await.unwrap();
+            let empty = source.checkpoint_snapshot().await.unwrap();
             // Newer local mutations must not leak into any selected snapshot.
             source
                 .put(key(0), b"after-barrier".to_vec(), PAGE_BYTES)
@@ -2373,13 +2373,13 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let first = backend.snapshot().await.unwrap();
+        let first = backend.checkpoint_snapshot().await.unwrap();
         backend.delete(key(1), PAGE_BYTES).await.unwrap();
         backend
             .put(key(0), b"new".to_vec(), PAGE_BYTES)
             .await
             .unwrap();
-        let second = backend.snapshot().await.unwrap();
+        let second = backend.checkpoint_snapshot().await.unwrap();
         backend
             .put(key(2), b"post-barrier".to_vec(), PAGE_BYTES)
             .await
@@ -2490,7 +2490,7 @@ mod tests {
         let storage = storage(&directory).await;
         let backend = MemoryLiveState::new();
         let empty = export(
-            &backend.snapshot().await.unwrap(),
+            &backend.checkpoint_snapshot().await.unwrap(),
             &namespace(),
             &config(),
             &storage,
@@ -2513,7 +2513,7 @@ mod tests {
         .unwrap();
         backend.put(key(0), vec![1; 32], PAGE_BYTES).await.unwrap();
         let metadata = export(
-            &backend.snapshot().await.unwrap(),
+            &backend.checkpoint_snapshot().await.unwrap(),
             &namespace(),
             &config(),
             &storage,
@@ -2600,7 +2600,7 @@ mod tests {
                 .unwrap();
         }
         let metadata = export(
-            &source.snapshot().await.unwrap(),
+            &source.checkpoint_snapshot().await.unwrap(),
             &namespace(),
             &config(),
             &storage,

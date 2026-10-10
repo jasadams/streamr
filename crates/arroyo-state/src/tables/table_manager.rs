@@ -1066,7 +1066,7 @@ impl TableManager {
                 {
                     snapshot.clone()
                 } else {
-                    let snapshot = match table.backend.snapshot().await {
+                    let snapshot = match table.backend.checkpoint_snapshot().await {
                         Ok(snapshot) => snapshot,
                         Err(error) => {
                             self.checkpoint_failed = true;

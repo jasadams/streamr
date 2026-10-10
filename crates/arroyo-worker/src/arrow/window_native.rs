@@ -4,7 +4,7 @@
 //! batches live and how the final plan receives one group's paged partials.
 use super::{
     StatelessPhysicalExecutor,
-    window_store::{WindowSnapshot, WindowStore, WindowStoreLimits},
+    window_store::{WindowStore, WindowStoreLimits},
 };
 use anyhow::{Context, Result, ensure};
 use arrow::{
@@ -599,15 +599,16 @@ impl NativeWindow {
 
     async fn emit_interval(
         &mut self,
-        snapshot: &WindowSnapshot,
         start: i64,
         end: i64,
         collector: &mut dyn Collector,
     ) -> Result<()> {
-        // All intervals at this watermark share one stable view. Each next
-        // interval starts at or beyond the prior expiry cutoff.
+        // The watermark handler exclusively owns mutations. Use one stable
+        // group view, then release it before downstream delivery can wait for
+        // another operator to acquire the worker-wide snapshot permit.
         let mut after_group = None;
         loop {
+            let snapshot = self.store()?.snapshot().await?;
             let group = snapshot.next_group(after_group.as_deref()).await?;
             let Some((key, latest)) = group else {
                 break;
@@ -686,7 +687,7 @@ impl NativeWindow {
             let mut finish = self.finish.execute(0, execution.task_context())?;
             // Move the sender into the producer so the input stream observes
             // EOF as soon as all paged partials have been sent.
-            let producer_snapshot = snapshot;
+            let producer_snapshot = &snapshot;
             let producer = async move {
                 let mut after = None;
                 if let Some(first) = first_for_producer {
@@ -731,6 +732,7 @@ impl NativeWindow {
                 Ok::<_, anyhow::Error>(output)
             };
             let (_, output) = try_join!(producer, consumer)?;
+            drop(snapshot);
             if let Some(output) = output {
                 ensure!(
                     output.get_array_memory_size() <= self.limits.partial_bytes,
@@ -777,15 +779,17 @@ impl NativeWindow {
         };
         let width = i64::try_from(self.width.as_nanos())?;
         let slide = i64::try_from(self.slide.as_nanos())?;
-        let snapshot = self.store()?.snapshot().await?;
         let mut retired_through = None;
         if self.hopping {
             let mut progress = self.store()?.progress().await?;
             loop {
-                let Some(earliest) = snapshot
-                    .next_expiry_time(retired_through.as_deref())
-                    .await?
-                else {
+                let earliest = {
+                    let snapshot = self.store()?.snapshot().await?;
+                    snapshot
+                        .next_expiry_time(retired_through.as_deref())
+                        .await?
+                };
+                let Some(earliest) = earliest else {
                     break;
                 };
                 // No input contributes to the empty slide intervals before
@@ -795,7 +799,6 @@ impl NativeWindow {
                     break;
                 }
                 self.emit_interval(
-                    &snapshot,
                     next.checked_sub(width)
                         .context("native window start overflow")?,
                     next,
@@ -808,23 +811,29 @@ impl NativeWindow {
                     .checked_add(slide)
                     .and_then(|time| time.checked_sub(width))
                     .context("native window expiry overflow")?;
+                let snapshot = self.store()?.snapshot().await?;
                 self.store()?
                     .expire_before_snapshot(&snapshot, expiry, &mut retired_through)
                     .await?;
             }
         } else {
-            while let Some(first) = snapshot
-                .next_expiry_time(retired_through.as_deref())
-                .await?
-            {
+            loop {
+                let first = {
+                    let snapshot = self.store()?.snapshot().await?;
+                    snapshot
+                        .next_expiry_time(retired_through.as_deref())
+                        .await?
+                };
+                let Some(first) = first else { break };
                 if floor.is_some_and(|floor| first >= floor) {
                     break;
                 }
                 let end = first
                     .checked_add(width)
                     .context("native window end overflow")?;
-                self.emit_interval(&snapshot, first, end, collector).await?;
+                self.emit_interval(first, end, collector).await?;
                 self.store()?.set_progress(end).await?;
+                let snapshot = self.store()?.snapshot().await?;
                 self.store()?
                     .expire_before_snapshot(&snapshot, end, &mut retired_through)
                     .await?;
@@ -850,6 +859,13 @@ mod tests {
     };
 
     fn store_for_schema(schema: SchemaRef) -> (WindowStore, WorkerStateResources) {
+        store_for_schema_with_snapshot_limit(schema, 8)
+    }
+
+    fn store_for_schema_with_snapshot_limit(
+        schema: SchemaRef,
+        max_snapshots: usize,
+    ) -> (WindowStore, WorkerStateResources) {
         let resources = WorkerStateResources::new(ResourceConfig {
             block_cache_bytes: 1024 * 1024,
             memtable_bytes: 1024 * 1024,
@@ -857,7 +873,7 @@ mod tests {
             decoded_value_bytes: 4 * 1024 * 1024,
             scan_page_bytes: 1024 * 1024,
             max_blocking_operations: 2,
-            max_snapshots: 8,
+            max_snapshots,
             max_open_databases: 1,
             disk_reserve_bytes: 0,
         })
@@ -1052,11 +1068,16 @@ mod tests {
     struct BlockedCollector {
         started: Option<tokio::sync::oneshot::Sender<std::sync::Weak<dyn Array>>>,
         release: tokio::sync::oneshot::Receiver<()>,
+        snapshots: Option<WorkerStateResources>,
     }
 
     #[async_trait::async_trait]
     impl Collector for BlockedCollector {
         async fn collect(&mut self, batch: RecordBatch) -> arroyo_rpc::errors::DataflowResult<()> {
+            if let Some(resources) = &self.snapshots {
+                let permit = resources.snapshot().await.unwrap();
+                drop(permit);
+            }
             self.started
                 .take()
                 .unwrap()
@@ -1075,11 +1096,15 @@ mod tests {
     }
 
     #[derive(Default)]
-    struct RecordedCollector(Vec<RecordBatch>);
+    struct RecordedCollector(Vec<RecordBatch>, Option<WorkerStateResources>);
 
     #[async_trait::async_trait]
     impl Collector for RecordedCollector {
         async fn collect(&mut self, batch: RecordBatch) -> arroyo_rpc::errors::DataflowResult<()> {
+            if let Some(resources) = &self.1 {
+                let permit = resources.snapshot().await.unwrap();
+                drop(permit);
+            }
             self.0.push(batch);
             Ok(())
         }
@@ -1093,20 +1118,39 @@ mod tests {
 
     #[tokio::test]
     async fn slow_tumble_cancellation_preserves_many_hot_panes() {
-        slow_closure_cancellation_preserves_many_hot_panes(false, false).await;
+        slow_closure_cancellation_preserves_many_hot_panes(false, false, false).await;
     }
 
     #[tokio::test]
     async fn slow_hop_cancellation_preserves_many_hot_panes() {
-        slow_closure_cancellation_preserves_many_hot_panes(true, false).await;
+        slow_closure_cancellation_preserves_many_hot_panes(true, false, false).await;
     }
 
     #[tokio::test]
     async fn collection_refusal_retry_and_cancellation_release_paged_state() {
-        slow_closure_cancellation_preserves_many_hot_panes(false, true).await;
+        slow_closure_cancellation_preserves_many_hot_panes(false, true, false).await;
     }
 
-    async fn slow_closure_cancellation_preserves_many_hot_panes(hopping: bool, collection: bool) {
+    #[tokio::test]
+    async fn one_snapshot_tumble_releases_views_before_downstream_collection() {
+        slow_closure_cancellation_preserves_many_hot_panes(false, false, true).await;
+    }
+
+    #[tokio::test]
+    async fn one_snapshot_hop_releases_views_before_downstream_collection() {
+        slow_closure_cancellation_preserves_many_hot_panes(true, false, true).await;
+    }
+
+    #[tokio::test]
+    async fn one_snapshot_collection_releases_views_before_downstream_collection() {
+        slow_closure_cancellation_preserves_many_hot_panes(false, true, true).await;
+    }
+
+    async fn slow_closure_cancellation_preserves_many_hot_panes(
+        hopping: bool,
+        collection: bool,
+        single_snapshot: bool,
+    ) {
         use super::super::execution::{ExecutionResources, with_test_execution_resources};
         use arroyo_planner::physical::{ArroyoMemExec, new_registry};
         use arroyo_rpc::config::ExecutionResourceConfig;
@@ -1153,11 +1197,16 @@ mod tests {
                 }).collect();
                 RecordBatch::try_new(schema.clone(), lists).unwrap()
             } else { partial() };
-            let (store, state) = store_for_schema(schema.clone());
+            let (store, state) = store_for_schema_with_snapshot_limit(
+                schema.clone(), if single_snapshot { 1 } else { 8 },
+            );
+            let groups: &[&[u8]] = if single_snapshot { &[b"a", b"b"] } else { &[b""] };
             // Many panes, with a hot first pane spanning many one-entry pages.
             for pane in 0..48 {
                 for _ in 0..if pane == 0 { 128 } else { 1 } {
-                    store.append(&[], pane * 10, &row).await.unwrap();
+                    for group in groups {
+                        store.append(group, pane * 10, &row).await.unwrap();
+                    }
                 }
             }
             let input: Arc<dyn ExecutionPlan> = Arc::new(ArroyoMemExec::new("input".into(), schema.clone()));
@@ -1236,7 +1285,8 @@ mod tests {
             }
             let (started_tx, mut started_rx) = tokio::sync::oneshot::channel();
             let (release_tx, release_rx) = tokio::sync::oneshot::channel();
-            let mut collector = BlockedCollector { started: Some(started_tx), release: release_rx };
+            let mut collector = BlockedCollector { started: Some(started_tx), release: release_rx,
+                snapshots: single_snapshot.then(|| state.clone()) };
             let mut pending = Box::pin(operator.handle_watermark(&mut ctx, &mut collector));
             let weak = tokio::time::timeout(Duration::from_secs(2), async {
                 tokio::select! {
@@ -1258,9 +1308,10 @@ mod tests {
             assert_eq!(operator.store().unwrap().earliest_time().await.unwrap(), Some(0));
             assert!(operator.finish_receiver.read().unwrap().is_none());
 
-            let mut resumed = RecordedCollector::default();
-            operator.handle_watermark(&mut ctx, &mut resumed).await.unwrap();
-            assert_eq!(resumed.0.len(), 2);
+            let mut resumed = RecordedCollector(Vec::new(), single_snapshot.then(|| state.clone()));
+            tokio::time::timeout(Duration::from_secs(2), operator.handle_watermark(&mut ctx, &mut resumed))
+                .await.expect("window reader blocked downstream snapshot admission").unwrap();
+            assert_eq!(resumed.0.len(), 2 * groups.len());
             if collection {
                 let values = resumed.0[0].column(0).as_any().downcast_ref::<ListArray>().unwrap().value(0);
                 assert_eq!(values.len(), 128);
@@ -1269,16 +1320,35 @@ mod tests {
                 assert_eq!(resumed.0[0].column(2).as_any().downcast_ref::<Int64Array>().unwrap().value(0), 1);
             } else {
                 assert_eq!(resumed.0[0].column(0).as_any().downcast_ref::<Int64Array>().unwrap().value(0), 128);
-                assert_eq!(resumed.0[1].column(0).as_any().downcast_ref::<Int64Array>().unwrap().value(0), if hopping { 129 } else { 1 });
+                for (index, batch) in resumed.0.iter().enumerate() {
+                    assert_eq!(batch.column(0).as_any().downcast_ref::<Int64Array>().unwrap().value(0),
+                        if index < groups.len() { 128 } else if hopping { 129 } else { 1 });
+                }
             }
             assert_eq!(operator.store().unwrap().progress().await.unwrap(), Some(20));
             assert_eq!(operator.store().unwrap().earliest_time().await.unwrap(), Some(if hopping { 10 } else { 20 }));
             // Equality closes [10,20), retaining the pane starting at 20.
             operator.handle_watermark(&mut ctx, &mut resumed).await.unwrap();
-            assert_eq!(resumed.0.len(), 2);
+            assert_eq!(resumed.0.len(), 2 * groups.len());
             ctx.watermarks.set(0, arroyo_types::Watermark::EventTime(arroyo_types::from_nanos(u64::MAX as u128)));
             operator.handle_watermark(&mut ctx, &mut resumed).await.unwrap();
-            assert_eq!(resumed.0.len(), if hopping { 49 } else { 48 });
+            assert_eq!(resumed.0.len(), (if hopping { 49 } else { 48 }) * groups.len());
+            if single_snapshot && !collection {
+                for (index, batch) in resumed.0.iter().enumerate() {
+                    let interval = index / groups.len();
+                    let expected = match interval {
+                        0 => 128,
+                        1 if hopping => 129,
+                        48 if hopping => 1,
+                        _ if hopping => 2,
+                        _ => 1,
+                    };
+                    assert_eq!(batch.column(0).as_any().downcast_ref::<Int64Array>().unwrap().value(0), expected);
+                    let timestamp = batch.column(1).as_any()
+                        .downcast_ref::<arrow_array::TimestampNanosecondArray>().unwrap().value(0);
+                    assert_eq!(timestamp, (interval as i64 - i64::from(hopping)) * 10);
+                }
+            }
             assert_eq!(operator.store().unwrap().earliest_time().await.unwrap(), None);
             assert_eq!(execution.runtime.memory_pool.reserved(), 0);
             drop(state.try_decoded_value(state.config().decoded_value_bytes).unwrap());

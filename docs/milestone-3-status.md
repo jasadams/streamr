@@ -54,8 +54,40 @@ current dispatch instructions. No implementation worker is claimed by this reset
   passed (91 tests, 4.84s; compilation 1m26s); `fmt --all -- --check` passed.
   Includes unlogged update/delete capture and typed full/empty cross-backend restore.
   Source patch/hash, image receipt and exact logs:
-  `/home/jason/qa-evidence/str71-rocksdb-20261010/`. Next: publish this increment.
+  `/home/jason/qa-evidence/str71-rocksdb-20261010/`. Published as
+  [PR #27](https://github.com/jasadams/streamr/pull/27); CI green, merge pending.
   Heavy compaction/RSS/fault/soak qualification remains the explicit STR-32 batch.
+
+## STR-72 native RocksDB read views — 2026-10-10
+
+- Start 03:53 UTC, `/root`, branch `audit/str-72-native-read-views`, fetched base
+  `8cbd443d4204578fa90c6e427e76d53ae94da743`, dependency STR-71 PR #27 cherry-picked
+  as `09b5f7c9`. Read `AGENTS.md`, `.claude/build-test.md`, current STR-72 and this
+  ledger before implementation/delegation. User approved lifecycle change and
+  resumed builds; no automatic deadline or signed-review requirement.
+- Acceptance: bounded safe native view ownership; stable reads/pages across
+  updates/deletes/compaction; close waits for final readers/cancelled native work;
+  ordinary views create no checkpoint files or flush; separate physical capture
+  preserves existing checkpoint export/recovery. Preserve SQL output/time semantics.
+- Coordinator owns state adapter/trait, checkpoint capture call, manifests/lock,
+  docs and serialized container checks/tests. Delegate owns fixed/session window
+  view release scopes and one-permit regressions; reviewer remains independent.
+- Implemented native `self_cell` views with original-sequence reads/pages and
+  bounded release before DB destruction; independent physical checkpoint capture
+  remains at table-manager barriers. Windows release group views before downstream
+  collection; SESSION releases retirement view before metadata lookup.
+- Final independent state/worker/documentation review: approve, no findings.
+  Container locked state/worker check passed (45.04s), strict Clippy passed
+  (51.25s), formatting passed. State: 103 tests (3.93s); worker suites:
+  window_native 10 (1.52s), session_store 15 (0.12s), session_native 4 (0.15s),
+  incremental_aggregator 38 (0.79s), aggregate_store 3 (0.02s). All passed.
+  Includes real native cancellation/clone/compaction/no-flush and one-permit
+  SQL window/session regressions. Same prebuilt image as STR-71.
+- Exact logs, source patch/hash and image receipt:
+  `/home/jason/qa-evidence/str72-native-views-20261010/`. Published as
+  [PR #28](https://github.com/jasadams/streamr/pull/28), based on #27;
+  CI/merge pending. No heavy STR-32 qualification batch or measured
+  capacity speedup claim.
 
 ## Available features
 

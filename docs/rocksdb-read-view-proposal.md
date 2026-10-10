@@ -1,7 +1,9 @@
-# RocksDB read views: lifecycle decision
+# RocksDB read views: approved lifecycle
 
-Proposal only. No implementation or contract change is approved by this document.
-This concerns existing native aggregate execution on disk-backed state. The
+The user approved this lifecycle change on 2026-10-10 after discussion of reader
+retention and shutdown tradeoffs. STR-72 implements it; validation is recorded
+in the milestone ledger. This concerns native aggregate execution on disk-backed
+state. The
 optional per-group emission policy in STR-44 remains post-MVP.
 
 ## Observed problem
@@ -41,30 +43,29 @@ Current evidence is retained in
 `/tmp/streamr-rocks-native-snapshot-feasibility.md` records pinned dependency
 sources, callsites and ownership constraints.
 
-## Why the current adapter does this
+## Why the previous adapter used physical views
 
-Streamr introduced a stronger read-view guarantee: a snapshot remains readable
-after its original live database has been explicitly closed and removed. Public
-documentation and three RocksDB tests promise that behavior. Independent local
+The previous adapter introduced a stronger read-view guarantee: a snapshot remained readable
+after its original live database has been explicitly closed and removed. Earlier documentation and three RocksDB tests promised that behavior; the
+approved lifecycle replaces it for ordinary views. Independent local
 checkpoint directories provide it.
 
 No production caller requiring reads after a completed explicit close/removal
 was found in the repository audit. Native operators release their scoped views;
 checkpoint exports retain views until completion or cancellation. This audit
-does not establish what external Rust consumers might depend on. The documented
-guarantee must not be silently removed.
+does not establish what external Rust consumers might depend on. The lifecycle change was explicitly agreed with the user.
 
 Sharing one view across an entire result drain is not a safe substitute. Holding
 its permit during downstream delivery can deadlock two operators sharing a
 single allowed snapshot. Current scopes release ownership before delivery.
 
-## Recommended contract for discussion
+## Approved contract
 
 Use native RocksDB read snapshots for the existing stable-view API. A view keeps
 its live database alive until its last reader and in-flight operation finish.
 Callers release views before awaiting explicit close/removal.
 
-| Behavior | Current adapter | Proposed native views |
+| Behavior | Previous physical views | Ordinary native views |
 | --- | --- | --- |
 | Read the old value after a live update/delete | Supported | Preserved |
 | Stable paging and cloned readers | Supported | Preserved |
@@ -78,10 +79,11 @@ admission at the open-database limit. Native snapshots retain historical
 versions during compaction; snapshot count does not bound reader age or retained
 disk history. These costs need measurement under the existing limits.
 
-The pinned Rust RocksDB binding exposes borrowed snapshots. Safe owned views
-need a small, explicitly reviewed ownership helper; the current dependencies do
-not provide a ready-made owned constructor. No unbounded worker threads, leaked
-handles or unchecked lifetime extension should be used.
+The pinned Rust RocksDB binding exposes borrowed snapshots. STR-72 uses
+`self_cell` 1.3.0 to own an `Arc<NativeDb>` and its borrowed snapshot safely.
+Reads and paged iterators use the captured sequence. Native release runs on the
+bounded cleanup executor before database-owner release; cancelled native work
+retains its view and admission until it completes.
 
 This changes Streamr's introduced backend lifecycle contract. Existing SQL,
 Arroyo Parquet checkpoint writers, formats, coordination and recovery remain the
@@ -89,10 +91,12 @@ integration path. Minimum filesystem headroom, operation/read/page/cache and
 snapshot limits must remain enforced; admission accounting must reflect the
 actual native-view costs.
 
-If independent readability after completed database removal is required, retain
-the current snapshot contract. A separate generic bounded live-range interface
-for serially owned operator state is an alternative, but it requires its own
-ownership and continuation contract discussion. It is not implemented here.
+Durable capture uses the generic `checkpoint_snapshot` method. RocksDB keeps
+its physical flush/checkpoint/read-only database path there; memory delegates to
+its existing stable view. The table-manager barrier captures this independent
+view before starting asynchronous Parquet export. Formats and publication remain
+unchanged. Existing physical-capture tests retain independent readability after
+live removal; ordinary-view tests instead require close to wait for final readers.
 
 ## Verification after agreement
 
@@ -102,7 +106,7 @@ real readers, final database lock/slot/path release, and open-database and
 snapshot limits of one. Preserve bounded cleanup and error propagation.
 
 Run the required combined Bookworm gates, existing checkpoint/export/recovery
-tests and unchanged native SQL oracles. Repeat the full capacity workload with
-the same budgets and record snapshot time, RSS, disk/compaction and actual
+tests and unchanged native SQL oracles. The separate STR-32 qualification batch must repeat the full capacity workload
+with the same budgets and record snapshot time, RSS, disk/compaction and actual
 checkpoint/restored-value evidence. Faster creation alone does not qualify
 milestone 3.
