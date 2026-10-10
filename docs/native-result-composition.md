@@ -440,17 +440,44 @@ investigation remains existing native window and relational composition, with
 explicit clock, expiry and bounded-state assertions. New keywords are not a
 prerequisite for repairing that engine support.
 
+### Quiet-key zero: watermark-driven current-result expiry (implemented)
+
+The selected two-stage composition now attaches event-time result expiry to
+the current-result stage. The planner recognizes per-key
+`LAST_VALUE(result ORDER BY window_end)` over finalized HOP/TUMBLE results
+(the window field traced through projection renames and view materialization
+boundaries to the windowed aggregate) and lowers `EventTimeExpiry` onto the
+updating aggregate: each result stamps its group's validity deadline at its
+window end plus one slide (the first empty closed boundary). An event-time
+watermark past the deadline retracts the retained result through the same
+bounded native expiry/cleanup pages as TTL; the deadline index and stamped
+deadline persist through configured memory/RocksDB adapters and survive
+checkpoint restore. Watermarks refresh data before applying expiry, repeated
+advances emit no duplicate transitions, and silence without watermark progress
+emits nothing (no processing-time fallback). The composed zero is expressed by
+existing SQL on the removal: `COALESCE(MAX(recent_count), 0)`, with
+`HAVING MAX(lifetime_count) IS NOT NULL` as retaining-key ownership. Ordinary
+window outputs and queries outside the pattern are unchanged. The generic
+oracle (`scripts/test-native-result-composition.py`) covers the quiet-key
+3/1-to-3/0 replacement, the silence hold and the two-source retaining-key
+deletion composition; executing that matrix is the shared STR-32 batch.
+Update-mode sources reject event-time fields ("can't use event_time_field with
+update mode"), so the retractable retaining key relation is a separate
+changelog source from the event-time rolling source.
+
 ## Remaining output contracts
 
-Closed HOP windows emit nonempty results; an absent empty window is not an
-explicit zero, update or delete. Composition must define how expiry changes a
-current rolling result without a new input event. Comparison with the last
-emitted snapshot remains required. The original application's immediate-first
-and first-pending coalescing policy is deferred post-MVP in STR-44; milestone 3
-retains Arroyo's periodic flushing and records the timing difference. An aligned
-TUMBLE or an aggregate flush interval does not establish the deferred policy.
+Closed HOP windows still emit nonempty results; an absent empty window is not
+an explicit zero, update or delete for ordinary window outputs. The selected
+composition defines quiet-key expiry as above; queries outside that path keep
+their existing behavior. Comparison with the last emitted snapshot remains
+required. The original application's immediate-first and first-pending
+coalescing policy is deferred post-MVP in STR-44; milestone 3 retains Arroyo's
+periodic flushing and records the timing difference. An aligned TUMBLE or an
+aggregate flush interval does not establish the deferred policy.
 
-These findings remain STR-29 work. They do not authorize application-specific
-operators, callbacks or output policies in Streamr. See the
+The runtime/resource acceptance for the quiet-key zero remains the shared
+STR-32 batch. None of this authorizes application-specific operators,
+callbacks or output policies in Streamr. See the
 [native capability audit](milestone-3-native-capabilities.md) and
 [validation record](milestone-3-validation.md) for the wider acceptance limits.

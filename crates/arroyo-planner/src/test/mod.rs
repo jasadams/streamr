@@ -1,5 +1,6 @@
 mod aggregate_retention;
 mod continuous_merge;
+mod current_result_expiry;
 mod event_clock;
 mod native_capabilities;
 mod plan_tests;

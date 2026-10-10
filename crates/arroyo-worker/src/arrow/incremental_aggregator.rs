@@ -13,7 +13,7 @@ use arrow_array::cast::AsArray;
 use arrow_array::types::UInt64Type;
 use arrow_array::{
     Array, ArrayRef, BinaryArray, BooleanArray, FixedSizeBinaryArray, RecordBatch, StructArray,
-    UInt32Array, UInt64Array,
+    TimestampNanosecondArray, UInt32Array, UInt64Array,
 };
 use arrow_schema::{DataType, Field, FieldRef, Schema, SchemaBuilder, TimeUnit};
 use arroyo_operator::context::Collector;
@@ -37,7 +37,7 @@ use arroyo_state::live::{
     worker::{ConfiguredBackendOwner, configured_worker_resources, construct_configured_backend},
 };
 use arroyo_state::timestamp_table_config;
-use arroyo_types::{CheckpointBarrier, SignalMessage, to_nanos};
+use arroyo_types::{CheckpointBarrier, SignalMessage, Watermark, to_nanos};
 use datafusion::common::{Result as DFResult, ScalarValue};
 use datafusion::execution::memory_pool::MemoryConsumer;
 use datafusion::functions_aggregate::min_max::Max;
@@ -357,6 +357,16 @@ struct Aggregator {
     injected_timestamp: bool,
 }
 
+/// Event-time validity of a retained current result on the selected
+/// rolling-result composition path. Each input row stamps its group's expiry
+/// deadline at the result timestamp plus one window slide; an event-time
+/// watermark past the deadline retracts the retained result. If no watermark
+/// advances, no expiry applies.
+struct EventTimeExpiryRuntime {
+    result_timestamp_expr: Arc<dyn PhysicalExpr>,
+    delay_nanos: i64,
+}
+
 pub struct IncrementalAggregatingFunc {
     flush_interval: Duration,
     metadata_expr: Arc<dyn PhysicalExpr>,
@@ -375,6 +385,7 @@ pub struct IncrementalAggregatingFunc {
     retain_indefinitely: bool,
     native_schema_identity: Vec<u8>,
     native_append_only: bool,
+    event_time_expiry: Option<EventTimeExpiryRuntime>,
 }
 
 const GLOBAL_KEY: Vec<u8> = vec![];
@@ -517,6 +528,17 @@ fn native_tuple_prefix(
 fn native_expiry_key(deadline_nanos: i64, group: &[u8]) -> Result<Vec<u8>> {
     let mut key = Vec::with_capacity(9 + group.len() + 4);
     key.push(b'E');
+    key.extend_from_slice(&deadline_nanos.to_be_bytes());
+    key.extend_from_slice(&u32::try_from(group.len())?.to_be_bytes());
+    key.extend_from_slice(group);
+    Ok(key)
+}
+
+/// Event-time deadline index for a retained current result, ordered by
+/// deadline so due expirations drain in bounded pages.
+fn native_validity_key(deadline_nanos: i64, group: &[u8]) -> Result<Vec<u8>> {
+    let mut key = Vec::with_capacity(9 + group.len() + 4);
+    key.push(b'V');
     key.extend_from_slice(&deadline_nanos.to_be_bytes());
     key.extend_from_slice(&u32::try_from(group.len())?.to_be_bytes());
     key.extend_from_slice(group);
@@ -1122,6 +1144,7 @@ impl IncrementalAggregatingFunc {
         Ok(accumulator.evaluate_mut()?)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn native_process_event(
         &self,
         scope: &mut AggregateScope<'_>,
@@ -1130,6 +1153,7 @@ impl IncrementalAggregatingFunc {
         row: usize,
         retract: bool,
         row_id: Option<&[u8]>,
+        result_timestamp_nanos: Option<i64>,
     ) -> Result<()> {
         ensure!(
             !retract || !self.native_append_only,
@@ -1219,6 +1243,12 @@ impl IncrementalAggregatingFunc {
                 let old_deadline = group.last_update_nanos.saturating_add(ttl_nanos);
                 scope.delete(&native_expiry_key(old_deadline, group_key)?)?;
             }
+            if self.event_time_expiry.is_some() {
+                scope.delete(&native_validity_key(
+                    group.validity_deadline_nanos,
+                    group_key,
+                )?)?;
+            }
             if expired {
                 scope.put(&native_cleanup_key(group_key, group.generation)?, b"M")?;
             }
@@ -1275,10 +1305,28 @@ impl IncrementalAggregatingFunc {
                 }
             }
         }
+        let mut validity_deadline_nanos = if expired {
+            0
+        } else {
+            previous
+                .as_ref()
+                .map_or(0, |group| group.validity_deadline_nanos)
+        };
+        if let Some(expiry) = &self.event_time_expiry
+            && let Some(stamp) = result_timestamp_nanos
+            && !retract
+        {
+            // The retained result stays valid until the first empty closed
+            // boundary after its window: one slide past its result timestamp.
+            // Later results extend validity to their own boundary.
+            validity_deadline_nanos =
+                validity_deadline_nanos.max(stamp.saturating_add(expiry.delay_nanos));
+        }
         let next = EncodedGroup {
             last_update_nanos: now,
             generation,
             next_ordinal,
+            validity_deadline_nanos,
             accumulator_state: self.native_state_values(&mut accumulators)?,
             last_emitted: previous.and_then(|group| group.last_emitted),
         };
@@ -1288,6 +1336,12 @@ impl IncrementalAggregatingFunc {
         if !self.retain_indefinitely {
             scope.put(
                 &native_expiry_key(now.saturating_add(ttl_nanos), group_key)?,
+                &[1],
+            )?;
+        }
+        if self.event_time_expiry.is_some() && validity_deadline_nanos != 0 {
+            scope.put(
+                &native_validity_key(validity_deadline_nanos, group_key)?,
                 &[1],
             )?;
         }
@@ -1364,6 +1418,21 @@ impl IncrementalAggregatingFunc {
         } else {
             Some(native_changelog_columns(batch)?)
         };
+        let expiry_stamps = self
+            .event_time_expiry
+            .as_ref()
+            .map(|expiry| {
+                let stamps = expiry
+                    .result_timestamp_expr
+                    .evaluate(batch)?
+                    .into_array(batch.num_rows())?;
+                stamps
+                    .as_any()
+                    .downcast_ref::<TimestampNanosecondArray>()
+                    .cloned()
+                    .context("event-time expiry result timestamp is not nanosecond timestamp")
+            })
+            .transpose()?;
         let limits = store.limits();
         let fallback = self
             .aggregates
@@ -1408,8 +1477,19 @@ impl IncrementalAggregatingFunc {
             for (row, key) in keys.iter().enumerate().take(end).skip(start) {
                 let retract = changelog.is_some_and(|(flags, _)| flags.value(row));
                 let row_id = changelog.map(|(_, ids)| ids.value(row));
-                self.native_process_event(&mut scope, key, &inputs, row, retract, row_id)
-                    .await?;
+                let result_timestamp_nanos = expiry_stamps
+                    .as_ref()
+                    .and_then(|stamps| stamps.is_valid(row).then(|| stamps.value(row)));
+                self.native_process_event(
+                    &mut scope,
+                    key,
+                    &inputs,
+                    row,
+                    retract,
+                    row_id,
+                    result_timestamp_nanos,
+                )
+                .await?;
             }
             scope.commit().await?;
         }
@@ -1475,6 +1555,102 @@ impl IncrementalAggregatingFunc {
                         .checked_add(1)
                         .ok_or_else(|| anyhow!("aggregate generation overflow"))?;
                     group.next_ordinal = 0;
+                    if self.event_time_expiry.is_some() {
+                        scope.delete(&native_validity_key(
+                            group.validity_deadline_nanos,
+                            group_key,
+                        )?)?;
+                        group.validity_deadline_nanos = 0;
+                    }
+                    group.accumulator_state =
+                        self.native_state_values(&mut self.native_accumulators(None)?)?;
+                    group.last_update_nanos = now;
+                    scope.put(
+                        &storage_key,
+                        &encode_group(&group, scope.limits().value_bytes)?,
+                    )?;
+                    scope.put(&native_group_key(b'D', group_key)?, &[1])?;
+                    if self.native_has_group_keys() {
+                        scope.put(&native_live_rows_key(group_key)?, &0_u64.to_be_bytes())?;
+                    }
+                    scope.put(&native_cleanup_key(group_key, old_generation)?, b"M")?;
+                    for (index, aggregate) in self.aggregates.iter().enumerate() {
+                        if aggregate.collection {
+                            scope.delete(&native_collection_totals_key(group_key, index)?)?;
+                        }
+                    }
+                }
+            }
+            scope.delete(&key)?;
+            after = Some(key);
+            processed += 1;
+        }
+        if processed > 0 {
+            scope.commit().await?;
+        }
+        Ok(processed > 0)
+    }
+
+    /// One admitted page of due event-time result expirations. A retained
+    /// current result is retracted once the event-time watermark reaches its
+    /// stamped deadline; pages are bounded and drained like wall-clock
+    /// expiry so output and cleanup stay bounded.
+    async fn expire_native_event_time(&self, watermark_nanos: i64) -> Result<bool> {
+        if self.event_time_expiry.is_none() {
+            return Ok(false);
+        }
+        let store = self
+            .native_store
+            .as_ref()
+            .ok_or_else(|| anyhow!("native aggregate store missing"))?;
+        let operations_per_expiry = 4
+            + usize::from(self.native_has_group_keys())
+            + self.aggregates.iter().filter(|a| a.collection).count();
+        let rows_per_chunk = (store.limits().write_operations / operations_per_expiry)
+            .min(
+                store.limits().write_bytes
+                    / (operations_per_expiry * store.max_encoded_entry_bytes()),
+            )
+            .min(
+                store.limits().overlay_bytes
+                    / (operations_per_expiry
+                        * (store.limits().key_bytes + store.limits().value_bytes)),
+            )
+            .min(store.limits().page_entries);
+        ensure!(
+            rows_per_chunk > 0,
+            "native aggregate budget cannot process one event-time expiry"
+        );
+        let now = to_nanos(SystemTime::now()) as i64;
+        let mut after = None;
+        let mut scope = store.begin().await?;
+        let mut processed = 0usize;
+        while processed < rows_per_chunk {
+            let Some((key, _)) = scope.first_from(b"V", after.as_deref()).await? else {
+                break;
+            };
+            ensure!(key.len() >= 13, "invalid aggregate validity key");
+            let deadline = i64::from_be_bytes(key[1..9].try_into()?);
+            if deadline > watermark_nanos {
+                break;
+            }
+            let group_key = &key[13..];
+            let storage_key = native_group_key(b'G', group_key)?;
+            if let Some(bytes) = scope.get(&storage_key).await? {
+                let mut group = decode_group(
+                    &bytes,
+                    &self.native_state_types(),
+                    &self.native_output_types(),
+                    scope.limits().value_bytes,
+                )?;
+                if group.validity_deadline_nanos == deadline {
+                    let old_generation = group.generation;
+                    group.generation = group
+                        .generation
+                        .checked_add(1)
+                        .ok_or_else(|| anyhow!("aggregate generation overflow"))?;
+                    group.next_ordinal = 0;
+                    group.validity_deadline_nanos = 0;
                     group.accumulator_state =
                         self.native_state_values(&mut self.native_accumulators(None)?)?;
                     group.last_update_nanos = now;
@@ -1777,6 +1953,13 @@ impl IncrementalAggregatingFunc {
                                 .last_update_nanos
                                 .saturating_add(i64::try_from(self.ttl.as_nanos())?);
                             scope.delete(&native_expiry_key(deadline, &group_key)?)?;
+                        }
+                        if self.event_time_expiry.is_some() {
+                            scope.delete(&native_validity_key(
+                                group.validity_deadline_nanos,
+                                &group_key,
+                            )?)?;
+                            group.validity_deadline_nanos = 0;
                         }
                     }
                     scope.put(
@@ -2694,6 +2877,37 @@ impl ArrowOperator for IncrementalAggregatingFunc {
         Ok(())
     }
 
+    async fn handle_watermark(
+        &mut self,
+        watermark: Watermark,
+        ctx: &mut OperatorContext,
+        collector: &mut dyn Collector,
+    ) -> DataflowResult<Option<Watermark>> {
+        if self.native_config.is_some()
+            && self.event_time_expiry.is_some()
+            && let Watermark::EventTime(time) = watermark
+        {
+            let watermark_nanos = to_nanos(time);
+            let watermark_nanos = if watermark_nanos >= i64::MAX as u128 {
+                i64::MAX
+            } else {
+                watermark_nanos as i64
+            };
+            // Same-watermark ordering: preceding data batches have already
+            // refreshed group state and deadlines; emit those refreshes first,
+            // then drain each due expiry page's retractions before the next.
+            self.flush_native(ctx, collector).await?;
+            while self.expire_native_event_time(watermark_nanos).await? {
+                self.drain_native_dirty(ctx, collector).await?;
+                tokio::task::yield_now().await;
+            }
+            while self.cleanup_native().await? {
+                tokio::task::yield_now().await;
+            }
+        }
+        Ok(Some(watermark))
+    }
+
     async fn handle_checkpoint(
         &mut self,
         _: CheckpointBarrier,
@@ -2873,6 +3087,9 @@ impl IncrementalAggregatingConstructor {
         if config.retain_indefinitely == Some(true) && native_config.is_none() {
             bail!("SET updating_ttl = NULL requires worker.aggregate-state native backend limits");
         }
+        if config.event_time_expiry.is_some() && native_config.is_none() {
+            bail!("event-time result expiry requires worker.aggregate-state native backend limits");
+        }
         let mut identity = Sha256::new();
         identity.update(b"streamr.native-updating-aggregate.v1");
         identity.update(&config.aggregate_exec);
@@ -2886,6 +3103,14 @@ impl IncrementalAggregatingConstructor {
         identity.update(&config.metadata_expr);
         identity.update(config.ttl_micros.to_be_bytes());
         identity.update([u8::from(config.retain_indefinitely == Some(true))]);
+        match &config.event_time_expiry {
+            Some(expiry) => {
+                identity.update([1u8]);
+                identity.update(&expiry.result_timestamp_expr);
+                identity.update(expiry.delay_nanos.to_be_bytes());
+            }
+            None => identity.update([0u8]),
+        }
         if let Some(schema) = &config.input_schema {
             identity.update(schema.encode_to_vec());
         }
@@ -2912,6 +3137,20 @@ impl IncrementalAggregatingConstructor {
             &input_schema.schema,
             &DefaultPhysicalExtensionCodec {},
         )?;
+        let event_time_expiry = config
+            .event_time_expiry
+            .map(|expiry| -> Result<EventTimeExpiryRuntime> {
+                Ok(EventTimeExpiryRuntime {
+                    result_timestamp_expr: parse_physical_expr(
+                        &PhysicalExprNode::decode(&mut expiry.result_timestamp_expr.as_slice())?,
+                        registry.as_ref(),
+                        &input_schema.schema,
+                        &DefaultPhysicalExtensionCodec {},
+                    )?,
+                    delay_nanos: expiry.delay_nanos,
+                })
+            })
+            .transpose()?;
 
         let aggregate_exec = PhysicalPlanNode::decode(&mut config.aggregate_exec.as_ref())?;
         let PhysicalPlanType::Aggregate(aggregate_exec) =
@@ -3304,6 +3543,7 @@ impl IncrementalAggregatingConstructor {
             retain_indefinitely: config.retain_indefinitely == Some(true),
             native_schema_identity,
             native_append_only,
+            event_time_expiry,
         })
     }
 }
@@ -3517,6 +3757,7 @@ mod tests {
                 ttl_micros: 3_600_000_000,
                 retain_indefinitely: None,
                 collection_output_limits: Default::default(),
+                event_time_expiry: None,
             },
             Arc::new(registry),
         )
@@ -3669,6 +3910,7 @@ mod tests {
             ttl_micros: 3_600_000_000,
             retain_indefinitely: Some(true),
             collection_output_limits: limit.map(|limit| (0, limit)).into_iter().collect(),
+            event_time_expiry: None,
         };
         IncrementalAggregatingConstructor::build_with_native_config(
             config,
@@ -3881,6 +4123,7 @@ mod tests {
                         0,
                         false,
                         Some(&test_row_id(&old, 0)),
+                        None,
                     )
                     .await
                     .unwrap();
@@ -3937,6 +4180,7 @@ mod tests {
                                 row,
                                 false,
                                 Some(&test_row_id(&input, row)),
+                                None,
                             )
                             .await
                             .unwrap();
@@ -4297,6 +4541,7 @@ mod tests {
                     row,
                     false,
                     Some(&test_row_id(&input, row)),
+                    None,
                 )
                 .await
                 .unwrap();
@@ -4319,6 +4564,7 @@ mod tests {
                 1,
                 true,
                 Some(&test_row_id(&input, 1)),
+                None,
             )
             .await
             .unwrap();
@@ -4355,6 +4601,7 @@ mod tests {
                     row,
                     true,
                     Some(&test_row_id(&input, row)),
+                    None,
                 )
                 .await
                 .unwrap();
@@ -4451,6 +4698,7 @@ mod tests {
                         row,
                         false,
                         Some(&test_row_id(&input, row)),
+                        None,
                     )
                     .await
                     .unwrap();
@@ -4524,6 +4772,7 @@ mod tests {
                     0,
                     true,
                     Some(&test_row_id(&input, 0)),
+                    None,
                 )
                 .await
                 .unwrap();
@@ -4566,6 +4815,7 @@ mod tests {
                     0,
                     false,
                     Some(&test_row_id(&input, 0)),
+                    None,
                 )
                 .await
                 .unwrap();
@@ -4617,6 +4867,7 @@ mod tests {
                     row,
                     false,
                     Some(&test_row_id(&input, row)),
+                    None,
                 )
                 .await
                 .unwrap();
@@ -4643,6 +4894,7 @@ mod tests {
                 1,
                 true,
                 Some(&test_row_id(&input, 1)),
+                None,
             )
             .await
             .unwrap();
@@ -4700,7 +4952,8 @@ mod tests {
                     &inputs,
                     0,
                     true,
-                    Some(&test_row_id(&input, 0))
+                    Some(&test_row_id(&input, 0)),
+                    None
                 )
                 .await
                 .unwrap_err()
@@ -4715,6 +4968,7 @@ mod tests {
                 0,
                 false,
                 Some(&test_row_id(&input, 0)),
+                None,
             )
             .await
             .unwrap();
@@ -4781,6 +5035,7 @@ mod tests {
                 0,
                 true,
                 Some(&test_row_id(&input, 0)),
+                None,
             )
             .await
             .unwrap();
@@ -4835,6 +5090,7 @@ mod tests {
                 0,
                 false,
                 Some(&test_row_id(&input, 0)),
+                None,
             )
             .await
             .unwrap();
@@ -4872,6 +5128,7 @@ mod tests {
                     row,
                     false,
                     Some(&test_row_id(&input, row)),
+                    None,
                 )
                 .await
                 .unwrap();
@@ -4895,6 +5152,7 @@ mod tests {
                 0,
                 true,
                 Some(&test_row_id(&input, 0)),
+                None,
             )
             .await
             .unwrap();
@@ -4909,6 +5167,7 @@ mod tests {
                 2,
                 true,
                 Some(&test_row_id(&input, 2)),
+                None,
             )
             .await
             .unwrap();
@@ -4936,7 +5195,8 @@ mod tests {
                     &inputs,
                     0,
                     false,
-                    Some(&test_row_id(&input, 0))
+                    Some(&test_row_id(&input, 0)),
+                    None
                 )
                 .await
                 .unwrap_err()
@@ -5122,6 +5382,7 @@ mod tests {
                 last_update_nanos: to_nanos(SystemTime::now()) as i64,
                 generation: 0,
                 next_ordinal: 1,
+                validity_deadline_nanos: 0,
                 accumulator_state: operator.native_state_values(&mut accumulators).unwrap(),
                 last_emitted: Some(previous),
             },
@@ -5224,7 +5485,7 @@ mod tests {
         for row in 0..input.num_rows() {
             let mut scope = store.begin().await.unwrap();
             operator
-                .native_process_event(&mut scope, &GLOBAL_KEY, &inputs, row, false, None)
+                .native_process_event(&mut scope, &GLOBAL_KEY, &inputs, row, false, None, None)
                 .await
                 .unwrap();
             scope.commit().await.unwrap();
@@ -5297,7 +5558,7 @@ mod tests {
         for row in 0..rows.num_rows() {
             let mut scope = store.begin().await.unwrap();
             operator
-                .native_process_event(&mut scope, &GLOBAL_KEY, &inputs, row, false, None)
+                .native_process_event(&mut scope, &GLOBAL_KEY, &inputs, row, false, None, None)
                 .await
                 .unwrap();
             scope.commit().await.unwrap();
@@ -5359,7 +5620,7 @@ mod tests {
         for row in 0..first_chunk.num_rows() {
             let mut scope = store.begin().await.unwrap();
             operator
-                .native_process_event(&mut scope, &GLOBAL_KEY, &inputs, row, false, None)
+                .native_process_event(&mut scope, &GLOBAL_KEY, &inputs, row, false, None, None)
                 .await
                 .unwrap();
             scope.commit().await.unwrap();
@@ -5419,7 +5680,7 @@ mod tests {
         for row in 0..second_chunk.num_rows() {
             let mut scope = store.begin().await.unwrap();
             fresh
-                .native_process_event(&mut scope, &GLOBAL_KEY, &inputs, row, false, None)
+                .native_process_event(&mut scope, &GLOBAL_KEY, &inputs, row, false, None, None)
                 .await
                 .unwrap();
             scope.commit().await.unwrap();
@@ -5512,7 +5773,7 @@ mod tests {
         let inputs = operator.compute_inputs(&input).unwrap();
         let mut scope = store.begin().await.unwrap();
         let error = operator
-            .native_process_event(&mut scope, &GLOBAL_KEY, &inputs, 0, true, None)
+            .native_process_event(&mut scope, &GLOBAL_KEY, &inputs, 0, true, None, None)
             .await
             .unwrap_err();
         assert!(
@@ -5549,6 +5810,7 @@ mod tests {
                     row,
                     false,
                     Some(&test_row_id(&initial, row)),
+                    None,
                 )
                 .await
                 .unwrap();
@@ -5619,6 +5881,7 @@ mod tests {
                 0,
                 true,
                 Some(&test_row_id(&removed, 0)),
+                None,
             )
             .await
             .unwrap();
@@ -5655,7 +5918,7 @@ mod tests {
         let mut scope = store.begin().await.unwrap();
         for (row, id) in ids.iter().enumerate() {
             operator
-                .native_process_event(&mut scope, &GLOBAL_KEY, &inputs, row, false, Some(id))
+                .native_process_event(&mut scope, &GLOBAL_KEY, &inputs, row, false, Some(id), None)
                 .await
                 .unwrap();
         }
@@ -5666,7 +5929,15 @@ mod tests {
         let inputs = fresh.compute_inputs(&before).unwrap();
         let mut scope = store.begin().await.unwrap();
         fresh
-            .native_process_event(&mut scope, &GLOBAL_KEY, &inputs, 0, true, Some(&ids[1]))
+            .native_process_event(
+                &mut scope,
+                &GLOBAL_KEY,
+                &inputs,
+                0,
+                true,
+                Some(&ids[1]),
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -5689,7 +5960,15 @@ mod tests {
         let inputs = fresh.compute_inputs(&replacement).unwrap();
         let mut scope = store.begin().await.unwrap();
         fresh
-            .native_process_event(&mut scope, &GLOBAL_KEY, &inputs, 0, false, Some(&ids[1]))
+            .native_process_event(
+                &mut scope,
+                &GLOBAL_KEY,
+                &inputs,
+                0,
+                false,
+                Some(&ids[1]),
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -5701,7 +5980,15 @@ mod tests {
         );
         assert!(
             fresh
-                .native_process_event(&mut scope, &GLOBAL_KEY, &inputs, 0, false, Some(&ids[1]))
+                .native_process_event(
+                    &mut scope,
+                    &GLOBAL_KEY,
+                    &inputs,
+                    0,
+                    false,
+                    Some(&ids[1]),
+                    None
+                )
                 .await
                 .unwrap_err()
                 .to_string()
@@ -5720,7 +6007,7 @@ mod tests {
         let mut scope = store.begin().await.unwrap();
         for (row, id) in ids.iter().enumerate() {
             operator
-                .native_process_event(&mut scope, &GLOBAL_KEY, &inputs, row, false, Some(id))
+                .native_process_event(&mut scope, &GLOBAL_KEY, &inputs, row, false, Some(id), None)
                 .await
                 .unwrap();
         }
@@ -5731,7 +6018,15 @@ mod tests {
         let inputs = fresh.compute_inputs(&before_a).unwrap();
         let mut scope = store.begin().await.unwrap();
         fresh
-            .native_process_event(&mut scope, &GLOBAL_KEY, &inputs, 0, true, Some(&ids[0]))
+            .native_process_event(
+                &mut scope,
+                &GLOBAL_KEY,
+                &inputs,
+                0,
+                true,
+                Some(&ids[0]),
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -5747,7 +6042,15 @@ mod tests {
         let inputs = fresh.compute_inputs(&before_b).unwrap();
         let mut scope = store.begin().await.unwrap();
         fresh
-            .native_process_event(&mut scope, &GLOBAL_KEY, &inputs, 0, true, Some(&ids[1]))
+            .native_process_event(
+                &mut scope,
+                &GLOBAL_KEY,
+                &inputs,
+                0,
+                true,
+                Some(&ids[1]),
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -5780,7 +6083,7 @@ mod tests {
         let inputs = operator.compute_inputs(&first).unwrap();
         let mut scope = store.begin().await.unwrap();
         operator
-            .native_process_event(&mut scope, &left, &inputs, 0, false, Some(&id))
+            .native_process_event(&mut scope, &left, &inputs, 0, false, Some(&id), None)
             .await
             .unwrap();
         scope.commit().await.unwrap();
@@ -5791,11 +6094,11 @@ mod tests {
         let after_inputs = operator.compute_inputs(&after).unwrap();
         let mut scope = store.begin().await.unwrap();
         operator
-            .native_process_event(&mut scope, &left, &before_inputs, 0, true, Some(&id))
+            .native_process_event(&mut scope, &left, &before_inputs, 0, true, Some(&id), None)
             .await
             .unwrap();
         operator
-            .native_process_event(&mut scope, &right, &after_inputs, 0, false, Some(&id))
+            .native_process_event(&mut scope, &right, &after_inputs, 0, false, Some(&id), None)
             .await
             .unwrap();
         assert!(!operator.native_group_is_live(&scope, &left).await.unwrap());
@@ -5825,6 +6128,7 @@ mod tests {
                 0,
                 false,
                 Some(&test_row_id(&first, 0)),
+                None,
             )
             .await
             .unwrap();
@@ -5836,6 +6140,7 @@ mod tests {
                 0,
                 false,
                 Some(&test_row_id(&tied, 0)),
+                None,
             )
             .await
             .unwrap();
@@ -5870,6 +6175,7 @@ mod tests {
                 0,
                 true,
                 Some(&test_row_id(&first, 0)),
+                None,
             )
             .await
             .unwrap();
@@ -5904,6 +6210,7 @@ mod tests {
                     row,
                     false,
                     Some(&test_row_id(&rows, row)),
+                    None,
                 )
                 .await
                 .unwrap();
@@ -5954,6 +6261,7 @@ mod tests {
                     row,
                     false,
                     Some(&test_row_id(&rows, row)),
+                    None,
                 )
                 .await
                 .unwrap();
@@ -5987,6 +6295,7 @@ mod tests {
                     last_update_nanos: 0,
                     generation: 0,
                     next_ordinal: 0,
+                    validity_deadline_nanos: 0,
                     accumulator_state: state.clone(),
                     last_emitted: None,
                 },
@@ -6031,6 +6340,302 @@ mod tests {
                     .is_some()
             );
         }
+    }
+
+    // A keyed current-result aggregate with event-time validity: the group
+    // key is an opaque Utf8 row and the result timestamp is the event-time
+    // column, matching the planner's selected composition lowering.
+    fn event_time_expiry_operator() -> (IncrementalAggregatingFunc, Vec<u8>) {
+        let mut operator = native_append_only_operator();
+        let mut fields = operator.schema_without_metadata.fields().to_vec();
+        fields.insert(0, Arc::new(Field::new("group_key", DataType::Utf8, false)));
+        operator.schema_without_metadata = Arc::new(Schema::new(fields));
+        operator.key_converter = RowConverter::new(vec![SortField::new_with_options(
+            DataType::Utf8,
+            SortOptions::default(),
+        )])
+        .unwrap();
+        operator.event_time_expiry = Some(EventTimeExpiryRuntime {
+            result_timestamp_expr: Arc::new(Column::new(TIMESTAMP_FIELD, 3)),
+            delay_nanos: 2,
+        });
+        operator.native_store = Some(native_test_store());
+        let group_rows = operator
+            .key_converter
+            .convert_columns(&[Arc::new(StringArray::from(vec!["keyA"]))])
+            .unwrap();
+        let group = group_rows.iter().next().unwrap().as_ref().to_vec();
+        (operator, group)
+    }
+
+    #[test]
+    fn event_time_expiry_requires_native_aggregate_state() {
+        let (mut config, registry) = native_config();
+        config.event_time_expiry = Some(arroyo_rpc::grpc::api::EventTimeExpiry {
+            result_timestamp_expr: serialize_physical_expr(
+                &(Arc::new(Column::new(TIMESTAMP_FIELD, 3)) as Arc<dyn PhysicalExpr>),
+                &DefaultPhysicalExtensionCodec {},
+            )
+            .unwrap()
+            .encode_to_vec(),
+            delay_nanos: 2,
+        });
+        let error = match IncrementalAggregatingConstructor::build_with_native_config(
+            config, registry, None,
+        ) {
+            Ok(_) => panic!("event-time expiry must reject non-native aggregate state"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("event-time result expiry"),
+            "received {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn event_time_expiry_retracts_only_after_the_watermark_reaches_the_deadline() {
+        let (operator, group) = event_time_expiry_operator();
+        // A result stamped at event time 10 stays valid through the first
+        // empty closed boundary at 12: one slide past its timestamp.
+        let input = batch_at(&[Some("v")], &[1], &[10]);
+        let inputs = operator.compute_inputs(&input).unwrap();
+        {
+            let store = operator.native_store.as_ref().unwrap();
+            let mut scope = store.begin_point().await.unwrap();
+            operator
+                .native_process_event(
+                    &mut scope,
+                    &group,
+                    &inputs,
+                    0,
+                    false,
+                    Some(&test_row_id(&input, 0)),
+                    Some(10),
+                )
+                .await
+                .unwrap();
+            scope.commit().await.unwrap();
+            let scope = store.begin().await.unwrap();
+            let retained = decode_group(
+                &scope
+                    .get(&native_group_key(b'G', &group).unwrap())
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                &operator.native_state_types(),
+                &operator.native_output_types(),
+                scope.limits().value_bytes,
+            )
+            .unwrap();
+            assert_eq!(retained.validity_deadline_nanos, 12);
+            assert!(
+                scope
+                    .get(&native_validity_key(12, &group).unwrap())
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+        }
+        // No watermark progress leaves the pending expiry untouched; only
+        // event time applies it. A watermark before the boundary is not due.
+        assert!(!operator.expire_native_event_time(11).await.unwrap());
+        {
+            let store = operator.native_store.as_ref().unwrap();
+            let scope = store.begin().await.unwrap();
+            assert_eq!(
+                decode_group(
+                    &scope
+                        .get(&native_group_key(b'G', &group).unwrap())
+                        .await
+                        .unwrap()
+                        .unwrap(),
+                    &operator.native_state_types(),
+                    &operator.native_output_types(),
+                    scope.limits().value_bytes,
+                )
+                .unwrap()
+                .validity_deadline_nanos,
+                12
+            );
+        }
+        assert!(operator.expire_native_event_time(12).await.unwrap());
+        // Repeated watermark advances must not repeat the transition.
+        assert!(!operator.expire_native_event_time(12).await.unwrap());
+        assert!(!operator.expire_native_event_time(13).await.unwrap());
+        let store = operator.native_store.as_ref().unwrap();
+        let scope = store.begin().await.unwrap();
+        let expired = decode_group(
+            &scope
+                .get(&native_group_key(b'G', &group).unwrap())
+                .await
+                .unwrap()
+                .unwrap(),
+            &operator.native_state_types(),
+            &operator.native_output_types(),
+            scope.limits().value_bytes,
+        )
+        .unwrap();
+        assert_eq!(expired.validity_deadline_nanos, 0);
+        assert_eq!(expired.generation, 1);
+        assert_eq!(
+            scope
+                .get(&native_live_rows_key(&group).unwrap())
+                .await
+                .unwrap()
+                .unwrap(),
+            0_u64.to_be_bytes()
+        );
+        assert!(
+            scope
+                .get(&native_validity_key(12, &group).unwrap())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            scope
+                .get(&native_group_key(b'D', &group).unwrap())
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn event_time_expiry_deadlines_survive_restore_and_apply_on_resumed_watermarks() {
+        let (mut operator, group) = event_time_expiry_operator();
+        let input = batch_at(&[Some("v")], &[1], &[10]);
+        let inputs = operator.compute_inputs(&input).unwrap();
+        {
+            let store = operator.native_store.as_ref().unwrap();
+            let mut scope = store.begin_point().await.unwrap();
+            operator
+                .native_process_event(
+                    &mut scope,
+                    &group,
+                    &inputs,
+                    0,
+                    false,
+                    Some(&test_row_id(&input, 0)),
+                    Some(10),
+                )
+                .await
+                .unwrap();
+            scope.commit().await.unwrap();
+        }
+        // A fresh operator over the restored store owns the same pending
+        // expiry: the deadline and its index entries are persistent state.
+        let mut fresh = event_time_expiry_operator().0;
+        fresh.native_store = operator.native_store.take();
+        assert!(!fresh.expire_native_event_time(11).await.unwrap());
+        assert!(fresh.expire_native_event_time(12).await.unwrap());
+        let store = fresh.native_store.as_ref().unwrap();
+        let scope = store.begin().await.unwrap();
+        let restored = decode_group(
+            &scope
+                .get(&native_group_key(b'G', &group).unwrap())
+                .await
+                .unwrap()
+                .unwrap(),
+            &fresh.native_state_types(),
+            &fresh.native_output_types(),
+            scope.limits().value_bytes,
+        )
+        .unwrap();
+        assert_eq!(restored.validity_deadline_nanos, 0);
+        assert!(
+            scope
+                .get(&native_validity_key(12, &group).unwrap())
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn event_time_watermark_emits_refresh_before_the_expiry_retraction() {
+        let (mut operator, group) = event_time_expiry_operator();
+        let mut values: Vec<FieldRef> = operator.schema_without_metadata.fields().to_vec();
+        values.push(Arc::new(Field::new(
+            UPDATING_META_FIELD,
+            DataType::Struct(updating_meta_fields()),
+            false,
+        )));
+        let output_schema = Arc::new(Schema::new(values));
+        let id = ScalarValue::FixedSizeBinary(16, Some(vec![7; 16]))
+            .to_array()
+            .unwrap();
+        let metadata = StructArray::new(
+            updating_meta_fields(),
+            vec![Arc::new(BooleanArray::from(vec![false])), id],
+            None,
+        );
+        operator.metadata_expr = Arc::new(Literal::new(ScalarValue::Struct(Arc::new(metadata))));
+        let input = batch_at(&[Some("v")], &[1], &[10]);
+        let inputs = operator.compute_inputs(&input).unwrap();
+        {
+            let store = operator.native_store.as_ref().unwrap();
+            let mut scope = store.begin_point().await.unwrap();
+            operator
+                .native_process_event(
+                    &mut scope,
+                    &group,
+                    &inputs,
+                    0,
+                    false,
+                    Some(&test_row_id(&input, 0)),
+                    Some(10),
+                )
+                .await
+                .unwrap();
+            scope.commit().await.unwrap();
+        }
+        let (control_tx, _control_rx) = tokio::sync::mpsc::channel(16);
+        let mut ctx = OperatorContext::new(
+            Arc::new(arroyo_types::get_test_task_info()),
+            None,
+            control_tx,
+            1,
+            vec![Arc::new(
+                ArroyoSchema::from_schema_unkeyed(input.schema()).unwrap(),
+            )],
+            Some(Arc::new(
+                ArroyoSchema::from_schema_unkeyed(output_schema).unwrap(),
+            )),
+            HashMap::new(),
+        )
+        .await;
+        let mut collector = AggregateCollector::default();
+        let watermark = Watermark::EventTime(SystemTime::UNIX_EPOCH + Duration::from_nanos(12));
+        let forwarded = operator
+            .handle_watermark(watermark, &mut ctx, &mut collector)
+            .await
+            .unwrap();
+        assert_eq!(
+            forwarded,
+            Some(Watermark::EventTime(
+                SystemTime::UNIX_EPOCH + Duration::from_nanos(12)
+            ))
+        );
+        // The data refresh is emitted first, then the expiry retraction; a
+        // later watermark emits nothing more.
+        assert_eq!(collector.batches.len(), 2);
+        let (refresh_retracts, _) = native_changelog_columns(&collector.batches[0]).unwrap();
+        let (expiry_retracts, _) = native_changelog_columns(&collector.batches[1]).unwrap();
+        assert_eq!(refresh_retracts.len(), 1);
+        assert!(!refresh_retracts.value(0));
+        assert_eq!(expiry_retracts.len(), 1);
+        assert!(expiry_retracts.value(0));
+        let mut collector = AggregateCollector::default();
+        operator
+            .handle_watermark(
+                Watermark::EventTime(SystemTime::UNIX_EPOCH + Duration::from_nanos(13)),
+                &mut ctx,
+                &mut collector,
+            )
+            .await
+            .unwrap();
+        assert!(collector.batches.is_empty());
     }
 
     fn batch(values: &[Option<&str>], sequence: &[i64], include: &[Option<bool>]) -> RecordBatch {
