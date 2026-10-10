@@ -1,5 +1,12 @@
 # Milestone 3 — agent backlog
 
+## STR-101 post-merge ordered collection repair — 2026-10-11
+
+- STR-32 unchanged full12 session reproduction fails construction on merged main682bea0d: ordered ARRAY_AGG paired partial states excluded by bounded instant-window admission. OriginalPR33 merged; generic fixture passes did not cover this reproduction.
+- Root coordinator/checkpoint_reader implementer; branch agent/str-101-ordered-instant-repair-20261011, fetched base682bea0d0955be2e021fe475b25228f3dacf7d5f. Instructions AGENTS.md, .claude/build-test.md/.claude/team.md, this ledger/feature plan and current STR101. Clear guard explicitly excludes historical merged PR33 branch.
+- Acceptance: preserve existing SQL/order/filter/strict closure/checkpoint contracts; account aligned value/order state and merge scratch, focused generic regressions, independent review, required container gates and unchanged application all8 backend/protocol/batch cases. No budget increase/new semantics.
+- Implemented shared admission/accounting for paired ordered ARRAY_AGG partial states and sorting scratch; original DataFusion final plan unchanged. Fresh independent source/test correction review approved. Locked worker/SQL check passed; first unit compile exposed two test-only type errors, repaired/reviewed. Window test rerun active; strict Clippy/fmt, preserved SQL pin and unchanged application8/profile25eight remain next. Evidence /home/jason/qa-evidence/str32-post-merge-20261011/; failed attempts retained. Heavy capacity/fault/backfill and full profile lifecycle remain STR32 gaps.
+
 ## Active STR-102 — 2026-10-10
 
 - Coordinator Codex `/root`, implementer `/root/implement`; branch
