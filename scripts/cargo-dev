@@ -19,6 +19,9 @@ if [[ "$1" == --build ]]; then
     mkdir "$build_context/docker"
     cp "$repo_dir/docker/cargo-dev-config.toml" "$build_context/docker/"
     cp "$repo_dir/docker/rustc-cache" "$build_context/docker/"
+    cp "$repo_dir/docker/build-rocksdb-prebuilt" "$build_context/docker/"
+    cp "$repo_dir/docker/rocksdb-prebuilt.json" "$build_context/docker/"
+    cp "$repo_dir/Cargo.lock" "$build_context/"
     cp "$repo_dir/Dockerfile.dev" "$build_context/Dockerfile.dev"
     "$repo_dir/scripts/rust-build" podman build \
         -f "$build_context/Dockerfile.dev" -t "$image" "$build_context"
@@ -39,12 +42,35 @@ else
     echo 'Build the dev image first: scripts/cargo-dev --build' >&2
     exit "$image_status"
 fi
+image_pin="$(podman image inspect --format '{{ index .Labels "io.streamr.rocksdb.pin" }}' "$image")"
+native_compile="$(python3 "$repo_dir/docker/rocksdb-build-mode.py" "$repo_dir" "$image_pin" "$@")"
+incremental_override=()
+if [[ -n "${CARGO_INCREMENTAL+x}" ]]; then
+    incremental_override=(-e "CARGO_INCREMENTAL=$CARGO_INCREMENTAL")
+fi
+native_overrides=()
+while IFS= read -r variable; do
+    case "$variable" in
+        CARGO_PROFILE_*|RUSTFLAGS|CARGO_ENCODED_RUSTFLAGS|CARGO_BUILD_TARGET|CC|CXX|CFLAGS|CXXFLAGS|ROCKSDB_CXX_STD)
+            native_overrides+=(-e "$variable=${!variable}")
+            ;;
+    esac
+done < <(compgen -e)
+shared_target="$repo_dir/target"
+if common_git_dir="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"; then
+    shared_target="$(dirname -- "$common_git_dir")/target"
+fi
 exec "$repo_dir/scripts/rust-build" podman run --rm \
     -w /app \
     -e CARGO_TARGET_DIR=/app/target/milestone2-runtime \
-    -e CARGO_INCREMENTAL=0 \
+    -e "CARGO_PROFILE_DEV_INCREMENTAL=${CARGO_PROFILE_DEV_INCREMENTAL:-true}" \
+    -e "CARGO_PROFILE_TEST_INCREMENTAL=${CARGO_PROFILE_TEST_INCREMENTAL:-true}" \
+    -e "ROCKSDB_COMPILE=$native_compile" \
+    "${incremental_override[@]}" \
+    "${native_overrides[@]}" \
     -e "CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-4}" \
     -v "$repo_dir:/app:z" \
+    -v "$shared_target:/app/target:z" \
     -v streamr-cargo-registry:/usr/local/cargo/registry \
     -v streamr-cargo-git:/usr/local/cargo/git \
     -v streamr-sccache:/var/cache/sccache \
