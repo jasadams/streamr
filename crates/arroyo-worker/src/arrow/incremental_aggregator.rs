@@ -1,3 +1,7 @@
+#[path = "calendar_native.rs"]
+mod calendar_native;
+use calendar_native::{CalendarAggregate, CalendarContributionChange, CalendarInput};
+
 use crate::arrow::aggregate_codec::{EncodedGroup, decode_group, encode_group};
 use crate::arrow::aggregate_store::{AggregateScope, AggregateStore, AggregateStoreLimits};
 use crate::arrow::decode_aggregate;
@@ -65,6 +69,16 @@ use tracing::log::warn;
 struct BatchData {
     count: u64,
     generation: u64,
+}
+
+/// One accepted contribution with its raw row clock and calendar inputs.
+struct NativeCalendarEvent<'a> {
+    group_key: &'a [u8],
+    inputs: &'a [AggregateInput],
+    row: usize,
+    retract: bool,
+    row_id: Option<&'a [u8]>,
+    calendar_inputs: &'a [CalendarInput],
 }
 
 /// One indexed aggregate member change within an admitted state scope.
@@ -375,6 +389,7 @@ pub struct IncrementalAggregatingFunc {
     retain_indefinitely: bool,
     native_schema_identity: Vec<u8>,
     native_append_only: bool,
+    calendars: Vec<CalendarAggregate>,
 }
 
 const GLOBAL_KEY: Vec<u8> = vec![];
@@ -1122,6 +1137,7 @@ impl IncrementalAggregatingFunc {
         Ok(accumulator.evaluate_mut()?)
     }
 
+    #[cfg(test)]
     async fn native_process_event(
         &self,
         scope: &mut AggregateScope<'_>,
@@ -1131,6 +1147,33 @@ impl IncrementalAggregatingFunc {
         retract: bool,
         row_id: Option<&[u8]>,
     ) -> Result<()> {
+        self.native_process_calendar_event(
+            scope,
+            NativeCalendarEvent {
+                group_key,
+                inputs,
+                row,
+                retract,
+                row_id,
+                calendar_inputs: &[],
+            },
+        )
+        .await
+    }
+
+    async fn native_process_calendar_event(
+        &self,
+        scope: &mut AggregateScope<'_>,
+        event: NativeCalendarEvent<'_>,
+    ) -> Result<()> {
+        let NativeCalendarEvent {
+            group_key,
+            inputs,
+            row,
+            retract,
+            row_id,
+            calendar_inputs,
+        } = event;
         ensure!(
             !retract || !self.native_append_only,
             "append-only native aggregate received a retraction",
@@ -1223,8 +1266,78 @@ impl IncrementalAggregatingFunc {
                 scope.put(&native_cleanup_key(group_key, group.generation)?, b"M")?;
             }
         }
+        let mut calendar_families = HashMap::new();
         for (index, (input, state)) in inputs.iter().zip(accumulators.iter_mut()).enumerate() {
-            let Some(values) = input.selected_values(Some(row))? else {
+            let calendar = self
+                .calendars
+                .iter()
+                .enumerate()
+                .find(|(_, calendar)| calendar.aggregate_index == index);
+            let contribution_day = calendar
+                .map(|(position, _)| calendar_inputs[position].contribution_day(row))
+                .transpose()?
+                .flatten();
+            let selected = input.selected_values(Some(row))?;
+            let storage_index = calendar.map_or(index, |(_, calendar)| calendar.storage_index);
+            let family_already_changed =
+                calendar.is_some() && calendar_families.contains_key(&storage_index);
+            let (selected, contribution_day) =
+                if let Some(original) = calendar_families.get(&storage_index) {
+                    let original: &(Option<Vec<ArrayRef>>, Option<i32>) = original;
+                    original.clone()
+                } else if !self.calendars.is_empty()
+                    && self.aggregates[index].accumulator_type == AccumulatorType::Sliding
+                {
+                    self.calendar_original_input(
+                        scope,
+                        CalendarContributionChange {
+                            group: group_key,
+                            generation,
+                            index: storage_index,
+                            row_id,
+                            retract,
+                            selected,
+                            day: contribution_day,
+                            argument_types: input
+                                .values
+                                .iter()
+                                .map(|value| value.data_type().clone())
+                                .collect(),
+                        },
+                    )
+                    .await?
+                } else {
+                    (selected, contribution_day)
+                };
+            if let Some((position, calendar)) = calendar {
+                if !family_already_changed {
+                    if let (Some(values), Some(day)) = (&selected, contribution_day) {
+                        self.calendar_bucket_delta(
+                            scope,
+                            calendar,
+                            day,
+                            NativeMemberChange {
+                                group: group_key,
+                                generation,
+                                aggregate_index: index,
+                                values,
+                                retract,
+                                ordinal,
+                                row_id,
+                            },
+                        )
+                        .await?;
+                    }
+                    calendar_families.insert(storage_index, (selected.clone(), contribution_day));
+                }
+                let reference = calendar_inputs[position].reference_day(row)?;
+                self.calendar_set_reference(scope, group_key, generation, calendar, reference)?;
+                *state = self
+                    .calendar_recalculate(scope, group_key, generation, calendar, reference)
+                    .await?;
+                continue;
+            }
+            let Some(values) = selected else {
                 continue;
             };
             match state {
@@ -1274,6 +1387,17 @@ impl IncrementalAggregatingFunc {
                     );
                 }
             }
+        }
+        if !self.calendars.is_empty() {
+            let reference = calendar_inputs
+                .iter()
+                .map(|input| input.reference_day(row))
+                .collect::<Result<Vec<_>>>()?
+                .into_iter()
+                .min()
+                .context("calendar aggregate reference is missing")?;
+            self.calendar_schedule(scope, group_key, generation, reference)
+                .await?;
         }
         let next = EncodedGroup {
             last_update_nanos: now,
@@ -1328,6 +1452,7 @@ impl IncrementalAggregatingFunc {
             vec![GLOBAL_KEY; batch.num_rows()]
         };
         let inputs = self.compute_inputs(batch)?;
+        let calendar_inputs = self.calendar_inputs(batch)?;
         let input_working_bytes = inputs.iter().try_fold(0usize, |total, input| {
             let total = input.values.iter().try_fold(total, |total, value| {
                 total.checked_add(value.get_array_memory_size())
@@ -1339,7 +1464,13 @@ impl IncrementalAggregatingFunc {
                     .map_or(0, |filter| filter.get_array_memory_size()),
             )
         });
+        let calendar_bytes = calendar_inputs.iter().fold(0usize, |bytes, input| {
+            bytes
+                .saturating_add(input.contribution.get_array_memory_size())
+                .saturating_add(input.reference.get_array_memory_size())
+        });
         let input_working_bytes = input_working_bytes
+            .and_then(|bytes| bytes.checked_add(calendar_bytes))
             .and_then(|total| {
                 keys.iter()
                     .try_fold(total, |total, key| total.checked_add(key.len()))
@@ -1379,6 +1510,7 @@ impl IncrementalAggregatingFunc {
             .checked_add(fallback.saturating_mul(2))
             .and_then(|value| value.checked_add(collections.saturating_mul(2)))
             .and_then(|value| value.checked_add(3 * usize::from(!self.retain_indefinitely)))
+            .and_then(|value| value.checked_add(self.calendar_write_operations()))
             .ok_or_else(|| anyhow!("native aggregate operation count overflow"))?;
         let worst_overlay_bytes = worst_operations
             .checked_mul(limits.key_bytes.saturating_add(limits.value_bytes))
@@ -1400,7 +1532,7 @@ impl IncrementalAggregatingFunc {
             // and TTL rollover) also use only keyed reads and this owner's overlay.
             let has_retracts =
                 changelog.is_some_and(|(flags, _)| (start..end).any(|row| flags.value(row)));
-            let mut scope = if fallback == 0 || !has_retracts {
+            let mut scope = if self.calendars.is_empty() && (fallback == 0 || !has_retracts) {
                 store.begin_point().await?
             } else {
                 store.begin().await?
@@ -1408,8 +1540,18 @@ impl IncrementalAggregatingFunc {
             for (row, key) in keys.iter().enumerate().take(end).skip(start) {
                 let retract = changelog.is_some_and(|(flags, _)| flags.value(row));
                 let row_id = changelog.map(|(_, ids)| ids.value(row));
-                self.native_process_event(&mut scope, key, &inputs, row, retract, row_id)
-                    .await?;
+                self.native_process_calendar_event(
+                    &mut scope,
+                    NativeCalendarEvent {
+                        group_key: key,
+                        inputs: &inputs,
+                        row,
+                        retract,
+                        row_id,
+                        calendar_inputs: &calendar_inputs,
+                    },
+                )
+                .await?;
             }
             scope.commit().await?;
         }
@@ -1518,7 +1660,13 @@ impl IncrementalAggregatingFunc {
         let group = &cleanup_key[5..group_end];
         let generation = u64::from_be_bytes(cleanup_key[group_end..].try_into()?);
         ensure!(
-            phase == b"M" || phase == b"R" || phase == b"T",
+            phase == b"M"
+                || phase == b"R"
+                || phase == b"B"
+                || phase == b"J"
+                || phase == b"Q"
+                || phase == b"U"
+                || phase == b"T",
             "invalid aggregate cleanup phase"
         );
         if phase == b"T" {
@@ -1584,11 +1732,36 @@ impl IncrementalAggregatingFunc {
             max_entries > 0,
             "native aggregate cleanup requires two write operations"
         );
+        let max_entries = if phase == b"U" {
+            max_entries / 2
+        } else {
+            max_entries
+        };
+        ensure!(
+            max_entries > 0,
+            "calendar cleanup cannot admit a due pointer"
+        );
         for _ in 0..max_entries {
             let Some((key, _)) = scope.first_from(&prefix, after.as_deref()).await? else {
                 exhausted = true;
                 break;
             };
+            if phase == b"U" {
+                let value = scope
+                    .get(&key)
+                    .await?
+                    .context("calendar due pointer is missing")?;
+                ensure!(value.len() == 8, "invalid calendar due pointer");
+                let deadline = i64::from_be_bytes(value.as_slice().try_into()?);
+                let due_key = calendar_native::calendar_due_key(deadline, group)?;
+                if scope
+                    .get(&due_key)
+                    .await?
+                    .is_some_and(|value| value == generation.to_be_bytes())
+                {
+                    scope.delete(&due_key)?;
+                }
+            }
             scope.delete(&key)?;
             after = Some(key);
         }
@@ -1596,7 +1769,14 @@ impl IncrementalAggregatingFunc {
             if phase == b"M" {
                 scope.put(&cleanup_key, b"R")?;
             } else {
-                scope.put(&cleanup_key, b"T")?;
+                let next = match phase.as_slice() {
+                    b"R" if !self.calendars.is_empty() => b"B",
+                    b"B" => b"J",
+                    b"J" => b"Q",
+                    b"Q" => b"U",
+                    _ => b"T",
+                };
+                scope.put(&cleanup_key, next)?;
             }
         }
         scope.commit().await?;
@@ -1862,6 +2042,7 @@ impl IncrementalAggregatingFunc {
             )
             .and_then(|count| count.checked_add(collections.saturating_mul(2)))
             .and_then(|count| count.checked_add(3 * usize::from(!self.retain_indefinitely)))
+            .and_then(|count| count.checked_add(self.calendar_write_operations()))
             .context("aggregate operation count overflow")?;
         ensure!(
             limits.write_operations >= required_operations
@@ -2892,6 +3073,19 @@ impl IncrementalAggregatingConstructor {
         if let Some(schema) = &config.final_schema {
             identity.update(schema.encode_to_vec());
         }
+        if !config.calendar_aggregates.is_empty() {
+            identity.update(b"\0calendar-day-state.v1");
+            identity.update(u64::try_from(config.calendar_aggregates.len())?.to_be_bytes());
+            for descriptor in &config.calendar_aggregates {
+                let encoded = descriptor.encode_to_vec();
+                identity.update(u64::try_from(encoded.len())?.to_be_bytes());
+                identity.update(encoded);
+            }
+        }
+        ensure!(
+            config.calendar_aggregates.is_empty() || native_config.is_some(),
+            "maintained calendar FILTER requires worker.aggregate-state native backend limits"
+        );
         let ttl = Duration::from_micros(if config.ttl_micros == 0 {
             warn!("ttl was not set for updating aggregate");
             24 * 60 * 60 * 1000 * 1000
@@ -3209,6 +3403,13 @@ impl IncrementalAggregatingConstructor {
             )
             .collect::<Result<_>>()?;
 
+        let calendars = CalendarAggregate::decode(
+            &config.calendar_aggregates,
+            &aggregates,
+            &input_schema.schema,
+            registry.as_ref(),
+        )?;
+
         // Only the append-only ordinary-state layout is new. Preserve existing
         // checkpoint identity for unchanged native COUNT/SUM/AVG and changelog
         // index formats while rejecting old indexed checkpoints for this layout.
@@ -3304,6 +3505,7 @@ impl IncrementalAggregatingConstructor {
             retain_indefinitely: config.retain_indefinitely == Some(true),
             native_schema_identity,
             native_append_only,
+            calendars,
         })
     }
 }
@@ -3517,6 +3719,7 @@ mod tests {
                 ttl_micros: 3_600_000_000,
                 retain_indefinitely: None,
                 collection_output_limits: Default::default(),
+                calendar_aggregates: Vec::new(),
             },
             Arc::new(registry),
         )
@@ -3669,12 +3872,522 @@ mod tests {
             ttl_micros: 3_600_000_000,
             retain_indefinitely: Some(true),
             collection_output_limits: limit.map(|limit| (0, limit)).into_iter().collect(),
+            calendar_aggregates: Vec::new(),
         };
         IncrementalAggregatingConstructor::build_with_native_config(
             config,
             Arc::new(registry),
             Some(native_test_config()),
         )
+    }
+
+    fn native_calendar_operator() -> IncrementalAggregatingFunc {
+        use arroyo_rpc::grpc::api::CalendarAggregateDescriptor;
+        let (mut config, registry) = native_config();
+        let mut plan = PhysicalPlanNode::decode(config.aggregate_exec.as_slice()).unwrap();
+        let Some(PhysicalPlanType::Aggregate(aggregate)) = &mut plan.physical_plan_type else {
+            panic!("expected aggregate");
+        };
+        aggregate.aggr_expr[7] = aggregate.aggr_expr[6].clone();
+        aggregate.aggr_expr_name[7] = "selected_week".into();
+        aggregate.filter_expr[7] = aggregate.filter_expr[6].clone();
+        let static_filter = aggregate.filter_expr[6]
+            .expr
+            .as_ref()
+            .map(|expression| expression.encode_to_vec());
+        config.aggregate_exec = plan.encode_to_vec();
+        let schema: ArroyoSchema = config.final_schema.take().unwrap().try_into().unwrap();
+        let mut fields = schema.schema.fields().to_vec();
+        fields[7] = Arc::new(fields[6].as_ref().clone().with_name("selected_week"));
+        config.final_schema = Some(
+            ArroyoSchema::from_schema_unkeyed(Arc::new(Schema::new(fields)))
+                .unwrap()
+                .into(),
+        );
+        let codec = DefaultPhysicalExtensionCodec {};
+        let date: Arc<dyn PhysicalExpr> = Arc::new(Literal::new(ScalarValue::Date32(Some(200))));
+        let one: Arc<dyn PhysicalExpr> = Arc::new(Literal::new(ScalarValue::Int64(Some(1))));
+        for (index, horizon) in [(6, 1), (7, 7)] {
+            config
+                .calendar_aggregates
+                .push(CalendarAggregateDescriptor {
+                    aggregate_index: index,
+                    horizon_days: horizon,
+                    argument: serialize_physical_expr(&one, &codec)
+                        .unwrap()
+                        .encode_to_vec(),
+                    static_filter: static_filter.clone(),
+                    contribution_date: serialize_physical_expr(&date, &codec)
+                        .unwrap()
+                        .encode_to_vec(),
+                    reference_date: serialize_physical_expr(&date, &codec)
+                        .unwrap()
+                        .encode_to_vec(),
+                    context_id: "generic-test-clock".into(),
+                });
+        }
+        config.retain_indefinitely = Some(true);
+        let mut input_fields = SchemaBuilder::from(input_schema().as_ref().clone());
+        input_fields.push(Field::new(
+            UPDATING_META_FIELD,
+            DataType::Struct(updating_meta_fields()),
+            false,
+        ));
+        config.input_schema = Some(
+            ArroyoSchema::from_schema_unkeyed(Arc::new(input_fields.finish()))
+                .unwrap()
+                .into(),
+        );
+        let mut operator = IncrementalAggregatingConstructor::build_with_native_config(
+            config,
+            registry,
+            Some(native_test_config()),
+        )
+        .unwrap();
+        operator.native_store = Some(native_test_store());
+        operator
+    }
+
+    async fn calendar_test_event(
+        operator: &mut IncrementalAggregatingFunc,
+        day: i32,
+        reference: i32,
+        include: Option<bool>,
+        retract: bool,
+        id: &[u8],
+    ) {
+        let input = batch(&[Some("value")], &[1], &[include]);
+        for calendar in &mut operator.calendars {
+            calendar.test_dates(day, reference);
+        }
+        let calendar_inputs = operator.calendar_inputs(&input).unwrap();
+        let inputs = operator.compute_inputs(&input).unwrap();
+        let store = operator.native_store.as_ref().unwrap();
+        let mut scope = store.begin().await.unwrap();
+        operator
+            .native_process_calendar_event(
+                &mut scope,
+                NativeCalendarEvent {
+                    group_key: &GLOBAL_KEY,
+                    inputs: &inputs,
+                    row: 0,
+                    retract,
+                    row_id: Some(id),
+                    calendar_inputs: &calendar_inputs,
+                },
+            )
+            .await
+            .unwrap();
+        scope.commit().await.unwrap();
+    }
+
+    async fn calendar_test_values(operator: &IncrementalAggregatingFunc) -> Vec<ScalarValue> {
+        let scope = operator
+            .native_store
+            .as_ref()
+            .unwrap()
+            .begin()
+            .await
+            .unwrap();
+        let bytes = scope
+            .get(&native_group_key(b'G', &GLOBAL_KEY).unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        let group = decode_group(
+            &bytes,
+            &operator.native_state_types(),
+            &operator.native_output_types(),
+            scope.limits().value_bytes,
+        )
+        .unwrap();
+        let mut state = operator.native_accumulators(Some(&group)).unwrap();
+        [5, 6, 7]
+            .into_iter()
+            .map(|index| state[index].evaluate().unwrap())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn calendar_shared_day_buckets_use_raw_reference_and_keep_lifetime() {
+        let mut operator = native_calendar_operator();
+        assert_eq!(
+            operator.calendars[0].storage_index,
+            operator.calendars[1].storage_index
+        );
+        for (ordinal, day) in [194, 193, 200, 201].into_iter().enumerate() {
+            calendar_test_event(
+                &mut operator,
+                day,
+                200,
+                Some(true),
+                false,
+                &[ordinal as u8; 16],
+            )
+            .await;
+        }
+        assert_eq!(
+            calendar_test_values(&operator).await,
+            vec![
+                ScalarValue::Int64(Some(4)),
+                ScalarValue::Int64(Some(1)),
+                ScalarValue::Int64(Some(2))
+            ]
+        );
+        // A static false row advances D without contributing to gated horizons.
+        calendar_test_event(&mut operator, 202, 201, Some(false), false, &[9; 16]).await;
+        assert_eq!(
+            calendar_test_values(&operator).await,
+            vec![
+                ScalarValue::Int64(Some(5)),
+                ScalarValue::Int64(Some(1)),
+                ScalarValue::Int64(Some(2))
+            ]
+        );
+        calendar_test_event(&mut operator, 202, 200, None, false, &[10; 16]).await;
+        assert_eq!(
+            calendar_test_values(&operator).await,
+            vec![
+                ScalarValue::Int64(Some(6)),
+                ScalarValue::Int64(Some(1)),
+                ScalarValue::Int64(Some(2))
+            ]
+        );
+        calendar_test_event(&mut operator, 300, 300, Some(false), false, &[11; 16]).await;
+        assert_eq!(
+            calendar_test_values(&operator).await,
+            vec![
+                ScalarValue::Int64(Some(7)),
+                ScalarValue::Int64(Some(0)),
+                ScalarValue::Int64(Some(0))
+            ]
+        );
+        // Callback uses real progress, leaves lifetime intact and persists due work.
+        let mut scope = operator
+            .native_store
+            .as_ref()
+            .unwrap()
+            .begin()
+            .await
+            .unwrap();
+        let next = operator
+            .recalculate_calendar_group(&mut scope, &GLOBAL_KEY, 201)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(next, 202 * 86_400_000_000_000);
+        scope.commit().await.unwrap();
+        assert_eq!(
+            calendar_test_values(&operator).await,
+            vec![
+                ScalarValue::Int64(Some(7)),
+                ScalarValue::Int64(Some(1)),
+                ScalarValue::Int64(Some(2))
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn calendar_correction_uses_persisted_day_gate_and_original_value() {
+        let mut operator = native_calendar_operator();
+        calendar_test_event(&mut operator, 200, 200, Some(true), false, &[1; 16]).await;
+        // Envelope date/gate differ; signed removal still uses original metadata.
+        calendar_test_event(&mut operator, 300, 300, Some(false), true, &[1; 16]).await;
+        assert_eq!(
+            calendar_test_values(&operator).await,
+            vec![
+                ScalarValue::Int64(Some(0)),
+                ScalarValue::Int64(Some(0)),
+                ScalarValue::Int64(Some(0))
+            ]
+        );
+        calendar_test_event(&mut operator, 201, 201, Some(true), false, &[1; 16]).await;
+        assert_eq!(
+            calendar_test_values(&operator).await,
+            vec![
+                ScalarValue::Int64(Some(1)),
+                ScalarValue::Int64(Some(1)),
+                ScalarValue::Int64(Some(1))
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn calendar_nullable_count_sum_corrections_preserve_recent_and_lifetime() {
+        use arroyo_rpc::grpc::api::CalendarAggregateDescriptor;
+        use datafusion::functions_aggregate::sum::sum_udaf;
+
+        let mut fields = input_schema().fields().to_vec();
+        fields[1] = Arc::new(fields[1].as_ref().clone().with_nullable(true));
+        let schema = Arc::new(Schema::new(fields));
+        let one: Arc<dyn PhysicalExpr> = Arc::new(Literal::new(ScalarValue::Int64(Some(1))));
+        let amount: Arc<dyn PhysicalExpr> = Arc::new(Column::new("sequence", 1));
+        let timestamp: Arc<dyn PhysicalExpr> = Arc::new(Column::new(TIMESTAMP_FIELD, 3));
+        let codec = DefaultPhysicalExtensionCodec {};
+        let expressions: Vec<_> = [
+            ("lifetime_rows", count_udaf(), one.clone()),
+            ("lifetime_nonnull", count_udaf(), amount.clone()),
+            ("lifetime_sum", sum_udaf(), amount.clone()),
+            ("recent_rows", count_udaf(), one.clone()),
+            ("recent_nonnull", count_udaf(), amount.clone()),
+            ("recent_sum", sum_udaf(), amount.clone()),
+            (TIMESTAMP_FIELD, max_udaf(), timestamp),
+        ]
+        .into_iter()
+        .map(|(name, function, argument)| {
+            Arc::new(
+                AggregateExprBuilder::new(function, vec![argument])
+                    .schema(schema.clone())
+                    .alias(name)
+                    .build()
+                    .unwrap(),
+            )
+        })
+        .collect();
+        let aggregate = AggregateExecNode {
+            aggr_expr: expressions
+                .iter()
+                .map(|expr| serialize_physical_aggr_expr(expr.clone(), &codec).unwrap())
+                .collect(),
+            aggr_expr_name: expressions
+                .iter()
+                .map(|expr| expr.name().to_string())
+                .collect(),
+            filter_expr: vec![MaybeFilter { expr: None }; expressions.len()],
+            ..Default::default()
+        };
+        let (mut config, _) = native_config();
+        config.aggregate_exec = PhysicalPlanNode {
+            physical_plan_type: Some(PhysicalPlanType::Aggregate(Box::new(aggregate))),
+        }
+        .encode_to_vec();
+        let metadata = Arc::new(Field::new(
+            UPDATING_META_FIELD,
+            DataType::Struct(updating_meta_fields()),
+            false,
+        ));
+        let mut input_fields = schema.fields().to_vec();
+        input_fields.push(metadata.clone());
+        config.input_schema = Some(
+            ArroyoSchema::from_schema_unkeyed(Arc::new(Schema::new(input_fields)))
+                .unwrap()
+                .into(),
+        );
+        let mut output_fields: Vec<_> = expressions.iter().map(|expr| expr.field()).collect();
+        output_fields.push(metadata);
+        config.final_schema = Some(
+            ArroyoSchema::from_schema_unkeyed(Arc::new(Schema::new(output_fields)))
+                .unwrap()
+                .into(),
+        );
+        config.retain_indefinitely = Some(true);
+        let date: Arc<dyn PhysicalExpr> = Arc::new(Literal::new(ScalarValue::Date32(Some(200))));
+        for (index, argument) in [(3, one), (4, amount.clone()), (5, amount)] {
+            config
+                .calendar_aggregates
+                .push(CalendarAggregateDescriptor {
+                    aggregate_index: index,
+                    horizon_days: 7,
+                    argument: serialize_physical_expr(&argument, &codec)
+                        .unwrap()
+                        .encode_to_vec(),
+                    static_filter: None,
+                    contribution_date: serialize_physical_expr(&date, &codec)
+                        .unwrap()
+                        .encode_to_vec(),
+                    reference_date: serialize_physical_expr(&date, &codec)
+                        .unwrap()
+                        .encode_to_vec(),
+                    context_id: "nullable-test-clock".into(),
+                });
+        }
+        let mut operator = IncrementalAggregatingConstructor::build_with_native_config(
+            config,
+            Arc::new(arroyo_planner::physical::new_registry()),
+            Some(native_test_config()),
+        )
+        .unwrap();
+        operator.native_store = Some(native_test_store());
+        // Retractions deliberately carry a different amount. The persisted NULL
+        // flag/value must remove the original contribution, never the envelope.
+        for (retract, value, expected) in [
+            (false, None, (1, 0, None)),
+            (true, Some(99), (0, 0, None)),
+            (false, Some(7), (1, 1, Some(7))),
+            (true, None, (0, 0, None)),
+            (false, None, (1, 0, None)),
+            (true, Some(99), (0, 0, None)),
+        ] {
+            let input = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(StringArray::from(vec![Some("row")])),
+                    Arc::new(Int64Array::from(vec![value])),
+                    Arc::new(BooleanArray::from(vec![Some(true)])),
+                    Arc::new(TimestampNanosecondArray::from(vec![1])),
+                ],
+            )
+            .unwrap();
+            let inputs = operator.compute_inputs(&input).unwrap();
+            let dates = operator.calendar_inputs(&input).unwrap();
+            let store = operator.native_store.as_ref().unwrap();
+            let mut scope = store.begin().await.unwrap();
+            operator
+                .native_process_calendar_event(
+                    &mut scope,
+                    NativeCalendarEvent {
+                        group_key: &GLOBAL_KEY,
+                        inputs: &inputs,
+                        row: 0,
+                        retract,
+                        row_id: Some(&[1; 16]),
+                        calendar_inputs: &dates,
+                    },
+                )
+                .await
+                .unwrap();
+            scope.commit().await.unwrap();
+            let scope = store.begin().await.unwrap();
+            let bytes = scope
+                .get(&native_group_key(b'G', &GLOBAL_KEY).unwrap())
+                .await
+                .unwrap()
+                .unwrap();
+            let group = decode_group(
+                &bytes,
+                &operator.native_state_types(),
+                &operator.native_output_types(),
+                scope.limits().value_bytes,
+            )
+            .unwrap();
+            let mut state = operator.native_accumulators(Some(&group)).unwrap();
+            let actual: Vec<_> = state[..6]
+                .iter_mut()
+                .map(|state| state.evaluate().unwrap())
+                .collect();
+            let (rows, nonnull, sum) = expected;
+            let expected = vec![
+                ScalarValue::Int64(Some(rows)),
+                ScalarValue::Int64(Some(nonnull)),
+                ScalarValue::Int64(sum),
+            ];
+            assert_eq!(actual, [expected.clone(), expected].concat());
+            drop(scope);
+            // Every event scope and decoded evaluation has released its budget.
+            let reservation = store
+                .resources()
+                .try_decoded_value(store.resources().config().decoded_value_bytes)
+                .unwrap();
+            drop(reservation);
+        }
+    }
+
+    #[test]
+    fn calendar_descriptor_rejects_argument_and_filter_mismatch() {
+        use arroyo_rpc::grpc::api::CalendarAggregateDescriptor;
+        let operator = native_calendar_operator();
+        let codec = DefaultPhysicalExtensionCodec {};
+        let date: Arc<dyn PhysicalExpr> = Arc::new(Literal::new(ScalarValue::Date32(Some(200))));
+        let aggregate = &operator.aggregates[6];
+        let mut descriptor = CalendarAggregateDescriptor {
+            aggregate_index: 6,
+            horizon_days: 7,
+            argument: serialize_physical_expr(&aggregate.input_exprs[0], &codec)
+                .unwrap()
+                .encode_to_vec(),
+            static_filter: aggregate.filter.as_ref().map(|filter| {
+                serialize_physical_expr(filter, &codec)
+                    .unwrap()
+                    .encode_to_vec()
+            }),
+            contribution_date: serialize_physical_expr(&date, &codec)
+                .unwrap()
+                .encode_to_vec(),
+            reference_date: serialize_physical_expr(&date, &codec)
+                .unwrap()
+                .encode_to_vec(),
+            context_id: "generic-test-clock".into(),
+        };
+        let registry = arroyo_planner::physical::new_registry();
+        assert!(
+            CalendarAggregate::decode(
+                &[descriptor.clone()],
+                &operator.aggregates,
+                &input_schema(),
+                &registry
+            )
+            .is_ok()
+        );
+        descriptor.argument = serialize_physical_expr(
+            &(Arc::new(Literal::new(ScalarValue::Int64(Some(2)))) as Arc<dyn PhysicalExpr>),
+            &codec,
+        )
+        .unwrap()
+        .encode_to_vec();
+        let error = CalendarAggregate::decode(
+            &[descriptor.clone()],
+            &operator.aggregates,
+            &input_schema(),
+            &registry,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("argument does not match"));
+        descriptor.argument = serialize_physical_expr(&aggregate.input_exprs[0], &codec)
+            .unwrap()
+            .encode_to_vec();
+        descriptor.static_filter = None;
+        let error = CalendarAggregate::decode(
+            &[descriptor],
+            &operator.aggregates,
+            &input_schema(),
+            &registry,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("static filter does not match"));
+    }
+
+    #[tokio::test]
+    async fn calendar_capacity_error_discards_contribution_and_releases_scope() {
+        let mut operator = native_calendar_operator();
+        operator.native_store = Some(native_test_store_with_limits(AggregateStoreLimits {
+            key_bytes: 256,
+            value_bytes: 256,
+            page_bytes: 8192,
+            page_entries: 4,
+            write_bytes: 64 * 1024,
+            write_operations: 64,
+            overlay_bytes: 64 * 1024,
+        }));
+        let input = batch(&[Some("value")], &[1], &[Some(true)]);
+        let inputs = operator.compute_inputs(&input).unwrap();
+        let dates = operator.calendar_inputs(&input).unwrap();
+        let store = operator.native_store.as_ref().unwrap();
+        let mut scope = store.begin().await.unwrap();
+        let error = operator
+            .native_process_calendar_event(
+                &mut scope,
+                NativeCalendarEvent {
+                    group_key: &GLOBAL_KEY,
+                    inputs: &inputs,
+                    row: 0,
+                    retract: false,
+                    row_id: Some(&[1; 16]),
+                    calendar_inputs: &dates,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("exceeds configured limit"));
+        drop(scope);
+        let decoded = store
+            .resources()
+            .try_decoded_value(store.resources().config().decoded_value_bytes)
+            .unwrap();
+        drop(decoded);
+        let scope = store.begin().await.unwrap();
+        for prefix in [b"G", b"J", b"B", b"H", b"Q", b"U", b"M", b"R"] {
+            assert!(scope.first(prefix).await.unwrap().is_none());
+        }
     }
 
     fn native_test_config() -> AggregateStateConfig {
