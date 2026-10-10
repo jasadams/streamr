@@ -1,5 +1,18 @@
 # Project instructions
 
+## Fresh task instructions
+
+Before starting a new implementation task, fetch the repository's default branch
+and create the task worktree from that fetched commit, unless the user explicitly
+requests another base. Preserve the invoking checkout and unrelated local changes.
+After creating the worktree, read its applicable `AGENTS.md`, build/test guidance,
+and current ticket ledger before implementation or delegation. Record the base
+commit and instruction paths; give delegates the same worktree and instructions.
+Treat repository instructions injected at session startup as a snapshot: reconcile
+them with the fetched worktree when they differ. Explicit current user instructions
+remain controlling. Do not retain a removed rule solely because it appeared in a
+stale startup snapshot. Re-read applicable guidance after a rebase changes it.
+
 ## Pre-release compatibility policy
 
 Streamr is pre-release. Backward compatibility is not required for code, SQL,
@@ -114,11 +127,12 @@ for required delegated work before ending the turn.
 - Each implementation worker owns one ticket at a time. The user authorized
   independent milestone 3 features to run in parallel on 2026-10-09. Claim
   separate tickets/worktrees and coordinate declared file ownership; delegates
-  work within their assigned feature. Record start, acceptance and the four-hour
-  deadline before implementation begins.
-- If the ticket remains unfinished after four hours, stop its work safely, pause
-  and explain the elapsed time, completed work, blocker and remaining steps.
-  Wait for user direction; do not switch tickets or restart automatically.
+  work within their assigned feature. Record start and acceptance before
+  implementation begins.
+- Do not impose an automatic elapsed-time limit on ticket work. The user has
+  disabled the previous one-hour and four-hour stop rules for all agents.
+  Continue authorized work until completion unless the user explicitly sets a
+  new time limit or asks to pause. Discussion takes precedence over automation.
 - Report concrete ticket outcomes and remaining acceptance gaps, rather than
   only narrating builds/tests. Discussion takes precedence over automation.
 - Read the current Trakkt ticket description and compact status ledger before

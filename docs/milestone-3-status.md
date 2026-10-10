@@ -6,6 +6,28 @@ current dispatch instructions. No implementation worker is claimed by this reset
 
 ## Available features
 
+## Active STR-62
+
+- Worker: Codex `/root`; branch `jason/str-62-calendar-2147`, base `67c242f5`.
+  Started 2026-10-09 21:47 UTC; resumed on explicit user direction.
+  Automatic time limits disabled. Core increment reviewed/tested; PR pending.
+- Acceptance: maintained inclusive UTC COUNT/SUM FILTERs, raw event reference,
+  independent lifetime, exact CDC, bounded registered state and recovery.
+- Evidence: affected check and strict Clippy exit 0; planner 13/13, worker 6/6;
+  actual SQL 32/32 default/shape configurations passed memory/RocksDB × batches
+  1/8 × controller/leader with live prefixes, checkpoint and fresh-worker restore.
+  Exact source/harness/binary receipts: `docs/str-62-calendar-filters.md`.
+- Next: final evidence review and publish the tested core increment without
+  closing STR-62; wait for current-head PR CI.
+- Remaining: no existing nonwindowed admission history floor justifies age
+  pruning. Buckets retain history under configured limits until group retirement;
+  no new cutoff implemented. Pruning/history-boundary acceptance remains STR-62;
+  quiet traversal/output belongs to STR-29; shared full qualification STR-32.
+- Reuse investigation: ten actual native SQL probes; completed append windows
+  pass, ordinary FILTER differs from maintained result, three relational patterns
+  reject, existing window CDC defect tracked separately as STR-68. Source traces
+  and reviewed receipts are recorded; do not repeat without new evidence.
+
 At the 2026-10-09 reset, all eight tickets were Todo, agent-ready and unblocked.
 STR-16 now has [PR #15](https://github.com/jasadams/streamr/pull/15) open awaiting
 final CI and merge. Independent agents may work in parallel in separate worktrees
