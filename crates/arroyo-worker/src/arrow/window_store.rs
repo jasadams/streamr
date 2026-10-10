@@ -57,7 +57,6 @@ pub(crate) struct WindowSnapshot {
 pub(crate) struct WindowPartial {
     pub key: Vec<u8>,
     pub batch: RecordBatch,
-    pub encoded_bytes: usize,
     _permit: ResourcePermit,
 }
 
@@ -244,25 +243,6 @@ impl WindowStore {
         Ok(self
             .resources
             .try_decoded_value(self.limits.value_bytes.saturating_mul(6))?)
-    }
-
-    /// Hold a separate budget for cardinality-growing final accumulators. The
-    /// caller counts the persisted IPC payload in a first, paged snapshot pass.
-    /// Leave room for the two queued partials and one decoded partial in the
-    /// same pool while the final reader and collector are active.
-    pub fn reserve_collection_final(&self, bytes: usize) -> Result<ResourcePermit> {
-        let concurrent = self
-            .limits
-            .value_bytes
-            .checked_mul(9)
-            .context("native window collection concurrent budget overflow")?;
-        ensure!(
-            bytes
-                .checked_add(concurrent)
-                .is_some_and(|total| { total <= self.resources.config().decoded_value_bytes }),
-            "native window collection exceeds decoded-state budget"
-        );
-        Ok(self.resources.try_decoded_value(bytes)?)
     }
 
     pub async fn progress(&self) -> Result<Option<i64>> {
@@ -875,7 +855,6 @@ impl WindowSnapshot {
                 return Ok(Some(WindowPartial {
                     key: entry.key.key,
                     batch,
-                    encoded_bytes: entry.value.len(),
                     _permit: permit,
                 }));
             }
@@ -1432,13 +1411,5 @@ mod tests {
             None
         );
         assert_eq!(store.earliest_time().await.unwrap(), None);
-    }
-
-    #[test]
-    fn collection_reservation_keeps_room_for_final_queue_and_decoder() {
-        let store = store();
-        let available = store.resources.config().decoded_value_bytes - 9 * store.limits.value_bytes;
-        assert!(store.reserve_collection_final(available).is_ok());
-        assert!(store.reserve_collection_final(available + 1).is_err());
     }
 }

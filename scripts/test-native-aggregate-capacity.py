@@ -18,7 +18,7 @@ sys.dont_write_bytecode = True
 _spec = importlib.util.spec_from_file_location('capacity', Path(__file__).with_name('test-native-window-capacity.py'))
 capacity = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(capacity)
-POOL_MIB = 78
+POOL_MIB = 62
 BASE = datetime(2023, 10, 9, 17, 13, 20)
 
 
@@ -140,13 +140,13 @@ def prepare(root, scenario, keys, members, size, require_10x, timeout, rss_limit
     full_floor = (keys if scenario == 'many' else members) * size
     threshold = 10 * POOL_MIB * 1024 * 1024
     if require_10x and min(cp_floor, full_floor) < threshold:
-        raise ValueError('checkpoint and live payload floors must each reach10x actual78MiB pool sum (before fixture writes)')
+        raise ValueError('checkpoint and live payload floors must each reach 10x actual 62 MiB pool sum (before fixture writes)')
     root.mkdir(parents=True, exist_ok=False)
     settings = dict(scenario=scenario, keys=keys, members=members, payload_bytes=size,
         input_rows=source_rows, checkpoint_input_rows=checkpoint,
         checkpoint_retained_payload_floor_bytes=cp_floor, live_retained_payload_floor_bytes=full_floor,
         declared_pool_budget_mib=POOL_MIB,
-        pool_budget_mib=dict(execution=16, block_cache=8, memtable=4, queued_write=32, decoded=16, scan=2),
+        pool_budget_mib=dict(block_cache=8, memtable=4, queued_write=32, decoded=16, scan=2),
         checkpoint_exceeds_10x_pool=cp_floor >= threshold, live_exceeds_10x_pool=full_floor >= threshold,
         require_10x=require_10x, timeout_seconds=timeout, child_rss_limit_mib=rss_limit,
         retention_premise=('Append-only MAX stores at least one full independent payload per key; count metadata not counted.' if scenario == 'many' else
@@ -287,7 +287,7 @@ def run(repo, binary, evidence, root, settings, backend, protocol):
     env = {k: v for k, v in os.environ.items() if not k.startswith(('STREAMR_TEST_', 'STREAMR_CAPTURE_'))}
     env.update(STREAMR_TEST_NATIVE_AGGREGATES='1', STREAMR_TEST_BACKEND=backend,
         STREAMR_TEST_CHECKPOINT_MODE=protocol, STREAMR_TEST_SOURCE_BATCH_ROWS='32',
-        STREAMR_TEST_EXECUTION_BYTES=str(16 * 1024 * 1024), STREAMR_TEST_AGGREGATE_FLUSH_SECONDS='3600',
+        STREAMR_TEST_AGGREGATE_FLUSH_SECONDS='3600',
         STREAMR_TEST_RUNTIME_TIMEOUT_SECONDS=str(settings['timeout_seconds']),
         STREAMR_CAPTURE_QUERY=str(d / 'query.sql'), STREAMR_CAPTURE_OUTPUT=str(output),
         STREAMR_CAPTURE_INPUT_ROWS_BEFORE_CHECKPOINT=str(settings['checkpoint_input_rows']),

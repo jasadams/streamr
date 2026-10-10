@@ -1,10 +1,7 @@
 //! Configured-backend SQL SESSION owner. The existing DataFusion aggregate
 //! remains the final computation; only retained input and scheduling move to
 //! the bounded live-state table.
-use super::{
-    execution::configured_execution_resources,
-    session_store::{SessionMeta, SessionStore},
-};
+use super::session_store::{SessionMeta, SessionStore};
 use anyhow::{Context, Result, ensure};
 use arrow::compute::take;
 use arrow_array::{
@@ -33,8 +30,9 @@ use arroyo_state::live::worker::{
     ConfiguredBackendOwner, configured_worker_resources, construct_configured_backend,
 };
 use arroyo_types::to_nanos;
-use datafusion::execution::memory_pool::MemoryConsumer;
+use datafusion::execution::{TaskContext, runtime_env::RuntimeEnvBuilder};
 use datafusion::physical_plan::{ExecutionPlan, aggregates::AggregateExec};
+use datafusion::prelude::SessionContext;
 use datafusion_proto::{physical_plan::AsExecutionPlan, protobuf::PhysicalPlanNode};
 use futures::{StreamExt, try_join};
 use prost::Message;
@@ -46,18 +44,6 @@ use std::{
 use tokio::sync::mpsc::{Receiver, channel};
 
 const TABLE: &str = "n";
-
-// Arrow's `take` owns one selected row while the input batch remains live. The
-// source reservation covers shared dictionary/backing buffers; this separate
-// allowance covers copied values, nested offsets and array construction.
-fn row_working_bytes(batch: &RecordBatch) -> Result<usize> {
-    batch
-        .get_array_memory_size()
-        .checked_mul(2)
-        .and_then(|bytes| bytes.checked_add(batch.num_columns().checked_mul(4096)?))
-        .and_then(|bytes| bytes.checked_add(4096))
-        .context("native SESSION row working admission overflow")
-}
 
 fn output_allowance(
     schema: &Schema,
@@ -173,7 +159,7 @@ fn normalize_collection_plan(
 fn validate_aggregates(
     finish: &dyn ExecutionPlan,
     input_schema: &arrow_schema::SchemaRef,
-) -> Result<(bool, usize)> {
+) -> Result<bool> {
     let aggregate = finish
         .as_any()
         .downcast_ref::<AggregateExec>()
@@ -183,7 +169,6 @@ fn validate_aggregates(
         "native SESSION final aggregate must consume one group at a time"
     );
     let mut collection_output = false;
-    let mut collection_scratch_factor = 0usize;
     for (index, expression) in aggregate.aggr_expr().iter().enumerate() {
         let name = expression.fun().name().to_ascii_lowercase();
         let ordered_first_last = matches!(name.as_str(), "first_value" | "last_value")
@@ -227,22 +212,13 @@ fn validate_aggregates(
                         .is::<datafusion::physical_expr::expressions::Column>()),
                 "native SESSION ARRAY_AGG requires a direct Boolean source column for FILTER"
             );
-            collection_scratch_factor = collection_scratch_factor
-                .checked_add(
-                    expression
-                        .order_bys()
-                        .map_or(1, |order| order.len() + 1)
-                        .checked_mul(16)
-                        .context("native SESSION collection scratch admission overflow")?,
-                )
-                .context("native SESSION collection scratch admission overflow")?;
         }
         ensure!(
             !expression.is_distinct() && (scalar || ordered_first_last || collection),
             "native SESSION supports non-distinct COUNT/SUM/AVG/MIN/MAX ordered FIRST_VALUE/LAST_VALUE and ARRAY_AGG; other aggregates require bounded output admission"
         );
     }
-    Ok((collection_output, collection_scratch_factor))
+    Ok(collection_output)
 }
 
 pub(crate) struct NativeSession {
@@ -254,7 +230,7 @@ pub(crate) struct NativeSession {
     finish_receiver: Arc<RwLock<Option<Receiver<RecordBatch>>>>,
     limits: WindowStateConfig,
     collection_output: bool,
-    collection_scratch_factor: usize,
+    task_context: Arc<TaskContext>,
     acknowledged_closure: Option<(Vec<u8>, SessionMeta)>,
     identity: Vec<u8>,
     store: Option<SessionStore>,
@@ -280,13 +256,11 @@ impl NativeSession {
         let codec = ArroyoPhysicalExtensionCodec {
             context: DecodingContext::BoundedBatchStream(receiver.clone()),
         };
-        let execution = configured_execution_resources()?
-            .context("native SESSION requires execution resources")?;
+        let runtime = RuntimeEnvBuilder::new().build_arc()?;
         let finish = PhysicalPlanNode::decode(config.final_aggregation_plan.as_slice())?
-            .try_into_physical_plan(registry.as_ref(), &execution.runtime, &codec)?;
+            .try_into_physical_plan(registry.as_ref(), &runtime, &codec)?;
         let finish = normalize_collection_plan(finish, &input_schema.schema)?;
-        let (collection_output, collection_scratch_factor) =
-            validate_aggregates(finish.as_ref(), &input_schema.schema)?;
+        let collection_output = validate_aggregates(finish.as_ref(), &input_schema.schema)?;
         let mut identity = Sha256::new();
         identity.update(b"streamr.native-session-raw.v2");
         identity.update(gap.to_be_bytes());
@@ -308,7 +282,8 @@ impl NativeSession {
             finish_receiver: receiver,
             limits,
             collection_output,
-            collection_scratch_factor,
+            task_context: SessionContext::new_with_config_rt(Default::default(), runtime)
+                .task_ctx(),
             acknowledged_closure: None,
             identity: identity.finalize().to_vec(),
             store: None,
@@ -389,13 +364,6 @@ impl NativeSession {
         if watermark.is_some_and(|wm| to_nanos(wm) == u64::MAX as u128) {
             return Ok(());
         }
-        let execution = configured_execution_resources()?
-            .context("native SESSION requires execution resources")?;
-        let _source = execution.reserve_batch("native SESSION source", &batch)?;
-        let working_bytes = row_working_bytes(&batch)?;
-        let mut _working = MemoryConsumer::new("native SESSION owned row")
-            .register(&execution.runtime.memory_pool);
-        _working.try_grow(working_bytes)?;
         let timestamps = batch
             .column(self.input_schema.timestamp_index)
             .as_any()
@@ -423,10 +391,6 @@ impl NativeSession {
                 .map(|column| take(column, &indices, None))
                 .collect::<arrow::error::Result<Vec<_>>>()?;
             let row = RecordBatch::try_new(batch.schema(), columns)?;
-            ensure!(
-                row.get_array_memory_size() <= working_bytes,
-                "native SESSION owned row exceeds admitted working bytes"
-            );
             let group = if group_count == 0 {
                 Vec::new()
             } else {
@@ -459,24 +423,8 @@ impl NativeSession {
             .schema
             .fields()
             .len();
-        let output_bytes =
-            output_allowance(self.finish.schema().as_ref(), output_fields, self.limits)?;
-        let execution = configured_execution_resources()?
-            .context("native SESSION requires execution resources")?;
-        ensure!(
-            output_bytes <= execution.limits.max_batch_bytes,
-            "native SESSION output allowance exceeds max-batch-bytes"
-        );
-        let mut _output = MemoryConsumer::new("native SESSION output allowance")
-            .register(&execution.runtime.memory_pool);
-        _output.try_grow(output_bytes)?;
-        // Collection accumulators retain their members until evaluate. Admit
-        // the entire bounded input working set before starting DataFusion, so a
-        // hot session errors before growing a collection without a value bound.
-        // This scan owns one row at a time and shares the emission snapshot.
-        let mut _collection_scratch =
-            MemoryConsumer::new("native SESSION collection finalization scratch")
-                .register(&execution.runtime.memory_pool);
+        output_allowance(self.finish.schema().as_ref(), output_fields, self.limits)?;
+        // Bound retained collection values before the final aggregate reads them.
         if self.collection_output {
             let mut after = None;
             let mut retained = 0usize;
@@ -499,22 +447,11 @@ impl NativeSession {
                 );
                 after = Some(row.key.clone());
             }
-            // Each direct-column member is backed by an independently decoded
-            // one-row Arrow array, including its array header. Reserve 16 copies
-            // per value/order column for ScalarValue conversion, paired sort
-            // vectors, cloned members, merge scratch and final Arrow building.
-            // DataFusion separately reserves retained accumulator state; this
-            // covers evaluate(), whose allocations are otherwise unreserved.
-            _collection_scratch.try_grow(
-                retained
-                    .checked_mul(self.collection_scratch_factor)
-                    .context("native SESSION collection scratch admission overflow")?,
-            )?;
         }
         let (sender, receiver) = channel(1);
         *self.finish_receiver.write().unwrap() = Some(receiver);
         self.finish.reset()?;
-        let mut finish = self.finish.execute(0, execution.task_context())?;
+        let mut finish = self.finish.execute(0, self.task_context.clone())?;
         let store = self.store()?;
         let producer = async move {
             let mut after = None;
@@ -641,49 +578,8 @@ impl NativeSession {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::arrow::execution::ExecutionResources;
     use arrow_array::StringArray;
     use arrow_schema::Schema;
-    use arroyo_rpc::config::ExecutionResourceConfig;
-
-    #[test]
-    fn owned_row_needs_separate_admission_while_source_batch_is_live() {
-        let long = "x".repeat(8192);
-        let batch = RecordBatch::try_new(
-            Arc::new(Schema::new(vec![Field::new(
-                "value",
-                DataType::Utf8,
-                false,
-            )])),
-            vec![Arc::new(StringArray::from(vec![long.as_str(), "y", "z"]))],
-        )
-        .unwrap()
-        .slice(1, 2);
-        let source_bytes = batch.get_array_memory_size();
-        let working_bytes = row_working_bytes(&batch).unwrap();
-        let resources = ExecutionResources::new(ExecutionResourceConfig {
-            memory_bytes: source_bytes + working_bytes - 1,
-            max_batch_bytes: source_bytes,
-        })
-        .unwrap();
-        let _source = resources.reserve_batch("source", &batch).unwrap();
-        let mut working = MemoryConsumer::new("owned row").register(&resources.runtime.memory_pool);
-        assert!(working.try_grow(working_bytes).is_err());
-
-        let resources = ExecutionResources::new(ExecutionResourceConfig {
-            memory_bytes: source_bytes + working_bytes,
-            max_batch_bytes: source_bytes,
-        })
-        .unwrap();
-        let _source = resources.reserve_batch("source", &batch).unwrap();
-        let mut working = MemoryConsumer::new("owned row").register(&resources.runtime.memory_pool);
-        working.try_grow(working_bytes).unwrap();
-        for index in 0..batch.num_rows() {
-            let indices = UInt32Array::from(vec![index as u32]);
-            let row = take(batch.column(0), &indices, None).unwrap();
-            assert!(row.get_array_memory_size() <= working_bytes);
-        }
-    }
 
     #[test]
     fn output_allowance_counts_each_variable_aggregate() {
@@ -853,7 +749,6 @@ mod tests {
 
     #[tokio::test]
     async fn planned_ordered_typed_arrays_and_filtered_metadata_execute_with_bounded_input() {
-        use crate::arrow::execution::with_test_execution_resources;
         use arroyo_state::live::{
             LiveStateBackend, Ownership,
             memory::MemoryLiveState,
@@ -861,14 +756,7 @@ mod tests {
             table::LiveTableManager,
         };
         use std::time::{Duration, UNIX_EPOCH};
-        let execution = Arc::new(
-            ExecutionResources::new(ExecutionResourceConfig {
-                memory_bytes: 16 * 1024 * 1024,
-                max_batch_bytes: 8 * 1024 * 1024,
-            })
-            .unwrap(),
-        );
-        with_test_execution_resources(execution.clone(), async {
+        {
             let query = "CREATE TABLE session_input (timestamp TIMESTAMP NOT NULL, ordinal BIGINT NOT NULL,
                 metric BIGINT NOT NULL, attribute TEXT NOT NULL, selected BOOLEAN NOT NULL,
                 WATERMARK FOR timestamp AS timestamp - INTERVAL '1 minute')
@@ -882,89 +770,229 @@ mod tests {
                     LAST_VALUE(attribute ORDER BY ordinal) FILTER (WHERE attribute <> '') AS last_attribute
                 FROM session_input GROUP BY window";
             async fn compile(query: &str) -> api::SessionWindowAggregateOperator {
-                let compiled = arroyo_planner::parse_and_get_program(query,
+                let compiled = arroyo_planner::parse_and_get_program(
+                    query,
                     arroyo_planner::ArroyoSchemaProvider::new(),
-                    arroyo_planner::SqlConfig { default_parallelism: 1 }).await.unwrap();
-                let operator = compiled.program.graph.node_weights()
-                    .flat_map(|node| node.operator_chain.iter()).map(|(operator, _)| operator)
-                    .find(|operator| operator.operator_name ==
-                        arroyo_datastream::logical::OperatorName::SessionWindowAggregate).unwrap();
-                api::SessionWindowAggregateOperator::decode(operator.operator_config.as_slice()).unwrap()
+                    arroyo_planner::SqlConfig {
+                        default_parallelism: 1,
+                    },
+                )
+                .await
+                .unwrap();
+                let operator = compiled
+                    .program
+                    .graph
+                    .node_weights()
+                    .flat_map(|node| node.operator_chain.iter())
+                    .map(|(operator, _)| operator)
+                    .find(|operator| {
+                        operator.operator_name
+                            == arroyo_datastream::logical::OperatorName::SessionWindowAggregate
+                    })
+                    .unwrap();
+                api::SessionWindowAggregateOperator::decode(operator.operator_config.as_slice())
+                    .unwrap()
             }
             let limits = WindowStateConfig {
-                key_bytes: 128, partial_bytes: 8192, page_bytes: 32768, page_entries: 1,
-                write_bytes: 65536, write_operations: 16, max_resident_bytes: 8 * 1024 * 1024,
+                key_bytes: 128,
+                partial_bytes: 8192,
+                page_bytes: 32768,
+                page_entries: 1,
+                write_bytes: 65536,
+                write_operations: 16,
+                max_resident_bytes: 8 * 1024 * 1024,
             };
             let registry = Arc::new(arroyo_planner::physical::new_registry());
             let config = compile(query).await;
             let mut operator = NativeSession::new(&config, registry.clone(), limits).unwrap();
-            assert_eq!(*operator.finish.as_any().downcast_ref::<AggregateExec>().unwrap().mode(),
-                datafusion::physical_plan::aggregates::AggregateMode::Single);
-            let expanded = compile(&query.replace("ARRAY_AGG(attribute ORDER BY timestamp, ordinal)",
-                "ARRAY_AGG(REPEAT(attribute, 1000000000) ORDER BY timestamp, ordinal)")).await;
-            let error = NativeSession::new(&expanded, registry, limits).err().expect("expanded collection expression was admitted");
+            assert_eq!(
+                *operator
+                    .finish
+                    .as_any()
+                    .downcast_ref::<AggregateExec>()
+                    .unwrap()
+                    .mode(),
+                datafusion::physical_plan::aggregates::AggregateMode::Single
+            );
+            let expanded = compile(&query.replace(
+                "ARRAY_AGG(attribute ORDER BY timestamp, ordinal)",
+                "ARRAY_AGG(REPEAT(attribute, 1000000000) ORDER BY timestamp, ordinal)",
+            ))
+            .await;
+            let error = NativeSession::new(&expanded, registry, limits)
+                .err()
+                .expect("expanded collection expression was admitted");
             assert!(error.to_string().contains("direct"), "{error}");
             let state = WorkerStateResources::new(ResourceConfig {
-                block_cache_bytes: 1024 * 1024, memtable_bytes: 1024 * 1024,
-                queued_write_bytes: 1024 * 1024, decoded_value_bytes: 1024 * 1024,
-                scan_page_bytes: 1024 * 1024, max_blocking_operations: 2,
-                max_snapshots: 2, max_open_databases: 1, disk_reserve_bytes: 0,
-            }).unwrap();
-            let backend: Arc<dyn LiveStateBackend> = Arc::new(MemoryLiveState::bounded(
-                state.clone(), limits.max_resident_bytes).unwrap());
-            let mut tables = LiveTableManager::new(backend.clone(), Ownership::PartitionLocal {
-                subtask: 0, parallelism: 1 }).unwrap();
+                block_cache_bytes: 1024 * 1024,
+                memtable_bytes: 1024 * 1024,
+                queued_write_bytes: 1024 * 1024,
+                decoded_value_bytes: 1024 * 1024,
+                scan_page_bytes: 1024 * 1024,
+                max_blocking_operations: 2,
+                max_snapshots: 2,
+                max_open_databases: 1,
+                disk_reserve_bytes: 0,
+            })
+            .unwrap();
+            let backend: Arc<dyn LiveStateBackend> = Arc::new(
+                MemoryLiveState::bounded(state.clone(), limits.max_resident_bytes).unwrap(),
+            );
+            let mut tables = LiveTableManager::new(
+                backend.clone(),
+                Ownership::PartitionLocal {
+                    subtask: 0,
+                    parallelism: 1,
+                },
+            )
+            .unwrap();
             let table = tables.register(TABLE).unwrap();
             let schema = operator.input_schema.schema.clone();
-            let store = SessionStore::new(backend, table, state.clone(), schema.clone(), limits, operator.gap).unwrap();
-            for (time, ordinal, metric, attribute, selected) in [(9, 0, 3, "later", true), (0, 1, 5, "", false)] {
-                let columns: Vec<Arc<dyn Array>> = schema.fields().iter().map(|field| match field.data_type() {
-                    DataType::Timestamp(_, _) => Arc::new(TimestampNanosecondArray::from(vec![time])) as Arc<dyn Array>,
-                    DataType::Int64 => Arc::new(arrow_array::Int64Array::from(vec![if field.name() == "ordinal" { ordinal } else { metric }])) as Arc<dyn Array>,
-                    DataType::Utf8 => Arc::new(StringArray::from(vec![attribute])) as Arc<dyn Array>,
-                    DataType::Boolean => Arc::new(arrow_array::BooleanArray::from(vec![selected])) as Arc<dyn Array>,
-                    other => panic!("unexpected planned input field {other:?}"),
-                }).collect();
-                store.insert(&[], time, &RecordBatch::try_new(schema.clone(), columns).unwrap()).await.unwrap();
+            let store = SessionStore::new(
+                backend,
+                table,
+                state.clone(),
+                schema.clone(),
+                limits,
+                operator.gap,
+            )
+            .unwrap();
+            for (time, ordinal, metric, attribute, selected) in
+                [(9, 0, 3, "later", true), (0, 1, 5, "", false)]
+            {
+                let columns: Vec<Arc<dyn Array>> = schema
+                    .fields()
+                    .iter()
+                    .map(|field| match field.data_type() {
+                        DataType::Timestamp(_, _) => {
+                            Arc::new(TimestampNanosecondArray::from(vec![time])) as Arc<dyn Array>
+                        }
+                        DataType::Int64 => Arc::new(arrow_array::Int64Array::from(vec![if field
+                            .name()
+                            == "ordinal"
+                        {
+                            ordinal
+                        } else {
+                            metric
+                        }])) as Arc<dyn Array>,
+                        DataType::Utf8 => {
+                            Arc::new(StringArray::from(vec![attribute])) as Arc<dyn Array>
+                        }
+                        DataType::Boolean => {
+                            Arc::new(arrow_array::BooleanArray::from(vec![selected]))
+                                as Arc<dyn Array>
+                        }
+                        other => panic!("unexpected planned input field {other:?}"),
+                    })
+                    .collect();
+                store
+                    .insert(
+                        &[],
+                        time,
+                        &RecordBatch::try_new(schema.clone(), columns).unwrap(),
+                    )
+                    .await
+                    .unwrap();
             }
             operator.store = Some(store);
             let mut fields = operator.finish.schema().fields().to_vec();
             fields.insert(operator.window_index, operator.window_field.clone());
-            fields.push(Arc::new(Field::new(arroyo_rpc::TIMESTAMP_FIELD,
-                DataType::Timestamp(arrow_schema::TimeUnit::Nanosecond, None), false)));
-            let output_schema = Arc::new(ArroyoSchema::from_schema_unkeyed(Arc::new(Schema::new(fields))).unwrap());
+            fields.push(Arc::new(Field::new(
+                arroyo_rpc::TIMESTAMP_FIELD,
+                DataType::Timestamp(arrow_schema::TimeUnit::Nanosecond, None),
+                false,
+            )));
+            let output_schema =
+                Arc::new(ArroyoSchema::from_schema_unkeyed(Arc::new(Schema::new(fields))).unwrap());
             let (control_tx, _control_rx) = channel(16);
-            let mut ctx = OperatorContext::new(Arc::new(arroyo_types::get_test_task_info()), None,
-                control_tx, 1, vec![operator.input_schema.clone()], Some(output_schema), HashMap::new()).await;
-            ctx.watermarks.set(0, arroyo_types::Watermark::EventTime(UNIX_EPOCH + Duration::from_secs(2)));
+            let mut ctx = OperatorContext::new(
+                Arc::new(arroyo_types::get_test_task_info()),
+                None,
+                control_tx,
+                1,
+                vec![operator.input_schema.clone()],
+                Some(output_schema),
+                HashMap::new(),
+            )
+            .await;
+            ctx.watermarks.set(
+                0,
+                arroyo_types::Watermark::EventTime(UNIX_EPOCH + Duration::from_secs(2)),
+            );
             let mut collector = RecordedSessionCollector::default();
-            operator.handle_watermark(&mut ctx, &mut collector, &Converter::new(vec![]).unwrap()).await.unwrap();
+            operator
+                .handle_watermark(&mut ctx, &mut collector, &Converter::new(vec![]).unwrap())
+                .await
+                .unwrap();
             assert_eq!(collector.0.len(), 1);
             let output = &collector.0[0];
             // SQL aliases are applied by the downstream projection; inspect
             // the physical aggregate columns in the query's declared order.
             let column = |index: usize| output.column(index).clone();
-            let list = |index| column(index).as_any().downcast_ref::<arrow_array::ListArray>().unwrap().value(0);
-            assert_eq!(column(1).as_any().downcast_ref::<arrow_array::Int64Array>().unwrap().value(0), 2);
-            assert_eq!(list(2).as_any().downcast_ref::<arrow_array::Int64Array>().unwrap().values().as_ref(), &[5, 3]);
+            let list = |index| {
+                column(index)
+                    .as_any()
+                    .downcast_ref::<arrow_array::ListArray>()
+                    .unwrap()
+                    .value(0)
+            };
+            assert_eq!(
+                column(1)
+                    .as_any()
+                    .downcast_ref::<arrow_array::Int64Array>()
+                    .unwrap()
+                    .value(0),
+                2
+            );
+            assert_eq!(
+                list(2)
+                    .as_any()
+                    .downcast_ref::<arrow_array::Int64Array>()
+                    .unwrap()
+                    .values()
+                    .as_ref(),
+                &[5, 3]
+            );
             let attributes = list(3);
             let attributes = attributes.as_any().downcast_ref::<StringArray>().unwrap();
-            assert_eq!(attributes.iter().collect::<Vec<_>>(), vec![Some(""), Some("later")]);
+            assert_eq!(
+                attributes.iter().collect::<Vec<_>>(),
+                vec![Some(""), Some("later")]
+            );
             let selected = list(4);
-            let selected = selected.as_any().downcast_ref::<arrow_array::BooleanArray>().unwrap();
-            assert_eq!(selected.iter().collect::<Vec<_>>(), vec![Some(false), Some(true)]);
+            let selected = selected
+                .as_any()
+                .downcast_ref::<arrow_array::BooleanArray>()
+                .unwrap();
+            assert_eq!(
+                selected.iter().collect::<Vec<_>>(),
+                vec![Some(false), Some(true)]
+            );
             for index in [5, 6] {
-                assert_eq!(column(index).as_any().downcast_ref::<StringArray>().unwrap().value(0), "later");
+                assert_eq!(
+                    column(index)
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .unwrap()
+                        .value(0),
+                    "later"
+                );
             }
-            assert!(operator.store().unwrap().first_due(None).await.unwrap().is_none());
-            assert_eq!(execution.runtime.memory_pool.reserved(), 0);
+            assert!(
+                operator
+                    .store()
+                    .unwrap()
+                    .first_due(None)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
             assert_snapshot_capacity(&state);
-        }).await;
+        }
     }
 
     #[tokio::test]
-    async fn watermark_cancellation_keeps_session_state_and_releases_emission_admission() {
-        use crate::arrow::execution::with_test_execution_resources;
+    async fn watermark_cancellation_keeps_session_state_and_releases_backend_pages() {
         use arroyo_planner::physical::ArroyoMemExec;
         use arroyo_state::live::{
             LiveStateBackend, Ownership,
@@ -979,14 +1007,8 @@ mod tests {
         use datafusion::physical_plan::aggregates::{AggregateMode, PhysicalGroupBy};
         use std::time::{Duration, UNIX_EPOCH};
 
-        let execution = Arc::new(
-            ExecutionResources::new(ExecutionResourceConfig {
-                memory_bytes: 128 * 1024,
-                max_batch_bytes: 64 * 1024,
-            })
-            .unwrap(),
-        );
-        with_test_execution_resources(execution.clone(), async {
+        let runtime = RuntimeEnvBuilder::new().build_arc().unwrap();
+        {
             let limits = WindowStateConfig {
                 key_bytes: 128,
                 partial_bytes: 1024,
@@ -1106,17 +1128,10 @@ mod tests {
                 context: DecodingContext::BoundedBatchStream(receiver.clone()),
             };
             let finish = serialized
-                .try_into_physical_plan(
-                    &arroyo_planner::physical::new_registry(),
-                    &execution.runtime,
-                    &codec,
-                )
+                .try_into_physical_plan(&arroyo_planner::physical::new_registry(), &runtime, &codec)
                 .unwrap();
-            assert_eq!(
-                validate_aggregates(finish.as_ref(), &schema).unwrap(),
-                (true, 32)
-            );
-            let admitted_output = output_allowance(finish.schema().as_ref(), 5, limits).unwrap();
+            assert_eq!(validate_aggregates(finish.as_ref(), &schema).unwrap(), true);
+            output_allowance(finish.schema().as_ref(), 5, limits).unwrap();
             let window = Arc::new(Field::new("window", window_arrow_struct(), true));
             let output_schema = Arc::new(Schema::new(vec![
                 window.as_ref().clone(),
@@ -1139,7 +1154,11 @@ mod tests {
                 finish_receiver: receiver,
                 limits,
                 collection_output: true,
-                collection_scratch_factor: 32,
+                task_context: SessionContext::new_with_config_rt(
+                    Default::default(),
+                    runtime.clone(),
+                )
+                .task_ctx(),
                 acknowledged_closure: None,
                 identity: vec![],
                 store: Some(store),
@@ -1168,7 +1187,6 @@ mod tests {
                 observer.first_due(Some(20)).await.unwrap(),
                 Some((vec![], due))
             );
-            assert_eq!(execution.runtime.memory_pool.reserved(), 0);
             let (started_tx, mut started_rx) = tokio::sync::oneshot::channel();
             let (release_tx, release_rx) = tokio::sync::oneshot::channel();
             let mut collector = BlockedSessionCollector {
@@ -1196,7 +1214,6 @@ mod tests {
             let free = state.config().decoded_value_bytes - limits.partial_bytes * 6;
             assert!(state.try_decoded_value(free + 1).is_err());
             drop(state.try_decoded_value(free).unwrap());
-            assert!(execution.runtime.memory_pool.reserved() >= admitted_output);
             assert_retained_session(&observer, due, &[(0, 3), (9, 5)]).await;
             assert_retained_session(&observer, future, &[(40, 7), (49, 11)]).await;
             drop(pending);
@@ -1206,7 +1223,6 @@ mod tests {
                 "cancelled collector receiver remained owned"
             );
             assert!(weak.upgrade().is_none(), "cancelled output remained owned");
-            assert_eq!(execution.runtime.memory_pool.reserved(), 0);
             drop(
                 state
                     .try_decoded_value(state.config().decoded_value_bytes)
@@ -1264,7 +1280,6 @@ mod tests {
                 "collector acknowledgment did not precede phase write"
             );
             assert_eq!(operator.acknowledged_closure, Some((vec![], future)));
-            assert_eq!(execution.runtime.memory_pool.reserved(), 0);
             assert_snapshot_capacity(&state);
             assert!(!observer.is_closing(&[], future).await.unwrap());
             assert_retained_session(&observer, future, &[(40, 7), (49, 11)]).await;
@@ -1282,7 +1297,6 @@ mod tests {
             assert_session_output(&emitted.0[1], 40, 59, 18);
             assert!(observer.first_due(None).await.unwrap().is_none());
             assert_retained_session(&observer, future, &[]).await;
-            assert_eq!(execution.runtime.memory_pool.reserved(), 0);
             assert_snapshot_capacity(&state);
             for time in 80..104 {
                 let row = RecordBatch::try_new(
@@ -1318,7 +1332,6 @@ mod tests {
                 2,
                 "oversized collection emitted a truncated result"
             );
-            assert_eq!(execution.runtime.memory_pool.reserved(), 0);
             assert_snapshot_capacity(&state);
             let oversized = SessionMeta {
                 start: 80,
@@ -1331,7 +1344,6 @@ mod tests {
                 &(80..104).map(|time| (time, 1)).collect::<Vec<_>>(),
             )
             .await;
-        })
-        .await;
+        }
     }
 }

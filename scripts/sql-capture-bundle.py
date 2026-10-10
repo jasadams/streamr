@@ -170,7 +170,6 @@ def run(args):
                 flag:'1', 'STREAMR_TEST_BACKEND':backend,
                 'STREAMR_TEST_CHECKPOINT_MODE':protocol,
                 'STREAMR_TEST_SOURCE_BATCH_ROWS':str(fixture.get('batch_rows', 1)),
-                'STREAMR_TEST_EXECUTION_BYTES':str(16*1024*1024),
                 'STREAMR_TEST_RUNTIME_TIMEOUT_SECONDS':str(timeout),
                 'STREAMR_CAPTURE_QUERY':str(query), 'STREAMR_CAPTURE_OUTPUT':str(output),
                 'STREAMR_CAPTURE_INPUT_ROWS_BEFORE_CHECKPOINT':str(prefix),

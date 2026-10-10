@@ -1,5 +1,20 @@
 # Milestone 3 — feature execution plan
 
+## Current MVP scope direction — 2026-10-11
+
+Fast-track Arcstream MVP with native SQL/state tables and configurable RocksDB
+state plus correct recovery. Keep backend limits. Restore upstream Arroyo
+execution and row backpressure by removing added queue/network and operator
+admission. Delete unused standalone timer/ranked/history helpers. Keep Kafka
+recovery and complete its architecture review before proposing changes.
+
+Test failures do not authorize new features or architecture. Establish upstream
+behavior and the concrete MVP need, discuss the smallest proposed contract and
+tradeoffs, and obtain agreement before implementation. Do not introduce hybrid
+resource policies to make a test pass. These decisions supersede older scope
+assignments below; existing SQL behavior and backend recovery remain required.
+The authoritative agent rule is in [AGENTS.md](../AGENTS.md).
+
 Use existing Trakkt feature tickets; do not create audit, decision or QA children.
 Current descriptions own the scope and acceptance. This plan replaces the old
 single active queue and twelve planning groups; Git history retains that text.
@@ -8,7 +23,7 @@ single active queue and twelve planning groups; Git history retains that text.
 
 | Ticket | Before / after | Scope boundary |
 | --- | --- | --- |
-| STR-16 | Retained queue/checkpoint buffers must preserve byte ownership through backpressure/cancel | Shared resources and queue permits; no read-view redesign |
+| STR-16 | Native backend/checkpoint buffers preserve reservation ownership through cancellation; graph/network queues use upstream Arroyo row backpressure | Queue byte admission removed by user direction; a future byte-aware backpressure design is a separate discussed feature. No read-view redesign |
 | STR-17 | Ordered ARRAY_AGG followed by slice must select finite K without materializing the full member array | Aggregate ranking/CDC; all necessary member counters may remain on disk |
 | STR-19 | Closing panes/collections must drain within declared limits or fail precisely | Existing TUMBLE/HOP semantics; no quiet-key policy change |
 | STR-20 | Many-key/hot-session closure must stay paged and recover remaining open state | Existing SESSION semantics; no application timer emulation |
@@ -62,7 +77,9 @@ checkpoint protocols, exact typed/CDC/prefix oracles, multi-epoch empty/deleted
 state, actual retained state at least10x declared state-memory budget, whole
 process RSS, hot keys, slow consumers/cancellation, representative backfill,
 production worker/controller/broker/storage faults, retention/cleanup,
-source/sink/offset consistency and actual24-hour live/fault operation.
+source/sink/offset consistency and user-directed Arcstream integration/live observation.
+The user waived the standalone actual24-hour run; preserve measured observation
+duration and do not count unrun acceptance as passed.
 
 Choose exact commands/manifests, resource limits and pinned source/binaries in
 the explicitly requested shared batch. Preserve held scenarios and source-bound

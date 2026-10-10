@@ -1,5 +1,13 @@
 # Milestone 3 implementation and verification
 
+Current-scope notice (2026-10-11): the user authorized removal of added graph/network
+and operator execution admission and unused timer/ranked/history helper APIs.
+The receipts below describe their original source revisions, including tests of
+now-removed code; they are historical evidence, not current configuration or API
+instructions. Current behavior and pending validation are in milestone-3-status.md
+and native-state-operations.md. Kafka recovery is retained and undergoing a
+separate architecture review.
+
 This branch builds on milestone 2 PR #4 at `fbd5179a`. It carries the existing
 capture harness originating in PR #5 and adds the first STR-16/29 implementation slice:
 shared execution accounting, durable dual-clock timers and paginated ranked

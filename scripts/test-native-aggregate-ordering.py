@@ -108,7 +108,6 @@ def run_case(binary: Path, directory: Path, batch: int, native: bool, total_orde
         STREAMR_TEST_BACKEND="memory",
         STREAMR_TEST_SOURCE_BATCH_ROWS=str(batch),
         STREAMR_TEST_AGGREGATE_FLUSH_SECONDS="3600",
-        STREAMR_TEST_EXECUTION_BYTES="16777216",
         STREAMR_TEST_CHECKPOINT_MODE="controller",
         STREAMR_CAPTURE_QUERY=str(directory / "query.sql"),
         STREAMR_CAPTURE_OUTPUT=str(directory / "output.jsonl"),

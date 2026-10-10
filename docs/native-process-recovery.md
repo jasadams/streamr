@@ -85,8 +85,9 @@ unnecessary. `arroyo_rpc::local_address` honors this existing hostname override
 or loopback worker bind instead of discovering a non-loopback interface. The script cleans inherited `ARROYO__`, `STREAMR_TEST_` and
 `STREAMR_CAPTURE_` variables and uses actual production config fields, not test
 flags. Generated operator/resource budgets are explicit small-fixture admission
-values, not recommended production defaults. A 16 MiB execution startup refusal
-is a finding, not an automatic reason to enlarge it. Both backends declare shared live resource budgets required by the native
+values, not recommended production defaults. The added execution admission pool
+has been removed; runtime failures remain findings rather than reasons to add
+new features or silently enlarge backend limits. Both backends declare shared live resource budgets required by the native
 aggregate. Memory uses its resident cap; RocksDB additionally declares disk
 configuration. The case must be new and
 outside the read-only package. `--prepare-only` creates reviewable assets without

@@ -41,7 +41,6 @@ pub struct FusedStateTable {
     tables: HashMap<String, TypedTable>,
     resources: Option<WorkerStateResources>,
     chunk_rows: usize,
-    max_input_batch_bytes: usize,
 }
 
 fn descriptor(definition: &StateTableDefinition) -> Result<TableDescriptor> {
@@ -100,11 +99,6 @@ impl OperatorConstructor for FusedStateTableConstructor {
             .as_ref()
             .context("native state table requires worker.typed-sql-state")?;
         typed.validate()?;
-        let max_input_batch_bytes = worker
-            .execution_resources
-            .as_ref()
-            .context("native state table requires worker.execution-resources.max-batch-bytes")?
-            .max_batch_bytes;
         ensure!(
             worker.live_state_resources.is_some(),
             "native state table requires worker.live-state-resources"
@@ -192,7 +186,6 @@ impl OperatorConstructor for FusedStateTableConstructor {
                 tables: HashMap::new(),
                 resources: None,
                 chunk_rows,
-                max_input_batch_bytes,
             },
         )))
     }
@@ -373,14 +366,11 @@ impl ArrowOperator for FusedStateTable {
                 .context("state-table key workspace bound overflow")?;
             Ok::<_, anyhow::Error>(largest.max(bytes))
         })?;
-        // A live scope, one admitted source batch, its owned working row, one captured
+        // A live scope, its owned working row, one captured
         // envelope and the concat copy can coexist. Probe that combination at
         // startup so an impossible resource configuration fails before events
-        // are consumed. Larger batches/chunks still use normal bounded
-        // admission and may be limited by available pool capacity.
-        let one_event_headroom = self
-            .max_input_batch_bytes
-            .checked_add(self.limits.max_working_event_bytes)
+        // are consumed. Captured rows retain their per-event backend bounds.
+        let one_event_headroom = Some(self.limits.max_working_event_bytes)
             .and_then(|bytes| {
                 bytes.checked_add(self.limits.max_captured_event_bytes.checked_mul(2)?)
             })
@@ -427,22 +417,6 @@ impl ArrowOperator for FusedStateTable {
         if batch.num_rows() == 0 {
             return Ok(());
         }
-        if batch.get_array_memory_size() > self.max_input_batch_bytes {
-            return Err(external(
-                "state-table source batch exceeds configured execution max-batch-bytes",
-            ));
-        }
-        let resources = self
-            .resources
-            .as_ref()
-            .ok_or_else(|| external("state-table resource pool is not registered"))?
-            .clone();
-        // Admit the shared source backing once. Each event is then compacted
-        // into its own one-row arrays before the per-event working budget is
-        // checked; charging `slice` here would count this entire batch per row.
-        let _input = resources
-            .try_decoded_value(batch.get_array_memory_size())
-            .map_err(external)?;
         self.emit_chunk(vec![batch], collector).await
     }
 }
@@ -580,7 +554,6 @@ mod tests {
             tables: HashMap::new(),
             resources: Some(resources.clone()),
             chunk_rows,
-            max_input_batch_bytes: 1 << 20,
         };
         let (control_tx, _control_rx) = tokio::sync::mpsc::channel(16);
         let mut context = OperatorContext::new(

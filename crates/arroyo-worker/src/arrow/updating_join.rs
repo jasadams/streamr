@@ -1,7 +1,6 @@
 //! Updating equijoins retain identity-indexed rows in one checkpoint namespace.
 //! Fanout is streamed one pair at a time; independent input branches are not atomic.
 use super::aggregate_store::{AggregateScope, AggregateStore, AggregateStoreLimits};
-use super::execution::{ExecutionResources, configured_execution_resources};
 use anyhow::{Context, Result};
 use arrow::ipc::{reader::StreamReader, writer::StreamWriter};
 use arrow::row::{RowConverter, SortField};
@@ -20,6 +19,7 @@ use arroyo_rpc::{UPDATING_META_FIELD, updating_meta_fields};
 use arroyo_state::live::worker::{
     ConfiguredBackendOwner, configured_worker_resources, construct_configured_backend,
 };
+use datafusion::execution::{TaskContext, runtime_env::RuntimeEnv};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion_proto::{physical_plan::AsExecutionPlan, protobuf::PhysicalPlanNode};
 use futures::StreamExt;
@@ -44,7 +44,6 @@ pub struct UpdatingJoin {
     converters: [RowConverter; 2],
     passers: [Arc<RwLock<Option<RecordBatch>>>; 2],
     plan: Arc<dyn ExecutionPlan>,
-    execution: Arc<ExecutionResources>,
     limits: JoinStateConfig,
     left_outer: bool,
     schema_identity: Vec<u8>,
@@ -250,7 +249,7 @@ impl UpdatingJoin {
         self.passers[0].write().unwrap().replace(left);
         self.passers[1].write().unwrap().replace(right);
         self.plan.reset()?;
-        let mut stream = self.plan.execute(0, self.execution.task_context())?;
+        let mut stream = self.plan.execute(0, Arc::new(TaskContext::default()))?;
         let result: DataflowResult<()> = async {
             while let Some(batch) = stream.next().await {
                 let batch = batch?;
@@ -261,9 +260,6 @@ impl UpdatingJoin {
                 if batch.num_rows() == 0 {
                     continue;
                 }
-                let _output = self
-                    .execution
-                    .reserve_batch("updating join output", &batch)?;
                 join_ensure!(
                     batch.get_array_memory_size() <= self.limits.max_pending_output_bytes,
                     "updating join output exceeds max-pending-output-bytes"
@@ -299,13 +295,6 @@ impl UpdatingJoin {
             .store
             .as_ref()
             .context("updating join was not initialized")?;
-        let _workspace = self.execution.reserve_bytes(
-            "updating join row workspace",
-            self.limits
-                .value_bytes
-                .saturating_mul(12)
-                .saturating_add(self.limits.key_bytes.saturating_mul(4)),
-        )?;
         join_ensure!(
             row.get_array_memory_size() <= self.limits.value_bytes,
             "updating join decoded row exceeds value-bytes"
@@ -505,14 +494,7 @@ impl ArrowOperator for UpdatingJoin {
         );
         let side = index / (total_inputs / 2);
         join_ensure!(side < 2, "invalid updating join input");
-        let _input = self
-            .execution
-            .reserve_batch("updating join input", &batch)?;
         for row in 0..batch.num_rows() {
-            let _compact = self.execution.reserve_bytes(
-                "updating join compact input",
-                batch.get_array_memory_size().saturating_mul(4),
-            )?;
             let index = arrow_array::UInt64Array::from(vec![
                 u64::try_from(row).context("updating join row index overflow")?,
             ]);
@@ -593,10 +575,8 @@ pub(super) fn construct(
         .join_state
         .context("updating joins require worker.join-state")?;
     limits.validate()?;
-    let execution = configured_execution_resources()?
-        .context("updating joins require worker.execution-resources")?;
     Ok(ConstructedOperator::from_operator(Box::new(build(
-        config, registry, limits, execution,
+        config, registry, limits,
     )?)))
 }
 
@@ -604,7 +584,6 @@ fn build(
     config: JoinOperator,
     registry: Arc<Registry>,
     limits: JoinStateConfig,
-    execution: Arc<ExecutionResources>,
 ) -> Result<UpdatingJoin> {
     limits.validate()?;
     let passers = [Arc::new(RwLock::new(None)), Arc::new(RwLock::new(None))];
@@ -616,7 +595,7 @@ fn build(
     };
     let plan = PhysicalPlanNode::decode(config.join_plan.as_slice())?.try_into_physical_plan(
         registry.as_ref(),
-        execution.runtime.as_ref(),
+        &RuntimeEnv::default(),
         &codec,
     )?;
     let schemas: [ArroyoSchema; 2] = [
@@ -655,7 +634,6 @@ fn build(
         converters,
         passers,
         plan,
-        execution,
         limits,
         left_outer: config.left_outer,
         schema_identity: hash.finalize().to_vec(),
@@ -668,7 +646,6 @@ mod tests {
     use super::*;
     use arrow_array::{Int64Array, TimestampNanosecondArray};
     use arrow_schema::DataType;
-    use arroyo_rpc::config::ExecutionResourceConfig;
     use arroyo_state::live::{
         LiveStateBackend, Ownership,
         memory::MemoryLiveState,
@@ -735,18 +712,10 @@ mod tests {
             max_pending_output_bytes: 65536,
             max_resident_bytes: 8 * 1024 * 1024,
         };
-        let execution = Arc::new(
-            ExecutionResources::new(ExecutionResourceConfig {
-                memory_bytes: 16 * 1024 * 1024,
-                max_batch_bytes: 1024 * 1024,
-            })
-            .unwrap(),
-        );
         let mut op = build(
             config,
             Arc::new(arroyo_planner::physical::new_registry()),
             limits,
-            execution,
         )
         .unwrap();
         let resources = WorkerStateResources::new(ResourceConfig {
@@ -1018,14 +987,12 @@ mod tests {
         let text = oversized.schema().index_of("la").unwrap();
         columns[text] = Arc::new(arrow_array::StringArray::from(vec!["z".repeat(20_000)]));
         let oversized = RecordBatch::try_new(oversized.schema(), columns).unwrap();
-        let before = op.execution.runtime.memory_pool.reserved();
         let error = op
             .process_batch_index(0, 2, oversized, &mut ctx, &mut capture)
             .await
             .unwrap_err();
         assert!(error.to_string().contains("value-bytes"), "{error}");
         assert_eq!(capture.0.len(), 8);
-        assert_eq!(op.execution.runtime.memory_pool.reserved(), before);
 
         struct Blocked;
         #[async_trait::async_trait]
@@ -1040,14 +1007,12 @@ mod tests {
                 Ok(())
             }
         }
-        let prior = op.execution.runtime.memory_pool.reserved();
         let right = row(&op, 1, 20, Some(1), 20, false);
         assert!(
             tokio::time::timeout(Duration::from_millis(50), op.change(1, right, &mut Blocked))
                 .await
                 .is_err()
         );
-        assert_eq!(op.execution.runtime.memory_pool.reserved(), prior);
         for passer in &op.passers {
             assert!(passer.read().unwrap().is_none());
         }

@@ -98,7 +98,6 @@ def run_case(binary, directory, mode, backend, protocol, batch):
         STREAMR_TEST_BACKEND=backend,
         STREAMR_TEST_CHECKPOINT_MODE=protocol,
         STREAMR_TEST_SOURCE_BATCH_ROWS=str(batch),
-        STREAMR_TEST_EXECUTION_BYTES='16777216',
         STREAMR_CAPTURE_QUERY=str(directory / 'query.sql'),
         STREAMR_CAPTURE_OUTPUT=str(directory / 'output.jsonl'),
         STREAMR_CAPTURE_INPUT_ROWS_BEFORE_CHECKPOINT='70',

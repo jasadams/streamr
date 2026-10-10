@@ -1859,10 +1859,7 @@ async fn external_sql_checkpoint_capture_inner() {
         ),
         selected_backend == "rocksdb"
     );
-    println!(
-        "CAPTURE_CONFIG backend={selected_backend} checkpoint_mode={selected_checkpoint} execution_resources={:?}",
-        config::config().worker.execution_resources
-    );
+    println!("CAPTURE_CONFIG backend={selected_backend} checkpoint_mode={selected_checkpoint}");
     let query_path = PathBuf::from(
         env::var("STREAMR_CAPTURE_QUERY").expect("STREAMR_CAPTURE_QUERY is required"),
     );
@@ -2314,12 +2311,7 @@ fn configure_test_worker() {
             assert!(rows > 0, "source batch rows must be positive");
             c.pipeline.source_batch_size = rows;
         }
-        if let Ok(bytes) = std::env::var("STREAMR_TEST_EXECUTION_BYTES") {
-            c.worker.execution_resources = Some(arroyo_rpc::config::ExecutionResourceConfig {
-                memory_bytes: bytes.parse().expect("invalid execution memory limit"),
-                max_batch_bytes: 1024 * 1024,
-            });
-        }
+
         if std::env::var("STREAMR_TEST_BACKEND").as_deref() == Ok("rocksdb") {
             use arroyo_rpc::config::{
                 DiskSqlStateConfig, LiveStateResourceConfig, SqlStateBackend,
@@ -2342,12 +2334,6 @@ fn configure_test_worker() {
             });
         }
         if std::env::var("STREAMR_TEST_TYPED_SQL").as_deref() == Ok("1") {
-            c.worker.execution_resources.get_or_insert(
-                arroyo_rpc::config::ExecutionResourceConfig {
-                    memory_bytes: 16 * 1024 * 1024,
-                    max_batch_bytes: 1024 * 1024,
-                },
-            );
             c.worker.typed_sql_state = Some(arroyo_rpc::config::TypedSqlStateConfig {
                 key_bytes: 4096,
                 row_bytes: 24 * 1024,
@@ -2384,10 +2370,6 @@ fn configure_test_worker() {
             resources.queued_write_bytes = 2 * 1024 * 1024;
         }
         if std::env::var("STREAMR_TEST_NATIVE_AGGREGATES").as_deref() == Ok("1") {
-            c.worker.execution_resources = Some(arroyo_rpc::config::ExecutionResourceConfig {
-                memory_bytes: 16 * 1024 * 1024,
-                max_batch_bytes: 8 * 1024 * 1024,
-            });
             c.worker.aggregate_state = Some(arroyo_rpc::config::AggregateStateConfig {
                 key_bytes: 512,
                 value_bytes: 32 * 1024,
@@ -2440,12 +2422,6 @@ fn configure_test_worker() {
             });
         }
         if std::env::var("STREAMR_TEST_NATIVE_WINDOWS").as_deref() == Ok("1") {
-            c.worker.execution_resources.get_or_insert(
-                arroyo_rpc::config::ExecutionResourceConfig {
-                    memory_bytes: 16 * 1024 * 1024,
-                    max_batch_bytes: 1024 * 1024,
-                },
-            );
             c.worker.window_state = Some(arroyo_rpc::config::WindowStateConfig {
                 key_bytes: 512,
                 partial_bytes: 32 * 1024,

@@ -425,10 +425,6 @@ pub struct CompilerConfig {
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub struct WorkerConfig {
-    /// Opt-in shared DataFusion memory and emitted-batch limits.
-    #[serde(default)]
-    pub execution_resources: Option<ExecutionResourceConfig>,
-
     /// Live SQL storage. RocksDB requires explicit disk and worker resource budgets.
     #[serde(default)]
     pub sql_state_backend: SqlStateBackend,
@@ -684,30 +680,6 @@ impl TypedSqlStateConfig {
         {
             bail!(
                 "worker.typed-sql-state requires positive compatible state, event, and pending-output budgets"
-            );
-        }
-        Ok(())
-    }
-}
-
-/// Cooperative DataFusion execution accounting, distinct from live-state budgets.
-/// This does not bound arbitrary UDF allocations or retained operator histories.
-#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
-#[serde(rename_all = "kebab-case", deny_unknown_fields)]
-pub struct ExecutionResourceConfig {
-    pub memory_bytes: usize,
-    pub max_batch_bytes: usize,
-}
-
-impl ExecutionResourceConfig {
-    pub fn validate(&self) -> anyhow::Result<()> {
-        if self.memory_bytes == 0
-            || self.max_batch_bytes == 0
-            || self.max_batch_bytes > self.memory_bytes
-            || self.memory_bytes > isize::MAX as usize
-        {
-            bail!(
-                "worker.execution-resources requires 0 < max-batch-bytes <= memory-bytes <= isize::MAX"
             );
         }
         Ok(())
@@ -1341,39 +1313,6 @@ impl TlsConfig {
 mod tests {
     use crate::config::{Config, DatabaseType, Scheduler, SchemaName, SqliteConfig, load_config};
     use url::Url;
-
-    #[test]
-    fn execution_resource_limits_require_nonzero_compatible_capacities() {
-        for (memory_bytes, max_batch_bytes) in [(0, 1), (1, 0), (1024, 1025), (usize::MAX, 1)] {
-            assert!(
-                super::ExecutionResourceConfig {
-                    memory_bytes,
-                    max_batch_bytes
-                }
-                .validate()
-                .is_err()
-            );
-        }
-        assert!(
-            super::ExecutionResourceConfig {
-                memory_bytes: 1024,
-                max_batch_bytes: 512
-            }
-            .validate()
-            .is_ok()
-        );
-        let parsed: super::ExecutionResourceConfig = serde_json::from_value(serde_json::json!({
-            "memory-bytes": 1024, "max-batch-bytes": 512
-        }))
-        .unwrap();
-        assert!(parsed.validate().is_ok());
-        assert!(
-            serde_json::from_value::<super::ExecutionResourceConfig>(serde_json::json!({
-                "memory-bytes": 1024, "max-batch-bytes": 512, "unaccounted-spill": true
-            }))
-            .is_err()
-        );
-    }
 
     #[test]
     fn schema_name_accepts_valid_identifiers() {

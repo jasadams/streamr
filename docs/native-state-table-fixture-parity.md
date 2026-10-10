@@ -18,8 +18,9 @@ accounted for. No stored state or checkpoint is rewritten by preparing these ass
 `manifest-batch1.json` and `manifest-batch8.json` use the existing bundle-runner
 format. Both require ordered comparison, 120 seconds per SQL child and a 512 MiB
 SQL-child RSS ceiling. Each package selects the existing `typed-sql` route;
-the runner supplies a 16 MiB execution pool and the existing typed-state test
-configuration. There is no queue-size override or pool increase. Source/sink
+the runner supplies the existing typed-state/backend test configuration.
+Operator execution uses upstream Arroyo behavior; the added execution admission
+pool was removed. There is no queue-size override or backend pool increase. Source/sink
 fields remain nullable. Singleton ownership is required; these rows do not
 establish order across multiple owners.
 
@@ -95,7 +96,7 @@ commands do not qualify physical source-free isolation.
 
 The runner renders only `{{INPUT}}` and `{{OUTPUT}}` paths, clears inherited
 STREAMR_TEST/STREAMR_CAPTURE flags and explicitly selects backend, protocol,
-source batch, typed route, execution bytes and epoch 1. It retains checkpoints
+source batch, typed route and epoch 1. It retains checkpoints
 under `results/<backend>-<protocol>/checkpoints`. Initial and recovered complete
 rows must equal the entire golden in order, including names, JSON types, nulls,
 Booleans and every value. The recovered prefix must equal the checkpoint golden.

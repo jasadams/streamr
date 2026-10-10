@@ -251,7 +251,6 @@ def main():
         # over 32 MiB together, including encoded-write copies and metadata.
         STREAMR_TEST_QUEUED_WRITE_BYTES="67108864",
         STREAMR_TEST_AGGREGATE_FLUSH_SECONDS="3600",
-        STREAMR_TEST_EXECUTION_BYTES="16777216",
         STREAMR_TEST_BACKEND=args.backend,
         STREAMR_TEST_CHECKPOINT_MODE=args.mode,
         STREAMR_TEST_SOURCE_BATCH_ROWS=str(args.batch),

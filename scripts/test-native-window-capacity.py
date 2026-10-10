@@ -22,7 +22,7 @@ import time
 
 
 BASE = datetime.fromisoformat("2023-10-09T17:13:20")
-POOL_BUDGET_MIB = 50  # executor 16 + cache 8 + memtable 4 + write 4 + decoded 16 + scan 2
+POOL_BUDGET_MIB = 34  # cache 8 + memtable 4 + write 4 + decoded 16 + scan 2
 CASES = ("tumble", "hop", "session")
 DEFAULT_CASES = ("tumble", "session")
 PROTOCOLS = ("controller", "leader")
@@ -184,7 +184,6 @@ def run_case(binary, directory, case, backend, protocol, rows, payload_bytes,
         STREAMR_TEST_BACKEND=backend,
         STREAMR_TEST_CHECKPOINT_MODE=protocol,
         STREAMR_TEST_SOURCE_BATCH_ROWS="32",
-        STREAMR_TEST_EXECUTION_BYTES=str(16 * 1024 * 1024),
         STREAMR_TEST_RUNTIME_TIMEOUT_SECONDS=str(timeout_seconds),
         STREAMR_CAPTURE_QUERY=str(directory / "query.sql"),
         STREAMR_CAPTURE_OUTPUT=str(output_path),

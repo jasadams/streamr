@@ -1,5 +1,13 @@
 # Milestone 3 — agent backlog
 
+## STR-32 MVP scope cleanup and Kafka review — 2026-10-11
+
+- User authorized removal of graph/network byte admission, operator execution admission and unused timer/ranked/history helper APIs. Keep native SQL, RocksDB backend limits and Kafka recovery; review Kafka architecture before proposing changes.
+- Fresh fetched base682bea0d remains current. Worktree /home/jason/repos/streamr-str32-arroyo-queues; guidance AGENTS.md, .claude/build-test.md/team.md, this ledger/work-plan, current STR32. Historical in-flight records are root-owned, no competing claim.
+- Queue-only removal source review approved; its compile check cancelled143 as superseded, no pass claimed. Helper removal frozen, worker/RPC/harness admission removal in progress. Kafka review is independent/read-only.
+- Acceptance: complete obsolete API/config/dispatch/test removal, preserve backend/current SQL/recovery contracts; fresh independent review, container gates, exact value/checkpoint/closure tests and original100k/batch32/RSS512MiB capacity regression. No replacement backpressure design or Kafka redesign.
+- Next: integrate worker/helper patches, update current docs/harness budgets honestly, serialize gates and pin current-source executable. Full application lifecycle/live journal/combined capacity qualification remains open; no pending user decision for these removals.
+
 ## Active STR-102 — 2026-10-10
 
 - Coordinator Codex `/root`, implementer `/root/implement`; branch
@@ -182,7 +190,8 @@ current dispatch instructions. No implementation worker is claimed by this reset
   capacity/fault qualification remains STR-32, external parity ARC-15/16.
   Separate window CDC deficiency remains STR-68. No remaining retention decision.
 
-At the 2026-10-09 reset, all eight tickets were Todo, agent-ready and unblocked.
+Historical ownership snapshot from the 2026-10-09 reset (superseded by current
+STR-32 scope above): all eight tickets were Todo, agent-ready and unblocked.
 STR-16 now has [PR #15](https://github.com/jasadams/streamr/pull/15) open awaiting
 final CI and merge. Independent agents may work in parallel in separate worktrees
 with the file ownership in each ticket.

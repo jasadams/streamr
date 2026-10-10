@@ -36,7 +36,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 mod aggregate_codec;
 mod aggregate_store;
 pub mod async_udf;
-pub(crate) mod execution;
 pub mod incremental_aggregator;
 pub mod instant_join;
 pub mod join_with_expiration;
@@ -113,7 +112,6 @@ pub struct ProjectionOperator {
     name: String,
     output_schema: ArroyoSchema,
     exprs: Vec<Arc<dyn PhysicalExpr>>,
-    resources: Option<Arc<execution::ExecutionResources>>,
 }
 
 pub struct ProjectionConstructor;
@@ -146,7 +144,6 @@ impl OperatorConstructor for ProjectionConstructor {
                 name: config.name,
                 output_schema,
                 exprs: exprs?,
-                resources: execution::configured_execution_resources()?,
             },
         )))
     }
@@ -174,11 +171,6 @@ impl ArrowOperator for ProjectionOperator {
         _: &mut OperatorContext,
         collector: &mut dyn Collector,
     ) -> DataflowResult<()> {
-        let _input_reservation = self
-            .resources
-            .as_ref()
-            .map(|resources| resources.reserve_batch("Streamr projection input", &record_batch))
-            .transpose()?;
         let outputs = self
             .exprs
             .iter()
@@ -189,11 +181,6 @@ impl ArrowOperator for ProjectionOperator {
             .try_collect()?;
 
         let output = RecordBatch::try_new(self.output_schema.schema.clone(), outputs)?;
-        let _output_reservation = self
-            .resources
-            .as_ref()
-            .map(|resources| resources.reserve_batch("Streamr projection output", &output))
-            .transpose()?;
         collector.collect(output).await
     }
 }
@@ -267,7 +254,6 @@ pub struct StatelessPhysicalExecutor {
     batch: Arc<RwLock<Option<RecordBatch>>>,
     plan: Arc<dyn ExecutionPlan>,
     task_context: Arc<TaskContext>,
-    resources: Option<Arc<execution::ExecutionResources>>,
     active: Arc<AtomicBool>,
 }
 
@@ -296,19 +282,7 @@ fn failed_execution_stream(
 }
 
 impl StatelessPhysicalExecutor {
-    pub fn new(proto: &[u8], registry: &Registry) -> anyhow::Result<Self> {
-        Self::new_with_resources(
-            proto,
-            registry,
-            execution::configured_execution_resources()?,
-        )
-    }
-
-    fn new_with_resources(
-        mut proto: &[u8],
-        registry: &Registry,
-        resources: Option<Arc<execution::ExecutionResources>>,
-    ) -> anyhow::Result<Self> {
+    pub fn new(mut proto: &[u8], registry: &Registry) -> anyhow::Result<Self> {
         let batch = Arc::new(RwLock::default());
 
         let plan = PhysicalPlanNode::decode(&mut proto)?;
@@ -316,21 +290,15 @@ impl StatelessPhysicalExecutor {
             context: DecodingContext::SingleLockedBatch(batch.clone()),
         };
 
-        let runtime = match &resources {
-            Some(resources) => resources.runtime.clone(),
-            None => RuntimeEnvBuilder::new().build_arc()?,
-        };
+        let runtime = RuntimeEnvBuilder::new().build_arc()?;
         let plan = plan.try_into_physical_plan(registry, &runtime, &codec)?;
-        let task_context = match &resources {
-            Some(resources) => resources.task_context(),
-            None => SessionContext::new_with_config_rt(Default::default(), runtime).task_ctx(),
-        };
+        let task_context =
+            SessionContext::new_with_config_rt(Default::default(), runtime).task_ctx();
 
         Ok(Self {
             batch,
             plan,
             task_context,
-            resources,
             active: Arc::new(AtomicBool::new(false)),
         })
     }
@@ -345,15 +313,6 @@ impl StatelessPhysicalExecutor {
             batch: self.batch.clone(),
             active: self.active.clone(),
         };
-        let input_reservation = match self
-            .resources
-            .as_ref()
-            .map(|resources| resources.reserve_batch("execution input", &batch))
-            .transpose()
-        {
-            Ok(reservation) => reservation,
-            Err(error) => return failed_execution_stream(self.plan.schema(), error),
-        };
         {
             let mut writer = self.batch.write().unwrap();
             *writer = Some(batch);
@@ -367,14 +326,8 @@ impl StatelessPhysicalExecutor {
             Err(error) => return failed_execution_stream(self.plan.schema(), error),
         };
         let schema = stream.schema();
-        let runtime = self
-            .resources
-            .as_ref()
-            .map(|resources| resources.runtime.clone());
         let held_input = async_stream::try_stream! {
             let _input_guard = input_guard;
-            let _runtime = runtime;
-            let _reservation = input_reservation;
             let mut stream = stream;
             while let Some(batch) = stream.next().await {
                 yield batch?;
@@ -383,18 +336,10 @@ impl StatelessPhysicalExecutor {
         let held_input = Box::pin(
             datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(schema, held_input),
         );
-        match &self.resources {
-            Some(resources) => sync::streams::bounded_output_stream(
-                held_input,
-                resources.runtime.memory_pool.clone(),
-                resources.limits.max_batch_bytes,
-            ),
-            None => held_input,
-        }
+        held_input
     }
 
-    /// The returned batch is caller-owned after the stream has drained; callers
-    /// retaining it must supply their own output reservation.
+    /// The returned batch is caller-owned after the stream has drained.
     pub async fn process_single(&mut self, batch: RecordBatch) -> DFResult<RecordBatch> {
         let mut stream = self.process_batch(batch).await;
         let result = stream.next().await.transpose()?.ok_or_else(|| {

@@ -35,9 +35,10 @@ use arroyo_state::live::worker::{
 use arroyo_types::to_nanos;
 use datafusion::{
     common::ScalarValue,
-    execution::memory_pool::MemoryConsumer,
+    execution::{TaskContext, runtime_env::RuntimeEnvBuilder},
     physical_expr::PhysicalExpr,
     physical_plan::{ExecutionPlan, aggregates::AggregateExec},
+    prelude::SessionContext,
 };
 use datafusion_proto::{physical_plan::AsExecutionPlan, protobuf::PhysicalPlanNode};
 use futures::{StreamExt, try_join};
@@ -71,29 +72,12 @@ fn hop_end(progress: Option<i64>, earliest: i64, slide: i64) -> Result<i64> {
 
 #[derive(Default)]
 struct CollectionSize {
-    encoded_bytes: usize,
-    elements: usize,
-    array_bytes: usize,
     output_elements: usize,
     output_bytes: usize,
-    partials: usize,
 }
 
 impl CollectionSize {
-    fn add_partial(
-        &mut self,
-        batch: &RecordBatch,
-        encoded: usize,
-        columns: &[(usize, bool)],
-    ) -> Result<()> {
-        self.encoded_bytes = self
-            .encoded_bytes
-            .checked_add(encoded)
-            .context("native window collection IPC size overflow")?;
-        self.partials = self
-            .partials
-            .checked_add(1)
-            .context("native window collection partial count overflow")?;
+    fn add_partial(&mut self, batch: &RecordBatch, columns: &[(usize, bool)]) -> Result<()> {
         for (column, output_array) in columns {
             let list = batch
                 .column(*column)
@@ -105,14 +89,6 @@ impl CollectionSize {
                 "native window collection partial must contain one row"
             );
             let values = list.value(0);
-            self.elements = self
-                .elements
-                .checked_add(values.len())
-                .context("native window collection element count overflow")?;
-            self.array_bytes = self
-                .array_bytes
-                .checked_add(values.get_array_memory_size())
-                .context("native window collection array size overflow")?;
             if *output_array {
                 self.output_elements = self
                     .output_elements
@@ -169,48 +145,15 @@ impl CollectionSize {
             .context("native window collection output bound overflow")
     }
 
-    fn admit(
-        &self,
-        output_array: bool,
-        fields: usize,
-        limits: WindowStateConfig,
-        execution: &arroyo_rpc::config::ExecutionResourceConfig,
-    ) -> Result<usize> {
+    fn admit(&self, output_array: bool, fields: usize, limits: WindowStateConfig) -> Result<()> {
         if output_array {
             let output = self.output_bound(limits.key_bytes, fields)?;
             ensure!(
                 output <= limits.partial_bytes,
                 "native window collection output exceeds configured partial limit"
             );
-            ensure!(
-                output <= execution.max_batch_bytes,
-                "native window collection output exceeds execution max-batch-bytes"
-            );
         }
-        let working = self.working_bound(limits.partial_bytes)?;
-        ensure!(
-            working
-                .checked_add(limits.partial_bytes)
-                .is_some_and(|bytes| bytes <= execution.memory_bytes),
-            "native window collection exceeds execution-memory budget"
-        );
-        Ok(working)
-    }
-
-    fn working_bound(&self, output_limit: usize) -> Result<usize> {
-        // DF48 flat DISTINCT uses HashSet<ScalarValue>; ARRAY_AGG keeps
-        // ArrayRefs and may concatenate them. Eight scalar slots per input
-        // covers hash-table spare capacity, cloned evaluation vectors, and
-        // transient final state. Eight child-buffer copies cover Arrow concat,
-        // list output and the decoded source while the same snapshot is read.
-        self.elements
-            .checked_mul(std::mem::size_of::<ScalarValue>())
-            .and_then(|bytes| bytes.checked_mul(8))
-            .and_then(|bytes| bytes.checked_add(self.array_bytes.checked_mul(8)?))
-            .and_then(|bytes| bytes.checked_add(self.encoded_bytes))
-            .and_then(|bytes| bytes.checked_add(self.partials.checked_mul(256)?))
-            .and_then(|bytes| bytes.checked_add(output_limit.checked_mul(2)?))
-            .context("native window collection working bound overflow")
+        Ok(())
     }
 }
 
@@ -221,6 +164,7 @@ pub(crate) struct NativeWindow {
     binning: Arc<dyn PhysicalExpr>,
     partial: StatelessPhysicalExecutor,
     finish: Arc<dyn ExecutionPlan>,
+    task_context: Arc<TaskContext>,
     finish_receiver: Arc<RwLock<Option<Receiver<RecordBatch>>>>,
     projection: Option<StatelessPhysicalExecutor>,
     finish_timestamp_schema: SchemaRef,
@@ -250,10 +194,6 @@ impl NativeWindow {
         limits: WindowStateConfig,
     ) -> Result<Self> {
         limits.validate()?;
-        ensure!(
-            config().worker.execution_resources.is_some(),
-            "native windows require worker.execution-resources"
-        );
         ensure!(
             (width == Duration::ZERO && slide == Duration::ZERO && !hopping)
                 || (width > Duration::ZERO && slide > Duration::ZERO),
@@ -378,11 +318,10 @@ impl NativeWindow {
         let finish_codec = ArroyoPhysicalExtensionCodec {
             context: DecodingContext::BoundedBatchStream(finish_receiver.clone()),
         };
-        let execution = super::execution::configured_execution_resources()?
-            .context("native windows require worker.execution-resources")?;
+        let runtime = RuntimeEnvBuilder::new().build_arc()?;
         let finish = PhysicalPlanNode::decode(finish_bytes)?.try_into_physical_plan(
             registry.as_ref(),
-            &execution.runtime,
+            &runtime,
             &finish_codec,
         )?;
         let projection = projection_bytes
@@ -412,6 +351,8 @@ impl NativeWindow {
             binning,
             partial,
             finish,
+            task_context: SessionContext::new_with_config_rt(Default::default(), runtime)
+                .task_ctx(),
             finish_receiver,
             projection,
             finish_timestamp_schema,
@@ -512,17 +453,6 @@ impl NativeWindow {
         {
             return Ok(());
         }
-        let execution = super::execution::configured_execution_resources()?
-            .context("native windows require worker.execution-resources")?;
-        let _input_permit = execution.reserve_batch("native window source", &batch)?;
-        let scratch_bytes = batch
-            .num_rows()
-            .checked_mul(32)
-            .context("native window source row count overflow")?;
-        let mut _scratch_permit =
-            datafusion::execution::memory_pool::MemoryConsumer::new("native window bin scratch")
-                .register(&execution.runtime.memory_pool);
-        _scratch_permit.try_grow(scratch_bytes)?;
         let bins = self
             .binning
             .evaluate(&batch)?
@@ -626,25 +556,20 @@ impl NativeWindow {
             else {
                 continue;
             };
-            // Collection preflight counts the same snapshot and reserves its
-            // final-state workspace. Keep its existing lifetime and budget:
-            // only scalar/ordered groups carry this decoded first partial
-            // into the bounded producer.
+            // Collection preflight scans the same snapshot. Scalar/ordered
+            // groups carry this decoded first partial into the paged producer.
             let first_for_producer = if self.collection_columns.is_empty() {
                 Some(first)
             } else {
                 drop(first);
                 None
             };
-            let execution = super::execution::configured_execution_resources()?
-                .context("native windows require worker.execution-resources")?;
             // ARRAY_AGG and DISTINCT retain cardinality-growing final state.
-            // Count the actual persisted IPC bytes in this same snapshot before
+            // Count collection output values in this same snapshot before
             // invoking DataFusion; this pass retains only one decoded partial.
             // Flat builtin state has one ListArray per collection expression.
-            // Charge its element count and actual child buffers rather than
-            // multiplying IPC framing overhead for small partials.
-            let _collection_reservations = if !self.collection_columns.is_empty() {
+            // Measure the value bound without imposing an execution pool.
+            if !self.collection_columns.is_empty() {
                 let mut after = None;
                 let mut size = CollectionSize::default();
                 while let Some(partial) = snapshot
@@ -657,11 +582,7 @@ impl NativeWindow {
                     )
                     .await?
                 {
-                    size.add_partial(
-                        &partial.batch,
-                        partial.encoded_bytes,
-                        &self.collection_columns,
-                    )?;
+                    size.add_partial(&partial.batch, &self.collection_columns)?;
                     // Refuse as soon as the bounded scan proves admission
                     // impossible. Do not walk the rest of a hot group before
                     // discovering a limit that has already been exceeded.
@@ -669,34 +590,15 @@ impl NativeWindow {
                         self.collection_output,
                         self.partial_schema.fields().len(),
                         self.limits,
-                        &execution.limits,
                     )?;
                     after = Some(partial.key.clone());
                 }
-                let expanded = size.admit(
-                    self.collection_output,
-                    self.partial_schema.fields().len(),
-                    self.limits,
-                    &execution.limits,
-                )?;
-                let decoded = self.store()?.reserve_collection_final(expanded)?;
-                Some(decoded)
-            } else {
-                None
-            };
-            // Final aggregation allocates its result before reserve_batch can
-            // inspect it. Admit that bounded result workspace before executing
-            // scalar, ordered, and collection plans, and retain it while a slow
-            // collector owns the result. DataFusion charges accumulator state
-            // separately in the same pool.
-            let mut _final_output_reservation = MemoryConsumer::new("native window final output")
-                .register(&execution.runtime.memory_pool);
-            _final_output_reservation.try_grow(self.limits.partial_bytes)?;
+            }
             let _input_queue_permit = self.store()?.reserve_final_input_queue()?;
             let (sender, receiver) = channel(1);
             *self.finish_receiver.write().unwrap() = Some(receiver);
             self.finish.reset()?;
-            let mut finish = self.finish.execute(0, execution.task_context())?;
+            let mut finish = self.finish.execute(0, self.task_context.clone())?;
             // Move the sender into the producer so the input stream observes
             // EOF as soon as all paged partials have been sent.
             let producer_snapshot = snapshot;
@@ -759,13 +661,9 @@ impl NativeWindow {
                     let mut output = projection.process_batch(output).await;
                     while let Some(batch) = output.next().await {
                         let batch = batch?;
-                        let _output_permit =
-                            execution.reserve_batch("native window output", &batch)?;
                         collector.collect(batch).await?;
                     }
                 } else {
-                    let _output_permit =
-                        execution.reserve_batch("native window output", &output)?;
                     collector.collect(output).await?;
                 }
             }
@@ -945,15 +843,14 @@ mod tests {
         let mut small = CollectionSize::default();
         for _ in 0..78 {
             small
-                .add_partial(&batch, 512, &[(0, true), (1, true), (2, false)])
+                .add_partial(&batch, &[(0, true), (1, true), (2, false)])
                 .unwrap();
         }
-        assert!(small.array_bytes > 32 * 1024);
         assert!(small.output_bound(512, 5).unwrap() <= 32 * 1024);
 
         let mut large = CollectionSize::default();
         for _ in 0..4096 {
-            large.add_partial(&batch, 512, &[(0, true)]).unwrap();
+            large.add_partial(&batch, &[(0, true)]).unwrap();
         }
         assert!(large.output_bound(512, 2).unwrap() > 32 * 1024);
     }
@@ -1005,8 +902,7 @@ mod tests {
     }
 
     #[test]
-    fn collection_preflight_refuses_output_and_execution_limits_before_final_execution() {
-        use arroyo_rpc::config::ExecutionResourceConfig;
+    fn collection_preflight_refuses_backend_output_limit_before_final_execution() {
         let limits = WindowStateConfig {
             key_bytes: 128,
             partial_bytes: 8192,
@@ -1032,13 +928,9 @@ mod tests {
         )
         .unwrap();
         let mut size = CollectionSize::default();
-        size.add_partial(&batch, 1024, &[(0, true)]).unwrap();
-        let mut execution = ExecutionResourceConfig {
-            memory_bytes: 16 * 1024 * 1024,
-            max_batch_bytes: 32768,
-        };
+        size.add_partial(&batch, &[(0, true)]).unwrap();
         assert!(
-            size.admit(true, 1, limits, &execution)
+            size.admit(true, 1, limits)
                 .unwrap_err()
                 .to_string()
                 .contains("configured partial limit")
@@ -1047,25 +939,7 @@ mod tests {
             partial_bytes: 32768,
             ..limits
         };
-        execution.max_batch_bytes = 8192;
-        assert!(
-            size.admit(true, 1, wider, &execution)
-                .unwrap_err()
-                .to_string()
-                .contains("max-batch-bytes")
-        );
-        // COUNT(DISTINCT) returns a scalar, but its hash state must still be
-        // admitted. Small output never bypasses the working-state bound.
-        execution.memory_bytes = 32768;
-        assert!(
-            size.admit(false, 1, limits, &execution)
-                .unwrap_err()
-                .to_string()
-                .contains("execution-memory budget")
-        );
-        execution.memory_bytes = 16 * 1024 * 1024;
-        execution.max_batch_bytes = 32768;
-        assert!(size.admit(true, 1, wider, &execution).is_ok());
+        assert!(size.admit(true, 1, wider).is_ok());
     }
 
     struct BlockedCollector {
@@ -1140,9 +1014,7 @@ mod tests {
         collection: bool,
         exact: bool,
     ) {
-        use super::super::execution::{ExecutionResources, with_test_execution_resources};
         use arroyo_planner::physical::{ArroyoMemExec, new_registry};
-        use arroyo_rpc::config::ExecutionResourceConfig;
         use datafusion::functions_aggregate::{
             array_agg::array_agg_udaf, count::count_udaf, sum::sum_udaf,
         };
@@ -1150,136 +1022,227 @@ mod tests {
         use datafusion::physical_plan::aggregates::{AggregateMode, PhysicalGroupBy};
         use std::time::UNIX_EPOCH;
 
-        let execution = Arc::new(
-            ExecutionResources::new(ExecutionResourceConfig {
-                memory_bytes: 16 * 1024 * 1024,
-                max_batch_bytes: 32768,
-            })
-            .unwrap(),
-        );
-        with_test_execution_resources(execution.clone(), async {
+        let runtime = RuntimeEnvBuilder::new().build_arc().unwrap();
+        {
             let registry = new_registry();
             let raw_schema = partial().schema();
             let mut aggregates = vec![];
             if collection {
-                for (fun, distinct, alias) in [(array_agg_udaf(), false, "items"),
-                    (array_agg_udaf(), true, "unique_items"), (count_udaf(), true, "distinct_count")] {
-                    let builder = AggregateExprBuilder::new(fun, vec![col("count", &raw_schema).unwrap()])
-                        .schema(raw_schema.clone()).alias(alias);
-                    let builder = if distinct { builder.distinct() } else { builder };
+                for (fun, distinct, alias) in [
+                    (array_agg_udaf(), false, "items"),
+                    (array_agg_udaf(), true, "unique_items"),
+                    (count_udaf(), true, "distinct_count"),
+                ] {
+                    let builder =
+                        AggregateExprBuilder::new(fun, vec![col("count", &raw_schema).unwrap()])
+                            .schema(raw_schema.clone())
+                            .alias(alias);
+                    let builder = if distinct {
+                        builder.distinct()
+                    } else {
+                        builder
+                    };
                     aggregates.push(Arc::new(builder.build().unwrap()));
                 }
             } else {
-                aggregates.push(Arc::new(AggregateExprBuilder::new(sum_udaf(), vec![col("count", &raw_schema).unwrap()])
-                    .schema(raw_schema.clone()).alias("total").build().unwrap()));
+                aggregates.push(Arc::new(
+                    AggregateExprBuilder::new(sum_udaf(), vec![col("count", &raw_schema).unwrap()])
+                        .schema(raw_schema.clone())
+                        .alias("total")
+                        .build()
+                        .unwrap(),
+                ));
             }
             let schema = if collection {
-                Arc::new(Schema::new(aggregates.iter().flat_map(|aggregate| aggregate.state_fields().unwrap()).collect::<Vec<_>>()))
-            } else { raw_schema.clone() };
+                Arc::new(Schema::new(
+                    aggregates
+                        .iter()
+                        .flat_map(|aggregate| aggregate.state_fields().unwrap())
+                        .collect::<Vec<_>>(),
+                ))
+            } else {
+                raw_schema.clone()
+            };
             let row = if collection {
-                let lists = schema.fields().iter().map(|field| {
-                    let DataType::List(item) = field.data_type() else { panic!("flat collection state required") };
-                    let mut builder = ListBuilder::new(Int64Builder::new()).with_field(item.clone());
-                    builder.values().append_value(1);
-                    builder.append(true);
-                    Arc::new(builder.finish()) as Arc<dyn Array>
-                }).collect();
+                let lists = schema
+                    .fields()
+                    .iter()
+                    .map(|field| {
+                        let DataType::List(item) = field.data_type() else {
+                            panic!("flat collection state required")
+                        };
+                        let mut builder =
+                            ListBuilder::new(Int64Builder::new()).with_field(item.clone());
+                        builder.values().append_value(1);
+                        builder.append(true);
+                        Arc::new(builder.finish()) as Arc<dyn Array>
+                    })
+                    .collect();
                 RecordBatch::try_new(schema.clone(), lists).unwrap()
-            } else { partial() };
+            } else {
+                partial()
+            };
             let (store, state) = store_for_schema(schema.clone());
             // Many panes, with a hot first pane spanning many one-entry pages.
             for pane in 0..48 {
                 for _ in 0..if pane == 0 { 128 } else { 1 } {
-                    store.append(&[], pane * if exact { 1 } else { 10 }, &row).await.unwrap();
+                    store
+                        .append(&[], pane * if exact { 1 } else { 10 }, &row)
+                        .await
+                        .unwrap();
                 }
             }
-            let input: Arc<dyn ExecutionPlan> = Arc::new(ArroyoMemExec::new("input".into(), schema.clone()));
+            let input: Arc<dyn ExecutionPlan> =
+                Arc::new(ArroyoMemExec::new("input".into(), schema.clone()));
             let filters = vec![None; aggregates.len()];
-            let planning: Arc<dyn ExecutionPlan> = Arc::new(AggregateExec::try_new(
-                if collection { AggregateMode::Final } else { AggregateMode::Single },
-                PhysicalGroupBy::new_single(vec![]), aggregates,
-                filters, input.clone(), raw_schema,
-            ).unwrap());
-            let codec = ArroyoPhysicalExtensionCodec { context: DecodingContext::Planning };
+            let planning: Arc<dyn ExecutionPlan> = Arc::new(
+                AggregateExec::try_new(
+                    if collection {
+                        AggregateMode::Final
+                    } else {
+                        AggregateMode::Single
+                    },
+                    PhysicalGroupBy::new_single(vec![]),
+                    aggregates,
+                    filters,
+                    input.clone(),
+                    raw_schema,
+                )
+                .unwrap(),
+            );
+            let codec = ArroyoPhysicalExtensionCodec {
+                context: DecodingContext::Planning,
+            };
             let serialized = PhysicalPlanNode::try_from_physical_plan(planning, &codec).unwrap();
             let receiver = Arc::new(RwLock::new(None));
-            let codec = ArroyoPhysicalExtensionCodec { context: DecodingContext::BoundedBatchStream(receiver.clone()) };
-            let finish = serialized.try_into_physical_plan(&registry, &execution.runtime, &codec).unwrap();
-            let partial_plan = PhysicalPlanNode::try_from_physical_plan(input, &ArroyoPhysicalExtensionCodec {
-                context: DecodingContext::Planning,
-            }).unwrap().encode_to_vec();
+            let codec = ArroyoPhysicalExtensionCodec {
+                context: DecodingContext::BoundedBatchStream(receiver.clone()),
+            };
+            let finish = serialized
+                .try_into_physical_plan(&registry, &runtime, &codec)
+                .unwrap();
+            let partial_plan = PhysicalPlanNode::try_from_physical_plan(
+                input,
+                &ArroyoPhysicalExtensionCodec {
+                    context: DecodingContext::Planning,
+                },
+            )
+            .unwrap()
+            .encode_to_vec();
             let finish_timestamp_schema = add_timestamp_field_arrow((*finish.schema()).clone());
             let mut operator = NativeWindow {
-                width: Duration::from_nanos(if exact { 0 } else if hopping { 20 } else { 10 }), slide: Duration::from_nanos(if exact { 0 } else { 10 }), hopping,
-                binning: Arc::new(datafusion::physical_expr::expressions::Literal::new(ScalarValue::TimestampNanosecond(Some(0), None))),
+                width: Duration::from_nanos(if exact {
+                    0
+                } else if hopping {
+                    20
+                } else {
+                    10
+                }),
+                slide: Duration::from_nanos(if exact { 0 } else { 10 }),
+                hopping,
+                binning: Arc::new(datafusion::physical_expr::expressions::Literal::new(
+                    ScalarValue::TimestampNanosecond(Some(0), None),
+                )),
                 partial: StatelessPhysicalExecutor::new(&partial_plan, &registry).unwrap(),
-                finish, finish_receiver: receiver, projection: None,
-                finish_timestamp_schema: finish_timestamp_schema.clone(), partial_schema: schema.clone(),
-                group_converter: None, group_fields: 0, collection_columns: if collection { vec![(0, true), (1, true), (2, false)] } else { vec![] }, collection_output: collection,
-                limits: WindowStateConfig { key_bytes: 128, partial_bytes: 8192, page_bytes: 32768,
-                    page_entries: 1, write_bytes: 65536, write_operations: 16, max_resident_bytes: 8 * 1024 * 1024 },
-                identity: vec![], store: Some(store),
+                finish,
+                task_context: SessionContext::new_with_config_rt(
+                    Default::default(),
+                    runtime.clone(),
+                )
+                .task_ctx(),
+                finish_receiver: receiver,
+                projection: None,
+                finish_timestamp_schema: finish_timestamp_schema.clone(),
+                partial_schema: schema.clone(),
+                group_converter: None,
+                group_fields: 0,
+                collection_columns: if collection {
+                    vec![(0, true), (1, true), (2, false)]
+                } else {
+                    vec![]
+                },
+                collection_output: collection,
+                limits: WindowStateConfig {
+                    key_bytes: 128,
+                    partial_bytes: 8192,
+                    page_bytes: 32768,
+                    page_entries: 1,
+                    write_bytes: 65536,
+                    write_operations: 16,
+                    max_resident_bytes: 8 * 1024 * 1024,
+                },
+                identity: vec![],
+                store: Some(store),
             };
             let (control, _control_rx) = channel(16);
             let mut ctx = OperatorContext::new(
-                Arc::new(arroyo_types::get_test_task_info()), None, control, 1,
-                vec![Arc::new(ArroyoSchema::from_schema_unkeyed(add_timestamp_field_arrow((*schema).clone())).unwrap())],
-                Some(Arc::new(ArroyoSchema::from_schema_unkeyed(finish_timestamp_schema).unwrap())),
+                Arc::new(arroyo_types::get_test_task_info()),
+                None,
+                control,
+                1,
+                vec![Arc::new(
+                    ArroyoSchema::from_schema_unkeyed(add_timestamp_field_arrow((*schema).clone()))
+                        .unwrap(),
+                )],
+                Some(Arc::new(
+                    ArroyoSchema::from_schema_unkeyed(finish_timestamp_schema).unwrap(),
+                )),
                 HashMap::new(),
-            ).await;
-            ctx.watermarks.set(0, arroyo_types::Watermark::EventTime(UNIX_EPOCH + Duration::from_nanos(if exact { 2 } else { 20 })));
+            )
+            .await;
+            ctx.watermarks.set(
+                0,
+                arroyo_types::Watermark::EventTime(
+                    UNIX_EPOCH + Duration::from_nanos(if exact { 2 } else { 20 }),
+                ),
+            );
             if exact {
                 assert_eq!(operator.bin_start(19).unwrap(), 19);
                 // The exact bin at the watermark is admitted; an older bin is late.
                 operator.process_batch(row.clone(), &mut ctx).await.unwrap();
-                assert_eq!(operator.store().unwrap().earliest_time().await.unwrap(), Some(0));
-                operator.binning = Arc::new(datafusion::physical_expr::expressions::Literal::new(ScalarValue::TimestampNanosecond(Some(2), None)));
+                assert_eq!(
+                    operator.store().unwrap().earliest_time().await.unwrap(),
+                    Some(0)
+                );
+                operator.binning = Arc::new(datafusion::physical_expr::expressions::Literal::new(
+                    ScalarValue::TimestampNanosecond(Some(2), None),
+                ));
                 if !collection {
                     operator.process_batch(row.clone(), &mut ctx).await.unwrap();
                 }
             }
             if collection {
-                // Persisted List state spans128 pages. Refusal occurs before
-                // any final execution, collector call, progress or expiry.
+                // The output value is bounded before any collector call or expiry.
                 let original = operator.limits;
-                for output_limit in [512, 8192] {
-                    operator.limits.partial_bytes = output_limit;
-                    let mut refused = RecordedCollector::default();
-                    let error = if output_limit == 512 {
-                        operator.handle_watermark(&mut ctx, &mut refused).await.unwrap_err()
-                    } else {
-                        let tight = Arc::new(ExecutionResources::new(ExecutionResourceConfig {
-                            memory_bytes: 32768, max_batch_bytes: 32768,
-                        }).unwrap());
-                        let error = with_test_execution_resources(tight.clone(),
-                            operator.handle_watermark(&mut ctx, &mut refused)).await.unwrap_err();
-                        assert_eq!(tight.runtime.memory_pool.reserved(), 0);
-                        error
-                    };
-                    assert!(error.to_string().contains(if output_limit == 512 {
-                        "configured partial limit"
-                    } else { "execution-memory budget" }), "{error}");
-                    assert!(refused.0.is_empty());
-                    assert_eq!(operator.store().unwrap().progress().await.unwrap(), None);
-                    assert_eq!(operator.store().unwrap().earliest_time().await.unwrap(), Some(0));
-                    assert_eq!(execution.runtime.memory_pool.reserved(), 0);
-                    drop(state.try_decoded_value(state.config().decoded_value_bytes).unwrap());
-                }
-                operator.limits = original;
-                let tight = Arc::new(ExecutionResources::new(ExecutionResourceConfig {
-                    memory_bytes: 16 * 1024 * 1024, max_batch_bytes: 512,
-                }).unwrap());
+                operator.limits.partial_bytes = 512;
                 let mut refused = RecordedCollector::default();
-                let error = with_test_execution_resources(tight.clone(),
-                    operator.handle_watermark(&mut ctx, &mut refused)).await.unwrap_err();
-                assert!(error.to_string().contains("max-batch-bytes"), "{error}");
+                let error = operator
+                    .handle_watermark(&mut ctx, &mut refused)
+                    .await
+                    .unwrap_err();
+                assert!(
+                    error.to_string().contains("configured partial limit"),
+                    "{error}"
+                );
                 assert!(refused.0.is_empty());
-                assert_eq!(tight.runtime.memory_pool.reserved(), 0);
-                drop(state.try_decoded_value(state.config().decoded_value_bytes).unwrap());
+                assert_eq!(operator.store().unwrap().progress().await.unwrap(), None);
+                assert_eq!(
+                    operator.store().unwrap().earliest_time().await.unwrap(),
+                    Some(0)
+                );
+                drop(
+                    state
+                        .try_decoded_value(state.config().decoded_value_bytes)
+                        .unwrap(),
+                );
+                operator.limits = original;
             }
             let (started_tx, mut started_rx) = tokio::sync::oneshot::channel();
             let (release_tx, release_rx) = tokio::sync::oneshot::channel();
-            let mut collector = BlockedCollector { started: Some(started_tx), release: release_rx };
+            let mut collector = BlockedCollector {
+                started: Some(started_tx),
+                release: release_rx,
+            };
             let mut pending = Box::pin(operator.handle_watermark(&mut ctx, &mut collector));
             let weak = tokio::time::timeout(Duration::from_secs(2), async {
                 tokio::select! {
@@ -1289,63 +1252,182 @@ mod tests {
             }).await.unwrap();
             assert!(futures::poll!(&mut pending).is_pending());
             assert!(weak.upgrade().is_some());
-            assert!(execution.runtime.memory_pool.reserved() >= 8192);
-            assert!(state.try_decoded_value(state.config().decoded_value_bytes - 6 * 8192 + 1).is_err());
+            assert!(
+                state
+                    .try_decoded_value(state.config().decoded_value_bytes - 6 * 8192 + 1)
+                    .is_err()
+            );
             drop(pending);
             drop(collector);
             assert!(release_tx.send(()).is_err());
             assert!(weak.upgrade().is_none());
-            assert_eq!(execution.runtime.memory_pool.reserved(), 0);
-            drop(state.try_decoded_value(state.config().decoded_value_bytes).unwrap());
+            drop(
+                state
+                    .try_decoded_value(state.config().decoded_value_bytes)
+                    .unwrap(),
+            );
             assert_eq!(operator.store().unwrap().progress().await.unwrap(), None);
-            assert_eq!(operator.store().unwrap().earliest_time().await.unwrap(), Some(0));
+            assert_eq!(
+                operator.store().unwrap().earliest_time().await.unwrap(),
+                Some(0)
+            );
             assert!(operator.finish_receiver.read().unwrap().is_none());
 
             let mut resumed = RecordedCollector::default();
-            operator.handle_watermark(&mut ctx, &mut resumed).await.unwrap();
+            operator
+                .handle_watermark(&mut ctx, &mut resumed)
+                .await
+                .unwrap();
             assert_eq!(resumed.0.len(), 2);
             if exact {
                 for (batch, time) in resumed.0.iter().zip([0, 1]) {
-                    assert_eq!(batch.column(batch.num_columns() - 1).as_any().downcast_ref::<PrimitiveArray<TimestampNanosecondType>>().unwrap().value(0), time);
+                    assert_eq!(
+                        batch
+                            .column(batch.num_columns() - 1)
+                            .as_any()
+                            .downcast_ref::<PrimitiveArray<TimestampNanosecondType>>()
+                            .unwrap()
+                            .value(0),
+                        time
+                    );
                 }
             }
             if collection {
-                let values = resumed.0[0].column(0).as_any().downcast_ref::<ListArray>().unwrap().value(0);
+                let values = resumed.0[0]
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<ListArray>()
+                    .unwrap()
+                    .value(0);
                 assert_eq!(values.len(), 128);
-                assert!(values.as_any().downcast_ref::<Int64Array>().unwrap().iter().all(|value| value == Some(1)));
-                assert_eq!(resumed.0[0].column(1).as_any().downcast_ref::<ListArray>().unwrap().value(0).len(), 1);
-                assert_eq!(resumed.0[0].column(2).as_any().downcast_ref::<Int64Array>().unwrap().value(0), 1);
+                assert!(
+                    values
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .unwrap()
+                        .iter()
+                        .all(|value| value == Some(1))
+                );
+                assert_eq!(
+                    resumed.0[0]
+                        .column(1)
+                        .as_any()
+                        .downcast_ref::<ListArray>()
+                        .unwrap()
+                        .value(0)
+                        .len(),
+                    1
+                );
+                assert_eq!(
+                    resumed.0[0]
+                        .column(2)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .unwrap()
+                        .value(0),
+                    1
+                );
             } else {
-                assert_eq!(resumed.0[0].column(0).as_any().downcast_ref::<Int64Array>().unwrap().value(0), 128);
-                assert_eq!(resumed.0[1].column(0).as_any().downcast_ref::<Int64Array>().unwrap().value(0), if hopping { 129 } else { 1 });
+                assert_eq!(
+                    resumed.0[0]
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .unwrap()
+                        .value(0),
+                    128
+                );
+                assert_eq!(
+                    resumed.0[1]
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .unwrap()
+                        .value(0),
+                    if hopping { 129 } else { 1 }
+                );
             }
-            assert_eq!(operator.store().unwrap().progress().await.unwrap(), Some(if exact { 1 } else { 20 }));
-            assert_eq!(operator.store().unwrap().earliest_time().await.unwrap(), Some(if hopping { 10 } else if exact { 2 } else { 20 }));
+            assert_eq!(
+                operator.store().unwrap().progress().await.unwrap(),
+                Some(if exact { 1 } else { 20 })
+            );
+            assert_eq!(
+                operator.store().unwrap().earliest_time().await.unwrap(),
+                Some(if hopping {
+                    10
+                } else if exact {
+                    2
+                } else {
+                    20
+                })
+            );
             // Repeating the watermark neither re-emits nor closes the equal bin.
-            operator.handle_watermark(&mut ctx, &mut resumed).await.unwrap();
+            operator
+                .handle_watermark(&mut ctx, &mut resumed)
+                .await
+                .unwrap();
             assert_eq!(resumed.0.len(), 2);
             if exact {
-                let directory = std::env::temp_dir().join(format!("native-exact-operator-{}-{}",
-                    std::process::id(), std::time::SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()));
+                let directory = std::env::temp_dir().join(format!(
+                    "native-exact-operator-{}-{}",
+                    std::process::id(),
+                    std::time::SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_nanos()
+                ));
                 // Adjacent nanosecond bins0/1 closed; bin2 is still open.
                 // Checkpoint this retained state and replace its live owner.
-                let fresh = Box::pin(operator.store.take().unwrap().checkpoint_restore_for_test(&directory)).await;
+                let fresh = Box::pin(
+                    operator
+                        .store
+                        .take()
+                        .unwrap()
+                        .checkpoint_restore_for_test(&directory),
+                )
+                .await;
                 operator.store = Some(fresh);
                 let mut equality = RecordedCollector::default();
-                operator.handle_watermark(&mut ctx, &mut equality).await.unwrap();
+                operator
+                    .handle_watermark(&mut ctx, &mut equality)
+                    .await
+                    .unwrap();
                 assert!(equality.0.is_empty());
-                assert_eq!(operator.store().unwrap().earliest_time().await.unwrap(), Some(2));
+                assert_eq!(
+                    operator.store().unwrap().earliest_time().await.unwrap(),
+                    Some(2)
+                );
                 std::fs::remove_dir_all(directory).unwrap();
             }
-            ctx.watermarks.set(0, arroyo_types::Watermark::EventTime(arroyo_types::from_nanos(u64::MAX as u128)));
-            operator.handle_watermark(&mut ctx, &mut resumed).await.unwrap();
+            ctx.watermarks.set(
+                0,
+                arroyo_types::Watermark::EventTime(arroyo_types::from_nanos(u64::MAX as u128)),
+            );
+            operator
+                .handle_watermark(&mut ctx, &mut resumed)
+                .await
+                .unwrap();
             assert_eq!(resumed.0.len(), if hopping { 49 } else { 48 });
             if exact && !collection {
-                assert_eq!(resumed.0[2].column(0).as_any().downcast_ref::<Int64Array>().unwrap().value(0), 2);
+                assert_eq!(
+                    resumed.0[2]
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .unwrap()
+                        .value(0),
+                    2
+                );
             }
-            assert_eq!(operator.store().unwrap().earliest_time().await.unwrap(), None);
-            assert_eq!(execution.runtime.memory_pool.reserved(), 0);
-            drop(state.try_decoded_value(state.config().decoded_value_bytes).unwrap());
-        }).await;
+            assert_eq!(
+                operator.store().unwrap().earliest_time().await.unwrap(),
+                None
+            );
+            drop(
+                state
+                    .try_decoded_value(state.config().decoded_value_bytes)
+                    .unwrap(),
+            );
+        }
     }
 }
