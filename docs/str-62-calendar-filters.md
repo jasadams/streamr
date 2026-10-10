@@ -5,7 +5,8 @@ Start: 2026-10-09 21:47 UTC; resumed on explicit user direction.
 The [current ticket](https://trakkt.app/issues/STR-62) owns acceptance.
 Automatic elapsed-time limits are disabled. The earlier queued retry was stopped
 at 22:46:54 UTC (exit 143), before acquiring a build slot; that historical stop
-is not an ongoing deadline. Preserved work is uncommitted; no PR yet.
+is not an ongoing deadline. The reviewed core is published in draft
+[PR #23](https://github.com/jasadams/streamr/pull/23); it does not close STR-62.
 
 ## Contract and ownership
 
@@ -80,7 +81,7 @@ pruning. No such contract change has been implemented.
 | Quiet retained-key output with STR-29 | Not run; scheduler integration pending |
 | Pruning/history-boundary, committed replay, capacity/cancellation | Not qualified |
 | Independent source review | No confirmed critical/major source defect; final lint/evidence review recorded separately |
-| Publication / PR CI | Not started |
+| Publication / PR CI | Draft PR #23; active Lint/tooling checks tracked on the PR. Full GitHub CI is disabled manually; no full-CI qualification claim |
 
 The independent SQL oracle is `scripts/test-native-calendar-filters.py`.
 It recomputes current source rows using ordinary date arithmetic, checks typed
@@ -99,8 +100,9 @@ Full milestone capacity/resource/fault qualification remains STR-32.
 Local logs and source receipts are preserved outside regenerable Cargo caches in
 `/home/jason/qa-evidence/streamr-str62-2147/`. Review logs are in the canonical
 checkout's `docs/review-logs/2026-10-10.md`. No calendar acceptance was moved to a new ticket:
-unfinished scope remains STR-62. The current action is final written evidence review and PR/CI publication of
-the tested core increment. `calendar-matrix-final-audit.json` links the exact
+unfinished scope remains STR-62. The tested core increment is published with final written review.
+Pruning/history-boundary acceptance remains unresolved; draft status prevents
+automatic full-ticket completion. `calendar-matrix-final-audit.json` links the exact
 binary, engine and harness hashes. After executable build, only fixture
 scheduling and explicit static Boolean grouping changed; engine source stayed
 identical. Both failed fixture captures remain preserved for attribution.

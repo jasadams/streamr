@@ -10,15 +10,16 @@ current dispatch instructions. No implementation worker is claimed by this reset
 
 - Worker: Codex `/root`; branch `jason/str-62-calendar-2147`, base `67c242f5`.
   Started 2026-10-09 21:47 UTC; resumed on explicit user direction.
-  Automatic time limits disabled. Core increment reviewed/tested; PR pending.
+  Automatic time limits disabled. Core increment reviewed/tested; [draft PR #23](https://github.com/jasadams/streamr/pull/23).
 - Acceptance: maintained inclusive UTC COUNT/SUM FILTERs, raw event reference,
   independent lifetime, exact CDC, bounded registered state and recovery.
 - Evidence: affected check and strict Clippy exit 0; planner 13/13, worker 6/6;
   actual SQL 32/32 default/shape configurations passed memory/RocksDB × batches
   1/8 × controller/leader with live prefixes, checkpoint and fresh-worker restore.
   Exact source/harness/binary receipts: `docs/str-62-calendar-filters.md`.
-- Next: final evidence review and publish the tested core increment without
-  closing STR-62; wait for current-head PR CI.
+- Next: resolve remaining retention acceptance before full-ticket completion;
+  draft PR keeps the reviewed core available and prevents automatic merge.
+  Active CI is Lint/tooling; the full GitHub CI workflow is disabled manually.
 - Remaining: no existing nonwindowed admission history floor justifies age
   pruning. Buckets retain history under configured limits until group retirement;
   no new cutoff implemented. Pruning/history-boundary acceptance remains STR-62;
