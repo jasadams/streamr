@@ -333,10 +333,9 @@ impl StatelessPhysicalExecutor {
                 yield batch?;
             }
         };
-        let held_input = Box::pin(
+        Box::pin(
             datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(schema, held_input),
-        );
-        held_input
+        )
     }
 
     /// The returned batch is caller-owned after the stream has drained.

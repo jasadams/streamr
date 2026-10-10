@@ -4,9 +4,9 @@
 
 - User authorized removal of graph/network byte admission, operator execution admission and unused timer/ranked/history helper APIs. Keep native SQL, RocksDB backend limits and Kafka recovery; review Kafka architecture before proposing changes.
 - Fresh fetched base682bea0d remains current. Worktree /home/jason/repos/streamr-str32-arroyo-queues; guidance AGENTS.md, .claude/build-test.md/team.md, this ledger/work-plan, current STR32. Historical in-flight records are root-owned, no competing claim.
-- Queue-only removal source review approved; its compile check cancelled143 as superseded, no pass claimed. Helper removal frozen, worker/RPC/harness admission removal in progress. Kafka review is independent/read-only.
+- Full removal source review approved on86d3fdf5; initial check failed on a leftover SESSION output-bound local, corrected and freshly reviewed in8a03fb98. Current locked five-crate check and fmt passed; strict Clippy/tests/capacity pending. Superseded queue-only check cancelled143, not a pass. Kafka architecture review is written; its crash/catch-up qualification gaps remain explicit.
 - Acceptance: complete obsolete API/config/dispatch/test removal, preserve backend/current SQL/recovery contracts; fresh independent review, container gates, exact value/checkpoint/closure tests and original100k/batch32/RSS512MiB capacity regression. No replacement backpressure design or Kafka redesign.
-- Next: integrate worker/helper patches, update current docs/harness budgets honestly, serialize gates and pin current-source executable. Full application lifecycle/live journal/combined capacity qualification remains open; no pending user decision for these removals.
+- Next: finish serialized strict Clippy and runtime gates, pin current-source SQL executable and rerun original100k/batch32 capacity. Actual aggregate backend pool sum62MiB; original payload still exceeds prior10x78MiB threshold. MVP scope guidance saved in AGENTS/feature plan and Trakkt project/milestone/STR32. Full application lifecycle/live journal/combined capacity qualification remains open; no pending user decision for these removals.
 
 ## Active STR-102 — 2026-10-10
 

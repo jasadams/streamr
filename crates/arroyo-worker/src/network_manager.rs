@@ -883,7 +883,7 @@ mod test {
 
     #[tokio::test]
     async fn network_setup_failure_does_not_wait_for_startup_control_consumer() {
-        let mut network = NetworkManager::new(0).await.unwrap();
+        let network = NetworkManager::new(0).await.unwrap();
         let (control, mut responses) = tokio::sync::mpsc::channel(128);
         for task_id in 0..128 {
             control
@@ -943,7 +943,7 @@ mod test {
 
     #[tokio::test]
     async fn network_setup_failure_report_is_cancelled_with_engine_network_tasks() {
-        let mut network = NetworkManager::new(0).await.unwrap();
+        let network = NetworkManager::new(0).await.unwrap();
         let (control, mut responses) = tokio::sync::mpsc::channel(1);
         control
             .send(arroyo_rpc::ControlResp::TaskStarted {

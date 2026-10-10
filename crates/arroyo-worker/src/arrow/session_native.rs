@@ -159,7 +159,7 @@ fn normalize_collection_plan(
 fn validate_aggregates(
     finish: &dyn ExecutionPlan,
     input_schema: &arrow_schema::SchemaRef,
-) -> Result<bool> {
+) -> Result<()> {
     let aggregate = finish
         .as_any()
         .downcast_ref::<AggregateExec>()
@@ -168,7 +168,6 @@ fn validate_aggregates(
         aggregate.group_expr().expr().is_empty(),
         "native SESSION final aggregate must consume one group at a time"
     );
-    let mut collection_output = false;
     for (index, expression) in aggregate.aggr_expr().iter().enumerate() {
         let name = expression.fun().name().to_ascii_lowercase();
         let ordered_first_last = matches!(name.as_str(), "first_value" | "last_value")
@@ -182,7 +181,6 @@ fn validate_aggregates(
             .inner()
             .as_any()
             .is::<datafusion::functions_aggregate::array_agg::ArrayAgg>();
-        collection_output |= collection;
         if collection {
             ensure!(
                 aggregate.input().name() == "bounded_reader"
@@ -218,7 +216,7 @@ fn validate_aggregates(
             "native SESSION supports non-distinct COUNT/SUM/AVG/MIN/MAX ordered FIRST_VALUE/LAST_VALUE and ARRAY_AGG; other aggregates require bounded output admission"
         );
     }
-    Ok(collection_output)
+    Ok(())
 }
 
 pub(crate) struct NativeSession {
@@ -229,7 +227,6 @@ pub(crate) struct NativeSession {
     finish: Arc<dyn ExecutionPlan>,
     finish_receiver: Arc<RwLock<Option<Receiver<RecordBatch>>>>,
     limits: WindowStateConfig,
-    collection_output: bool,
     task_context: Arc<TaskContext>,
     acknowledged_closure: Option<(Vec<u8>, SessionMeta)>,
     identity: Vec<u8>,
@@ -260,7 +257,7 @@ impl NativeSession {
         let finish = PhysicalPlanNode::decode(config.final_aggregation_plan.as_slice())?
             .try_into_physical_plan(registry.as_ref(), &runtime, &codec)?;
         let finish = normalize_collection_plan(finish, &input_schema.schema)?;
-        let collection_output = validate_aggregates(finish.as_ref(), &input_schema.schema)?;
+        validate_aggregates(finish.as_ref(), &input_schema.schema)?;
         let mut identity = Sha256::new();
         identity.update(b"streamr.native-session-raw.v2");
         identity.update(gap.to_be_bytes());
@@ -281,7 +278,6 @@ impl NativeSession {
             finish,
             finish_receiver: receiver,
             limits,
-            collection_output,
             task_context: SessionContext::new_with_config_rt(Default::default(), runtime)
                 .task_ctx(),
             acknowledged_closure: None,
@@ -425,30 +421,6 @@ impl NativeSession {
             .len();
         let output_bytes =
             output_allowance(self.finish.schema().as_ref(), output_fields, self.limits)?;
-        // Bound retained collection values before the final aggregate reads them.
-        if self.collection_output {
-            let mut after = None;
-            let mut retained = 0usize;
-            while let Some(row) = self
-                .store()?
-                .next_row(&snapshot, group, session, after.as_deref())
-                .await?
-            {
-                retained = retained
-                    .checked_add(row.batch.get_array_memory_size())
-                    .and_then(|bytes| {
-                        bytes.checked_add(
-                            std::mem::size_of::<Arc<dyn Array>>() * row.batch.num_columns(),
-                        )
-                    })
-                    .context("native SESSION collection admission overflow")?;
-                ensure!(
-                    retained <= self.limits.partial_bytes,
-                    "native SESSION collection input exceeds configured value limit"
-                );
-                after = Some(row.key.clone());
-            }
-        }
         let (sender, receiver) = channel(1);
         *self.finish_receiver.write().unwrap() = Some(receiver);
         self.finish.reset()?;
@@ -1131,7 +1103,7 @@ mod tests {
             let finish = serialized
                 .try_into_physical_plan(&arroyo_planner::physical::new_registry(), &runtime, &codec)
                 .unwrap();
-            assert_eq!(validate_aggregates(finish.as_ref(), &schema).unwrap(), true);
+            validate_aggregates(finish.as_ref(), &schema).unwrap();
             output_allowance(finish.schema().as_ref(), 5, limits).unwrap();
             let window = Arc::new(Field::new("window", window_arrow_struct(), true));
             let output_schema = Arc::new(Schema::new(vec![
@@ -1154,7 +1126,6 @@ mod tests {
                 finish,
                 finish_receiver: receiver,
                 limits,
-                collection_output: true,
                 task_context: SessionContext::new_with_config_rt(
                     Default::default(),
                     runtime.clone(),
@@ -1299,7 +1270,88 @@ mod tests {
             assert!(observer.first_due(None).await.unwrap().is_none());
             assert_retained_session(&observer, future, &[]).await;
             assert_snapshot_capacity(&state);
+            let mut retained_input_bytes = 0usize;
             for time in 80..104 {
+                let row = RecordBatch::try_new(
+                    operator.input_schema.schema.clone(),
+                    vec![
+                        Arc::new(arrow_array::Int64Array::from(vec![1])),
+                        Arc::new(TimestampNanosecondArray::from(vec![time])),
+                    ],
+                )
+                .unwrap();
+                retained_input_bytes += row.get_array_memory_size();
+                operator
+                    .store()
+                    .unwrap()
+                    .insert(&[], time, &row)
+                    .await
+                    .unwrap();
+            }
+            assert!(retained_input_bytes > limits.partial_bytes);
+            ctx.watermarks.set(
+                0,
+                arroyo_types::Watermark::EventTime(UNIX_EPOCH + Duration::from_nanos(114)),
+            );
+            operator
+                .handle_watermark(&mut ctx, &mut emitted, &converter)
+                .await
+                .unwrap();
+            assert_eq!(emitted.0.len(), 3);
+            let fitted = &emitted.0[2];
+            assert_eq!(fitted.num_rows(), 1);
+            assert_eq!(fitted.num_columns(), 5);
+            for column in [1, 2] {
+                let value = fitted
+                    .column(column)
+                    .as_any()
+                    .downcast_ref::<arrow_array::Int64Array>()
+                    .unwrap();
+                assert_eq!(value.iter().collect::<Vec<_>>(), vec![Some(24)]);
+            }
+            let window = fitted
+                .column(0)
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .unwrap();
+            for (index, expected) in [(0, 80), (1, 113)] {
+                assert_eq!(
+                    window
+                        .column(index)
+                        .as_any()
+                        .downcast_ref::<TimestampNanosecondArray>()
+                        .unwrap()
+                        .iter()
+                        .collect::<Vec<_>>(),
+                    vec![Some(expected)]
+                );
+            }
+            let items = fitted
+                .column(3)
+                .as_any()
+                .downcast_ref::<arrow_array::ListArray>()
+                .unwrap();
+            assert!(!items.is_null(0));
+            let items = items.value(0);
+            let items = items
+                .as_any()
+                .downcast_ref::<arrow_array::Int64Array>()
+                .unwrap();
+            assert_eq!(items.iter().collect::<Vec<_>>(), vec![Some(1); 24]);
+            assert_eq!(
+                fitted
+                    .column(4)
+                    .as_any()
+                    .downcast_ref::<TimestampNanosecondArray>()
+                    .unwrap()
+                    .iter()
+                    .collect::<Vec<_>>(),
+                vec![Some(80)]
+            );
+            assert!(observer.first_due(None).await.unwrap().is_none());
+            // Individual stored rows fit, but the actual 128-member final
+            // collection exceeds the unchanged backend value limit.
+            for time in 200..328 {
                 let row = RecordBatch::try_new(
                     operator.input_schema.schema.clone(),
                     vec![
@@ -1317,7 +1369,7 @@ mod tests {
             }
             ctx.watermarks.set(
                 0,
-                arroyo_types::Watermark::EventTime(UNIX_EPOCH + Duration::from_nanos(114)),
+                arroyo_types::Watermark::EventTime(UNIX_EPOCH + Duration::from_nanos(338)),
             );
             let error = operator
                 .handle_watermark(&mut ctx, &mut emitted, &converter)
@@ -1326,23 +1378,20 @@ mod tests {
             assert!(
                 error
                     .to_string()
-                    .contains("collection input exceeds configured value limit")
+                    .contains("output aggregate exceeds configured value limit"),
+                "{error:#}"
             );
-            assert_eq!(
-                emitted.0.len(),
-                2,
-                "oversized collection emitted a truncated result"
-            );
+            assert_eq!(emitted.0.len(), 3, "oversized final value was emitted");
             assert_snapshot_capacity(&state);
             let oversized = SessionMeta {
-                start: 80,
-                end: 103,
+                start: 200,
+                end: 327,
             };
             assert!(!observer.is_closing(&[], oversized).await.unwrap());
             assert_retained_session(
                 &observer,
                 oversized,
-                &(80..104).map(|time| (time, 1)).collect::<Vec<_>>(),
+                &(200..328).map(|time| (time, 1)).collect::<Vec<_>>(),
             )
             .await;
         }

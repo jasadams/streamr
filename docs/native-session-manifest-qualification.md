@@ -153,8 +153,9 @@ be a direct Boolean input column. The typed fixtures materialize their Boolean
 member in the source rather than expanding an expression during collection.
 Array ordering, element types and nulls follow DataFusion semantics.
 
-The native backend adapter retains the configured collection input/output value
-limits while paging retained rows for evaluation. Collection and sorting
+The native backend adapter retains limits on individual stored rows and actual
+final output values while paging retained rows for evaluation. It does not reject
+a collection based on the cumulative size of its input rows. Collection and sorting
 execution uses upstream DataFusion contexts; the added shared execution-memory
 admission and scratch multiplier have been removed. Backend value limits do not
 bound sorting scratch or whole-process RSS. Limits are not increased and output
