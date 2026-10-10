@@ -39,10 +39,16 @@ else
     echo 'Build the dev image first: scripts/cargo-dev --build' >&2
     exit "$image_status"
 fi
+incremental_override=()
+if [[ -n "${CARGO_INCREMENTAL+x}" ]]; then
+    incremental_override=(-e "CARGO_INCREMENTAL=$CARGO_INCREMENTAL")
+fi
 exec "$repo_dir/scripts/rust-build" podman run --rm \
     -w /app \
     -e CARGO_TARGET_DIR=/app/target/milestone2-runtime \
-    -e CARGO_INCREMENTAL=0 \
+    -e "CARGO_PROFILE_DEV_INCREMENTAL=${CARGO_PROFILE_DEV_INCREMENTAL:-true}" \
+    -e "CARGO_PROFILE_TEST_INCREMENTAL=${CARGO_PROFILE_TEST_INCREMENTAL:-true}" \
+    "${incremental_override[@]}" \
     -e "CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-4}" \
     -v "$repo_dir:/app:z" \
     -v streamr-cargo-registry:/usr/local/cargo/registry \

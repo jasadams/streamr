@@ -2,13 +2,14 @@
 rustc-wrapper = "/usr/local/bin/streamr-rustc-cache"
 jobs = 4
 
-# Disable incremental compilation so Rust compilations are eligible for sccache.
+# Reuse compilation work within edited workspace crates. Unchanged dependencies
+# remain eligible for sccache; incremental rustc invocations fall back to rustc.
 [profile.dev]
-incremental = false
+incremental = true
 debug = "line-tables-only"
 
 [profile.test]
-incremental = false
+incremental = true
 debug = "line-tables-only"
 
 [target.x86_64-unknown-linux-gnu]
