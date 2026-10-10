@@ -70,10 +70,12 @@ The builder reserves worker bytes before allocating or copying and retains them
 through native completion. Existing owned `write_batch` inputs remain caller
 allocations while waiting; they must be separately bounded by their producer.
 Native request copies and output container overhead are accounted before their
-allocation. Reads pin native values and check size before copying. Writes remain
-WAL enabled. Diagnostic `open` and `reopen` synchronize each write to disk.
+allocation. Reads pin native values and check size before copying.
+Diagnostic `open` and `reopen` enable WAL and synchronize each write to disk.
 Disposable worker attempts complete atomic native writes before emitting rows,
-but omit per-row WAL fsync. Stable snapshots still capture completed writes;
+but disable WAL logging. The pinned checkpoint binding uses a zero flush
+threshold, flushing memtables before opening the independent snapshot database.
+Stable snapshots therefore capture completed puts and deletes without WAL;
 pipeline durability comes from publishing the full committed checkpoint.
 Worker recovery always restores that selected checkpoint into fresh storage,
 so a newer local WAL is never accepted as committed pipeline state.

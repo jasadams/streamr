@@ -21,7 +21,24 @@ pub struct RocksLiveState {
     completion: oneshot::Receiver<Result<()>>,
     path: PathBuf,
     resources: WorkerStateResources,
-    sync_writes: bool,
+    durability: WriteDurability,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WriteDurability {
+    /// Disposable working state; only a published pipeline checkpoint is durable.
+    Checkpoint,
+    /// Explicit local open/reopen supports recovery of acknowledged writes.
+    SynchronousWal,
+}
+
+impl WriteDurability {
+    fn options(self) -> WriteOptions {
+        let mut options = WriteOptions::default();
+        options.disable_wal(self == Self::Checkpoint);
+        options.set_sync(self == Self::SynchronousWal);
+        options
+    }
 }
 
 fn backend(error: impl std::fmt::Display) -> LiveStateError {
@@ -53,7 +70,7 @@ impl RocksLiveState {
     /// Worker entry point: every operator uses the configured process-wide pool.
     /// This opens fresh live storage; checkpoint restore remains caller-managed.
     /// Exhausted database slots fail immediately to avoid readiness deadlocks.
-    /// Writes complete atomically with WAL enabled, without per-row fsync;
+    /// Writes complete atomically without WAL logging or per-row fsync;
     /// recovery must restore a committed checkpoint into this fresh attempt.
     pub async fn open_worker(config: RocksStateConfig) -> Result<Self> {
         let resources = super::worker::configured_worker_resources()?.ok_or_else(|| {
@@ -67,19 +84,40 @@ impl RocksLiveState {
         resources: WorkerStateResources,
     ) -> Result<Self> {
         let permit = resources.try_database()?;
-        Self::open_mode(config, resources, false, permit, false).await
+        Self::open_mode(
+            config,
+            resources,
+            false,
+            permit,
+            WriteDurability::Checkpoint,
+        )
+        .await
     }
 
     pub async fn open(config: RocksStateConfig, resources: WorkerStateResources) -> Result<Self> {
         let permit = resources.database().await?;
-        Self::open_mode(config, resources, false, permit, true).await
+        Self::open_mode(
+            config,
+            resources,
+            false,
+            permit,
+            WriteDurability::SynchronousWal,
+        )
+        .await
     }
 
     /// Explicit reuse of precisely the supplied attempt. Missing or corrupt
     /// databases fail instead of being replaced with empty state.
     pub async fn reopen(config: RocksStateConfig, resources: WorkerStateResources) -> Result<Self> {
         let permit = resources.database().await?;
-        Self::open_mode(config, resources, true, permit, true).await
+        Self::open_mode(
+            config,
+            resources,
+            true,
+            permit,
+            WriteDurability::SynchronousWal,
+        )
+        .await
     }
 
     async fn open_mode(
@@ -87,7 +125,7 @@ impl RocksLiveState {
         resources: WorkerStateResources,
         reopen: bool,
         database_permit: ResourcePermit,
-        sync_writes: bool,
+        durability: WriteDurability,
     ) -> Result<Self> {
         let cleanup = resources.cleanup().await.map_err(LiveStateError::from)?;
         let task_resources = resources.clone();
@@ -129,7 +167,7 @@ impl RocksLiveState {
                     completion,
                     path,
                     resources: task_resources,
-                    sync_writes,
+                    durability,
                 })
             })
             .await
@@ -161,7 +199,7 @@ impl RocksLiveState {
         let db = self.db.clone();
         let path = self.path.clone();
         let resources = self.resources.clone();
-        let sync_writes = self.sync_writes;
+        let durability = self.durability;
         self.resources
             .run_blocking(move || {
                 let _latency = resources.operation_timer("write");
@@ -229,9 +267,7 @@ impl RocksLiveState {
                         native.delete(key);
                     }
                 }
-                let mut options = WriteOptions::default();
-                options.disable_wal(false);
-                options.set_sync(sync_writes);
+                let options = durability.options();
                 let result = db.write_opt(native, &options).map_err(backend);
                 if let Some(health) = &db.health {
                     if result.is_ok() {
@@ -439,6 +475,9 @@ impl LiveStateBackend for RocksLiveState {
                 if path.try_exists().map_err(lifecycle::io_error)? {
                     return Err(backend("snapshot directory already exists"));
                 }
+                // rust-rocksdb 0.24 passes a zero flush threshold here. This
+                // flushes memtables, including WAL-disabled worker writes,
+                // before opening the independent checkpoint database.
                 if let Err(error) =
                     Checkpoint::new(&db).and_then(|checkpoint| checkpoint.create_checkpoint(&path))
                 {
@@ -1123,13 +1162,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn worker_checkpoint_captures_unlogged_memtable_updates_and_deletes() {
+        let config = config();
+        let resources = resources();
+        let state = RocksLiveState::open_worker_with_resources(config.clone(), resources.clone())
+            .await
+            .unwrap();
+        let mut deleted = key();
+        deleted.key = b"deleted".to_vec();
+        state.put(key(), b"old".to_vec(), 1024).await.unwrap();
+        state
+            .put(deleted.clone(), b"old".to_vec(), 1024)
+            .await
+            .unwrap();
+        // Establish older SST values, then leave the changes entirely in RAM.
+        state.db.flush().unwrap();
+        state
+            .put(key(), b"checkpoint".to_vec(), 1024)
+            .await
+            .unwrap();
+        state.delete(deleted.clone(), 1024).await.unwrap();
+        assert!(
+            state
+                .db
+                .property_int_value("rocksdb.num-entries-active-mem-table")
+                .unwrap()
+                .unwrap()
+                >= 2
+        );
+        let wal_bytes = || {
+            std::fs::read_dir(state.path())
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .filter(|path| path.extension().is_some_and(|extension| extension == "log"))
+                .map(|path| std::fs::metadata(path).unwrap().len())
+                .sum::<u64>()
+        };
+        assert_eq!(
+            wal_bytes(),
+            0,
+            "worker mutations must not append WAL records"
+        );
+        let snapshot = state.snapshot().await.unwrap();
+        state.put(key(), b"newer".to_vec(), 1024).await.unwrap();
+        state
+            .put(deleted.clone(), b"newer".to_vec(), 1024)
+            .await
+            .unwrap();
+        state.close_and_remove().await.unwrap();
+        let read = ReadOptions { max_bytes: 1024 };
+        assert_eq!(
+            snapshot.get(&key(), read).await.unwrap(),
+            Some(b"checkpoint".to_vec())
+        );
+        assert_eq!(snapshot.get(&deleted, read).await.unwrap(), None);
+        drop(snapshot);
+        drain_cleanup(&resources).await;
+        std::fs::remove_dir_all(config.root).unwrap();
+    }
+
+    #[tokio::test]
     async fn worker_writes_are_visible_and_snapshots_survive_without_per_write_sync() {
         let config = config();
         let resources = resources();
         let state = RocksLiveState::open_worker_with_resources(config.clone(), resources.clone())
             .await
             .unwrap();
-        assert!(!state.sync_writes);
+        assert_eq!(state.durability, WriteDurability::Checkpoint);
         // Covers atomic batch rejection, operation ordering, immediate reads,
         // namespace isolation, and snapshot pagination on the worker write mode.
         super::super::tests::backend_contract(&state).await;
@@ -1163,7 +1262,7 @@ mod tests {
         let state = RocksLiveState::open(config.clone(), resources.clone())
             .await
             .unwrap();
-        assert!(state.sync_writes);
+        assert_eq!(state.durability, WriteDurability::SynchronousWal);
         super::super::tests::backend_contract(&state).await;
         state.put(key(), b"persisted".to_vec(), 1024).await.unwrap();
         assert!(
@@ -1176,7 +1275,7 @@ mod tests {
         let reopened = RocksLiveState::reopen(config.clone(), resources.clone())
             .await
             .unwrap();
-        assert!(reopened.sync_writes);
+        assert_eq!(reopened.durability, WriteDurability::SynchronousWal);
         assert_eq!(
             reopened
                 .get(&key(), ReadOptions { max_bytes: 9 })

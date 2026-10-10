@@ -4,6 +4,59 @@ Updated 2026-10-09 at the user's request. Read the current Trakkt ticket descrip
 before claiming work. Historical comments and validation logs are evidence, not
 current dispatch instructions. No implementation worker is claimed by this reset.
 
+## STR-71 RocksDB audit and worker WAL optimization — 2026-10-10
+
+- Worker `/root`, branch `audit/str-71-rocksdb`, start 01:05 UTC; base fetched
+  `67c242f5f3fbfbe977d8595c2960f83fd9c9bcfc`. Instructions: `AGENTS.md`,
+  `.claude/build-test.md`, this ledger; current user overrides historical
+  deadlines/signing. Ticket guard clear; current STR-25/26 scopes read.
+- Acceptance: independent recovery/performance audits; worker-only WAL disable;
+  unlogged memtable update/delete snapshot regression; full logical export/restore
+  coverage; container check/Clippy/tests and written review. Diagnostics retain
+  synchronous WAL. Acceptance checks below passed.
+- Recovery audit: worker construction uses fresh UUID attempts; table-manager
+  barrier capture precedes asynchronous full export and completion metadata;
+  controller/leader publication chooses recovery; Kafka source checkpoint offsets
+  select replay. Exactly-once output remains sink dependent.
+- Flush evidence: rust-rocksdb v0.24.0 `src/checkpoint.rs` passes zero flush
+  threshold; RocksDB v10.4.2 `db/db_filesnapshot.cc` flushes memtables before file
+  capture. This permits WAL-disabled worker puts/deletes without format changes.
+- Performance findings at base: `live/rocks.rs` writes perform one old-value
+  lookup per distinct key for exact logical telemetry, under a DB mutex; native
+  health properties/free-space sampling run every batch. `multi_get` loops
+  individual pinned gets; bulk scans populate shared cache; native background
+  compaction uses default settings. These require measured tuning, not invented
+  production defaults. Shared cache/WBM, admission and pinned value limits remain.
+- Largest known cost: ordinary read views create physical checkpoints/read-only
+  DBs, including memtable flushes. Existing
+  [read-view proposal](rocksdb-read-view-proposal.md) records source-bound evidence
+  and lifecycle tradeoffs. Full remote checkpoints
+  still scan/upload every row; incremental SST work remains STR-24/25.
+- Process-loss gap: `NativeDb::Drop` cannot clean attempts after abrupt death;
+  fresh UUID construction has no stale-attempt scavenger. Reclamation needs
+  ownership/active-process proof. No shared storage deletion was performed.
+- User approved lightweight ordinary snapshots after the lifecycle explanation:
+  readers retain the live DB, close/removal waits for their release, durable
+  checkpoint capture stays separate. Implement as the next reviewed increment
+  after delivery of this WAL change; long readers retain historical versions.
+- Additional binding gaps: WAL-disabled shutdown flushes memtables by default;
+  Rust 0.24 has no safe `avoid_flush_during_shutdown` setter. Batched pinned
+  MultiGet exists but needs explicit CF opening and bounded concurrent value
+  pinning; do not replace the safe serial loop without resolving those bounds.
+- Resumed with user approval after the build-process pause. Rebased onto
+  `48ceb3fee902d80d012be3de3320b018e3418364`; re-read `AGENTS.md` and
+  `.claude/build-test.md`. The updated wrapper uses the prebuilt RocksDB image
+  and shared target. Independent final review approves with no findings.
+- Validation on that base with image `a95d0ca27fc16ae428c9b0df8d02b603dacab71ebf3a915aad85c94b422cf9ab`:
+  container `check --locked -p arroyo-state` passed (1m13s); strict locked
+  `clippy --no-deps --all-features --all-targets -p arroyo-state -- -D warnings`
+  passed (17.99s); `test --locked -p arroyo-state --lib live:: -- --test-threads=1`
+  passed (91 tests, 4.84s; compilation 1m26s); `fmt --all -- --check` passed.
+  Includes unlogged update/delete capture and typed full/empty cross-backend restore.
+  Source patch/hash, image receipt and exact logs:
+  `/home/jason/qa-evidence/str71-rocksdb-20261010/`. Next: publish this increment.
+  Heavy compaction/RSS/fault/soak qualification remains the explicit STR-32 batch.
+
 ## Available features
 
 ## Active STR-62
