@@ -332,6 +332,125 @@ impl KafkaSourceWithReads {
 }
 
 #[tokio::test]
+async fn test_kafka_restored_offsets_survive_idle_checkpoint_and_continue() {
+    let mut tester = KafkaTopicTester {
+        topic: format!("__arroyo-source-idle-restore-{}", random::<u64>()),
+        server: "0.0.0.0:9092".to_string(),
+        group_id: None,
+    };
+    let mut task_info = arroyo_types::get_test_task_info();
+    task_info.job_id = format!("kafka-idle-restore-{}", random::<u64>());
+    tester.create_topic().await;
+    let mut reader = tester.get_source_with_reader(task_info.clone(), None).await;
+    let mut producer = tester.get_producer();
+    for i in [1, 2] {
+        producer.send_data(TestData { i });
+    }
+    reader
+        .assert_next_message_record_values(
+            [1, 2]
+                .into_iter()
+                .map(|i| serde_json::to_string(&TestData { i }).unwrap())
+                .collect(),
+        )
+        .await;
+
+    async fn checkpoint_and_stop(
+        reader: &mut KafkaSourceWithReads,
+        task_info: &TaskInfo,
+        epoch: u32,
+    ) {
+        reader
+            .to_control_tx
+            .send(ControlMessage::Checkpoint(CheckpointBarrier {
+                epoch,
+                min_epoch: 1,
+                timestamp: SystemTime::now(),
+                then_stop: true,
+            }))
+            .await
+            .unwrap();
+        let completed = tokio::time::timeout(
+            Duration::from_secs(30),
+            reader.assert_control_checkpoint(epoch),
+        )
+        .await
+        .unwrap();
+        // An idle restored source must reach the barrier without replay data.
+        reader.assert_next_message_checkpoint(epoch).await;
+        let subtask = completed.subtask_metadata;
+        let table_metadata = GlobalKeyedTable::merge_checkpoint_metadata(
+            subtask.table_configs["k"].clone(),
+            single_item_hash_map(0_u32, subtask.table_metadata["k"].clone()),
+        )
+        .unwrap()
+        .unwrap();
+        StateBackend::write_operator_checkpoint_metadata(
+            &StorageProviderFor::Worker,
+            OperatorCheckpointMetadata {
+                start_time: 0,
+                finish_time: 0,
+                table_checkpoint_metadata: single_item_hash_map("k", table_metadata),
+                table_configs: subtask.table_configs,
+                operator_metadata: Some(OperatorMetadata {
+                    job_id: task_info.job_id.clone(),
+                    operator_id: task_info.operator_id.clone(),
+                    epoch,
+                    min_watermark: Some(0),
+                    max_watermark: Some(0),
+                    min_watermark_negative_nanos: None,
+                    max_watermark_negative_nanos: None,
+                    parallelism: 1,
+                }),
+            },
+        )
+        .await
+        .unwrap();
+        StateBackend::write_checkpoint_metadata(
+            &StorageProviderFor::Worker,
+            CheckpointMetadata {
+                job_id: task_info.job_id.clone(),
+                epoch,
+                min_epoch: 1,
+                start_time: 0,
+                finish_time: 0,
+                operator_ids: vec![task_info.operator_id.clone()],
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    checkpoint_and_stop(&mut reader, &task_info, 1).await;
+    // Restore and checkpoint without producing or consuming another record.
+    let mut reader = tester
+        .get_source_with_reader(task_info.clone(), Some(1))
+        .await;
+    checkpoint_and_stop(&mut reader, &task_info, 2).await;
+    let mut reader = tester
+        .get_source_with_reader(task_info.clone(), Some(2))
+        .await;
+    producer.send_data(TestData { i: 3 });
+    reader
+        .assert_next_message_record_values(
+            vec![serde_json::to_string(&TestData { i: 3 }).unwrap()].into(),
+        )
+        .await;
+    checkpoint_and_stop(&mut reader, &task_info, 3).await;
+    // The next consumed offset must also survive, with no off-by-one replay.
+    let mut reader = tester
+        .get_source_with_reader(task_info.clone(), Some(3))
+        .await;
+    producer.send_data(TestData { i: 4 });
+    reader
+        .assert_next_message_record_values(
+            vec![serde_json::to_string(&TestData { i: 4 }).unwrap()].into(),
+        )
+        .await;
+    checkpoint_and_stop(&mut reader, &task_info, 4).await;
+}
+
+#[tokio::test]
 async fn test_kafka() {
     let mut kafka_topic_tester = KafkaTopicTester {
         topic: "__arroyo-source-test".to_string(),

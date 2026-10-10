@@ -1,12 +1,13 @@
 # Milestone 3 — agent backlog
 
-## Active STR-32 recovery admission repair
+## Active STR-32 Arcstream integration and Kafka idle recovery
 
-- Base fetched `52391450bc055704c38112967c73265e9bafe015`; branch `agent/str-32-recovery-admission-20261010`, coordinator Codex `/root`, delegated checkpoint-only implementation and independent review.
-- User approved bounded cancellable checksum memory admission after production combined worker loss produced repeated scan-pool refusals. Same 64 KiB allowance, same shared byte budgets/formats/ownership; no SQL semantic change.
-- Acceptance: real Parquet contention/cancellation/fresh-retry regression and all-four-branch production recovery on controller/leader with verified checkpoint/source/sink prefixes; no unexpected scan refusals.
-- Implementation and independent source/evidence reviews passed. All 92 live-state tests, locked check, strict Clippy and format passed. Fresh combined RocksDB controller/leader × batch targets 1/8 passed exact all-four outputs and selected epoch 2 recovery with one replacement generation and no scan refusals. Exact next action: publish reviewed repair increment and continue remaining STR-32 functional coverage. User directed no queue and no automatic elapsed-time limit.
-- Evidence: `/home/jason/qa-evidence/str32-20261010-52391450/combined-production-functional/` and `recovery-admission-repair/`. Original failures/retries retained. Full capacity/backfill/fault/24-hour qualification remains open; no decision pending for this repair.
+- Checksum admission repair merged as PR #31 (`130f43a2`); 92 live-state tests and four finite combined production recovery cases passed independent review.
+- User waived standalone 24-hour soak and selected Arcstream integration as the live test. Native identity must use state tables. Application worktree `/home/jason/repos/arcstream-streamr-integration` uses fetched Arcstream base `c7f4777`; original dirty checkout and existing reference branches preserved.
+- Current native identity eight-case matrix and initial Kafka 13-event/two-merge oracle passed. An idle checkpoint after offset restore then another resume replayed committed records: 14 raw inputs,27 captures,40 unified outputs,four merges. All three isolated pipelines checkpoint-stopped; live producer not started.
+- Root owns generic Kafka repair from fetched `130f43a2`, branch `agent/str-32-kafka-idle-offset-20261010`, worktree `/home/jason/repos/streamr-str32-kafka-offset`. Kafka source matches upstream `74c967e3`; restored startup offsets are not seeded into the map written by idle checkpoints. No new recovery semantics or checkpoint format proposed.
+- Repair implemented and source-reviewed. Three real-broker source tests, locked connector check, strict Clippy, format and product build passed. Fresh isolated Arcstream double-restore/idle checkpoint/new input passed exact 14 raw/capture/unified and two merges, stable literal identities and source-offset proofs. Next: independent evidence review and publish this increment; native session diagnostics run serially next. No queue, automatic time limit or pending semantic decision for this repair.
+- Evidence `/home/jason/qa-evidence/str32-20261010-52391450/arcstream-integration/` and `kafka-idle-offset-repair/`. Event-clock40 stale-oracle failures after approved watermark admission remain documented; broader capacity/fault/backfill and full profile/session consumer acceptance remain open.
 
 ## Active STR-56 continuation — 2026-10-10
 
