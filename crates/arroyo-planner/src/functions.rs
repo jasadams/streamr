@@ -118,6 +118,29 @@ pub fn register_all(registry: &mut dyn FunctionRegistry) {
         .unwrap();
 
     registry.register_udf(multi_hash()).unwrap();
+
+    // ANSI SQL/JSON kernels. Registered here — the single choke point for
+    // planner and worker (`physical::new_registry`) — so both sides always
+    // resolve the same implementations. Names are lowercase because
+    // DataFusion normalizes unquoted function identifiers before lookup.
+    registry
+        .register_udf(crate::sql_json::kernels::json_value())
+        .unwrap();
+    registry
+        .register_udf(crate::sql_json::kernels::json_value_boolean())
+        .unwrap();
+    registry
+        .register_udf(crate::sql_json::kernels::json_value_double())
+        .unwrap();
+    registry
+        .register_udf(crate::sql_json::kernels::json_query())
+        .unwrap();
+    registry
+        .register_udf(crate::sql_json::kernels::json_exists())
+        .unwrap();
+    registry
+        .register_udf(crate::sql_json::kernels::json_object())
+        .unwrap();
 }
 
 fn parse_path(name: &str, path: &ScalarValue) -> Result<Arc<JsonPath>> {

@@ -77,6 +77,7 @@ pub mod engine;
 pub mod job_controller;
 mod lifecycle_metrics;
 mod network_manager;
+mod udf_guard;
 pub mod utils;
 
 pub static TIMER_TABLE: char = '[';
@@ -340,12 +341,22 @@ impl WorkerState {
         req: StartExecutionReq,
         readiness: Option<lifecycle_metrics::Readiness>,
     ) -> Result<()> {
-        let mut registry = new_registry();
         let logical = Arc::new(
             LogicalProgram::try_from(req.program.expect("Program is None"))
                 .map_err(|e| Status::internal(format!("Failed to create LogicalProgram: {}", e)))?,
         );
 
+        // A pipeline UDF must never replace a trusted SQL/JSON builtin at
+        // decode time: physical plans resolve scalar functions by name.
+        // Reject shadowing names before loading or visualizing anything.
+        for udf_name in logical.program_config.udf_dylibs.keys() {
+            udf_guard::reject_shadowing_udf_name("dylib", udf_name)?;
+        }
+        for udf_name in logical.program_config.python_udfs.keys() {
+            udf_guard::reject_shadowing_udf_name("Python", udf_name)?;
+        }
+
+        let mut registry = new_registry();
         debug!(
             "Starting execution for graph\n{}",
             to_d2(&logical)
@@ -1864,5 +1875,108 @@ mod engine_lifetime_tests {
     #[tokio::test]
     async fn nonleader_finished_cancels_and_releases_engine() {
         exercise_job_finished_lifetime(false).await;
+    }
+}
+
+#[cfg(test)]
+mod udf_shadowing_tests {
+    use super::*;
+    use arrow_schema::DataType;
+    use arroyo_rpc::grpc::api::{
+        ArrowProgram, ArrowProgramConfig, DylibUdfConfig, PythonUdfConfig,
+    };
+    use arroyo_server_common::shutdown::{Shutdown, SignalBehavior};
+    use datafusion_proto::protobuf::ArrowType;
+
+    fn encoded_utf8() -> Vec<u8> {
+        ArrowType::try_from(&DataType::Utf8)
+            .unwrap()
+            .encode_to_vec()
+    }
+
+    fn shadowing_req(dylib_name: Option<&str>, python_name: Option<&str>) -> StartExecutionReq {
+        let mut udf_dylibs = HashMap::new();
+        if let Some(name) = dylib_name {
+            udf_dylibs.insert(
+                name.to_string(),
+                DylibUdfConfig {
+                    dylib_path: "s3://unused/shadow.so".to_string(),
+                    arg_types: vec![],
+                    return_type: encoded_utf8(),
+                    aggregate: false,
+                    is_async: false,
+                },
+            );
+        }
+        let mut python_udfs = HashMap::new();
+        if let Some(name) = python_name {
+            python_udfs.insert(
+                name.to_string(),
+                PythonUdfConfig {
+                    name: name.to_string(),
+                    arg_types: vec![],
+                    return_type: encoded_utf8(),
+                    definition: "def f(x):\n    return x".to_string(),
+                },
+            );
+        }
+        StartExecutionReq {
+            program: Some(ArrowProgram {
+                nodes: vec![],
+                edges: vec![],
+                program_config: Some(ArrowProgramConfig {
+                    udf_dylibs,
+                    python_udfs,
+                }),
+            }),
+            ..Default::default()
+        }
+    }
+
+    async fn initialize_inner_rejects(dylib_name: Option<&str>, python_name: Option<&str>) {
+        let shutdown = Shutdown::new("udf-shadowing-test", SignalBehavior::None);
+        let state = WorkerState {
+            worker_context: WorkerContext {
+                machine_id: MachineId(Arc::new("test-machine".into())),
+                worker_id: WorkerId(0),
+                pipeline_id: PipelineId(Arc::new("test-pipeline".into())),
+                job_id: JobId(Arc::new("test-job".into())),
+                generation: 0,
+            },
+            phase: Arc::new(Mutex::new(WorkerExecutionPhase::Idle)),
+            network: Arc::new(Mutex::new(None)),
+            job_controller_tx: Arc::new(OnceLock::new()),
+            job_status: Arc::new(Mutex::new(JobStatus {
+                job_state: rpc::JobState::JobInitializing.into(),
+                updated_at: to_micros(SystemTime::now()),
+                transitioned_at: to_micros(SystemTime::now()),
+                last_checkpointed_at: None,
+                job_failure: None,
+            })),
+            checkpoint_history: Arc::new(Mutex::new(CheckpointHistory::default())),
+            metrics: Arc::new(OnceLock::new()),
+        };
+        let error = state
+            .initialize_inner(
+                shutdown.guard("inner"),
+                shadowing_req(dylib_name, python_name),
+                None,
+            )
+            .await
+            .expect_err("reserved name must be rejected");
+        let message = error.to_string();
+        assert!(message.contains("shadows"), "{message}");
+        let expected = dylib_name.or(python_name).unwrap();
+        assert!(message.contains(expected), "{message}");
+    }
+
+    #[tokio::test]
+    async fn initialize_inner_rejects_shadowing_dylib_udf() {
+        initialize_inner_rejects(Some("json_value"), None).await;
+    }
+
+    #[tokio::test]
+    async fn initialize_inner_rejects_shadowing_python_udf() {
+        initialize_inner_rejects(None, Some("json_query")).await;
     }
 }

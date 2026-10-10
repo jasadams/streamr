@@ -158,8 +158,12 @@ fn expression(
     schema: &DFSchema,
     provider: &ArroyoSchemaProvider,
 ) -> Result<Expr> {
-    let expr =
-        SqlToRel::new(provider).sql_to_expr(sql.clone(), schema, &mut PlannerContext::new())?;
+    // Lower ANSI SQL/JSON constructors before sql_to_expr; MERGE predicates,
+    // assignments and INSERT values are planned through this helper directly
+    // rather than via produce_optimized_plan.
+    let mut sql = sql.clone();
+    crate::sql_json::lowering::rewrite_expr(&mut sql)?;
+    let expr = SqlToRel::new(provider).sql_to_expr(sql, schema, &mut PlannerContext::new())?;
     expr.apply(|expr| {
         match expr {
             Expr::AggregateFunction(_) | Expr::WindowFunction(_) | Expr::ScalarSubquery(_) | Expr::Exists(_) | Expr::InSubquery(_) => {

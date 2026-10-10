@@ -56,3 +56,6 @@ url = { workspace = true }
 
 
 [dev-dependencies]
+# Needed to name the FFI types when constructing a dummy `LocalUdf` fixture
+# for the UDF-shadowing rejection tests.
+arroyo-udf-common = { path = "../arroyo-udf/arroyo-udf-common" }

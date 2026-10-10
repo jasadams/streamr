@@ -245,6 +245,7 @@ impl FusedEventProgram {
                             step.operator_config.as_slice(),
                         )?,
                         registry,
+                        &concat_allowance,
                     )?)),
                     "projection" => {
                         let projection =

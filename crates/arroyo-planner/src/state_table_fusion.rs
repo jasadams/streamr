@@ -103,8 +103,26 @@ fn admit_expression(expr: &dyn PhysicalExpr, uuid_value_root: bool) -> Result<()
             .as_any()
             .is::<datafusion_functions::string::concat::ConcatFunc>()
             && function.return_type() == &DataType::Utf8;
+        // The ANSI SQL/JSON kernels are admitted by implementation type. They
+        // are guarded by the same fused-owner working-event allowance as
+        // CONCAT (input, temporary and output bytes are charged through the
+        // owner's reservation before state writes); path expansion/depth and
+        // output construction are hard-bounded in the kernels themselves.
+        let sql_json = implementation
+            .as_any()
+            .is::<crate::sql_json::kernels::JsonValueFunc>()
+            || implementation
+                .as_any()
+                .is::<crate::sql_json::kernels::JsonQueryFunc>()
+            || implementation
+                .as_any()
+                .is::<crate::sql_json::kernels::JsonExistsFunc>()
+            || implementation
+                .as_any()
+                .is::<crate::sql_json::kernels::JsonObjectFunc>();
         if !bounded_uuid
             && !bounded_concat
+            && !sql_json
             && !implementation
                 .as_any()
                 .is::<datafusion_functions::core::getfield::GetFieldFunc>()
@@ -195,6 +213,77 @@ mod uuid_admission_tests {
         );
         let spoof_expr = ScalarFunctionExpr::new("uuid", Arc::new(spoof), vec![], field);
         assert!(admit_expression(&spoof_expr, true).is_err());
+    }
+}
+
+#[cfg(test)]
+mod sql_json_admission_tests {
+    use super::admit_expression;
+    use arrow_schema::{DataType, Field};
+    use datafusion::logical_expr::{ScalarUDF, Volatility, create_udf};
+    use datafusion::physical_expr::ScalarFunctionExpr;
+    use std::sync::Arc;
+
+    fn utf8_field() -> Arc<Field> {
+        Arc::new(Field::new("candidate", DataType::Utf8, true))
+    }
+
+    fn extraction_args() -> Vec<Arc<dyn datafusion::physical_expr::PhysicalExpr>> {
+        use datafusion::common::ScalarValue;
+        use datafusion::physical_expr::expressions::Literal;
+        vec![
+            Arc::new(Literal::new(ScalarValue::Utf8(Some("{}".into())))),
+            Arc::new(Literal::new(ScalarValue::Utf8(Some("$.a".into())))),
+        ]
+    }
+
+    fn json_udfs() -> Vec<Arc<ScalarUDF>> {
+        vec![
+            crate::sql_json::kernels::json_value(),
+            crate::sql_json::kernels::json_value_boolean(),
+            crate::sql_json::kernels::json_value_double(),
+            crate::sql_json::kernels::json_query(),
+            crate::sql_json::kernels::json_exists(),
+            crate::sql_json::kernels::json_object(),
+        ]
+    }
+
+    #[test]
+    fn all_sql_json_impl_types_are_admitted() {
+        let field = utf8_field();
+        for udf in json_udfs() {
+            let name = udf.name().to_string();
+            let expr =
+                ScalarFunctionExpr::new(name.as_str(), udf, extraction_args(), field.clone());
+            admit_expression(&expr, true).unwrap();
+            admit_expression(&expr, false).unwrap();
+        }
+    }
+
+    #[test]
+    fn same_named_spoofs_are_rejected() {
+        let field = utf8_field();
+        for name in [
+            "json_value",
+            "json_value_boolean",
+            "json_value_double",
+            "json_query",
+            "json_exists",
+            "json_object",
+        ] {
+            let spoof: Arc<ScalarUDF> = Arc::new(create_udf(
+                name,
+                vec![DataType::Utf8, DataType::Utf8],
+                DataType::Utf8,
+                Volatility::Immutable,
+                Arc::new(|_| panic!("admission must never evaluate a named spoof")),
+            ));
+            let expr = ScalarFunctionExpr::new(name, spoof, extraction_args(), field.clone());
+            assert!(
+                admit_expression(&expr, true).is_err(),
+                "spoof {name} must be rejected"
+            );
+        }
     }
 }
 
