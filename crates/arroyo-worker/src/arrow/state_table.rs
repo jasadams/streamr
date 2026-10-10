@@ -23,6 +23,8 @@ use datafusion_proto::physical_plan::from_proto::parse_physical_expr;
 use datafusion_proto::protobuf::PhysicalExprNode;
 use prost::Message;
 
+use super::state_table_concat::{ConcatAllowance, guard_expression};
+
 struct MutationClause {
     matched: bool,
     predicate: Option<Arc<dyn PhysicalExpr>>,
@@ -132,14 +134,12 @@ fn decode_expr(
     bytes: &[u8],
     schema: &Schema,
     registry: &Registry,
+    allowance: &Arc<ConcatAllowance>,
 ) -> Result<Arc<dyn PhysicalExpr>> {
     let node = PhysicalExprNode::decode(bytes)?;
-    Ok(parse_physical_expr(
-        &node,
-        registry,
-        schema,
-        &DefaultPhysicalExtensionCodec {},
-    )?)
+    let expression =
+        parse_physical_expr(&node, registry, schema, &DefaultPhysicalExtensionCodec {})?;
+    guard_expression(expression, allowance).map_err(Into::into)
 }
 
 fn decode_clause(
@@ -148,6 +148,7 @@ fn decode_clause(
     registry: &Registry,
     field_count: usize,
     primary_key: &[usize],
+    allowance: &Arc<ConcatAllowance>,
 ) -> Result<MutationClause> {
     let action = match clause.action.as_str() {
         "insert" if !clause.matched => MutationAction::Insert,
@@ -157,7 +158,7 @@ fn decode_clause(
     };
     let predicate = clause
         .predicate
-        .map(|bytes| decode_expr(&bytes, schema, registry))
+        .map(|bytes| decode_expr(&bytes, schema, registry, allowance))
         .transpose()?;
     let mut values = Vec::with_capacity(clause.values.len());
     for value in clause.values {
@@ -167,7 +168,10 @@ fn decode_clause(
             !values.iter().any(|(prior, _)| *prior == index),
             "duplicate state-table field assignment"
         );
-        values.push((index, decode_expr(&value.expression, schema, registry)?));
+        values.push((
+            index,
+            decode_expr(&value.expression, schema, registry, allowance)?,
+        ));
     }
     match action {
         MutationAction::Insert => ensure!(
@@ -202,7 +206,11 @@ impl StateTableStep {
         self.lookup.is_none()
     }
 
-    pub(crate) fn decode(config: StateTableOperator, registry: &Registry) -> Result<Self> {
+    pub(super) fn decode(
+        config: StateTableOperator,
+        registry: &Registry,
+        allowance: &Arc<ConcatAllowance>,
+    ) -> Result<Self> {
         ensure!(
             config.requires_fused_serial_owner,
             "state-table access requires a fused serial event owner"
@@ -257,7 +265,7 @@ impl StateTableStep {
         let keys = config
             .key_expressions
             .iter()
-            .map(|bytes| decode_expr(bytes, &input_schema.schema, registry))
+            .map(|bytes| decode_expr(bytes, &input_schema.schema, registry, allowance))
             .collect::<Result<Vec<_>>>()?;
         let clauses = config
             .clauses
@@ -269,6 +277,7 @@ impl StateTableStep {
                     registry,
                     table_schema.fields().len(),
                     &primary_key,
+                    allowance,
                 )
             })
             .collect::<Result<Vec<_>>>()?;
@@ -705,7 +714,9 @@ impl ArrowOperator for StateTableCapture {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::arrow::state_table_owner::{EventOperation, EventStep, FusedEventProgram};
+    use crate::arrow::state_table_owner::{
+        EventOperation, EventStep, FusedEventProgram, PendingEnvelopes,
+    };
     use arrow_array::{Int64Array, StringArray, TimestampNanosecondArray};
     use arrow_schema::{Field, TimeUnit};
     use arroyo_state::live::{
@@ -1028,5 +1039,396 @@ mod tests {
                 .value(0),
             3
         );
+    }
+
+    /// Parse SQL and decode exactly the fused worker plan emitted by the
+    /// planner. These tests exercise MERGE, rather than invoking JSON UDFs.
+    async fn planned_json_merge(expression: &str) -> (FusedEventProgram, SchemaRef) {
+        use arroyo_rpc::grpc::api::FusedStateTableOperator;
+        use prost::Message;
+        let sql = format!(
+            r#"
+CREATE TABLE json_events (k TEXT NOT NULL, payload TEXT NOT NULL)
+WITH (connector='single_file',path='/tmp/json-atomic-source.jsonl',format='json',type='source');
+CREATE STATE TABLE json_rows (k TEXT PRIMARY KEY, payload TEXT) PARTITION BY k;
+CREATE VIEW applied AS MERGE INTO json_rows AS target USING json_events AS source
+ON target.k=source.k
+WHEN MATCHED THEN UPDATE SET payload={expression}
+WHEN NOT MATCHED THEN INSERT (k,payload) VALUES (source.k,{expression})
+RETURNING source AS source,old AS old,new AS new,action AS action;
+SELECT * FROM applied;
+"#
+        );
+        let compiled = arroyo_planner::parse_and_get_program(
+            &sql,
+            arroyo_planner::ArroyoSchemaProvider::new(),
+            arroyo_planner::SqlConfig {
+                default_parallelism: 1,
+            },
+        )
+        .await
+        .unwrap();
+        let operator = compiled
+            .program
+            .graph
+            .node_weights()
+            .flat_map(|node| node.operator_chain.iter())
+            .map(|(operator, _)| operator)
+            .find(|operator| {
+                operator.operator_name == arroyo_datastream::logical::OperatorName::FusedStateTable
+            })
+            .expect("SQL MERGE must produce a fused worker owner");
+        let config = FusedStateTableOperator::decode(operator.operator_config.as_slice()).unwrap();
+        let input: ArroyoSchema = config.input_schema.clone().unwrap().try_into().unwrap();
+        let limits = arroyo_rpc::config::TypedSqlStateConfig {
+            key_bytes: 1024,
+            row_bytes: 64 * 1024,
+            decoded_bytes: 64 * 1024,
+            scope_bytes: 256 * 1024,
+            scope_operations: 16,
+            page_bytes: 256 * 1024,
+            page_entries: 2,
+            max_working_event_bytes: 4 * 1024 * 1024,
+            max_captured_event_bytes: 256 * 1024,
+            max_pending_output_rows: 8,
+            max_pending_output_bytes: 1024 * 1024,
+            max_resident_bytes: 1024 * 1024,
+        };
+        (
+            FusedEventProgram::decode(&config, &limits, &arroyo_planner::physical::new_registry())
+                .unwrap(),
+            input.schema,
+        )
+    }
+
+    fn json_event(schema: &SchemaRef, payload: &str) -> RecordBatch {
+        let columns = schema
+            .fields()
+            .iter()
+            .map(|field| match field.name().as_str() {
+                "k" => Arc::new(StringArray::from(vec!["a"])) as ArrayRef,
+                "payload" => Arc::new(StringArray::from(vec![payload])) as ArrayRef,
+                "_timestamp" => Arc::new(TimestampNanosecondArray::from(vec![1])) as ArrayRef,
+                other => panic!("unexpected planned source field {other}"),
+            })
+            .collect();
+        RecordBatch::try_new(schema.clone(), columns).unwrap()
+    }
+
+    struct JsonBackendCleanup {
+        root: std::path::PathBuf,
+        backend: Arc<arroyo_state::live::rocks::RocksLiveState>,
+    }
+
+    async fn json_tables(
+        program: &FusedEventProgram,
+        rocks: bool,
+    ) -> (
+        Arc<HashMap<String, TypedTable>>,
+        WorkerStateResources,
+        Option<JsonBackendCleanup>,
+    ) {
+        use arroyo_state::live::{
+            LiveStateBackend, lifecycle::RocksStateConfig, rocks::RocksLiveState,
+        };
+        let resources = WorkerStateResources::new(ResourceConfig {
+            block_cache_bytes: 1 << 20,
+            memtable_bytes: 1 << 20,
+            // Cover the table's configured worst-case headroom: queued writes
+            // reserve 5 * scope_bytes plus operation overhead; scans reserve
+            // 6 * page_bytes plus namespace/key/entry overhead.
+            queued_write_bytes: 2 << 20,
+            decoded_value_bytes: 16 << 20,
+            scan_page_bytes: 2 << 20,
+            max_blocking_operations: 2,
+            max_snapshots: 2,
+            max_open_databases: 1,
+            disk_reserve_bytes: 0,
+        })
+        .unwrap();
+        let root = rocks.then(|| {
+            std::env::temp_dir().join(format!(
+                "streamr-json-atomic-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ))
+        });
+        let rocks_backend = if let Some(root) = &root {
+            Some(Arc::new(
+                RocksLiveState::open(
+                    RocksStateConfig {
+                        root: root.clone(),
+                        job_id: "json-atomic".into(),
+                        operator_id: "owner".into(),
+                        subtask: 0,
+                        generation: 0,
+                        attempt: 0,
+                    },
+                    resources.clone(),
+                )
+                .await
+                .unwrap(),
+            ))
+        } else {
+            None
+        };
+        let backend: Arc<dyn LiveStateBackend> = match &rocks_backend {
+            Some(backend) => backend.clone(),
+            None => Arc::new(MemoryLiveState::bounded(resources.clone(), 1 << 20).unwrap()),
+        };
+        let mut tables = HashMap::new();
+        for step in &program.steps {
+            if let EventOperation::StateTable(access) = &step.operation {
+                tables
+                    .entry(access.table_identity.clone())
+                    .or_insert_with(|| {
+                        TypedTable::new(
+                            backend.clone(),
+                            StateNamespace {
+                                ownership: Ownership::PartitionLocal {
+                                    subtask: 0,
+                                    parallelism: 1,
+                                },
+                                table: access.table_identity.as_bytes().to_vec(),
+                            },
+                            access.descriptor(),
+                            arroyo_state::live::typed_table::TableLimits {
+                                key_bytes: 1024,
+                                row_bytes: 64 * 1024,
+                                decoded_bytes: 64 * 1024,
+                                scope_bytes: 256 * 1024,
+                                scope_operations: 16,
+                                page_bytes: 256 * 1024,
+                                page_entries: 2,
+                            },
+                            resources.clone(),
+                        )
+                        .unwrap()
+                    });
+            }
+        }
+        assert_eq!(tables.len(), 1);
+        (
+            Arc::new(tables),
+            resources,
+            root.zip(rocks_backend)
+                .map(|(root, backend)| JsonBackendCleanup { root, backend }),
+        )
+    }
+
+    fn assert_json_scope_permits_released(resources: &WorkerStateResources) {
+        // Acquire the full configured pools: no event/scope permit can remain.
+        let _decoded = resources
+            .try_decoded_value(resources.config().decoded_value_bytes)
+            .unwrap();
+        let _queued = resources
+            .try_queued_write(resources.config().queued_write_bytes)
+            .unwrap();
+    }
+
+    async fn stored_json(table: &TypedTable) -> String {
+        let key = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("k", DataType::Utf8, false)])),
+            vec![Arc::new(StringArray::from(vec!["a"]))],
+        )
+        .unwrap();
+        let stored = table.get(&key).await.unwrap().unwrap();
+        stored
+            .batch()
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .value(0)
+            .to_owned()
+    }
+
+    #[tokio::test]
+    async fn planned_sql_json_merge_errors_discard_pending_writes_and_release_reservations() {
+        let expansion = format!(
+            "{{\"items\":[{}]}}",
+            vec!["{}"; arroyo_planner::sql_json::path::MAX_PATH_ITEMS + 1].join(",")
+        );
+        let large = format!("{{\"value\":\"{}\"}}", "x".repeat(32 * 1024));
+        let nested = format!("{{\"value\":\"{}\"}}", "x".repeat(128));
+        for rocks in [false, true] {
+            for (
+                expression,
+                initial,
+                pending_value,
+                bad,
+                limit,
+                diagnostic,
+                expected_invocations,
+            ) in [
+                (
+                    "JSON_QUERY(source.payload, '$')",
+                    "{}",
+                    "{\"pending\":true}",
+                    large.as_str(),
+                    128 * 1024,
+                    "backing-byte allowance",
+                    0,
+                ),
+                (
+                    "JSON_QUERY(source.payload, '$.items[*]')",
+                    "{\"items\":[{}]}",
+                    "{\"items\":[{\"pending\":true}]}",
+                    expansion.as_str(),
+                    4 * 1024 * 1024,
+                    "maximum",
+                    1,
+                ),
+                (
+                    "JSON_OBJECT('v' VALUE source.payload FORMAT JSON)",
+                    "{}",
+                    "{\"pending\":true}",
+                    "invalid",
+                    4 * 1024 * 1024,
+                    "complete JSON value",
+                    1,
+                ),
+                (
+                    "JSON_OBJECT('v' VALUE source.payload)",
+                    "seed",
+                    "pending",
+                    large.as_str(),
+                    128 * 1024,
+                    "backing-byte allowance",
+                    0,
+                ),
+                (
+                    "JSON_OBJECT('x' VALUE JSON_QUERY(source.payload, '$') FORMAT JSON, 'y' VALUE JSON_QUERY(source.payload, '$') FORMAT JSON)",
+                    "{}",
+                    "{\"pending\":true}",
+                    nested.as_str(),
+                    100 * 1024,
+                    "backing-byte allowance",
+                    1,
+                ),
+            ] {
+                // 128 KiB admits the 32 KiB source and its planned projection,
+                // while the conservative JSON charge still greatly exceeds it.
+                // The nested case admits the first extraction but rejects the
+                // second, proving nested calls consume one shared allowance.
+                let (mut program, schema) = planned_json_merge(expression).await;
+                program.max_working_event_bytes = limit;
+                let (tables, resources, root) = json_tables(&program, rocks).await;
+                let table = tables.values().next().unwrap();
+                let initial = json_event(&schema, initial);
+                let mut scope = table.begin().await.unwrap();
+                program
+                    .execute_event(&initial, &tables, &mut scope)
+                    .await
+                    .unwrap();
+                scope.commit().await.unwrap();
+                let before = stored_json(table).await;
+                let mut scope = table.begin().await.unwrap();
+                // A prior event already staged a write/output in this chunk.
+                let envelope = program
+                    .execute_event(&json_event(&schema, pending_value), &tables, &mut scope)
+                    .await
+                    .unwrap();
+                let permit = resources
+                    .try_decoded_value(envelope.get_array_memory_size() + 64)
+                    .unwrap();
+                let mut pending = PendingEnvelopes::new(8, 1024 * 1024).unwrap();
+                pending.push_admitted(envelope, permit).unwrap();
+                let invocations_before = program.concat_allowance.invocation_count();
+                let error = program
+                    .execute_event(&json_event(&schema, bad), &tables, &mut scope)
+                    .await
+                    .unwrap_err();
+                assert!(
+                    format!("{error:#}").contains(diagnostic),
+                    "{expression}: {error:#}"
+                );
+                let invocations_after = program.concat_allowance.invocation_count();
+                assert_eq!(
+                    invocations_after - invocations_before,
+                    expected_invocations,
+                    "decoded MERGE must reserve before kernel execution; nested calls share one cumulative allowance"
+                );
+                drop(pending); // No pending envelope is emitted on failure.
+                drop(scope);
+                assert_eq!(stored_json(table).await, before);
+                assert_json_scope_permits_released(&resources);
+                // Retry through the same guarded physical plan proves that the
+                // per-operation allowance was disarmed as well.
+                let mut scope = table.begin().await.unwrap();
+                program
+                    .execute_event(&initial, &tables, &mut scope)
+                    .await
+                    .unwrap();
+                scope.commit().await.unwrap();
+                drop(tables);
+                if let Some(JsonBackendCleanup { root, backend }) = root {
+                    Arc::try_unwrap(backend)
+                        .unwrap_or_else(|_| panic!("test retained live backend"))
+                        .close_and_remove()
+                        .await
+                        .unwrap();
+                    std::fs::remove_dir_all(root).unwrap();
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn planned_sql_json_merge_cancellation_discards_uncommitted_output_and_state() {
+        for rocks in [false, true] {
+            let (mut program, schema) =
+                planned_json_merge("JSON_OBJECT('v' VALUE source.payload FORMAT JSON)").await;
+            let (tables, resources, root) = json_tables(&program, rocks).await;
+            let table = tables.values().next().unwrap();
+            let mut scope = table.begin().await.unwrap();
+            program
+                .execute_event(&json_event(&schema, "{}"), &tables, &mut scope)
+                .await
+                .unwrap();
+            scope.commit().await.unwrap();
+            let before = stored_json(table).await;
+            let worker_tables = tables.clone();
+            let worker_resources = resources.clone();
+            let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+            let task = tokio::spawn(async move {
+                let table = worker_tables.values().next().unwrap();
+                let mut scope = table.begin().await.unwrap();
+                let envelope = program
+                    .execute_event(
+                        &json_event(&schema, "{\"changed\":true}"),
+                        &worker_tables,
+                        &mut scope,
+                    )
+                    .await
+                    .unwrap();
+                let permit = worker_resources
+                    .try_decoded_value(envelope.get_array_memory_size() + 64)
+                    .unwrap();
+                let mut _pending = PendingEnvelopes::new(8, 1024 * 1024).unwrap();
+                _pending.push_admitted(envelope, permit).unwrap();
+                entered_tx.send(()).unwrap();
+                // SQL kernels are synchronous: cancellation is observed at an
+                // await boundary while the worker owns uncommitted envelopes.
+                futures::future::pending::<()>().await;
+            });
+            entered_rx.await.unwrap();
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
+            assert_eq!(stored_json(table).await, before);
+            assert_json_scope_permits_released(&resources);
+            drop(tables);
+            if let Some(JsonBackendCleanup { root, backend }) = root {
+                Arc::try_unwrap(backend)
+                    .unwrap_or_else(|_| panic!("test retained live backend"))
+                    .close_and_remove()
+                    .await
+                    .unwrap();
+                std::fs::remove_dir_all(root).unwrap();
+            }
+        }
     }
 }

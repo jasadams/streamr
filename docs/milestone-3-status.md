@@ -1,5 +1,42 @@
 # Milestone 3 — agent backlog
 
+## Active STR-56 continuation — 2026-10-10
+
+- Codex `/root`, start 00:21 UTC; branch
+  `jason/str-56-sql-json-delivery-20261010`, workspace
+  `/home/jason/repos/streamr-worktrees/str-56-delivery-20261010`.
+  Resumed with explicit user authorization on fetched base `48ceb3fe`;
+  unpublished Phase B `31928d94` rescued as `db54dad8` with the staged
+  continuation patch. Both earlier worktrees remain preserved.
+- Instructions: `AGENTS.md`, `.claude/team.md`, `.claude/build-test.md`,
+  this ledger, and current Trakkt STR-56 description/comments. Current user
+  instructions retire signing and all automatic elapsed-time limits.
+- Acceptance remaining: complete SQL projection and consecutive MERGE presence
+  gating; memory/RocksDB, source batches 1/8, checkpoint/fresh-worker VARCHAR
+  recovery; oversized-operation atomic failure and reservation release; fresh
+  independent review, affected-crate gates and green open PR.
+- Prior queued validation session `15738` was canceled with exit 130 at the
+  user's request; no final validation gate ran. Repairs and runtime fixtures
+  remain staged. Formatting, whitespace and harness syntax passed on that
+  source; runtime, crate checks and Clippy remain pending. Source review found
+  the original defects repaired; final approval awaits validation.
+- Current validation: round 4 exact SELECT planner/worker fixture and all eight
+  Engine MERGE recovery configurations passed after StringView/MERGE guard
+  repairs. Planner 57 tests, worker six tests, locked check and formatting passed.
+  Independent material source review approved. Strict Clippy found only decode
+  visibility and test Arc-initialization lints; narrow repairs passed final worker
+  tests, locked check, strict Clippy and formatting (all exit 0).
+  Round 3 stale generated RPC artifacts were recovered with targeted crate
+  cleanup; source protocol was unchanged.
+- Next action: finish narrow gates/evidence, integrate latest main's unrelated
+  worktree preservation tooling, obtain final review and publish the open PR.
+  Prior evidence is preserved
+  in `/home/jason/qa-evidence/str56-20261010/`; resumed receipts go to
+  `/home/jason/qa-evidence/str56-delivery-20261010/` and
+  `docs/str-56-validation.md`. STR-70 tracks non-blocking parser naming cleanup;
+  STR-73 tracks shared-target generated RPC artifact invalidation.
+  No PR or push; ticket In Progress. No pending user decision.
+
 Updated 2026-10-09 at the user's request. Read the current Trakkt ticket description
 before claiming work. Historical comments and validation logs are evidence, not
 current dispatch instructions. No implementation worker is claimed by this reset.

@@ -458,3 +458,93 @@ async fn decoded_spoof_udf_is_not_deserialized_as_builtin() {
             .is::<crate::sql_json::kernels::JsonValueFunc>()
     );
 }
+
+/// Emit a complete SQL-planned projection for the actual worker executor test.
+/// Only its native bounded VALUES source is adapted to the existing worker
+/// batch input placeholder; no projection expression or VALUES row is rebuilt.
+#[test(tokio::test)]
+#[ignore = "opt-in complete SELECT physical fixture for worker execution"]
+async fn sql_json_complete_select_worker_fixture() {
+    use crate::physical::{ArroyoMemExec, ArroyoPhysicalExtensionCodec, DecodingContext};
+    use datafusion::physical_planner::{DefaultPhysicalPlanner, PhysicalPlanner};
+    use datafusion_proto::physical_plan::AsExecutionPlan;
+
+    fn adapt_values(
+        plan: Arc<dyn ExecutionPlan>,
+        values: &mut Vec<arrow_array::RecordBatch>,
+    ) -> Arc<dyn ExecutionPlan> {
+        if let Some(source) = plan
+            .as_any()
+            .downcast_ref::<datafusion::datasource::source::DataSourceExec>()
+        {
+            let memory = source
+                .data_source()
+                .as_any()
+                .downcast_ref::<MemorySourceConfig>()
+                .expect("complete SELECT must have only its native VALUES source");
+            assert!(
+                values.is_empty(),
+                "fixture must have exactly one VALUES source"
+            );
+            assert!(
+                memory.projection().is_none(),
+                "native VALUES source must retain full input schema"
+            );
+            values.extend(memory.partitions().iter().flatten().cloned());
+            return Arc::new(ArroyoMemExec::new("ticket_values".into(), plan.schema()));
+        }
+        let children = plan
+            .children()
+            .iter()
+            .map(|child| adapt_values((*child).clone(), values))
+            .collect();
+        plan.with_new_children(children).unwrap()
+    }
+
+    let directory =
+        std::path::PathBuf::from(std::env::var("STREAMR_SQL_JSON_FIXTURE_DIR").unwrap());
+    std::fs::create_dir_all(&directory).unwrap();
+    let sql = include_str!("../../../../scripts/fixtures/sql-json/ticket-projection.sql");
+    let statement = crate::parse_sql(sql).unwrap().remove(0);
+    let logical =
+        crate::tables::produce_optimized_plan(&statement, &ArroyoSchemaProvider::new()).unwrap();
+    let context = SessionContext::new();
+    let physical = DefaultPhysicalPlanner::default()
+        .create_physical_plan(&logical, &context.state())
+        .await
+        .unwrap();
+    let mut values = Vec::new();
+    let adapted = adapt_values(physical, &mut values);
+    assert_eq!(values.len(), 1);
+    assert_eq!(values[0].num_rows(), 1);
+    assert_eq!(values[0].num_columns(), 2);
+    let codec = ArroyoPhysicalExtensionCodec {
+        context: DecodingContext::Planning,
+    };
+    let proto =
+        datafusion_proto::protobuf::PhysicalPlanNode::try_from_physical_plan(adapted, &codec)
+            .unwrap();
+    let serialized_plan = format!("{proto:?}");
+    for function in [
+        "json_exists",
+        "json_value",
+        "json_value_double",
+        "json_value_boolean",
+        "json_query",
+        "json_object",
+    ] {
+        assert!(
+            serialized_plan.contains(&format!("name: \"{function}\"")),
+            "complete query must retain {function} through physical serialization"
+        );
+    }
+    std::fs::write(directory.join("select-plan.txt"), serialized_plan).unwrap();
+    std::fs::write(directory.join("select.pb"), proto.encode_to_vec()).unwrap();
+    std::fs::write(directory.join("select.sql"), sql).unwrap();
+    let file = std::fs::File::create(directory.join("values.arrow")).unwrap();
+    let mut writer =
+        arrow::ipc::writer::StreamWriter::try_new(file, values[0].schema().as_ref()).unwrap();
+    writer.write(&values[0]).unwrap();
+    writer.finish().unwrap();
+    println!("SQL_JSON_COMPLETE_SELECT_FIXTURE {}", directory.display());
+}

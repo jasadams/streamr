@@ -2,9 +2,9 @@
 //!
 //! One implementation is shared by the JSON_VALUE / JSON_QUERY / JSON_EXISTS
 //! extraction kernels, JSON_OBJECT construction validation, and (later) the
-//! JSON_TABLE row-expansion ticket. Literal paths are compiled once — at plan
-//! time for validation diagnostics and memoized per process for execution —
-//! never reparsed per row.
+//! JSON_TABLE row-expansion ticket. Literal paths are validated at plan
+//! time and compiled within the execution reservation; no process-wide cache
+//! retains event allocations.
 //!
 //! The accepted dialect is deliberately narrower than full JSONPath. Only the
 //! catalog subset is accepted; anything else is a precise diagnostic naming
@@ -14,7 +14,7 @@
 //! real path item.
 
 use std::fmt;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use datafusion::common::{DataFusionError, Result};
 use serde_json::Value;
@@ -114,8 +114,6 @@ impl From<EvalError> for DataFusionError {
 #[derive(Debug, Clone, PartialEq)]
 pub enum FilterLiteral {
     Str(String),
-    Number(serde_json::Number),
-    Bool(bool),
 }
 
 /// A filter predicate over `@` or `@.member...`.
@@ -238,27 +236,23 @@ impl CompiledPath {
         doc: &'a Value,
     ) -> std::result::Result<Vec<PathItem<'a>>, EvalError> {
         let mut items = vec![PathItem::Value(doc)];
+        let mut object_ids = std::collections::HashMap::new();
         for (index, step) in self.steps.iter().enumerate() {
-            let mut next: Vec<PathItem<'a>> = Vec::new();
+            let mut next = BoundedItems {
+                items: Vec::new(),
+                path: &self.source,
+                step,
+                index,
+            };
             for item in &items {
                 match step {
-                    Step::Member(name) => member_step(item, name, &mut next),
-                    Step::Wildcard => wildcard_step(item, &mut next),
-                    Step::KeyValue => keyvalue_step(item, &mut next),
+                    Step::Member(name) => member_step(item, name, &mut next)?,
+                    Step::Wildcard => wildcard_step(item, &mut next)?,
+                    Step::KeyValue => keyvalue_step(item, &mut next, &mut object_ids)?,
                     Step::Filter(predicate) => filter_step(item, predicate, &mut next)?,
                 }
-                if next.len() > MAX_PATH_ITEMS {
-                    return Err(EvalError::new(
-                        &self.source,
-                        format!(
-                            "step {} ('{}') expanded beyond the maximum of {MAX_PATH_ITEMS} items",
-                            index + 1,
-                            step_display(step),
-                        ),
-                    ));
-                }
             }
-            items = next;
+            items = next.items;
         }
         Ok(items)
     }
@@ -287,16 +281,42 @@ fn step_display(step: &Step) -> String {
 fn literal_display(literal: &FilterLiteral) -> String {
     match literal {
         FilterLiteral::Str(s) => format!("\"{s}\""),
-        FilterLiteral::Number(n) => n.to_string(),
-        FilterLiteral::Bool(b) => b.to_string(),
     }
 }
 
-fn member_step<'a>(item: &PathItem<'a>, name: &str, out: &mut Vec<PathItem<'a>>) {
+struct BoundedItems<'a, 'p> {
+    items: Vec<PathItem<'a>>,
+    path: &'p str,
+    step: &'p Step,
+    index: usize,
+}
+
+impl<'a> BoundedItems<'a, '_> {
+    fn push(&mut self, item: PathItem<'a>) -> std::result::Result<(), EvalError> {
+        if self.items.len() == MAX_PATH_ITEMS {
+            return Err(EvalError::new(
+                self.path,
+                format!(
+                    "step {} ('{}') expanded beyond the maximum of {MAX_PATH_ITEMS} items",
+                    self.index + 1,
+                    step_display(self.step)
+                ),
+            ));
+        }
+        self.items.push(item);
+        Ok(())
+    }
+}
+
+fn member_step<'a>(
+    item: &PathItem<'a>,
+    name: &str,
+    out: &mut BoundedItems<'a, '_>,
+) -> std::result::Result<(), EvalError> {
     match item {
         PathItem::Value(Value::Object(map)) => {
             if let Some(value) = map.get(name) {
-                out.push(PathItem::Value(value));
+                out.push(PathItem::Value(value))?;
             }
         }
         // Standard lax auto-adaptation: member access over an array projects
@@ -306,43 +326,75 @@ fn member_step<'a>(item: &PathItem<'a>, name: &str, out: &mut Vec<PathItem<'a>>)
                 if let Value::Object(map) = element
                     && let Some(value) = map.get(name)
                 {
-                    out.push(PathItem::Value(value));
+                    out.push(PathItem::Value(value))?;
                 }
             }
         }
         // Synthetic keyvalue items expose `key`, `value` and `id` members.
         PathItem::KeyValue { key, value, id } => match name {
-            "key" => out.push(PathItem::Str(key)),
-            "value" => out.push(PathItem::Value(value)),
-            "id" => out.push(PathItem::Id(*id)),
+            "key" => out.push(PathItem::Str(key))?,
+            "value" => out.push(PathItem::Value(value))?,
+            "id" => out.push(PathItem::Id(*id))?,
             _ => {}
         },
         _ => {}
     }
+    Ok(())
 }
 
-fn wildcard_step<'a>(item: &PathItem<'a>, out: &mut Vec<PathItem<'a>>) {
+fn wildcard_step<'a>(
+    item: &PathItem<'a>,
+    out: &mut BoundedItems<'a, '_>,
+) -> std::result::Result<(), EvalError> {
     match item {
         PathItem::Value(Value::Array(elements)) => {
             for element in elements {
-                out.push(PathItem::Value(element));
+                out.push(PathItem::Value(element))?;
             }
         }
         // Lax adaptation: a non-array item passes through unchanged.
-        other => out.push(*other),
+        other => out.push(*other)?,
     }
+    Ok(())
 }
 
-fn keyvalue_step<'a>(item: &PathItem<'a>, out: &mut Vec<PathItem<'a>>) {
-    if let PathItem::Value(Value::Object(map)) = item {
-        for (id, (key, value)) in map.iter().enumerate() {
+fn keyvalue_step<'a>(
+    item: &PathItem<'a>,
+    out: &mut BoundedItems<'a, '_>,
+    object_ids: &mut std::collections::HashMap<usize, u64>,
+) -> std::result::Result<(), EvalError> {
+    fn append_object<'a>(
+        map: &'a serde_json::Map<String, Value>,
+        out: &mut BoundedItems<'a, '_>,
+        object_ids: &mut std::collections::HashMap<usize, u64>,
+    ) -> std::result::Result<(), EvalError> {
+        // The borrowed object address is an invocation-local identity only;
+        // it is never dereferenced or serialized as an address.
+        let identity = map as *const _ as usize;
+        let next_id = object_ids.len() as u64;
+        let id = *object_ids.entry(identity).or_insert(next_id);
+        for (key, value) in map {
             out.push(PathItem::KeyValue {
                 key: key.as_str(),
                 value,
-                id: id as u64,
-            });
+                id,
+            })?;
         }
+        Ok(())
     }
+    match item {
+        PathItem::Value(Value::Object(map)) => append_object(map, out, object_ids)?,
+        PathItem::Value(Value::Array(elements)) => {
+            // Standard lax method adaptation unwraps exactly one array level.
+            for element in elements {
+                if let Value::Object(map) = element {
+                    append_object(map, out, object_ids)?;
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 /// Lax filter auto-adaptation: a filter over an array applies its predicate
@@ -351,108 +403,67 @@ fn keyvalue_step<'a>(item: &PathItem<'a>, out: &mut Vec<PathItem<'a>>) {
 fn filter_step<'a>(
     item: &PathItem<'a>,
     predicate: &FilterPredicate,
-    out: &mut Vec<PathItem<'a>>,
+    out: &mut BoundedItems<'a, '_>,
 ) -> std::result::Result<(), EvalError> {
     match item {
         PathItem::Value(Value::Array(elements)) => {
             for element in elements {
                 let element_item = PathItem::Value(element);
-                if predicate.matches(&element_item)? {
-                    out.push(element_item);
+                if predicate.matches(&element_item, out.path)? {
+                    out.push(element_item)?;
                 }
             }
         }
         other => {
-            if predicate.matches(other)? {
-                out.push(*other);
+            if predicate.matches(other, out.path)? {
+                out.push(*other)?;
             }
         }
     }
     Ok(())
 }
 
-/// Resolve `@` or `@.member...` from one item to a comparison target.
-enum Target<'a> {
-    Value(&'a Value),
-    Str(&'a str),
-    Id(u64),
-    /// The subject chain did not resolve (lax absence). Absence is never
-    /// equal to a present JSON null.
-    Missing,
-}
-
-fn resolve_subject<'a>(item: &PathItem<'a>, subject: &[String]) -> Target<'a> {
-    if subject.is_empty() {
-        return match item {
-            PathItem::Value(value) => Target::Value(value),
-            PathItem::Str(s) => Target::Str(s),
-            PathItem::Id(id) => Target::Id(*id),
-            // `@` on a keyvalue item addresses the synthetic object; compare
-            // `.key`/`.value`/`.id` explicitly instead.
-            PathItem::KeyValue { .. } => Target::Missing,
-        };
-    }
-    // Synthetic keyvalue items expose `key`, `value` and `id` members.
-    if let PathItem::KeyValue { key, value, id } = item {
-        return match subject[0].as_str() {
-            "key" if subject.len() == 1 => Target::Str(key),
-            "value" => resolve_member_chain(Target::Value(value), &subject[1..]),
-            "id" if subject.len() == 1 => Target::Id(*id),
-            _ => Target::Missing,
-        };
-    }
-    // Walk the member chain from the item.
-    let start = match item {
-        PathItem::Value(value) => Target::Value(value),
-        PathItem::Str(_) | PathItem::Id(_) | PathItem::KeyValue { .. } => Target::Missing,
-    };
-    resolve_member_chain(start, subject)
-}
-
-fn resolve_member_chain<'a>(start: Target<'a>, names: &[String]) -> Target<'a> {
-    let mut current = start;
-    for name in names {
-        let map = match current {
-            Target::Value(Value::Object(map)) => map,
-            _ => return Target::Missing,
-        };
-        current = match map.get(name) {
-            Some(value) => Target::Value(value),
-            None => return Target::Missing,
-        };
-    }
-    current
-}
-
-fn target_equals_null(target: &Target<'_>) -> bool {
-    matches!(target, Target::Value(Value::Null))
-}
-
-fn target_equals_literal(target: &Target<'_>, literal: &FilterLiteral) -> bool {
-    match (target, literal) {
-        (Target::Value(Value::String(s)), FilterLiteral::Str(expected)) => s == expected,
-        (Target::Str(s), FilterLiteral::Str(expected)) => s == expected,
-        // serde_json's Number equality is exact: JSON `1` (integer) does not
-        // equal the literal `1.0` (float), and vice versa. The catalog only
-        // requires string and null filters, so this numeric strictness is a
-        // deliberate superset beyond the contract, not an approximation of
-        // SQL numeric comparison.
-        (Target::Value(Value::Number(n)), FilterLiteral::Number(expected)) => n == expected,
-        (Target::Id(id), FilterLiteral::Number(expected)) => {
-            serde_json::Number::from(*id) == *expected
-        }
-        (Target::Value(Value::Bool(b)), FilterLiteral::Bool(expected)) => b == expected,
-        _ => false,
-    }
-}
-
 impl FilterPredicate {
-    fn matches(&self, item: &PathItem<'_>) -> std::result::Result<bool, EvalError> {
-        let target = resolve_subject(item, &self.subject);
-        Ok(match &self.op {
-            FilterOp::EqualsNull => target_equals_null(&target),
-            FilterOp::EqualsLiteral(literal) => target_equals_literal(&target, literal),
-        })
+    fn matches(&self, item: &PathItem<'_>, path: &str) -> std::result::Result<bool, EvalError> {
+        // Reuse the bounded, one-level lax member traversal used by normal
+        // path steps. Each subject step is a sequence, not a single value.
+        let mut targets = vec![*item];
+        for name in &self.subject {
+            let step = Step::Member(name.clone());
+            let mut next = BoundedItems {
+                items: Vec::new(),
+                path,
+                step: &step,
+                index: 0,
+            };
+            for target in &targets {
+                member_step(target, name, &mut next)?;
+            }
+            targets = next.items;
+        }
+        let scalar_matches = |item: &PathItem<'_>| match (&self.op, item) {
+            (FilterOp::EqualsNull, PathItem::Value(Value::Null)) => true,
+            (
+                FilterOp::EqualsLiteral(FilterLiteral::Str(expected)),
+                PathItem::Value(Value::String(actual)),
+            ) => actual == expected,
+            (FilterOp::EqualsLiteral(FilterLiteral::Str(expected)), PathItem::Str(actual)) => {
+                *actual == expected
+            }
+            _ => false,
+        };
+        // Comparison unwraps an array once; nested arrays are not flattened.
+        let comparison = Step::Filter(self.clone());
+        let mut scalars = BoundedItems {
+            items: Vec::new(),
+            path,
+            step: &comparison,
+            index: 0,
+        };
+        for target in &targets {
+            wildcard_step(target, &mut scalars)?;
+        }
+        Ok(scalars.items.iter().any(scalar_matches))
     }
 }
 
@@ -629,68 +640,17 @@ impl<'a> PathParser<'a> {
                 self.pos = end + 1;
                 FilterOp::EqualsLiteral(FilterLiteral::Str(self.source[start..end].to_string()))
             }
-            Some(b't') | Some(b'f') | Some(b'n') => {
-                let rest = &self.source[self.pos..];
-                if rest.starts_with("true") {
-                    self.pos += 4;
-                    FilterOp::EqualsLiteral(FilterLiteral::Bool(true))
-                } else if rest.starts_with("false") {
-                    self.pos += 5;
-                    FilterOp::EqualsLiteral(FilterLiteral::Bool(false))
-                } else if rest.starts_with("null") {
-                    self.pos += 4;
-                    FilterOp::EqualsNull
-                } else {
-                    return self.error(self.pos, "expected a literal after '=='");
-                }
+            Some(b'n') if self.source[self.pos..].starts_with("null") => {
+                self.pos += 4;
+                FilterOp::EqualsNull
             }
-            Some(b'-' | b'0'..=b'9') => {
-                let start = self.pos;
-                if self.peek() == Some(b'-') {
-                    self.pos += 1;
-                }
-                let mut consumed_digits = false;
-                while matches!(self.peek(), Some(b'0'..=b'9')) {
-                    self.pos += 1;
-                    consumed_digits = true;
-                }
-                if self.peek() == Some(b'.') {
-                    self.pos += 1;
-                    while matches!(self.peek(), Some(b'0'..=b'9')) {
-                        self.pos += 1;
-                        consumed_digits = true;
-                    }
-                }
-                if matches!(self.peek(), Some(b'e' | b'E')) {
-                    self.pos += 1;
-                    if matches!(self.peek(), Some(b'+' | b'-')) {
-                        self.pos += 1;
-                    }
-                    let mut exponent_digits = false;
-                    while matches!(self.peek(), Some(b'0'..=b'9')) {
-                        self.pos += 1;
-                        exponent_digits = true;
-                    }
-                    if !exponent_digits {
-                        return self.error(self.pos, "expected digits in the numeric exponent");
-                    }
-                }
-                if !consumed_digits {
-                    return self.error(start, "expected a numeric literal after '=='");
-                }
-                let text = &self.source[start..self.pos];
-                let number: serde_json::Number = match text.parse() {
-                    Ok(number) => number,
-                    Err(_) => {
-                        return self.error(start, format!("invalid numeric literal '{text}'"));
-                    }
-                };
-                FilterOp::EqualsLiteral(FilterLiteral::Number(number))
+            Some(b't' | b'f' | b'-' | b'0'..=b'9') => {
+                return self.error(self.pos, "numeric and boolean filter literals are unsupported; only strings and null are accepted");
             }
             _ => {
                 return self.error(
                     self.pos,
-                    "expected a literal (double-quoted string, number, true, false or null) after '=='",
+                    "expected a literal (double-quoted string or null) after '=='",
                 );
             }
         };
@@ -698,54 +658,13 @@ impl<'a> PathParser<'a> {
     }
 }
 
-/// Process-wide memo for compiled literal paths.
-///
-/// Literal paths are validated at plan time; execution looks the compiled
-/// form up here so a path is parsed at most once per process rather than per
-/// row. The cache is bounded; a full cache is cleared rather than growing
-/// without limit.
-#[derive(Default)]
-pub struct PathCache {
-    paths: Mutex<std::collections::HashMap<String, Arc<CompiledPath>>>,
-}
-
-impl PathCache {
-    pub fn with_capacity(capacity: usize) -> Self {
-        Self {
-            paths: Mutex::new(std::collections::HashMap::with_capacity(capacity)),
-        }
-    }
-
-    /// Compile (or fetch a previously compiled) path. Syntax errors are
-    /// returned as planning diagnostics so an invalid literal path fails at
-    /// plan time, never as a runtime "missing field".
-    pub fn compile(&self, path: &str) -> Result<Arc<CompiledPath>> {
-        let mut paths = self.paths.lock().unwrap();
-        if let Some(compiled) = paths.get(path) {
-            return Ok(Arc::clone(compiled));
-        }
-        let compiled = Arc::new(
-            CompiledPath::compile(path)
-                .map_err(|error| DataFusionError::Plan(error.to_string()))?,
-        );
-        if paths.len() >= 4096 {
-            paths.clear();
-        }
-        paths.insert(path.to_string(), Arc::clone(&compiled));
-        Ok(compiled)
-    }
-}
-
-/// A shared cache instance used by every SQL/JSON kernel.
-pub fn shared_path_cache() -> &'static PathCache {
-    static CACHE: std::sync::OnceLock<PathCache> = std::sync::OnceLock::new();
-    CACHE.get_or_init(PathCache::default)
-}
-
-/// Compile a literal path at plan time, producing a planner diagnostic that
-/// names the full path and the offending segment on failure.
+/// Compile a literal path, producing a diagnostic that names the complete
+/// path and offending segment. The caller owns the compiled path; execution
+/// retains no path allocation after its operation reservation is released.
 pub fn compile_literal_path(path: &str) -> Result<Arc<CompiledPath>> {
-    shared_path_cache().compile(path)
+    CompiledPath::compile(path)
+        .map(Arc::new)
+        .map_err(|error| DataFusionError::Plan(error.to_string()))
 }
 
 #[cfg(test)]
@@ -861,7 +780,7 @@ mod tests {
         // serde_json's default map is ordered by key.
         assert_eq!(
             eval("$.m.keyvalue()", doc.clone()),
-            vec!["kv(key=a, value=1, id=0)", "kv(key=b, value=2, id=1)"]
+            vec!["kv(key=a, value=1, id=0)", "kv(key=b, value=2, id=0)"]
         );
         assert_eq!(eval("$.m.keyvalue().value", doc.clone()), vec!["1", "2"]);
         // `.key` materializes the bare key as a string item.
@@ -869,16 +788,61 @@ mod tests {
     }
 
     #[test]
-    fn numeric_and_boolean_filter_literals() {
-        let doc = json!({"xs": [{"n": 1, "b": true}, {"n": 2, "b": false}]});
-        // serde_json's default map serializes keys in sorted order.
-        assert_eq!(
-            eval("$.xs[*] ? (@.n == 2)", doc.clone()),
-            vec!["{\"b\":false,\"n\":2}"]
+    fn numeric_and_boolean_filter_literals_are_rejected() {
+        for literal in ["1", "1.0", "-2", "true", "false"] {
+            let error =
+                CompiledPath::compile(&format!("$.xs[*] ? (@.n == {literal})")).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("numeric and boolean filter literals are unsupported")
+            );
+        }
+    }
+
+    #[test]
+    fn filter_subject_uses_lax_member_sequences_and_array_comparison() {
+        let doc = json!({"xs": [
+            {"kind": ["match"], "a": [{"b": "match"}], "nullable": [null]},
+            {"kind": [["match"]], "a": [{"b": "other"}]},
+            {"kind": "other", "nullable": []}
+        ]});
+        for path in [
+            "$.xs[*] ? (@.kind == \"match\")",
+            "$.xs[*] ? (@.a.b == \"match\")",
+            "$.xs[*] ? (@.nullable == null)",
+        ] {
+            let compiled = CompiledPath::compile(path).unwrap();
+            assert_eq!(
+                compiled.evaluate(&doc).unwrap(),
+                vec![PathItem::Value(&doc["xs"][0])]
+            );
+        }
+    }
+
+    #[test]
+    fn keyvalue_lax_array_adaptation_is_one_level_and_bounded() {
+        let doc = json!({"objects": [{"a":1}, [{"nested":2}], {"b":3}]});
+        assert_eq!(eval("$.objects.keyvalue().value", doc.clone()), ["1", "3"]);
+        assert_eq!(eval("$.objects.keyvalue().id", doc), ["0", "1"]);
+        let dense = json!({"objects": vec![json!({"a":1}); MAX_PATH_ITEMS + 1]});
+        assert!(
+            CompiledPath::compile("$.objects.keyvalue()")
+                .unwrap()
+                .evaluate(&dense)
+                .unwrap_err()
+                .to_string()
+                .contains("maximum")
         );
+    }
+
+    #[test]
+    fn keyvalue_ids_identify_objects_and_persist_across_steps() {
+        let doc = json!({"a": [{"x": {"p": 1}, "y": {"q": 2}}, {"z": {"r": 3}}]});
+        assert_eq!(eval("$.a[*].keyvalue().id", doc.clone()), ["0", "0", "1"]);
         assert_eq!(
-            eval("$.xs[*] ? (@.b == true)", doc),
-            vec!["{\"b\":true,\"n\":1}"]
+            eval("$.a[*].keyvalue().value.keyvalue().id", doc),
+            ["2", "3", "4"]
         );
     }
 
@@ -953,12 +917,12 @@ mod tests {
     }
 
     #[test]
-    fn cache_returns_the_same_compiled_instance() {
-        let cache = PathCache::with_capacity(4);
-        let first = cache.compile("$.a.b").unwrap();
-        let second = cache.compile("$.a.b").unwrap();
-        assert!(Arc::ptr_eq(&first, &second));
-        let diagnostic = cache.compile("$.a[").unwrap_err();
+    fn compiled_paths_are_caller_owned_and_preserve_diagnostics() {
+        let first = compile_literal_path("$.a.b").unwrap();
+        let second = compile_literal_path("$.a.b").unwrap();
+        assert!(!Arc::ptr_eq(&first, &second));
+        assert_eq!(first, second);
+        let diagnostic = compile_literal_path("$.a[").unwrap_err();
         assert!(diagnostic.to_string().contains("invalid SQL/JSON path"));
     }
 }

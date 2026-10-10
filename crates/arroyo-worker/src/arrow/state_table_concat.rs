@@ -10,7 +10,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use arrow_array::{Array, LargeStringArray, RecordBatch, StringArray};
+use arrow_array::{Array, LargeStringArray, RecordBatch, StringArray, StringViewArray};
 use arrow_schema::{DataType, FieldRef, Schema};
 use datafusion::{
     common::{DataFusionError, Result, ScalarValue},
@@ -41,6 +41,11 @@ pub(super) struct ConcatAllowance {
 }
 
 impl ConcatAllowance {
+    #[cfg(test)]
+    pub(super) fn invocation_count(&self) -> usize {
+        self.invocations.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     pub(super) fn begin(self: &Arc<Self>, bytes: usize) -> Result<ConcatScope> {
         let mut remaining = self.remaining.lock().unwrap();
         if remaining.is_some() {
@@ -258,51 +263,51 @@ fn charge_add(a: usize, b: usize) -> Result<usize> {
     a.checked_add(b).ok_or_else(sql_json_exhausted)
 }
 
-/// Charge the working-event allowance for a SQL/JSON kernel before it
-/// allocates, accounting the input bytes, the temporary parsed-document
-/// copy, and a worst-case bound on the output:
-///
-/// * extraction kernels: the document is parsed into a temporary value
-///   (~input bytes) and the output never exceeds the document text
-///   (a subtree serialization of valid JSON), so `3 * doc + path`;
-/// * JSON_OBJECT: values may be re-escaped (up to 6x for control
-///   characters) and FORMAT JSON embeds input whole, so values are charged
-///   at `7 * bytes` plus metadata and per-pair overhead.
-///
-/// The charge covers the full set the kernels execute: UTF8 text by byte
-/// length, fixed-width scalars at 16 bytes, fixed-width arrays at
-/// `rows × element size`, and bare/typed SQL nulls at 16 bytes. Only types
-/// the kernels themselves reject (nested lists, structs, …) fail here.
-///
-/// The fused owner evaluates one event at a time; a multi-row batch means
-/// the plan expanded the event and is rejected. Over-reservation is safe
-/// (the scope releases on drop); under-reservation is not.
-fn sql_json_charge(args: &[ColumnarValue], rows: usize, kind: SqlJsonKind) -> Result<usize> {
+/// Reserve before parsing, traversal or construction. A serialized byte is
+/// allowed 64 bytes of parsed storage: Value/vector capacity rounding, decoded
+/// string capacity, and BTreeMap node/key overhead (an object entry requires at
+/// least a quoted key, colon and value). Dense scalar arrays are the largest
+/// Value-to-text ratio, rather than long strings. Two simultaneously live path
+/// vectors have at most one item per document byte and each vector may round
+/// its capacity up to twice its length. Lax filter-subject traversal has two
+/// additional vectors while those outer vectors live, hence 8 * PathItem per
+/// source byte. A further 64 bytes per source byte covers the evaluation-local
+/// keyvalue object-identity hash table, including hash-table capacity rounding.
+/// Another 32 bytes per source byte covers input conversion, escaped text
+/// (at most 6x), String capacity rounding, serialization and Arrow output
+/// copies. The 1024-byte base covers empty-document/root-item/builders.
+/// Construction uses the same bound for FORMAT JSON and metadata parsing;
+/// it retains no metadata cache. Charges accumulate in the event scope and
+/// are released when that scope drops, including errors and cancellation.
+fn sql_json_charge(args: &[ColumnarValue], rows: usize, _kind: SqlJsonKind) -> Result<usize> {
     if rows > 1 {
         return Err(DataFusionError::Execution(
             "fused SQL/JSON evaluation requires at most one event row".into(),
         ));
     }
-    let mut bytes = 256usize; // fixed builder/parse overhead
+    let mut bytes = 1024usize;
     for arg in args {
         let length = sql_json_arg_bytes(arg, rows)?;
-        bytes = match kind {
-            SqlJsonKind::Extraction => charge_add(bytes, length.saturating_mul(3))?,
-            SqlJsonKind::Construction => charge_add(bytes, length.saturating_mul(7))?,
-        };
+        let peak_per_byte =
+            64 + 64 + 8 * std::mem::size_of::<arroyo_planner::sql_json::path::PathItem<'_>>() + 32;
+        let allocation = length
+            .checked_mul(peak_per_byte)
+            .ok_or_else(sql_json_exhausted)?;
+        bytes = charge_add(bytes, allocation)?;
     }
     Ok(bytes)
 }
 
 /// Backing bytes attributed to one SQL/JSON argument, matching the types the
-/// kernels execute: UTF8/LargeUtf8 text by byte length, every fixed-width
+/// kernels execute: UTF8/LargeUtf8/Utf8View text by byte length, every fixed-width
 /// scalar (boolean, integer, float, bare/typed null) at 16 bytes, and
 /// fixed-width arrays at `rows × element size`. Anything else is a type the
 /// kernels reject, and fails here with the same clarity.
 fn sql_json_arg_bytes(arg: &ColumnarValue, rows: usize) -> Result<usize> {
     match arg {
         ColumnarValue::Scalar(ScalarValue::Utf8(value))
-        | ColumnarValue::Scalar(ScalarValue::LargeUtf8(value)) => {
+        | ColumnarValue::Scalar(ScalarValue::LargeUtf8(value))
+        | ColumnarValue::Scalar(ScalarValue::Utf8View(value)) => {
             Ok(value.as_ref().map_or(0, String::len))
         }
         ColumnarValue::Scalar(scalar) if is_fixed_width_scalar(scalar) => Ok(16),
@@ -331,6 +336,21 @@ fn sql_json_arg_bytes(arg: &ColumnarValue, rows: usize) -> Result<usize> {
                 })?
                 .values()
                 .len()),
+            // Views borrow admitted input buffers. Charge every visible value
+            // byte (including repeats) before scalar/array materialization in
+            // the kernel; the 32-byte conversion term also covers view records.
+            DataType::Utf8View => array
+                .as_any()
+                .downcast_ref::<StringViewArray>()
+                .ok_or_else(|| {
+                    DataFusionError::Execution(
+                        "SQL/JSON UTF8 view argument has invalid representation".into(),
+                    )
+                })?
+                .iter()
+                .try_fold(0usize, |bytes, value| {
+                    charge_add(bytes, value.map_or(0, str::len))
+                }),
             other => fixed_width(other)
                 .map(|width| rows.saturating_mul(width))
                 .ok_or_else(|| {
@@ -421,6 +441,10 @@ impl PhysicalExpr for AdmittedSqlJson {
             .collect::<Result<Vec<_>>>()?;
         self.allowance
             .charge(sql_json_charge(&args, batch.num_rows(), self.kind)?)?;
+        #[cfg(test)]
+        self.allowance
+            .invocations
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let arg_fields = self
             .function
             .args()
@@ -966,6 +990,51 @@ mod tests {
     }
 
     #[test]
+    fn dense_sql_json_inputs_are_admitted_before_kernel_allocation() {
+        let dense = format!("[{}]", vec!["0"; 1000].join(","));
+        for (index, call) in [
+            json_call(
+                arroyo_planner::sql_json::kernels::json_exists(),
+                vec![literal(Some(&dense)), literal(Some("$"))],
+            ),
+            json_call(
+                arroyo_planner::sql_json::kernels::json_object(),
+                vec![literal(Some(r#"[["items",true]]"#)), literal(Some(&dense))],
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let allowance = Arc::new(ConcatAllowance::default());
+            let guarded = guard_expression(call, &allowance).unwrap();
+            {
+                let _scope = allowance.begin(8 * 1024).unwrap();
+                assert!(matches!(
+                    guarded.evaluate(&row()),
+                    Err(DataFusionError::ResourcesExhausted(_))
+                ));
+                assert_eq!(allowance.invocations.load(Ordering::Relaxed), 0);
+            }
+            {
+                let _retry = allowance.begin(2 * 1024 * 1024).unwrap();
+                let output = guarded.evaluate(&row()).unwrap();
+                assert_eq!(allowance.invocations.load(Ordering::Relaxed), 1);
+                if index == 0 {
+                    let array = output.into_array(1).unwrap();
+                    let values = array
+                        .as_any()
+                        .downcast_ref::<arrow_array::BooleanArray>()
+                        .unwrap();
+                    assert!(!values.is_null(0));
+                    assert!(values.value(0));
+                } else {
+                    assert_eq!(text(output), format!("{{\"items\":{dense}}}"));
+                }
+            }
+        }
+    }
+
+    #[test]
     fn sql_json_charge_admits_every_kernel_executed_type() {
         let allowance = Arc::new(ConcatAllowance::default());
         let scalar =
@@ -1009,6 +1078,83 @@ mod tests {
             let out = guarded.evaluate(&batch).unwrap();
             assert_eq!(text(out), r#"{"n":42}"#);
         }
+    }
+
+    #[test]
+    fn sql_json_utf8_views_charge_and_construct_as_character_values() {
+        let allowance = Arc::new(ConcatAllowance::default());
+        let object = json_call(
+            arroyo_planner::sql_json::kernels::json_object(),
+            vec![
+                Arc::new(Literal::new(ScalarValue::Utf8View(Some(
+                    r#"[["plain",false],["json",true],["null",true]]"#.into(),
+                )))),
+                Arc::new(Literal::new(ScalarValue::Utf8View(Some("{}".into())))),
+                Arc::new(Literal::new(ScalarValue::Utf8View(Some("{}".into())))),
+                Arc::new(Literal::new(ScalarValue::Utf8View(None))),
+            ],
+        );
+        let guarded = guard_expression(object, &allowance).unwrap();
+        {
+            let _scope = allowance.begin(128 * 1024).unwrap();
+            assert_eq!(
+                text(guarded.evaluate(&row()).unwrap()),
+                r#"{"plain":"{}","json":{},"null":null}"#
+            );
+        }
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Utf8View,
+            true,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(StringViewArray::from(vec![Some("x".repeat(512))]))],
+        )
+        .unwrap();
+        let object = json_call(
+            arroyo_planner::sql_json::kernels::json_object(),
+            vec![
+                literal(Some(r#"[["v",false]]"#)),
+                Arc::new(Column::new("value", 0)),
+            ],
+        );
+        let guarded = guard_expression(object, &allowance).unwrap();
+        let before = allowance.invocation_count();
+        {
+            let _scope = allowance.begin(8 * 1024).unwrap();
+            assert!(matches!(
+                guarded.evaluate(&batch),
+                Err(DataFusionError::ResourcesExhausted(_))
+            ));
+            assert_eq!(allowance.invocation_count(), before);
+        }
+        {
+            let _scope = allowance.begin(512 * 1024).unwrap();
+            assert_eq!(
+                text(guarded.evaluate(&batch).unwrap()),
+                format!("{{\"v\":\"{}\"}}", "x".repeat(512))
+            );
+            assert_eq!(allowance.invocation_count(), before + 1);
+        }
+        // View arrays are character operands for metadata and FORMAT JSON too.
+        let meta =
+            Arc::new(StringViewArray::from(vec![Some(r#"[["v",true]]"#)])) as arrow_array::ArrayRef;
+        let value = Arc::new(StringViewArray::from(vec![Some("null")])) as arrow_array::ArrayRef;
+        let args = [ColumnarValue::Array(meta), ColumnarValue::Array(value)];
+        assert!(sql_json_charge(&args, 1, SqlJsonKind::Construction).unwrap() > 0);
+        let udf = arroyo_planner::sql_json::kernels::json_object();
+        let output = udf
+            .invoke_with_args(ScalarFunctionArgs {
+                args: args.to_vec(),
+                arg_fields: (0..2)
+                    .map(|_| Arc::new(Field::new("arg", DataType::Utf8View, true)))
+                    .collect(),
+                number_rows: 1,
+                return_field: Arc::new(Field::new("result", DataType::Utf8, true)),
+            })
+            .unwrap();
+        assert_eq!(text(output), r#"{"v":null}"#);
     }
 
     #[test]

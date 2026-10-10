@@ -5,8 +5,8 @@
 //! provider and the worker physical-plan registry (`new_registry`) always
 //! resolve the same implementations. Literal SQL/JSON paths are compiled
 //! through [`crate::sql_json::path`] — validated at plan time by the AST
-//! lowering and memoized per process here, so a path is never reparsed per
-//! row.
+//! lowering and compiled in the invocation scope here. No parsed documents,
+//! paths or construction metadata outlive their invocation reservation.
 //!
 //! Error model: malformed documents, missing paths and incompatible scalar
 //! conversions obey each function's standard default (`NULL ON ERROR`;
@@ -16,10 +16,12 @@
 //! results.
 
 use std::any::Any;
-use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, RwLock};
+use std::collections::HashSet;
+use std::sync::Arc;
 
-use arrow_array::{Array, ArrayRef, BooleanArray, Float64Array, StringArray};
+use arrow_array::{
+    Array, ArrayRef, BooleanArray, Float64Array, LargeStringArray, StringArray, StringViewArray,
+};
 use arrow_schema::DataType;
 use datafusion::common::{DataFusionError, Result, ScalarValue};
 use datafusion::logical_expr::{
@@ -54,7 +56,7 @@ pub struct JsonExistsFunc {
 }
 
 /// The `[key, format_json]` pair list parsed from a JSON_OBJECT metadata
-/// literal, shared because the literal is memoized.
+/// literal. Metadata is scoped to the invocation, with no retained cache.
 type ObjectPairs = Arc<Vec<(String, bool)>>;
 
 /// SQL/JSON `JSON_OBJECT`.
@@ -65,8 +67,6 @@ type ObjectPairs = Arc<Vec<(String, bool)>>;
 /// per pair.
 pub struct JsonObjectFunc {
     signature: Signature,
-    /// Memoized parse of pair-metadata literals, keyed by the literal text.
-    pairs: RwLock<HashMap<String, ObjectPairs>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -112,15 +112,16 @@ fn output_too_large(function: &str, bytes: usize) -> DataFusionError {
 
 /// Resolve the compiled path for one invocation.
 ///
-/// The lowering always emits a literal path; the per-process path cache makes
-/// execution compile each distinct literal at most once rather than once per
-/// row. A non-literal path (only reachable by invoking the registered
+/// Lowering emits a literal path, compiled in invocation-owned storage so no
+/// execution allocation is retained after its reservation releases.
+/// A non-literal path (only reachable by invoking the registered
 /// function directly) and a null path are precise errors, never silent
 /// fallbacks.
 fn compiled_path(path: &ColumnarValue, function: &str) -> Result<Arc<CompiledPath>> {
     match path {
         ColumnarValue::Scalar(ScalarValue::Utf8(Some(s)))
-        | ColumnarValue::Scalar(ScalarValue::LargeUtf8(Some(s))) => {
+        | ColumnarValue::Scalar(ScalarValue::LargeUtf8(Some(s)))
+        | ColumnarValue::Scalar(ScalarValue::Utf8View(Some(s))) => {
             super::path::compile_literal_path(s)
         }
         ColumnarValue::Scalar(_) => Err(DataFusionError::Execution(format!(
@@ -133,17 +134,21 @@ fn compiled_path(path: &ColumnarValue, function: &str) -> Result<Arc<CompiledPat
 }
 
 fn row_str(array: &ArrayRef, row: usize) -> Result<Option<&str>> {
-    let strings = array
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .ok_or_else(|| {
-            DataFusionError::Internal("SQL/JSON document argument is not UTF8".into())
-        })?;
-    if strings.is_null(row) {
-        Ok(None)
-    } else {
-        Ok(Some(strings.value(row)))
+    if array.is_null(row) {
+        return Ok(None);
     }
+    if let Some(strings) = array.as_any().downcast_ref::<StringArray>() {
+        return Ok(Some(strings.value(row)));
+    }
+    if let Some(strings) = array.as_any().downcast_ref::<LargeStringArray>() {
+        return Ok(Some(strings.value(row)));
+    }
+    if let Some(strings) = array.as_any().downcast_ref::<StringViewArray>() {
+        return Ok(Some(strings.value(row)));
+    }
+    Err(DataFusionError::Internal(
+        "SQL/JSON character argument is not UTF8 text".into(),
+    ))
 }
 
 /// Per-row outcome of document parsing + path evaluation, before the parsed
@@ -494,7 +499,6 @@ impl JsonObjectFunc {
     pub fn new() -> Self {
         Self {
             signature: Signature::new(TypeSignature::VariadicAny, Volatility::Immutable),
-            pairs: RwLock::new(HashMap::new()),
         }
     }
 
@@ -544,6 +548,9 @@ impl JsonObjectFunc {
                     return Err(output_too_large(FUNCTION, output.len()));
                 }
             }
+            if output.len() >= MAX_OUTPUT_BYTES {
+                return Err(output_too_large(FUNCTION, output.len() + 1));
+            }
             output.push('}');
             builder.push(Some(output));
         }
@@ -552,9 +559,9 @@ impl JsonObjectFunc {
         ))
     }
 
-    fn pairs_for(&self, meta: &str) -> Result<Arc<Vec<(String, bool)>>> {
-        if let Some(pairs) = self.pairs.read().unwrap().get(meta) {
-            return Ok(Arc::clone(pairs));
+    fn pairs_for(&self, meta: &str) -> Result<ObjectPairs> {
+        if meta.len() > MAX_DOCUMENT_BYTES {
+            return Err(document_too_large("JSON_OBJECT metadata", meta.len()));
         }
         let parsed: Vec<(String, bool)> = serde_json::from_str(meta).map_err(|error| {
             DataFusionError::Execution(format!("invalid JSON_OBJECT pair metadata: {error}"))
@@ -567,13 +574,7 @@ impl JsonObjectFunc {
                 )));
             }
         }
-        let pairs = Arc::new(parsed);
-        let mut cache = self.pairs.write().unwrap();
-        if cache.len() >= 4096 {
-            cache.clear();
-        }
-        cache.insert(meta.to_string(), Arc::clone(&pairs));
-        Ok(pairs)
+        Ok(Arc::new(parsed))
     }
 }
 
@@ -598,6 +599,7 @@ fn object_value_text(value: &ScalarValue, format_json: bool, key: &str) -> Resul
         ScalarValue::Null
             | ScalarValue::Utf8(None)
             | ScalarValue::LargeUtf8(None)
+            | ScalarValue::Utf8View(None)
             | ScalarValue::Boolean(None)
             | ScalarValue::Int8(None)
             | ScalarValue::Int16(None)
@@ -615,9 +617,9 @@ fn object_value_text(value: &ScalarValue, format_json: bool, key: &str) -> Resul
     }
     if format_json {
         return match value {
-            ScalarValue::Utf8(Some(text)) | ScalarValue::LargeUtf8(Some(text)) => {
-                validate_and_embed_json(text, key)
-            }
+            ScalarValue::Utf8(Some(text))
+            | ScalarValue::LargeUtf8(Some(text))
+            | ScalarValue::Utf8View(Some(text)) => validate_and_embed_json(text, key),
             other => Err(DataFusionError::Execution(format!(
                 "FORMAT JSON for JSON_OBJECT key {key:?} requires a character value, not {}",
                 non_null_kind(other)
@@ -625,13 +627,11 @@ fn object_value_text(value: &ScalarValue, format_json: bool, key: &str) -> Resul
         };
     }
     match value {
-        ScalarValue::Utf8(Some(text)) | ScalarValue::LargeUtf8(Some(text)) => {
-            serde_json::to_string(text).map_err(|error| {
-                DataFusionError::Internal(format!(
-                    "JSON_OBJECT string serialization failed: {error}"
-                ))
-            })
-        }
+        ScalarValue::Utf8(Some(text))
+        | ScalarValue::LargeUtf8(Some(text))
+        | ScalarValue::Utf8View(Some(text)) => serde_json::to_string(text).map_err(|error| {
+            DataFusionError::Internal(format!("JSON_OBJECT string serialization failed: {error}"))
+        }),
         ScalarValue::Boolean(Some(b)) => Ok(if *b { "true" } else { "false" }.to_string()),
         ScalarValue::Int8(Some(v)) => Ok(v.to_string()),
         ScalarValue::Int16(Some(v)) => Ok(v.to_string()),
@@ -678,6 +678,9 @@ fn json_f64(value: f64, key: &str) -> Result<String> {
 }
 
 fn validate_and_embed_json(text: &str, key: &str) -> Result<String> {
+    if text.len() > MAX_DOCUMENT_BYTES {
+        return Err(document_too_large("JSON_OBJECT FORMAT JSON", text.len()));
+    }
     match serde_json::from_str::<Value>(text) {
         Ok(_) => Ok(text.to_string()),
         Err(error) => Err(DataFusionError::Execution(format!(
@@ -1254,6 +1257,20 @@ mod tests {
             one_string(invoke(&udf, vec![utf8(r#"[["k",true]]"#), ScalarValue::Null]).unwrap()),
             Some(r#"{"k":null}"#.to_string())
         );
+    }
+
+    #[test]
+    fn object_output_bound_includes_closing_brace() {
+        let exact = "a".repeat(MAX_OUTPUT_BYTES - 8);
+        let output = one_string(
+            invoke(&json_object(), vec![utf8(r#"[["x",false]]"#), utf8(&exact)]).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(output.len(), MAX_OUTPUT_BYTES);
+        let value = "a".repeat(MAX_OUTPUT_BYTES - 7);
+        let error =
+            invoke(&json_object(), vec![utf8(r#"[["x",false]]"#), utf8(&value)]).unwrap_err();
+        assert!(matches!(error, DataFusionError::ResourcesExhausted(_)));
     }
 
     #[test]

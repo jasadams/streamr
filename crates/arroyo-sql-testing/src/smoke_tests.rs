@@ -2049,6 +2049,12 @@ async fn external_sql_checkpoint_capture_inner() {
         "STREAMR_CAPTURE_MAX_CHECKPOINT_ROWS",
     )
     .await;
+    tokio::fs::copy(
+        &output_path,
+        output_path.with_extension(format!("checkpoint-{}.jsonl", capture.checkpoint_epoch)),
+    )
+    .await
+    .expect("cannot preserve committed checkpoint output prefix");
     if leader_mode() {
         use arroyo_state_protocol::store::read_protobuf;
         let paths = arroyo_state_protocol::ProtocolPaths::new(
@@ -2330,7 +2336,9 @@ fn configure_test_worker() {
                 scope_operations: 128,
                 page_bytes: 128 * 1024,
                 page_entries: 64,
-                max_working_event_bytes: 256 * 1024,
+                max_working_event_bytes: std::env::var("STREAMR_TEST_TYPED_WORKING_EVENT_BYTES")
+                    .map(|value| value.parse().expect("invalid typed working-event limit"))
+                    .unwrap_or(256 * 1024),
                 max_captured_event_bytes: 128 * 1024,
                 max_pending_output_rows: 64,
                 max_pending_output_bytes: 512 * 1024,
@@ -2466,3 +2474,6 @@ mod fault_tests;
 
 #[path = "smoke_state_table_lifecycle.rs"]
 mod smoke_state_table_lifecycle;
+
+#[path = "smoke_sql_json.rs"]
+mod smoke_sql_json;
