@@ -28,8 +28,9 @@
   tests, locked check, strict Clippy and formatting (all exit 0).
   Round 3 stale generated RPC artifacts were recovered with targeted crate
   cleanup; source protocol was unchanged.
-- Next action: finish narrow gates/evidence, integrate latest main's unrelated
-  worktree preservation tooling, obtain final review and publish the open PR.
+- Latest main `8cbd443d` integrated by clean rebase; its unrelated preservation
+  tooling/build guidance was reread. Final independent verdict approved publication.
+- Next action: publish the open PR and verify current-head CI.
   Prior evidence is preserved
   in `/home/jason/qa-evidence/str56-20261010/`; resumed receipts go to
   `/home/jason/qa-evidence/str56-delivery-20261010/` and

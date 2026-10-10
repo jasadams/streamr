@@ -163,3 +163,8 @@ STR-57 JSON_TABLE and STR-66 JSON_OBJECTAGG are separate tickets; this evidence
 does not qualify those features or the composed external application catalog.
 
 STR-70 tracks the non-blocking parser-fork enum-name lint cleanup; it does not block STR-56 or change SQL semantics.
+
+Final publication integrates main `8cbd443d` by clean rebase. Its delta from
+validated base `48ceb3fe` contains only preservation tooling and build guidance;
+no engine source changed. Applicable AGENTS/build guidance was reread. Independent
+review approved publication after auditing the final source and receipts.
