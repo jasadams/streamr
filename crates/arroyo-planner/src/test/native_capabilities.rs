@@ -382,10 +382,18 @@ async fn native_session_aggregate_plan() {
 }
 
 #[test(tokio::test)]
-async fn native_updating_input_joins_reject() {
+async fn native_mixed_append_updating_input_joins_reject() {
     for (left, right, diagnostic) in [
-        ("counts", "raw", "can't handle updating left side of join"),
-        ("raw", "counts", "can't handle updating right side of join"),
+        (
+            "counts",
+            "raw",
+            "updating equijoins require changelog metadata on both inputs",
+        ),
+        (
+            "raw",
+            "counts",
+            "updating equijoins require changelog metadata on both inputs",
+        ),
     ] {
         let sql = format!(
             "WITH counts AS (SELECT bid.auction AS key, COUNT(*) AS n FROM nexmark \

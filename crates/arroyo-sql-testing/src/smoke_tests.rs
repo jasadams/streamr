@@ -395,6 +395,7 @@ fn set_internal_parallelism(graph: &mut Graph<LogicalNode, LogicalEdge>, paralle
             .iter()
             .any(|(operator, _)| match operator.operator_name {
                 OperatorName::UpdatingAggregate => native_aggregate,
+                OperatorName::Join => worker.join_state.is_some(),
                 OperatorName::SlidingWindowAggregate => native_window,
                 OperatorName::SessionWindowAggregate => native_window,
                 OperatorName::TumblingWindowAggregate if native_window => {
@@ -2415,6 +2416,28 @@ fn configure_test_worker() {
             // Two native owners can each admit a complete 2 MiB write scope.
             resources.queued_write_bytes = 32 * 1024 * 1024;
             resources.decoded_value_bytes = 16 * 1024 * 1024;
+        }
+        if std::env::var("STREAMR_TEST_NATIVE_UPDATING_JOINS").as_deref() == Ok("1") {
+            // Two aggregate owners plus joins each own one database. This is
+            // an explicit finite fixture budget, not a product auto-expansion.
+            c.worker
+                .live_state_resources
+                .as_mut()
+                .expect("updating join fixtures require native aggregates")
+                .max_open_databases = 8;
+            c.worker.join_state = Some(arroyo_rpc::config::JoinStateConfig {
+                max_retained_rows: 100000,
+                max_probe_rows: 10000,
+                key_bytes: 512,
+                value_bytes: 32 * 1024,
+                page_bytes: 128 * 1024,
+                page_entries: 64,
+                write_bytes: 2 * 1024 * 1024,
+                write_operations: 128,
+                overlay_bytes: 2 * 1024 * 1024,
+                max_pending_output_bytes: 512 * 1024,
+                max_resident_bytes: 128 * 1024 * 1024,
+            });
         }
         if std::env::var("STREAMR_TEST_NATIVE_WINDOWS").as_deref() == Ok("1") {
             c.worker.execution_resources.get_or_insert(

@@ -77,6 +77,8 @@ message JoinOperator {
   ArroyoSchema output_schema = 4;
   bytes join_plan = 5;
   optional uint64 ttl_micros = 6;
+  bool updating = 7;
+  bool left_outer = 8;
 }
 
 message LookupJoinCondition {

@@ -1,0 +1,1 @@
+INSERT INTO join_output SELECT l.item_id AS left_id, r.item_id AS right_id, l.k1, l.k2, l.total AS left_total, r.total AS right_total, l.events AS left_count, r.events AS right_count FROM left_values l @JOIN@ JOIN right_values r ON l.k1 = r.k1 AND l.k2 = r.k2;
