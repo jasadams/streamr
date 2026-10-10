@@ -21,8 +21,8 @@ current dispatch instructions. No implementation worker is claimed by this reset
   admission; signed optional emitted boundary checkpoints in existing state.
   Calendar W/V progress and cursor prune one bounded page at a time, with
   per-family horizon floors; equality/future buckets and G/J survive.
-- Next: publish the reviewed current source in PR #23 after tooling-only main
-  integration, require current-head active CI, then hand off In Review for merge.
+- Publication: reviewed source is pushed in ready PR #23. Next: current-head
+  active CI gate, then `/merge-sweeper` owns merge and the Done transition.
   Executable qualification used optimized main `48ceb3fe`; integration onto
   `8cbd443d` preserves every recorded engine/harness hash (`post-rebase-audit.json`).
   No build remains in flight.
