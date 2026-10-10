@@ -255,8 +255,9 @@ impl NativeWindow {
             "native windows require worker.execution-resources"
         );
         ensure!(
-            width > Duration::ZERO && slide > Duration::ZERO,
-            "native window width and slide must be positive"
+            (width == Duration::ZERO && slide == Duration::ZERO && !hopping)
+                || (width > Duration::ZERO && slide > Duration::ZERO),
+            "native windows require positive width/slide or exact-timestamp tumbling mode"
         );
         ensure!(
             !hopping || (width >= slide && width.as_nanos().is_multiple_of(slide.as_nanos())),
@@ -488,6 +489,9 @@ impl NativeWindow {
     }
 
     fn bin_start(&self, time: i64) -> Result<i64> {
+        if self.width == Duration::ZERO {
+            return Ok(time);
+        }
         let width = i64::try_from(self.slide.as_nanos())?;
         Ok(time.div_euclid(width) * width)
     }
@@ -616,7 +620,10 @@ impl NativeWindow {
             if latest < start {
                 continue;
             }
-            let Some(first) = snapshot.next_partial(&key, start, end, None).await? else {
+            let Some(first) = snapshot
+                .next_partial_range(&key, start, end, self.width == Duration::ZERO, None)
+                .await?
+            else {
                 continue;
             };
             // Collection preflight counts the same snapshot and reserves its
@@ -641,7 +648,13 @@ impl NativeWindow {
                 let mut after = None;
                 let mut size = CollectionSize::default();
                 while let Some(partial) = snapshot
-                    .next_partial(&key, start, end, after.as_deref())
+                    .next_partial_range(
+                        &key,
+                        start,
+                        end,
+                        self.width == Duration::ZERO,
+                        after.as_deref(),
+                    )
                     .await?
                 {
                     size.add_partial(
@@ -687,6 +700,7 @@ impl NativeWindow {
             // Move the sender into the producer so the input stream observes
             // EOF as soon as all paged partials have been sent.
             let producer_snapshot = snapshot;
+            let exact = self.width == Duration::ZERO;
             let producer = async move {
                 let mut after = None;
                 if let Some(first) = first_for_producer {
@@ -703,7 +717,7 @@ impl NativeWindow {
                     drop(first);
                 }
                 while let Some(partial) = producer_snapshot
-                    .next_partial(&key, start, end, after.as_deref())
+                    .next_partial_range(&key, start, end, exact, after.as_deref())
                     .await?
                 {
                     after = Some(partial.key.clone());
@@ -826,7 +840,12 @@ impl NativeWindow {
                 self.emit_interval(&snapshot, first, end, collector).await?;
                 self.store()?.set_progress(end).await?;
                 self.store()?
-                    .expire_before_snapshot(&snapshot, end, &mut retired_through)
+                    .expire_range_snapshot(
+                        &snapshot,
+                        end,
+                        self.width == Duration::ZERO,
+                        &mut retired_through,
+                    )
                     .await?;
             }
         }
@@ -1093,20 +1112,34 @@ mod tests {
 
     #[tokio::test]
     async fn slow_tumble_cancellation_preserves_many_hot_panes() {
-        slow_closure_cancellation_preserves_many_hot_panes(false, false).await;
+        slow_closure_cancellation_preserves_many_hot_panes(false, false, false).await;
     }
 
     #[tokio::test]
     async fn slow_hop_cancellation_preserves_many_hot_panes() {
-        slow_closure_cancellation_preserves_many_hot_panes(true, false).await;
+        slow_closure_cancellation_preserves_many_hot_panes(true, false, false).await;
     }
 
     #[tokio::test]
     async fn collection_refusal_retry_and_cancellation_release_paged_state() {
-        slow_closure_cancellation_preserves_many_hot_panes(false, true).await;
+        slow_closure_cancellation_preserves_many_hot_panes(false, true, false).await;
     }
 
-    async fn slow_closure_cancellation_preserves_many_hot_panes(hopping: bool, collection: bool) {
+    #[tokio::test]
+    async fn slow_exact_cancellation_preserves_many_hot_bins() {
+        slow_closure_cancellation_preserves_many_hot_panes(false, false, true).await;
+    }
+
+    #[tokio::test]
+    async fn exact_collection_refusal_retry_and_cancellation_release_paged_state() {
+        slow_closure_cancellation_preserves_many_hot_panes(false, true, true).await;
+    }
+
+    async fn slow_closure_cancellation_preserves_many_hot_panes(
+        hopping: bool,
+        collection: bool,
+        exact: bool,
+    ) {
         use super::super::execution::{ExecutionResources, with_test_execution_resources};
         use arroyo_planner::physical::{ArroyoMemExec, new_registry};
         use arroyo_rpc::config::ExecutionResourceConfig;
@@ -1157,7 +1190,7 @@ mod tests {
             // Many panes, with a hot first pane spanning many one-entry pages.
             for pane in 0..48 {
                 for _ in 0..if pane == 0 { 128 } else { 1 } {
-                    store.append(&[], pane * 10, &row).await.unwrap();
+                    store.append(&[], pane * if exact { 1 } else { 10 }, &row).await.unwrap();
                 }
             }
             let input: Arc<dyn ExecutionPlan> = Arc::new(ArroyoMemExec::new("input".into(), schema.clone()));
@@ -1177,7 +1210,7 @@ mod tests {
             }).unwrap().encode_to_vec();
             let finish_timestamp_schema = add_timestamp_field_arrow((*finish.schema()).clone());
             let mut operator = NativeWindow {
-                width: Duration::from_nanos(if hopping { 20 } else { 10 }), slide: Duration::from_nanos(10), hopping,
+                width: Duration::from_nanos(if exact { 0 } else if hopping { 20 } else { 10 }), slide: Duration::from_nanos(if exact { 0 } else { 10 }), hopping,
                 binning: Arc::new(datafusion::physical_expr::expressions::Literal::new(ScalarValue::TimestampNanosecond(Some(0), None))),
                 partial: StatelessPhysicalExecutor::new(&partial_plan, &registry).unwrap(),
                 finish, finish_receiver: receiver, projection: None,
@@ -1194,7 +1227,17 @@ mod tests {
                 Some(Arc::new(ArroyoSchema::from_schema_unkeyed(finish_timestamp_schema).unwrap())),
                 HashMap::new(),
             ).await;
-            ctx.watermarks.set(0, arroyo_types::Watermark::EventTime(UNIX_EPOCH + Duration::from_nanos(20)));
+            ctx.watermarks.set(0, arroyo_types::Watermark::EventTime(UNIX_EPOCH + Duration::from_nanos(if exact { 2 } else { 20 })));
+            if exact {
+                assert_eq!(operator.bin_start(19).unwrap(), 19);
+                // The exact bin at the watermark is admitted; an older bin is late.
+                operator.process_batch(row.clone(), &mut ctx).await.unwrap();
+                assert_eq!(operator.store().unwrap().earliest_time().await.unwrap(), Some(0));
+                operator.binning = Arc::new(datafusion::physical_expr::expressions::Literal::new(ScalarValue::TimestampNanosecond(Some(2), None)));
+                if !collection {
+                    operator.process_batch(row.clone(), &mut ctx).await.unwrap();
+                }
+            }
             if collection {
                 // Persisted List state spans128 pages. Refusal occurs before
                 // any final execution, collector call, progress or expiry.
@@ -1261,6 +1304,11 @@ mod tests {
             let mut resumed = RecordedCollector::default();
             operator.handle_watermark(&mut ctx, &mut resumed).await.unwrap();
             assert_eq!(resumed.0.len(), 2);
+            if exact {
+                for (batch, time) in resumed.0.iter().zip([0, 1]) {
+                    assert_eq!(batch.column(batch.num_columns() - 1).as_any().downcast_ref::<PrimitiveArray<TimestampNanosecondType>>().unwrap().value(0), time);
+                }
+            }
             if collection {
                 let values = resumed.0[0].column(0).as_any().downcast_ref::<ListArray>().unwrap().value(0);
                 assert_eq!(values.len(), 128);
@@ -1271,14 +1319,30 @@ mod tests {
                 assert_eq!(resumed.0[0].column(0).as_any().downcast_ref::<Int64Array>().unwrap().value(0), 128);
                 assert_eq!(resumed.0[1].column(0).as_any().downcast_ref::<Int64Array>().unwrap().value(0), if hopping { 129 } else { 1 });
             }
-            assert_eq!(operator.store().unwrap().progress().await.unwrap(), Some(20));
-            assert_eq!(operator.store().unwrap().earliest_time().await.unwrap(), Some(if hopping { 10 } else { 20 }));
-            // Equality closes [10,20), retaining the pane starting at 20.
+            assert_eq!(operator.store().unwrap().progress().await.unwrap(), Some(if exact { 1 } else { 20 }));
+            assert_eq!(operator.store().unwrap().earliest_time().await.unwrap(), Some(if hopping { 10 } else if exact { 2 } else { 20 }));
+            // Repeating the watermark neither re-emits nor closes the equal bin.
             operator.handle_watermark(&mut ctx, &mut resumed).await.unwrap();
             assert_eq!(resumed.0.len(), 2);
+            if exact {
+                let directory = std::env::temp_dir().join(format!("native-exact-operator-{}-{}",
+                    std::process::id(), std::time::SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()));
+                // Adjacent nanosecond bins0/1 closed; bin2 is still open.
+                // Checkpoint this retained state and replace its live owner.
+                let fresh = Box::pin(operator.store.take().unwrap().checkpoint_restore_for_test(&directory)).await;
+                operator.store = Some(fresh);
+                let mut equality = RecordedCollector::default();
+                operator.handle_watermark(&mut ctx, &mut equality).await.unwrap();
+                assert!(equality.0.is_empty());
+                assert_eq!(operator.store().unwrap().earliest_time().await.unwrap(), Some(2));
+                std::fs::remove_dir_all(directory).unwrap();
+            }
             ctx.watermarks.set(0, arroyo_types::Watermark::EventTime(arroyo_types::from_nanos(u64::MAX as u128)));
             operator.handle_watermark(&mut ctx, &mut resumed).await.unwrap();
             assert_eq!(resumed.0.len(), if hopping { 49 } else { 48 });
+            if exact && !collection {
+                assert_eq!(resumed.0[2].column(0).as_any().downcast_ref::<Int64Array>().unwrap().value(0), 2);
+            }
             assert_eq!(operator.store().unwrap().earliest_time().await.unwrap(), None);
             assert_eq!(execution.runtime.memory_pool.reserved(), 0);
             drop(state.try_decoded_value(state.config().decoded_value_bytes).unwrap());
