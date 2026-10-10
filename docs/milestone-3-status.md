@@ -10,7 +10,8 @@ current dispatch instructions. No implementation worker is claimed by this reset
 
 - Worker: Codex `/root`; branch `jason/str-62-calendar-2147`, base `67c242f5`.
   Started 2026-10-09 21:47 UTC; no automatic time limit.
-  [PR #23](https://github.com/jasadams/streamr/pull/23) remains draft during repair.
+  [PR #23](https://github.com/jasadams/streamr/pull/23) delivers the reviewed feature;
+  current-head CI and merge handoff remain publication gates.
 - Decision: user instructed acceptance revision and implementation of common
   watermark finality. Existing AS is the sole control: drop late source changes
   atomically, preserve admitted CDC trigger context, prune recent buckets from
@@ -22,8 +23,9 @@ current dispatch instructions. No implementation worker is claimed by this reset
   per-family horizon floors; equality/future buckets and G/J survive.
 - Next: publish the reviewed current source in PR #23 after tooling-only main
   integration, require current-head active CI, then hand off In Review for merge.
-  Executable qualification used optimized main `48ceb3fe`; final integration
-  preserves the recorded engine/harness hashes. No build or agent remains in flight.
+  Executable qualification used optimized main `48ceb3fe`; integration onto
+  `8cbd443d` preserves every recorded engine/harness hash (`post-rebase-audit.json`).
+  No build remains in flight.
 - Evidence: locked affected check, formatting and strict Clippy passed; planner
   162/162, calendar worker 12/12 and admission 7/7 passed. Actual SQL 40/40 passed:
   pruning 8, default calendar 16 and expression shapes 16, with 40 fresh-worker

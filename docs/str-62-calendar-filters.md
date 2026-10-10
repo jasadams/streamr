@@ -8,7 +8,8 @@ Automatic elapsed-time limits are disabled. The earlier queued retry was stopped
 at 22:46:54 UTC (exit 143), before acquiring a build slot; that historical stop
 is not an ongoing deadline. The reviewed implementation is delivered through
 [PR #23](https://github.com/jasadams/streamr/pull/23), awaiting current-head CI and merge.
-Final main integration is tooling/docs only; validated engine/harness hashes are preserved.
+Final main integration onto `8cbd443d` is tooling/docs only; validated engine/harness
+hashes are preserved in `post-rebase-audit.json`.
 
 ## Contract and ownership
 
