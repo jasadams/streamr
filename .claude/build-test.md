@@ -47,6 +47,32 @@ preserving Cargo's exit status.
 are per container and reset on each run. Use Cargo's `--timings` to measure
 build performance. The machine-wide build queue and four-job default remain.
 
+The development image also contains the exact pinned RocksDB 10.4.2 static
+library, built once through `librocksdb-sys`'s original build script with LZ4,
+O0 and line-table debug information. Normal dev/test commands generate bindings
+and link this archive without recompiling RocksDB C++. LZ4 and Kafka continue to
+use their existing dependencies. The image retains a source checksum, build lock
+and archive hash under `/opt/streamr-rocksdb`.
+
+Rebuild with `scripts/cargo-dev --build` to obtain this image. The wrapper checks
+the image pin against the checkout's lockfile and RocksDB features before
+building, so old or mismatched images fail with rebuild instructions. The state
+crate supplies the external archive's Linux C++ runtime linkage without changing
+workspace-wide compiler flags. Use the wrapper for validated image defaults.
+
+Release/custom profiles, custom targets, compiler/profile overrides, local
+`.cargo/config` files and Cargo `--config` options select the original native
+source build. `ROCKSDB_COMPILE=1 scripts/cargo-dev build --locked -p arroyo-worker
+--lib --timings` explicitly selects it for a native rebuild comparison. Keep
+this setting stable during ordinary iterations: switching native build modes
+invalidates the RocksDB dependency and its dependents.
+
+Linked Git worktrees automatically mount the original checkout's `target/` at
+`/app/target`, using `target/milestone2-runtime` for every queued build. Do not
+add another mount for `/app/target`. The queue still serializes builds; alternating
+source revisions can invalidate workspace incremental work, while the prebuilt
+native library remains available independently of Cargo cache eviction.
+
 To compare against the previous non-incremental mode, run
 `CARGO_INCREMENTAL=0 scripts/cargo-dev build --locked -p arroyo-worker --lib --timings`.
 Explicit `CARGO_INCREMENTAL` values are forwarded to the container; this global

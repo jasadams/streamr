@@ -26,6 +26,13 @@ class CargoDevTest(unittest.TestCase):
         shutil.copy2(REPO / "docker/cargo-dev-config.toml",
                      self.root / "docker/cargo-dev-config.toml")
         shutil.copy2(REPO / "docker/rustc-cache", self.root / "docker/rustc-cache")
+        for name in ("build-rocksdb-prebuilt", "rocksdb-prebuilt.json", "rocksdb-build-mode.py"):
+            shutil.copy2(REPO / "docker" / name, self.root / "docker" / name)
+        shutil.copy2(REPO / "Cargo.lock", self.root / "Cargo.lock")
+        shutil.copy2(REPO / "Cargo.toml", self.root / "Cargo.toml")
+        state = self.root / "crates/arroyo-state"
+        state.mkdir(parents=True)
+        shutil.copy2(REPO / "crates/arroyo-state/Cargo.toml", state / "Cargo.toml")
         for name in ("cargo-dev", "rust-build"):
             shutil.copy2(REPO / "scripts" / name, self.root / "scripts" / name)
         self.bin = self.base / "bin"
@@ -38,6 +45,7 @@ class CargoDevTest(unittest.TestCase):
         self.env.pop("STREAMR_DEV_IMAGE", None)
         self.env.pop("CARGO_BUILD_JOBS", None)
         self.env.pop("CARGO_INCREMENTAL", None)
+        self.env.pop("ROCKSDB_COMPILE", None)
         self.env.pop("CARGO_PROFILE_DEV_INCREMENTAL", None)
         self.env.pop("CARGO_PROFILE_TEST_INCREMENTAL", None)
         self.write_stub("podman", """
@@ -51,6 +59,11 @@ if sys.argv[1] == 'build':
     record['dockerfile'] = (context / 'Dockerfile.dev').read_text()
 with open(os.environ['WRAPPER_TEST_LOG'], 'a') as log:
     log.write(json.dumps(record) + '\\n')
+if sys.argv[1:3] == ['image', 'inspect']:
+    pin = json.loads(pathlib.Path('docker/rocksdb-prebuilt.json').read_text())
+    expected = ':'.join(pin[k] for k in ('version', 'checksum', 'lz4_version', 'lz4_checksum'))
+    print(os.environ.get('PREBUILT_PIN', expected))
+    sys.exit(int(os.environ.get('INSPECT_STATUS', '0')))
 if sys.argv[1:3] == ['image', 'exists']:
     sys.exit(int(os.environ.get('IMAGE_STATUS', '0')))
 if sys.argv[1] == 'run' and os.environ.get('EXECUTE_CONTAINER_SHELL'):
@@ -77,13 +90,15 @@ sys.exit(int(os.environ.get('COMMAND_STATUS', '0')))
     def test_container_arguments_cwd_and_queue(self):
         result = self.run_wrapper("test", "-p", "crate", "--", "a spaced argument")
         self.assertEqual(result.returncode, 0, result.stderr)
-        image, run = self.records()
+        image, inspect, run = self.records()
         self.assertEqual(image['args'], ['image', 'exists', 'arroyo-dev'])
         self.assertEqual(run['args'], [
             'run', '--rm', '-w', '/app', '-e', 'CARGO_TARGET_DIR=/app/target/milestone2-runtime',
             '-e', 'CARGO_PROFILE_DEV_INCREMENTAL=true',
-            '-e', 'CARGO_PROFILE_TEST_INCREMENTAL=true', '-e', 'CARGO_BUILD_JOBS=4',
+            '-e', 'CARGO_PROFILE_TEST_INCREMENTAL=true', '-e', 'ROCKSDB_COMPILE=0',
+            '-e', 'CARGO_BUILD_JOBS=4',
             '-v', f'{self.root}:/app:z',
+            '-v', f'{self.root}/target:/app/target:z',
             '-v', 'streamr-cargo-registry:/usr/local/cargo/registry',
             '-v', 'streamr-cargo-git:/usr/local/cargo/git',
             '-v', 'streamr-sccache:/var/cache/sccache',
@@ -95,18 +110,35 @@ sys.exit(int(os.environ.get('COMMAND_STATUS', '0')))
     def test_stats_uses_same_container_shell_and_cache(self):
         result = self.run_wrapper('--stats')
         self.assertEqual(result.returncode, 0, result.stderr)
-        image, run = self.records()
+        image, inspect, run = self.records()
         self.assertEqual(run['args'][-7:],
                          ['arroyo-dev', 'sh', '-c', CONTAINER_SHELL, 'sh',
                           'sccache', '--show-stats'])
         self.assertIn('streamr-sccache:/var/cache/sccache', run['args'])
+
+    def test_linked_worktree_mounts_original_checkout_target(self):
+        subprocess.run(['git', 'init', '-q', str(self.root)], check=True)
+        subprocess.run(['git', '-C', str(self.root), 'add', '.'], check=True)
+        subprocess.run(['git', '-C', str(self.root), '-c', 'user.name=Fixture',
+                        '-c', 'user.email=fixture@example.invalid', '-c', 'commit.gpgsign=false',
+                        'commit', '-qm', 'fixture'], check=True)
+        linked = self.base / 'linked worktree'
+        subprocess.run(['git', '-C', str(self.root), 'worktree', 'add', '-q',
+                        '--detach', str(linked)], check=True)
+        result = subprocess.run([str(linked / 'scripts/cargo-dev'), 'build'],
+                                cwd=self.base, env=self.env, capture_output=True,
+                                text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        run = self.records()[-1]
+        self.assertIn(f'{linked}:/app:z', run['args'])
+        self.assertIn(f'{self.root}/target:/app/target:z', run['args'])
 
     def test_incremental_overrides_are_forwarded_without_changing_release_profile(self):
         result = self.run_wrapper('build', '--release', CARGO_INCREMENTAL='0',
                                   CARGO_PROFILE_DEV_INCREMENTAL='false',
                                   CARGO_PROFILE_TEST_INCREMENTAL='false')
         self.assertEqual(result.returncode, 0, result.stderr)
-        _, run = self.records()
+        _, _, run = self.records()
         self.assertIn('CARGO_INCREMENTAL=0', run['args'])
         self.assertIn('CARGO_PROFILE_DEV_INCREMENTAL=false', run['args'])
         self.assertIn('CARGO_PROFILE_TEST_INCREMENTAL=false', run['args'])
@@ -149,10 +181,56 @@ sys.exit(37)
         result = self.run_wrapper('check', STREAMR_DEV_IMAGE='custom:image',
                                   CARGO_BUILD_JOBS='2', COMMAND_STATUS='101')
         self.assertEqual(result.returncode, 101)
-        image, run = self.records()
+        image, inspect, run = self.records()
         self.assertEqual(image['args'][-1], 'custom:image')
         self.assertIn('custom:image', run['args'])
         self.assertIn('CARGO_BUILD_JOBS=2', run['args'])
+
+    def test_native_source_override_and_release_preserve_source_compilation(self):
+        for args, env in [(('build',), {'ROCKSDB_COMPILE': '1'}),
+                          (('build', '--release'), {}),
+                          (('test', '--profile=release'), {})]:
+            with self.subTest(args=args, env=env):
+                result = self.run_wrapper(*args, **env)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn('ROCKSDB_COMPILE=1', self.records()[-1]['args'])
+
+    def test_old_or_mismatched_prebuilt_image_fails_before_build(self):
+        result = self.run_wrapper('build', PREBUILT_PIN='old-image')
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn('scripts/cargo-dev --build', result.stderr)
+        self.assertEqual([r['args'][0] for r in self.records()], ['image', 'image'])
+
+    def test_test_harness_arguments_do_not_change_native_mode(self):
+        result = self.run_wrapper('test', '--', '--release', '--target=custom')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('ROCKSDB_COMPILE=0', self.records()[-1]['args'])
+
+    def test_custom_native_profile_uses_source_and_forwards_settings(self):
+        result = self.run_wrapper('build', CARGO_PROFILE_DEV_OPT_LEVEL='2')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('ROCKSDB_COMPILE=1', self.records()[-1]['args'])
+        self.assertIn('CARGO_PROFILE_DEV_OPT_LEVEL=2', self.records()[-1]['args'])
+        manifest = self.root / 'Cargo.toml'
+        manifest.write_text(manifest.read_text().replace('[profile.dev]', '[profile.dev]\nopt-level = 2'))
+        result = self.run_wrapper('build')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('ROCKSDB_COMPILE=1', self.records()[-1]['args'])
+
+    def test_mismatched_lock_or_features_fails_before_build(self):
+        lock = self.root / 'Cargo.lock'
+        lock.write_text(lock.read_text().replace('version = "0.17.3+10.4.2"',
+                                                'version = "0.17.3+99.0.0"'))
+        result = self.run_wrapper('build')
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn('differs from the prebuilt pin', result.stderr)
+        shutil.copy2(REPO / 'Cargo.lock', lock)
+        state = self.root / 'crates/arroyo-state/Cargo.toml'
+        state.write_text(state.read_text().replace('"bindgen-runtime", "lz4"',
+                                                  '"bindgen-runtime", "zstd"'))
+        result = self.run_wrapper('build')
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn('features differ', result.stderr)
 
     def test_build_context_is_minimal_and_always_removed(self):
         for status in ('0', '17'):
@@ -162,8 +240,10 @@ sys.exit(37)
                 record, = self.records()
                 self.assertEqual(record['args'][:2], ['build', '-f'])
                 self.assertEqual(record['args'][3:5], ['-t', 'arroyo-dev'])
-                self.assertEqual(record['files'], ['Dockerfile.dev', 'docker',
+                self.assertEqual(record['files'], ['Cargo.lock', 'Dockerfile.dev', 'docker',
+                                                   'docker/build-rocksdb-prebuilt',
                                                    'docker/cargo-dev-config.toml',
+                                                   'docker/rocksdb-prebuilt.json',
                                                    'docker/rustc-cache'])
                 self.assertEqual(record['cargo_config'],
                                  (REPO / 'docker/cargo-dev-config.toml').read_text())

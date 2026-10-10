@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+# Run only while building Dockerfile.dev. Use the crate's original build.rs,
+# not a separately maintained CMake approximation of its native configuration.
+set -euo pipefail
+build_dir=/tmp/streamr-rocksdb-build
+install_dir=/opt/streamr-rocksdb
+mkdir -p "$build_dir/src" "$install_dir/lib"
+python3 - <<'PY'
+import json, pathlib, tomllib
+root = pathlib.Path('/tmp/streamr-rocksdb-input')
+pin = json.loads((root / 'rocksdb-prebuilt.json').read_text())
+if (sorted(pin['features']) != ['bindgen-runtime', 'lz4', 'static']
+        or pin['profile'] != {'opt-level': 0, 'debug': 'line-tables-only'}
+        or pin['target'] != 'x86_64-unknown-linux-gnu'):
+    raise SystemExit('Unsupported prebuilt native recipe; update the build harness with its pin')
+packages = tomllib.loads((root / 'Cargo.lock').read_text())['package']
+for name, version, checksum in [
+    (pin['crate'], pin['version'], pin['checksum']),
+    ('lz4-sys', pin['lz4_version'], pin['lz4_checksum']),
+]:
+    matches = [p for p in packages if p['name'] == name]
+    if len(matches) != 1 or matches[0]['version'] != version or matches[0].get('checksum') != checksum:
+        raise SystemExit(f'Prebuilt pin differs from Cargo.lock: {name}')
+build = pathlib.Path('/tmp/streamr-rocksdb-build')
+(build / 'Cargo.toml').write_text('''[package]
+name = "streamr-rocksdb-prebuild"
+version = "0.0.0"
+edition = "2021"
+
+[dependencies]
+librocksdb-sys = { path = "librocksdb-sys", default-features = false, features = ["static", "lz4", "bindgen-runtime"] }
+
+[profile.dev]
+opt-level = 0
+debug = "line-tables-only"
+incremental = false
+''')
+(build / 'src/lib.rs').write_text('// Native archive build harness.\n')
+(build / 'Cargo.lock').write_bytes((root / 'Cargo.lock').read_bytes())
+PY
+cd "$build_dir"
+mapfile -t source_pin < <(python3 - <<'PY'
+import json, pathlib, re
+pin = json.loads(pathlib.Path('/tmp/streamr-rocksdb-input/rocksdb-prebuilt.json').read_text())
+if pin['crate'] != 'librocksdb-sys' or not re.fullmatch(r'[0-9A-Za-z.+-]+', pin['version']) or not re.fullmatch(r'[0-9a-f]{64}', pin['checksum']):
+    raise SystemExit('Invalid native source pin')
+print(pin['version'])
+print(pin['checksum'])
+PY
+)
+test "${#source_pin[@]}" -eq 2
+curl -fsSL "https://static.crates.io/crates/librocksdb-sys/librocksdb-sys-${source_pin[0]}.crate" -o rocksdb.crate
+printf '%s  rocksdb.crate\n' "${source_pin[1]}" | sha256sum -c -
+mkdir librocksdb-sys
+tar -xzf rocksdb.crate -C librocksdb-sys --strip-components=1
+python3 - <<'PY'
+import json, pathlib, tomllib
+pin = json.loads(pathlib.Path('/tmp/streamr-rocksdb-input/rocksdb-prebuilt.json').read_text())
+package = tomllib.loads(pathlib.Path('librocksdb-sys/Cargo.toml').read_text())['package']
+if package['name'] != pin['crate'] or package['version'] != pin['version']:
+    raise SystemExit('Extracted native source differs from pinned package')
+PY
+# Cargo adjusts only the root/path package graph; verify every resolved registry
+# package still comes from the repository lock before compiling anything.
+RUSTC_WRAPPER= cargo fetch --manifest-path Cargo.toml
+python3 - <<'PY'
+import pathlib, tomllib
+original = tomllib.loads(pathlib.Path('/tmp/streamr-rocksdb-input/Cargo.lock').read_text())
+allowed = {(p['name'], p['version'], p.get('checksum')) for p in original['package']}
+resolved = tomllib.loads(pathlib.Path('Cargo.lock').read_text())
+for p in resolved['package']:
+    if p.get('source') and (p['name'], p['version'], p.get('checksum')) not in allowed:
+        raise SystemExit(f'Build dependency not pinned by repository lock: {p["name"]} {p["version"]}')
+PY
+# Do not inherit the final image's prebuilt overrides or a native compiler cache.
+env -u ROCKSDB_LIB_DIR -u ROCKSDB_STATIC -u ROCKSDB_INCLUDE_DIR RUSTC_WRAPPER= \
+    cargo build --locked --manifest-path Cargo.toml --jobs "${STREAMR_ROCKSDB_BUILD_JOBS:-4}"
+archives=(target/debug/build/librocksdb-sys-*/out/librocksdb.a)
+test "${#archives[@]}" -eq 1
+install -m 644 "${archives[0]}" "$install_dir/lib/librocksdb.a"
+cp /tmp/streamr-rocksdb-input/rocksdb-prebuilt.json "$install_dir/manifest.json"
+cp Cargo.lock "$install_dir/build-Cargo.lock"
+sha256sum "$install_dir/lib/librocksdb.a" > "$install_dir/archive.sha256"
+sha256sum /tmp/streamr-rocksdb-input/Cargo.lock > "$install_dir/source-lock.sha256"
+rm -rf "$build_dir"
