@@ -1,0 +1,170 @@
+{
+  "status": "pass",
+  "source_commit": "25d8b554c9396c6e49e4be61a6bfc1c5f35f8d39",
+  "binary_sha256": "5254dd09df9b677d5d9e640fbbfe8425d20edca8e1ab4ce363c314213bf848ab",
+  "cases": [
+    {
+      "case": "session-full-memory-controller-1",
+      "status": "pass",
+      "independent_source_oracle": true,
+      "checkpoint_physical_rows": 1,
+      "recovered_rows": 3,
+      "checkpoint_sha256": "17160d47e445117f15ad31b6888411d16014c27edea6a33eb5840d4f94a5a591",
+      "exact_byte_prefix_and_fresh_suffix": true,
+      "selected_protocol_metadata": "CheckpointMetadata"
+    },
+    {
+      "case": "session-full-memory-controller-8",
+      "status": "pass",
+      "independent_source_oracle": true,
+      "checkpoint_physical_rows": 0,
+      "recovered_rows": 3,
+      "checkpoint_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "exact_byte_prefix_and_fresh_suffix": true,
+      "selected_protocol_metadata": "CheckpointMetadata"
+    },
+    {
+      "case": "session-full-memory-leader-1",
+      "status": "pass",
+      "independent_source_oracle": true,
+      "checkpoint_physical_rows": 1,
+      "recovered_rows": 3,
+      "checkpoint_sha256": "17160d47e445117f15ad31b6888411d16014c27edea6a33eb5840d4f94a5a591",
+      "exact_byte_prefix_and_fresh_suffix": true,
+      "selected_protocol_metadata": "CheckpointManifest"
+    },
+    {
+      "case": "session-full-memory-leader-8",
+      "status": "pass",
+      "independent_source_oracle": true,
+      "checkpoint_physical_rows": 0,
+      "recovered_rows": 3,
+      "checkpoint_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "exact_byte_prefix_and_fresh_suffix": true,
+      "selected_protocol_metadata": "CheckpointManifest"
+    },
+    {
+      "case": "session-full-rocksdb-controller-1",
+      "status": "pass",
+      "independent_source_oracle": true,
+      "checkpoint_physical_rows": 1,
+      "recovered_rows": 3,
+      "checkpoint_sha256": "17160d47e445117f15ad31b6888411d16014c27edea6a33eb5840d4f94a5a591",
+      "exact_byte_prefix_and_fresh_suffix": true,
+      "selected_protocol_metadata": "CheckpointMetadata"
+    },
+    {
+      "case": "session-full-rocksdb-controller-8",
+      "status": "pass",
+      "independent_source_oracle": true,
+      "checkpoint_physical_rows": 0,
+      "recovered_rows": 3,
+      "checkpoint_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "exact_byte_prefix_and_fresh_suffix": true,
+      "selected_protocol_metadata": "CheckpointMetadata"
+    },
+    {
+      "case": "session-full-rocksdb-leader-1",
+      "status": "pass",
+      "independent_source_oracle": true,
+      "checkpoint_physical_rows": 1,
+      "recovered_rows": 3,
+      "checkpoint_sha256": "17160d47e445117f15ad31b6888411d16014c27edea6a33eb5840d4f94a5a591",
+      "exact_byte_prefix_and_fresh_suffix": true,
+      "selected_protocol_metadata": "CheckpointManifest"
+    },
+    {
+      "case": "session-full-rocksdb-leader-8",
+      "status": "pass",
+      "independent_source_oracle": true,
+      "checkpoint_physical_rows": 0,
+      "recovered_rows": 3,
+      "checkpoint_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "exact_byte_prefix_and_fresh_suffix": true,
+      "selected_protocol_metadata": "CheckpointManifest"
+    },
+    {
+      "case": "profile25-memory-controller-1",
+      "status": "pass",
+      "independent_source_oracle": true,
+      "checkpoint_physical_rows": 2,
+      "recovered_rows": 4,
+      "checkpoint_sha256": "a33fdd83ef0c27b136825df740b4405e6528a01f9c1f6be3c7c23711c72374ea",
+      "exact_byte_prefix_and_fresh_suffix": true,
+      "selected_protocol_metadata": "CheckpointMetadata"
+    },
+    {
+      "case": "profile25-memory-controller-8",
+      "status": "pass",
+      "independent_source_oracle": true,
+      "checkpoint_physical_rows": 2,
+      "recovered_rows": 4,
+      "checkpoint_sha256": "a33fdd83ef0c27b136825df740b4405e6528a01f9c1f6be3c7c23711c72374ea",
+      "exact_byte_prefix_and_fresh_suffix": true,
+      "selected_protocol_metadata": "CheckpointMetadata"
+    },
+    {
+      "case": "profile25-memory-leader-1",
+      "status": "pass",
+      "independent_source_oracle": true,
+      "checkpoint_physical_rows": 2,
+      "recovered_rows": 4,
+      "checkpoint_sha256": "a33fdd83ef0c27b136825df740b4405e6528a01f9c1f6be3c7c23711c72374ea",
+      "exact_byte_prefix_and_fresh_suffix": true,
+      "selected_protocol_metadata": "CheckpointManifest"
+    },
+    {
+      "case": "profile25-memory-leader-8",
+      "status": "pass",
+      "independent_source_oracle": true,
+      "checkpoint_physical_rows": 2,
+      "recovered_rows": 4,
+      "checkpoint_sha256": "a33fdd83ef0c27b136825df740b4405e6528a01f9c1f6be3c7c23711c72374ea",
+      "exact_byte_prefix_and_fresh_suffix": true,
+      "selected_protocol_metadata": "CheckpointManifest"
+    },
+    {
+      "case": "profile25-rocksdb-controller-1",
+      "status": "pass",
+      "independent_source_oracle": true,
+      "checkpoint_physical_rows": 2,
+      "recovered_rows": 4,
+      "checkpoint_sha256": "a33fdd83ef0c27b136825df740b4405e6528a01f9c1f6be3c7c23711c72374ea",
+      "exact_byte_prefix_and_fresh_suffix": true,
+      "selected_protocol_metadata": "CheckpointMetadata"
+    },
+    {
+      "case": "profile25-rocksdb-controller-8",
+      "status": "pass",
+      "independent_source_oracle": true,
+      "checkpoint_physical_rows": 2,
+      "recovered_rows": 4,
+      "checkpoint_sha256": "a33fdd83ef0c27b136825df740b4405e6528a01f9c1f6be3c7c23711c72374ea",
+      "exact_byte_prefix_and_fresh_suffix": true,
+      "selected_protocol_metadata": "CheckpointMetadata"
+    },
+    {
+      "case": "profile25-rocksdb-leader-1",
+      "status": "pass",
+      "independent_source_oracle": true,
+      "checkpoint_physical_rows": 2,
+      "recovered_rows": 4,
+      "checkpoint_sha256": "a33fdd83ef0c27b136825df740b4405e6528a01f9c1f6be3c7c23711c72374ea",
+      "exact_byte_prefix_and_fresh_suffix": true,
+      "selected_protocol_metadata": "CheckpointManifest"
+    },
+    {
+      "case": "profile25-rocksdb-leader-8",
+      "status": "pass",
+      "independent_source_oracle": true,
+      "checkpoint_physical_rows": 2,
+      "recovered_rows": 4,
+      "checkpoint_sha256": "a33fdd83ef0c27b136825df740b4405e6528a01f9c1f6be3c7c23711c72374ea",
+      "exact_byte_prefix_and_fresh_suffix": true,
+      "selected_protocol_metadata": "CheckpointManifest"
+    }
+  ],
+  "passed": 16,
+  "pending": 0,
+  "scope": "finite native SESSION12 and guarded profile25 values/typed CDC/operator checkpoint recovery only; not full33, timeout reset, every prefix, emission/processing-clock parity, atomic branch emission, capacity or Kafka transactions"
+}

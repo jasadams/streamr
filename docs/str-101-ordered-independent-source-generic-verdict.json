@@ -1,0 +1,104 @@
+{
+  "verdict": "APPROVED source and finite generic evidence; application audit separate",
+  "source_commit": "25d8b554c9396c6e49e4be61a6bfc1c5f35f8d39",
+  "source_sha256": "a5d384556fd9fb9e1f65355788e52384fb0cc7d47a97b8b5d7bc22d78ef19e1e",
+  "binary_sha256": "5254dd09df9b677d5d9e640fbbfe8425d20edca8e1ab4ce363c314213bf848ab",
+  "image": "a95d0ca27fc16ae428c9b0df8d02b603dacab71ebf3a915aad85c94b422cf9ab",
+  "gates": [
+    "strict-clippy exit 0",
+    "format-check exit 0",
+    "final-locked-check exit 0",
+    "sql-executable-build exit 0",
+    "generic-nested-normal exit 0",
+    "generic-nested-late exit 0"
+  ],
+  "window_tests": "18 passed0failed window-tests-attempt5.log",
+  "generic_cases": [
+    {
+      "case": "generic-normal/memory-1-controller",
+      "rows": 5,
+      "committed_rows": 3,
+      "exact_payloads": true,
+      "byte_prefix_preserved": true
+    },
+    {
+      "case": "generic-normal/memory-1-leader",
+      "rows": 5,
+      "committed_rows": 3,
+      "exact_payloads": true,
+      "byte_prefix_preserved": true
+    },
+    {
+      "case": "generic-normal/memory-8-controller",
+      "rows": 5,
+      "committed_rows": 3,
+      "exact_payloads": true,
+      "byte_prefix_preserved": true
+    },
+    {
+      "case": "generic-normal/memory-8-leader",
+      "rows": 5,
+      "committed_rows": 3,
+      "exact_payloads": true,
+      "byte_prefix_preserved": true
+    },
+    {
+      "case": "generic-normal/rocksdb-1-controller",
+      "rows": 5,
+      "committed_rows": 3,
+      "exact_payloads": true,
+      "byte_prefix_preserved": true
+    },
+    {
+      "case": "generic-normal/rocksdb-1-leader",
+      "rows": 5,
+      "committed_rows": 3,
+      "exact_payloads": true,
+      "byte_prefix_preserved": true
+    },
+    {
+      "case": "generic-normal/rocksdb-8-controller",
+      "rows": 5,
+      "committed_rows": 3,
+      "exact_payloads": true,
+      "byte_prefix_preserved": true
+    },
+    {
+      "case": "generic-normal/rocksdb-8-leader",
+      "rows": 5,
+      "committed_rows": 3,
+      "exact_payloads": true,
+      "byte_prefix_preserved": true
+    },
+    {
+      "case": "generic-late/memory-1-controller",
+      "rows": 6,
+      "committed_rows": 4,
+      "exact_payloads": true,
+      "byte_prefix_preserved": true
+    },
+    {
+      "case": "generic-late/memory-1-leader",
+      "rows": 6,
+      "committed_rows": 4,
+      "exact_payloads": true,
+      "byte_prefix_preserved": true
+    },
+    {
+      "case": "generic-late/rocksdb-1-controller",
+      "rows": 6,
+      "committed_rows": 4,
+      "exact_payloads": true,
+      "byte_prefix_preserved": true
+    },
+    {
+      "case": "generic-late/rocksdb-1-leader",
+      "rows": 6,
+      "committed_rows": 4,
+      "exact_payloads": true,
+      "byte_prefix_preserved": true
+    }
+  ],
+  "scope": "ordered ARRAY_AGG unit regression and unchanged generic nested window/late-input finite recovery; no application schema, SQL semantic, budget or checkpoint redesign",
+  "remaining": "Application SESSION and profile25 matrices separately reviewed; throughput/RSS/beyondRAM/capacity/live Kafka remain STR32 acceptance gaps."
+}

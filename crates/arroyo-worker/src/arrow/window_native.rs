@@ -12,7 +12,7 @@ use arrow::{
     row::{RowConverter, SortField},
 };
 use arrow_array::{
-    Array, ListArray, PrimitiveArray, RecordBatch, StringArray, UInt32Array,
+    Array, ListArray, PrimitiveArray, RecordBatch, StringArray, StructArray, UInt32Array,
     types::TimestampNanosecondType,
 };
 use arrow_schema::{DataType, SchemaRef};
@@ -77,6 +77,7 @@ struct CollectionSize {
     output_elements: usize,
     output_bytes: usize,
     partials: usize,
+    ordered: bool,
 }
 
 impl CollectionSize {
@@ -157,6 +158,69 @@ impl CollectionSize {
         Ok(())
     }
 
+    fn add_ordering_scratch(
+        &mut self,
+        batch: &RecordBatch,
+        pairs: &[(usize, usize)],
+    ) -> Result<()> {
+        for (value_column, ordering_column) in pairs {
+            let values = batch
+                .column(*value_column)
+                .as_any()
+                .downcast_ref::<ListArray>()
+                .context("native ordered ARRAY_AGG values must be a list")?;
+            let ordering = batch
+                .column(*ordering_column)
+                .as_any()
+                .downcast_ref::<ListArray>()
+                .context("native ordered ARRAY_AGG orderings must be a list")?;
+            ensure!(
+                values.len() == 1 && ordering.len() == 1,
+                "native ordered ARRAY_AGG partial must contain one row"
+            );
+            ensure!(
+                !ordering.is_null(0),
+                "native ordered ARRAY_AGG ordering list cannot be null"
+            );
+            let value_is_null = values.is_null(0);
+            let values = values.value(0);
+            let ordering = ordering.value(0);
+            // DF48 state() represents an empty filtered result as a null value
+            // list paired with a nonnull empty ordering list. No hidden children
+            // in a null list are valid input to its final merge accumulator.
+            ensure!(
+                !value_is_null || (values.is_empty() && ordering.is_empty()),
+                "native ordered ARRAY_AGG null value list must be empty"
+            );
+            let ordering = ordering
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .context("native ordered ARRAY_AGG orderings must contain structs")?;
+            ensure!(
+                values.len() == ordering.len(),
+                "native ordered ARRAY_AGG value/order lengths differ"
+            );
+            ensure!(
+                ordering.null_count() == 0,
+                "native ordered ARRAY_AGG ordering tuples cannot be null"
+            );
+            // add_partial already charged the struct scalar and all child buffers.
+            // Charge each nested ordering ScalarValue as well, before DF clones
+            // paired vectors and merges partial streams using the original order.
+            self.elements = self
+                .elements
+                .checked_add(
+                    ordering
+                        .len()
+                        .checked_mul(ordering.num_columns())
+                        .context("native ordered ARRAY_AGG ordering element overflow")?,
+                )
+                .context("native ordered ARRAY_AGG scratch element overflow")?;
+            self.ordered = true;
+        }
+        Ok(())
+    }
+
     fn output_bound(&self, key_bytes: usize, fields: usize) -> Result<usize> {
         self.output_bytes
             .checked_add(
@@ -203,15 +267,70 @@ impl CollectionSize {
         // covers hash-table spare capacity, cloned evaluation vectors, and
         // transient final state. Eight child-buffer copies cover Arrow concat,
         // list output and the decoded source while the same snapshot is read.
+        // Ordered ARRAY_AGG additionally clones nested Scalars and paired sort/
+        // merge vectors. Sixteen copies cover those temporaries, matching the
+        // retained-row SESSION admission; ordering cells are counted separately.
+        let copies = if self.ordered { 16 } else { 8 };
         self.elements
             .checked_mul(std::mem::size_of::<ScalarValue>())
-            .and_then(|bytes| bytes.checked_mul(8))
-            .and_then(|bytes| bytes.checked_add(self.array_bytes.checked_mul(8)?))
+            .and_then(|bytes| bytes.checked_mul(copies))
+            .and_then(|bytes| bytes.checked_add(self.array_bytes.checked_mul(copies)?))
             .and_then(|bytes| bytes.checked_add(self.encoded_bytes))
             .and_then(|bytes| bytes.checked_add(self.partials.checked_mul(256)?))
             .and_then(|bytes| bytes.checked_add(output_limit.checked_mul(2)?))
             .context("native window collection working bound overflow")
     }
+}
+
+fn flat_collection_type(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Boolean
+            | DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64
+            | DataType::Utf8
+    )
+}
+
+fn validate_ordered_array_state(
+    fields: &[arrow_schema::FieldRef],
+    value_type: &DataType,
+    ordering_types: &[DataType],
+) -> Result<()> {
+    ensure!(
+        fields.len() == 2,
+        "native ordered ARRAY_AGG partial must have value and ordering lists"
+    );
+    let DataType::List(value) = fields[0].data_type() else {
+        anyhow::bail!("native ordered ARRAY_AGG value state must be a list")
+    };
+    let DataType::List(ordering) = fields[1].data_type() else {
+        anyhow::bail!("native ordered ARRAY_AGG ordering state must be a list")
+    };
+    let DataType::Struct(ordering) = ordering.data_type() else {
+        anyhow::bail!("native ordered ARRAY_AGG ordering list must contain structs")
+    };
+    ensure!(
+        value.data_type() == value_type && flat_collection_type(value_type),
+        "native ordered ARRAY_AGG value state type changed"
+    );
+    ensure!(
+        !ordering_types.is_empty()
+            && ordering.len() == ordering_types.len()
+            && ordering
+                .iter()
+                .zip(ordering_types)
+                .all(|(field, expected)| field.data_type() == expected
+                    && flat_collection_type(expected)),
+        "native ordered ARRAY_AGG requires matching flat ordering fields"
+    );
+    Ok(())
 }
 
 pub(crate) struct NativeWindow {
@@ -228,6 +347,7 @@ pub(crate) struct NativeWindow {
     group_converter: Option<RowConverter>,
     group_fields: usize,
     collection_columns: Vec<(usize, bool)>,
+    collection_ordering_pairs: Vec<(usize, usize)>,
     collection_output: bool,
     limits: WindowStateConfig,
     identity: Vec<u8>,
@@ -280,6 +400,7 @@ impl NativeWindow {
             "native window group key layout changed"
         );
         let mut collection_columns = Vec::new();
+        let mut collection_ordering_pairs = Vec::new();
         let mut collection_output = false;
         let mut variable_other_output = false;
         let mut state_column = key_count;
@@ -295,7 +416,11 @@ impl NativeWindow {
             let array_agg = function.is::<datafusion::functions_aggregate::array_agg::ArrayAgg>();
             let distinct_count = aggregate.is_distinct()
                 && function.is::<datafusion::functions_aggregate::count::Count>();
-            let collection = (array_agg || distinct_count) && aggregate.order_bys().is_none();
+            let ordered_array = array_agg
+                && !aggregate.is_distinct()
+                && aggregate.order_bys().is_some_and(|order| !order.is_empty());
+            let collection =
+                ((array_agg || distinct_count) && aggregate.order_bys().is_none()) || ordered_array;
             if collection {
                 let args = aggregate.expressions();
                 ensure!(
@@ -337,7 +462,36 @@ impl NativeWindow {
                 );
             }
             let state_fields = aggregate.state_fields()?;
-            if collection {
+            if ordered_array {
+                let ordering = aggregate
+                    .order_bys()
+                    .context("native ordered ARRAY_AGG order missing")?;
+                ensure!(
+                    aggregate.expressions()[0]
+                        .as_any()
+                        .is::<datafusion::physical_expr::expressions::Column>()
+                        && ordering.iter().all(|sort| {
+                            sort.expr
+                                .as_any()
+                                .is::<datafusion::physical_expr::expressions::Column>()
+                        }),
+                    "native ordered ARRAY_AGG requires direct value and ordering columns"
+                );
+                let ordering_types = ordering
+                    .iter()
+                    .map(|sort| sort.expr.data_type(&partial_aggregate.input().schema()))
+                    .collect::<datafusion::common::Result<Vec<_>>>()?;
+                validate_ordered_array_state(
+                    &state_fields,
+                    &aggregate.expressions()[0].data_type(&partial_aggregate.input().schema())?,
+                    &ordering_types,
+                )?;
+                let ordering_column = state_column
+                    .checked_add(1)
+                    .context("native ordered ARRAY_AGG state column overflow")?;
+                collection_columns.push((ordering_column, false));
+                collection_ordering_pairs.push((state_column, ordering_column));
+            } else if collection {
                 ensure!(
                     state_fields.len() == 1
                         && matches!(state_fields[0].data_type(), arrow_schema::DataType::List(_)),
@@ -419,6 +573,7 @@ impl NativeWindow {
             group_converter,
             group_fields: key_count,
             collection_columns,
+            collection_ordering_pairs,
             collection_output,
             limits,
             identity: identity.finalize().to_vec(),
@@ -662,6 +817,7 @@ impl NativeWindow {
                         partial.encoded_bytes,
                         &self.collection_columns,
                     )?;
+                    size.add_ordering_scratch(&partial.batch, &self.collection_ordering_pairs)?;
                     // Refuse as soon as the bounded scan proves admission
                     // impossible. Do not walk the rest of a hot group before
                     // discovering a limit that has already been exceeded.
@@ -959,6 +1115,359 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ordered_arrays_preserve_paired_values_filter_and_null_order_across_paged_partials() {
+        use super::super::execution::{ExecutionResources, with_test_execution_resources};
+        use arrow_array::BooleanArray;
+        use arroyo_planner::physical::{ArroyoMemExec, new_registry};
+        use arroyo_rpc::config::ExecutionResourceConfig;
+        use datafusion::functions_aggregate::array_agg::array_agg_udaf;
+        use datafusion::physical_expr::{
+            LexOrdering, PhysicalSortExpr, aggregate::AggregateExprBuilder, expressions::col,
+        };
+        use datafusion::physical_plan::aggregates::{AggregateMode, PhysicalGroupBy};
+        use futures::TryStreamExt;
+
+        for nulls_first in [true, false] {
+            let execution = Arc::new(
+                ExecutionResources::new(ExecutionResourceConfig {
+                    memory_bytes: 16 * 1024 * 1024,
+                    max_batch_bytes: 1024 * 1024,
+                })
+                .unwrap(),
+            );
+            with_test_execution_resources(execution.clone(), async {
+                let registry = Arc::new(new_registry());
+                let raw_schema = Arc::new(Schema::new(vec![
+                    Field::new("label", DataType::Utf8, false),
+                    Field::new("number", DataType::Int64, false),
+                    Field::new("sort_key", DataType::Utf8, true),
+                    Field::new("tie", DataType::Int64, true),
+                    Field::new("selected", DataType::Boolean, false),
+                ]));
+                let ordering = LexOrdering::new(vec![
+                    PhysicalSortExpr::new(
+                        col("sort_key", &raw_schema).unwrap(),
+                        arrow::compute::SortOptions {
+                            descending: true,
+                            nulls_first,
+                        },
+                    ),
+                    PhysicalSortExpr::new(
+                        col("tie", &raw_schema).unwrap(),
+                        arrow::compute::SortOptions {
+                            descending: false,
+                            nulls_first,
+                        },
+                    ),
+                ]);
+                let aggregates = ["label", "number"]
+                    .into_iter()
+                    .map(|name| {
+                        Arc::new(
+                            AggregateExprBuilder::new(
+                                array_agg_udaf(),
+                                vec![col(name, &raw_schema).unwrap()],
+                            )
+                            .schema(raw_schema.clone())
+                            .alias(format!("{name}_items"))
+                            .order_by(ordering.clone())
+                            .build()
+                            .unwrap(),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                for aggregate in &aggregates {
+                    let fields = aggregate.state_fields().unwrap();
+                    validate_ordered_array_state(
+                        &fields,
+                        &aggregate.expressions()[0].data_type(&raw_schema).unwrap(),
+                        &[DataType::Utf8, DataType::Int64],
+                    )
+                    .unwrap();
+                }
+                let input: Arc<dyn ExecutionPlan> =
+                    Arc::new(ArroyoMemExec::new("input".into(), raw_schema.clone()));
+                let planning: Arc<dyn ExecutionPlan> = Arc::new(
+                    AggregateExec::try_new(
+                        AggregateMode::Partial,
+                        PhysicalGroupBy::new_single(vec![]),
+                        aggregates.clone(),
+                        vec![Some(col("selected", &raw_schema).unwrap()); 2],
+                        input,
+                        raw_schema.clone(),
+                    )
+                    .unwrap(),
+                );
+                let partial_schema = planning.schema();
+                let codec = ArroyoPhysicalExtensionCodec {
+                    context: DecodingContext::Planning,
+                };
+                let partial_bytes = PhysicalPlanNode::try_from_physical_plan(planning, &codec)
+                    .unwrap()
+                    .encode_to_vec();
+                let mut partial =
+                    StatelessPhysicalExecutor::new(&partial_bytes, &registry).unwrap();
+                let (store, resources) = store_for_schema(partial_schema.clone());
+                let columns = [(0, true), (1, false), (2, true), (3, false)];
+                let pairs = [(0, 1), (2, 3)];
+                // One retained page per partial; overlapping sort keys and a
+                // rejected FILTER row exercise the real DF Partial state layout.
+                for (label, number, key, tie, selected) in [
+                    ("z-later", 21, Some("z"), Some(2), true),
+                    ("a", 10, Some("a"), Some(1), true),
+                    ("filtered", 99, Some("zz"), None, false),
+                    ("nil", 30, None, None, true),
+                    ("z-first", 20, Some("z"), Some(1), true),
+                ] {
+                    let raw = RecordBatch::try_new(
+                        raw_schema.clone(),
+                        vec![
+                            Arc::new(StringArray::from(vec![label])),
+                            Arc::new(Int64Array::from(vec![number])),
+                            Arc::new(StringArray::from(vec![key])),
+                            Arc::new(Int64Array::from(vec![tie])),
+                            Arc::new(BooleanArray::from(vec![selected])),
+                        ],
+                    )
+                    .unwrap();
+                    let batches = partial
+                        .process_batch(raw)
+                        .await
+                        .try_collect::<Vec<_>>()
+                        .await
+                        .unwrap();
+                    assert_eq!(batches.len(), 1);
+                    let mut size = CollectionSize::default();
+                    size.add_partial(&batches[0], 512, &columns).unwrap();
+                    size.add_ordering_scratch(&batches[0], &pairs).unwrap();
+                    if !selected {
+                        assert_eq!(size.elements, 0);
+                    }
+                    store.append(&[], 0, &batches[0]).await.unwrap();
+                }
+                let input: Arc<dyn ExecutionPlan> =
+                    Arc::new(ArroyoMemExec::new("input".into(), partial_schema.clone()));
+                let planning: Arc<dyn ExecutionPlan> = Arc::new(
+                    AggregateExec::try_new(
+                        AggregateMode::Final,
+                        PhysicalGroupBy::new_single(vec![]),
+                        aggregates,
+                        vec![None, None],
+                        input,
+                        raw_schema,
+                    )
+                    .unwrap(),
+                );
+                let serialized =
+                    PhysicalPlanNode::try_from_physical_plan(planning, &codec).unwrap();
+                let receiver = Arc::new(RwLock::new(None));
+                let codec = ArroyoPhysicalExtensionCodec {
+                    context: DecodingContext::BoundedBatchStream(receiver.clone()),
+                };
+                let finish = serialized
+                    .try_into_physical_plan(registry.as_ref(), &execution.runtime, &codec)
+                    .unwrap();
+                let finish_timestamp_schema = add_timestamp_field_arrow((*finish.schema()).clone());
+                let mut operator = NativeWindow {
+                    width: Duration::ZERO,
+                    slide: Duration::ZERO,
+                    hopping: false,
+                    binning: Arc::new(datafusion::physical_expr::expressions::Literal::new(
+                        ScalarValue::TimestampNanosecond(Some(0), None),
+                    )),
+                    partial,
+                    finish,
+                    finish_receiver: receiver,
+                    projection: None,
+                    finish_timestamp_schema,
+                    partial_schema,
+                    group_converter: None,
+                    group_fields: 0,
+                    collection_columns: columns.to_vec(),
+                    collection_ordering_pairs: pairs.to_vec(),
+                    collection_output: true,
+                    limits: WindowStateConfig {
+                        key_bytes: 128,
+                        partial_bytes: 8192,
+                        page_bytes: 32768,
+                        page_entries: 1,
+                        write_bytes: 65536,
+                        write_operations: 16,
+                        max_resident_bytes: 8 * 1024 * 1024,
+                    },
+                    identity: vec![],
+                    store: Some(store),
+                };
+                let snapshot = operator.store().unwrap().snapshot().await.unwrap();
+                let mut collector = RecordedCollector::default();
+                operator.limits.partial_bytes = 128;
+                let refusal = operator
+                    .emit_interval(&snapshot, 0, 0, &mut collector)
+                    .await
+                    .unwrap_err();
+                assert!(
+                    refusal.to_string().contains("configured partial limit"),
+                    "unexpected preflight refusal: {refusal:#}"
+                );
+                assert!(collector.0.is_empty());
+                assert_eq!(
+                    operator.store().unwrap().earliest_time().await.unwrap(),
+                    Some(0)
+                );
+                assert_eq!(execution.runtime.memory_pool.reserved(), 0);
+                operator.limits.partial_bytes = 8192;
+                operator
+                    .emit_interval(&snapshot, 0, 0, &mut collector)
+                    .await
+                    .unwrap();
+                assert_eq!(collector.0.len(), 1);
+                let labels = collector.0[0]
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<ListArray>()
+                    .unwrap()
+                    .value(0);
+                let labels = labels
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap()
+                    .iter()
+                    .collect::<Vec<_>>();
+                let numbers = collector.0[0]
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<ListArray>()
+                    .unwrap()
+                    .value(0);
+                let numbers = numbers
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .iter()
+                    .collect::<Vec<_>>();
+                let expected = if nulls_first {
+                    vec![
+                        (Some("nil"), Some(30)),
+                        (Some("z-first"), Some(20)),
+                        (Some("z-later"), Some(21)),
+                        (Some("a"), Some(10)),
+                    ]
+                } else {
+                    vec![
+                        (Some("z-first"), Some(20)),
+                        (Some("z-later"), Some(21)),
+                        (Some("a"), Some(10)),
+                        (Some("nil"), Some(30)),
+                    ]
+                };
+                assert_eq!(
+                    labels.into_iter().zip(numbers).collect::<Vec<_>>(),
+                    expected
+                );
+                drop(collector);
+                drop(snapshot);
+                assert_eq!(execution.runtime.memory_pool.reserved(), 0);
+                drop(
+                    resources
+                        .try_decoded_value(resources.config().decoded_value_bytes)
+                        .unwrap(),
+                );
+            })
+            .await;
+        }
+    }
+
+    #[test]
+    fn ordered_collection_rejects_malformed_partial_pairs_and_bounds_sort_scratch() {
+        use arrow::buffer::{NullBuffer, OffsetBuffer};
+        let fields = vec![Arc::new(Field::new("ordering", DataType::Utf8, true))];
+        let values: Arc<dyn Array> = Arc::new(StringArray::from(vec!["a"]));
+        let order: Arc<dyn Array> = Arc::new(StructArray::new(
+            fields.clone().into(),
+            vec![values.clone()],
+            None,
+        ));
+        let make_list = |child: Arc<dyn Array>, null: bool| -> Arc<dyn Array> {
+            Arc::new(ListArray::new(
+                Arc::new(Field::new_list_field(child.data_type().clone(), true)),
+                OffsetBuffer::new(vec![0_i32, child.len() as i32].into()),
+                child,
+                Some(NullBuffer::from(vec![!null])),
+            ))
+        };
+        let make_batch = |value: Arc<dyn Array>, order: Arc<dyn Array>| {
+            RecordBatch::try_new(
+                Arc::new(Schema::new(vec![
+                    Field::new("values", value.data_type().clone(), true),
+                    Field::new("orderings", order.data_type().clone(), true),
+                ])),
+                vec![value, order],
+            )
+            .unwrap()
+        };
+        for batch in [
+            make_batch(
+                make_list(values.clone(), true),
+                make_list(order.clone(), false),
+            ),
+            make_batch(
+                make_list(values.clone(), false),
+                make_list(order.clone(), true),
+            ),
+            make_batch(
+                make_list(Arc::new(StringArray::from(vec!["a", "b"])), false),
+                make_list(order.clone(), false),
+            ),
+            make_batch(
+                make_list(values.clone(), false),
+                make_list(
+                    Arc::new(StructArray::new(
+                        fields.into(),
+                        vec![values],
+                        Some(NullBuffer::from(vec![false])),
+                    )),
+                    false,
+                ),
+            ),
+        ] {
+            assert!(
+                CollectionSize::default()
+                    .add_ordering_scratch(&batch, &[(0, 1)])
+                    .is_err()
+            );
+        }
+        let batch = make_batch(
+            make_list(Arc::new(StringArray::from(vec!["a"])), false),
+            make_list(order, false),
+        );
+        let mut size = CollectionSize::default();
+        for _ in 0..128 {
+            size.add_partial(&batch, 512, &[(0, true), (1, false)])
+                .unwrap();
+            size.add_ordering_scratch(&batch, &[(0, 1)]).unwrap();
+        }
+        let limits = WindowStateConfig {
+            key_bytes: 128,
+            partial_bytes: 8192,
+            page_bytes: 32768,
+            page_entries: 1,
+            write_bytes: 65536,
+            write_operations: 16,
+            max_resident_bytes: 8 * 1024 * 1024,
+        };
+        let execution = arroyo_rpc::config::ExecutionResourceConfig {
+            memory_bytes: 128 * 1024,
+            max_batch_bytes: 8192,
+        };
+        assert!(
+            size.admit(true, 2, limits, &execution)
+                .unwrap_err()
+                .to_string()
+                .contains("execution-memory budget")
+        );
+    }
+
+    #[tokio::test]
     async fn terminal_watermark_drains_only_retained_tumbling_windows() {
         assert!(is_terminal_watermark(arroyo_types::from_nanos(
             u64::MAX as u128
@@ -1215,7 +1724,7 @@ mod tests {
                 partial: StatelessPhysicalExecutor::new(&partial_plan, &registry).unwrap(),
                 finish, finish_receiver: receiver, projection: None,
                 finish_timestamp_schema: finish_timestamp_schema.clone(), partial_schema: schema.clone(),
-                group_converter: None, group_fields: 0, collection_columns: if collection { vec![(0, true), (1, true), (2, false)] } else { vec![] }, collection_output: collection,
+                group_converter: None, group_fields: 0, collection_columns: if collection { vec![(0, true), (1, true), (2, false)] } else { vec![] }, collection_ordering_pairs: vec![], collection_output: collection,
                 limits: WindowStateConfig { key_bytes: 128, partial_bytes: 8192, page_bytes: 32768,
                     page_entries: 1, write_bytes: 65536, write_operations: 16, max_resident_bytes: 8 * 1024 * 1024 },
                 identity: vec![], store: Some(store),
