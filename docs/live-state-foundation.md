@@ -74,8 +74,10 @@ allocation. Reads pin native values and check size before copying.
 Diagnostic `open` and `reopen` enable WAL and synchronize each write to disk.
 Disposable worker attempts complete atomic native writes before emitting rows,
 but disable WAL logging. The pinned checkpoint binding uses a zero flush
-threshold, flushing memtables before opening the independent snapshot database.
-Stable snapshots therefore capture completed puts and deletes without WAL;
+threshold for `checkpoint_snapshot`, flushing memtables before opening its
+independent database. Ordinary `snapshot` reads pin a native sequence without
+flushing, creating directories or opening another database. Both view types
+capture completed puts and deletes without WAL;
 pipeline durability comes from publishing the full committed checkpoint.
 Worker recovery always restores that selected checkpoint into fresh storage,
 so a newer local WAL is never accepted as committed pipeline state.
@@ -86,9 +88,16 @@ permits with executing work until it finishes.
 Database and snapshot owners reserve cleanup capacity before creation. A bounded
 dedicated thread closes native databases and removes snapshot directories after
 the last reader drops. `close` awaits destruction; `close_and_remove` also awaits
-attempt deletion and propagates removal errors. Snapshots live in separately
-owned sibling directories and survive live-database close/removal. Failed fresh
-opens remove only directories they created; failed reopen preserves diagnostics.
+attempt deletion and propagates removal errors. Ordinary read views retain the
+live database, including its database admission slot, until their final clone
+and in-flight native operations release it. Release these views before awaiting
+explicit close/removal. Long readers retain historical versions during compaction;
+the snapshot count limit does not bound their age or retained disk history.
+`checkpoint_snapshot` instead owns an independent sibling database so asynchronous
+checkpoint export can continue after live-attempt removal. Native borrowed views
+use a safe owned `self_cell` helper; dependent release precedes DB-owner release.
+Failed fresh opens remove only directories they created; failed reopen preserves
+diagnostics.
 
 The disk reserve checks filesystem headroom before writes and checkpoint capture.
 They cannot reserve against unrelated filesystem writers or predict every byte

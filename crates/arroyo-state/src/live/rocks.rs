@@ -1,5 +1,5 @@
-//! RocksDB live state. Local checkpoints implement owned stable snapshots;
-//! they are not durable distributed checkpoints or restore artifacts.
+//! RocksDB live state with owned native read views. Physical local capture
+//! is separate from ordinary reads and from durable distributed publication.
 use super::lifecycle::{RocksStateConfig, directory_bytes};
 use super::resources::{CleanupPermit, ResourcePermit, WorkerStateResources};
 use super::{
@@ -299,8 +299,8 @@ impl RocksLiveState {
         completion.await.map_err(backend)?
     }
 
-    /// Remove only this attempt's live database. Snapshot checkpoints are siblings
-    /// and retain their own cleanup guard until their last reader finishes.
+    /// Wait for ordinary read views, then remove this attempt's live database.
+    /// Physical checkpoint captures are independent sibling databases.
     pub async fn close_and_remove(self) -> Result<()> {
         self.db.remove.store(true, Ordering::Relaxed);
         self.close().await
@@ -348,31 +348,30 @@ async fn read_many(
         .run_blocking(move || {
             let _latency = task_resources.operation_timer("read");
             let _permit = permit;
-            let snapshot = db.snapshot();
-            let mut native_read = rocksdb::ReadOptions::default();
-            native_read.set_snapshot(&snapshot);
-            let mut used = 0usize;
-            let mut values = Vec::with_capacity(keys.len());
-            for key in keys {
-                // Pin native storage first so the limit is enforced before copying
-                // a potentially oversized value into an owned result.
-                let value = db.get_pinned_opt(key, &native_read).map_err(backend)?;
-                if let Some(value) = value {
-                    // Check the version without allocating, then bound decoded bytes.
-                    if value.first() != Some(&1) {
-                        return Err(LiveStateError::InvalidEncoding(
-                            "unsupported value version".into(),
-                        ));
+            db.with_snapshot(|snapshot| {
+                let mut used = 0usize;
+                let mut values = Vec::with_capacity(keys.len());
+                for key in keys {
+                    // Pin native storage first so the limit is enforced before copying
+                    // a potentially oversized value into an owned result.
+                    let value = snapshot.get_pinned(key).map_err(backend)?;
+                    if let Some(value) = value {
+                        // Check the version without allocating, then bound decoded bytes.
+                        if value.first() != Some(&1) {
+                            return Err(LiveStateError::InvalidEncoding(
+                                "unsupported value version".into(),
+                            ));
+                        }
+                        enforce_read_limit(used.saturating_add(value.len() - 1), read)?;
+                        let value = decode_value(&value)?;
+                        used = used.saturating_add(value.len());
+                        values.push(Some(value));
+                    } else {
+                        values.push(None);
                     }
-                    enforce_read_limit(used.saturating_add(value.len() - 1), read)?;
-                    let value = decode_value(&value)?;
-                    used = used.saturating_add(value.len());
-                    values.push(Some(value));
-                } else {
-                    values.push(None);
                 }
-            }
-            Ok(values)
+                Ok(values)
+            })
         })
         .await
         .map_err(LiveStateError::from)?
@@ -454,6 +453,38 @@ impl LiveStateBackend for RocksLiveState {
             .cleanup()
             .await
             .map_err(LiveStateError::from)?;
+        let db = self.db.clone();
+        let resources = self.resources.clone();
+        self.resources
+            .run_blocking(move || {
+                let _latency = resources.operation_timer("snapshot");
+                // Native snapshots pin a sequence, without flushing or opening files.
+                let view = OwnedNativeSnapshot::new(db, |db| db.snapshot());
+                Ok(StateSnapshot(Arc::new(RocksSnapshot {
+                    db: DbHandle::ReadView(Arc::new(NativeReadView {
+                        view: Some(view),
+                        permit: Some(permit),
+                        cleanup: Some(cleanup),
+                    })),
+                    id: super::memory::next_snapshot_id(),
+                    resources,
+                })))
+            })
+            .await
+            .map_err(LiveStateError::from)?
+    }
+
+    async fn checkpoint_snapshot(&self) -> Result<StateSnapshot> {
+        let permit = self
+            .resources
+            .snapshot()
+            .await
+            .map_err(LiveStateError::from)?;
+        let cleanup = self
+            .resources
+            .cleanup()
+            .await
+            .map_err(LiveStateError::from)?;
         let id = super::memory::next_snapshot_id();
         let path = self.path.with_file_name(format!(
             "{}-snapshot-{}-{id}",
@@ -468,7 +499,7 @@ impl LiveStateBackend for RocksLiveState {
         let live_path = self.path.clone();
         self.resources
             .run_blocking(move || {
-                let _latency = resources.operation_timer("snapshot");
+                let _latency = resources.operation_timer("checkpoint_snapshot");
                 resources
                     .ensure_disk_space(&live_path, directory_bytes(&live_path)?)
                     .map_err(LiveStateError::from)?;
@@ -493,7 +524,7 @@ impl LiveStateBackend for RocksLiveState {
                         }
                     };
                 Ok(StateSnapshot(Arc::new(RocksSnapshot {
-                    db: Arc::new(NativeDb {
+                    db: DbHandle::Physical(Arc::new(NativeDb {
                         db: Some(snapshot_db),
                         write_lock: Mutex::new(()),
                         health: None,
@@ -503,7 +534,7 @@ impl LiveStateBackend for RocksLiveState {
                         resources: Some(resources.clone()),
                         cleanup: Some(cleanup),
                         finished: None,
-                    }),
+                    })),
                     id,
                     resources,
                 })))
@@ -513,15 +544,53 @@ impl LiveStateBackend for RocksLiveState {
     }
 }
 
+// self_cell owns the stable DB reference and releases the borrowed snapshot
+// before its owner. No unchecked lifetime extension is used in this adapter.
+type NativeSnapshot<'a> = rocksdb::Snapshot<'a>;
+self_cell::self_cell!(
+    struct OwnedNativeSnapshot {
+        owner: Arc<NativeDb>,
+        #[covariant]
+        dependent: NativeSnapshot,
+    }
+);
+
+struct NativeReadView {
+    view: Option<OwnedNativeSnapshot>,
+    permit: Option<ResourcePermit>,
+    cleanup: Option<CleanupPermit>,
+}
+impl Drop for NativeReadView {
+    fn drop(&mut self) {
+        let view = self.view.take();
+        let permit = self.permit.take();
+        self.cleanup
+            .take()
+            .expect("reserved view cleanup")
+            .submit(move || {
+                // ReleaseSnapshot runs on the bounded cleanup executor. The owner
+                // remains alive until ReleaseSnapshot and all read operations finish.
+                drop(view);
+                drop(permit);
+            });
+    }
+}
+
+#[derive(Clone)]
 enum DbHandle {
     Live(Arc<NativeDb>),
-    Snapshot(Arc<NativeDb>),
+    Physical(Arc<NativeDb>),
+    ReadView(Arc<NativeReadView>),
 }
-impl std::ops::Deref for DbHandle {
-    type Target = DB;
-    fn deref(&self) -> &DB {
+impl DbHandle {
+    fn with_snapshot<R>(&self, read: impl FnOnce(&rocksdb::Snapshot<'_>) -> R) -> R {
         match self {
-            Self::Live(db) | Self::Snapshot(db) => db,
+            Self::Live(db) | Self::Physical(db) => read(&db.snapshot()),
+            Self::ReadView(view) => view
+                .view
+                .as_ref()
+                .expect("live read view")
+                .with_dependent(|_, snapshot| read(snapshot)),
         }
     }
 }
@@ -575,7 +644,7 @@ impl Drop for NativeDb {
     }
 }
 struct RocksSnapshot {
-    db: Arc<NativeDb>,
+    db: DbHandle,
     id: u64,
     resources: WorkerStateResources,
 }
@@ -594,18 +663,11 @@ impl SnapshotReader for RocksSnapshot {
         keys: &[StateKey],
         read: ReadOptions,
     ) -> Result<Vec<Option<Vec<u8>>>> {
-        read_many(
-            DbHandle::Snapshot(self.db.clone()),
-            self.resources.clone(),
-            keys,
-            read,
-            false,
-        )
-        .await
+        read_many(self.db.clone(), self.resources.clone(), keys, read, false).await
     }
     async fn try_get(&self, key: &StateKey, read: ReadOptions) -> Result<Option<Vec<u8>>> {
         Ok(read_many(
-            DbHandle::Snapshot(self.db.clone()),
+            self.db.clone(),
             self.resources.clone(),
             std::slice::from_ref(key),
             read,
@@ -626,7 +688,7 @@ impl RocksSnapshot {
     async fn scan_admission(&self, request: ScanRequest, fail_fast: bool) -> Result<ScanPage> {
         request.validate(self.id)?;
         let id = self.id;
-        let db = DbHandle::Snapshot(self.db.clone());
+        let db = self.db.clone();
         let namespace_bytes = encoding::encoded_namespace_size(&request.range.namespace)?;
         let request_bytes = namespace_bytes.saturating_mul(5).saturating_add(
             request
@@ -687,77 +749,79 @@ impl RocksSnapshot {
                 {
                     lower = cursor.last_key.clone();
                 }
-                let mut iterator = db.raw_iterator();
-                iterator.seek(&lower);
-                let mut first = true;
-                let mut entries = Vec::new();
-                let mut used = 0usize;
-                let mut next_cursor = None;
-                loop {
-                    if !first {
-                        iterator.next();
-                    }
-                    first = false;
-                    if !iterator.valid() {
-                        break;
-                    }
-                    let encoded_key = iterator.key().expect("valid iterator key");
-                    let encoded_value = iterator.value().expect("valid iterator value");
-                    if !encoded_key.starts_with(&namespace) {
-                        break;
-                    }
-                    if prefix
-                        .as_ref()
-                        .is_some_and(|prefix| !encoded_key.starts_with(prefix))
-                    {
-                        break;
-                    }
-                    if end
-                        .as_ref()
-                        .is_some_and(|end| encoded_key >= end.as_slice())
-                    {
-                        break;
-                    }
-                    if request
-                        .cursor
-                        .as_ref()
-                        .is_some_and(|c| encoded_key <= c.last_key.as_slice())
-                    {
-                        continue;
-                    }
-                    let size = encoded_key.len().saturating_add(encoded_value.len());
-                    if size > request.max_bytes && entries.is_empty() {
-                        return Err(LiveStateError::ReadLimitExceeded {
-                            required: size,
-                            limit: request.max_bytes,
+                db.with_snapshot(|snapshot| {
+                    let mut iterator = snapshot.raw_iterator();
+                    iterator.seek(&lower);
+                    let mut first = true;
+                    let mut entries = Vec::new();
+                    let mut used = 0usize;
+                    let mut next_cursor = None;
+                    loop {
+                        if !first {
+                            iterator.next();
+                        }
+                        first = false;
+                        if !iterator.valid() {
+                            break;
+                        }
+                        let encoded_key = iterator.key().expect("valid iterator key");
+                        let encoded_value = iterator.value().expect("valid iterator value");
+                        if !encoded_key.starts_with(&namespace) {
+                            break;
+                        }
+                        if prefix
+                            .as_ref()
+                            .is_some_and(|prefix| !encoded_key.starts_with(prefix))
+                        {
+                            break;
+                        }
+                        if end
+                            .as_ref()
+                            .is_some_and(|end| encoded_key >= end.as_slice())
+                        {
+                            break;
+                        }
+                        if request
+                            .cursor
+                            .as_ref()
+                            .is_some_and(|c| encoded_key <= c.last_key.as_slice())
+                        {
+                            continue;
+                        }
+                        let size = encoded_key.len().saturating_add(encoded_value.len());
+                        if size > request.max_bytes && entries.is_empty() {
+                            return Err(LiveStateError::ReadLimitExceeded {
+                                required: size,
+                                limit: request.max_bytes,
+                            });
+                        }
+                        if entries.len() >= request.max_entries
+                            || used.saturating_add(size) > request.max_bytes
+                        {
+                            next_cursor = entries.last().map(|entry: &ScanEntry| ScanCursor {
+                                snapshot_id: id,
+                                range: request.range.clone(),
+                                last_key: encode_key(&entry.key).expect("validated key"),
+                            });
+                            break;
+                        }
+                        // Native key/value lengths are checked before allocating either decode.
+                        let key = decode_key(encoded_key)?;
+                        if key.namespace != request.range.namespace {
+                            break;
+                        }
+                        used += size;
+                        entries.push(ScanEntry {
+                            key,
+                            value: decode_value(encoded_value)?,
                         });
                     }
-                    if entries.len() >= request.max_entries
-                        || used.saturating_add(size) > request.max_bytes
-                    {
-                        next_cursor = entries.last().map(|entry: &ScanEntry| ScanCursor {
-                            snapshot_id: id,
-                            range: request.range.clone(),
-                            last_key: encode_key(&entry.key).expect("validated key"),
-                        });
-                        break;
-                    }
-                    // Native key/value lengths are checked before allocating either decode.
-                    let key = decode_key(encoded_key)?;
-                    if key.namespace != request.range.namespace {
-                        break;
-                    }
-                    used += size;
-                    entries.push(ScanEntry {
-                        key,
-                        value: decode_value(encoded_value)?,
-                    });
-                }
-                iterator.status().map_err(backend)?;
-                Ok(ScanPage {
-                    entries,
-                    next_cursor,
-                    _reservation: Some(permit),
+                    iterator.status().map_err(backend)?;
+                    Ok(ScanPage {
+                        entries,
+                        next_cursor,
+                        _reservation: Some(permit),
+                    })
                 })
             })
             .await
@@ -1162,6 +1226,207 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn native_view_does_not_flush_and_keeps_one_sequence_across_pages_and_compaction() {
+        let config = config();
+        let resources = resources();
+        let state = RocksLiveState::open_worker_with_resources(config.clone(), resources.clone())
+            .await
+            .unwrap();
+        let keys: Vec<_> = [b"a", b"b", b"c"]
+            .into_iter()
+            .map(|bytes| {
+                let mut key = key();
+                key.key = bytes.to_vec();
+                key
+            })
+            .collect();
+        for (index, key) in keys.iter().enumerate() {
+            state
+                .put(key.clone(), vec![index as u8], 1024)
+                .await
+                .unwrap();
+        }
+        let files = || {
+            let mut files: Vec<_> = std::fs::read_dir(state.path())
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect();
+            files.sort();
+            files
+        };
+        let before = files();
+        let memtable = state
+            .db
+            .property_int_value("rocksdb.num-entries-active-mem-table")
+            .unwrap();
+        assert_eq!(memtable, Some(3));
+        let snapshot = state.snapshot().await.unwrap();
+        assert_eq!(files(), before);
+        assert_eq!(
+            state
+                .db
+                .property_int_value("rocksdb.num-entries-active-mem-table")
+                .unwrap(),
+            memtable
+        );
+        assert_eq!(
+            std::fs::read_dir(state.path().parent().unwrap())
+                .unwrap()
+                .count(),
+            1
+        );
+        let mut request = ScanRequest {
+            range: ScanRange {
+                namespace: key().namespace,
+                prefix: None,
+                start: None,
+                end: None,
+            },
+            max_entries: 1,
+            max_bytes: 1024,
+            cursor: None,
+        };
+        let first = snapshot.scan(request.clone()).await.unwrap();
+        assert_eq!(first.entries[0].key, keys[0]);
+        assert_eq!(first.entries[0].value, vec![0]);
+        request.cursor = first.next_cursor.clone();
+        drop(first);
+        state.put(keys[0].clone(), vec![9], 1024).await.unwrap();
+        state.delete(keys[1].clone(), 1024).await.unwrap();
+        let mut inserted = key();
+        inserted.key = b"bb".to_vec();
+        state.put(inserted.clone(), vec![9], 1024).await.unwrap();
+        state.db.flush().unwrap();
+        state.db.compact_range(None::<&[u8]>, None::<&[u8]>);
+        assert_eq!(
+            snapshot
+                .multi_get(&keys, ReadOptions { max_bytes: 3 })
+                .await
+                .unwrap(),
+            vec![Some(vec![0]), Some(vec![1]), Some(vec![2])]
+        );
+        assert_eq!(
+            snapshot
+                .try_get(&keys[1], ReadOptions { max_bytes: 1 })
+                .await
+                .unwrap(),
+            Some(vec![1])
+        );
+        assert_eq!(
+            snapshot
+                .get(&inserted, ReadOptions { max_bytes: 1 })
+                .await
+                .unwrap(),
+            None
+        );
+        for expected in &keys[1..] {
+            let page = snapshot.try_scan(request.clone()).await.unwrap();
+            assert_eq!(page.entries.len(), 1);
+            assert_eq!(&page.entries[0].key, expected);
+            request.cursor = page.next_cursor.clone();
+        }
+        assert!(request.cursor.is_none());
+        drop(snapshot);
+        state.close_and_remove().await.unwrap();
+        std::fs::remove_dir_all(config.root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn close_waits_for_last_native_view_clone_and_releases_one_database_slot() {
+        let config = config();
+        let mut limits = resources().config().clone();
+        limits.max_snapshots = 1;
+        limits.max_open_databases = 1;
+        let resources = WorkerStateResources::new(limits).unwrap();
+        let state = RocksLiveState::open_worker_with_resources(config.clone(), resources.clone())
+            .await
+            .unwrap();
+        state.put(key(), b"old".to_vec(), 1024).await.unwrap();
+        let snapshot = state.snapshot().await.unwrap();
+        let cloned = snapshot.clone();
+        state.put(key(), b"new".to_vec(), 1024).await.unwrap();
+        let mut close = Box::pin(state.close_and_remove());
+        assert!(futures::poll!(&mut close).is_pending());
+        drop(snapshot);
+        assert!(futures::poll!(&mut close).is_pending());
+        assert!(config.path().exists());
+        assert!(resources.try_database().is_err());
+        assert_eq!(
+            cloned
+                .get(&key(), ReadOptions { max_bytes: 3 })
+                .await
+                .unwrap(),
+            Some(b"old".to_vec())
+        );
+        drop(cloned);
+        tokio::time::timeout(std::time::Duration::from_secs(5), close)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!config.path().exists());
+        assert!(resources.try_database().is_ok());
+        let next = resources.snapshot().await.unwrap();
+        drop(next);
+        std::fs::remove_dir_all(config.root).unwrap();
+    }
+
+    #[test]
+    fn cancelled_native_read_keeps_view_and_database_until_blocking_work_finishes() {
+        // Queue a real snapshot read behind an occupied Tokio blocking thread.
+        // Aborting its awaiter cannot cancel the already submitted native closure.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let config = config();
+            let mut limits = resources().config().clone();
+            limits.max_snapshots = 1;
+            limits.max_open_databases = 1;
+            let resources = WorkerStateResources::new(limits).unwrap();
+            let state =
+                RocksLiveState::open_worker_with_resources(config.clone(), resources.clone())
+                    .await
+                    .unwrap();
+            state.put(key(), b"retained".to_vec(), 1024).await.unwrap();
+            let snapshot = state.snapshot().await.unwrap();
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let occupied = tokio::task::spawn_blocking(move || {
+                started_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            });
+            started_rx.await.unwrap();
+            let key = key();
+            let mut read = Box::pin(snapshot.get(&key, ReadOptions { max_bytes: 8 }));
+            assert!(futures::poll!(&mut read).is_pending());
+            drop(read);
+            drop(snapshot);
+            let mut close = Box::pin(state.close_and_remove());
+            let closed_early =
+                tokio::time::timeout(std::time::Duration::from_millis(50), &mut close)
+                    .await
+                    .is_ok();
+            let database_still_owned = resources.try_database().is_err();
+            let path_still_owned = config.path().exists();
+            let mut next_view = Box::pin(resources.snapshot());
+            let view_still_owned = futures::poll!(&mut next_view).is_pending();
+            release_tx.send(()).unwrap();
+            occupied.await.unwrap();
+            assert!(!closed_early);
+            assert!(database_still_owned && path_still_owned && view_still_owned);
+            tokio::time::timeout(std::time::Duration::from_secs(5), close)
+                .await
+                .unwrap()
+                .unwrap();
+            drop(next_view.await.unwrap());
+            assert!(!config.path().exists());
+            std::fs::remove_dir_all(config.root).unwrap();
+        });
+    }
+
+    #[tokio::test]
     async fn worker_checkpoint_captures_unlogged_memtable_updates_and_deletes() {
         let config = config();
         let resources = resources();
@@ -1203,7 +1468,7 @@ mod tests {
             0,
             "worker mutations must not append WAL records"
         );
-        let snapshot = state.snapshot().await.unwrap();
+        let snapshot = state.checkpoint_snapshot().await.unwrap();
         state.put(key(), b"newer".to_vec(), 1024).await.unwrap();
         state
             .put(deleted.clone(), b"newer".to_vec(), 1024)
@@ -1222,7 +1487,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn worker_writes_are_visible_and_snapshots_survive_without_per_write_sync() {
+    async fn worker_writes_are_visible_and_checkpoint_capture_survives_removal() {
         let config = config();
         let resources = resources();
         let state = RocksLiveState::open_worker_with_resources(config.clone(), resources.clone())
@@ -1233,7 +1498,7 @@ mod tests {
         // namespace isolation, and snapshot pagination on the worker write mode.
         super::super::tests::backend_contract(&state).await;
         state.put(key(), b"committed".to_vec(), 1024).await.unwrap();
-        let snapshot = state.snapshot().await.unwrap();
+        let snapshot = state.checkpoint_snapshot().await.unwrap();
         state.put(key(), b"newer".to_vec(), 1024).await.unwrap();
         assert_eq!(
             state
@@ -1270,7 +1535,7 @@ mod tests {
                 .await
                 .is_err()
         );
-        let snapshot = state.snapshot().await.unwrap();
+        let snapshot = state.checkpoint_snapshot().await.unwrap();
         state.close().await.unwrap();
         let reopened = RocksLiveState::reopen(config.clone(), resources.clone())
             .await
@@ -1348,14 +1613,14 @@ mod tests {
         std::fs::remove_dir_all(config.root).unwrap();
     }
     #[tokio::test]
-    async fn removal_preserves_snapshot_until_last_reader_and_drop_unlocks_db() {
+    async fn removal_preserves_physical_capture_and_drop_unlocks_db() {
         let config = config();
         let resources = resources();
         let state = RocksLiveState::open(config.clone(), resources.clone())
             .await
             .unwrap();
         state.put(key(), b"retained".to_vec(), 1024).await.unwrap();
-        let snapshot = state.snapshot().await.unwrap();
+        let snapshot = state.checkpoint_snapshot().await.unwrap();
         state.close_and_remove().await.unwrap();
         assert!(!config.path().exists());
         assert_eq!(

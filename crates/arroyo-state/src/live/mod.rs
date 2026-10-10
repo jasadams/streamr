@@ -268,7 +268,14 @@ pub trait LiveStateBackend: Send + Sync {
     /// requiring queued buffer accounting should reserve before assembling data
     /// (RocksLiveState::admitted_batch) and keep source/overlay memory bounded.
     async fn write_batch(&self, batch: WriteBatch) -> Result<()>;
+    /// Stable ordinary read view. Release views before awaiting backend close;
+    /// disk-backed views retain the database and its historical versions.
     async fn snapshot(&self) -> Result<StateSnapshot>;
+    /// Capture for asynchronous checkpoint export. RocksDB flushes unlogged
+    /// writes and owns an independent physical database; memory uses its view.
+    async fn checkpoint_snapshot(&self) -> Result<StateSnapshot> {
+        self.snapshot().await
+    }
     /// Explicit shutdown after all operator/table handles have been released.
     async fn close(self: Arc<Self>) -> Result<()> {
         Err(LiveStateError::Backend(

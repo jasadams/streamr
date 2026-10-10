@@ -946,6 +946,10 @@ impl SessionStore {
             // that admitted one row lose its existing retirement path.
             self.retire_single_rows(&snapshot, group, session).await?;
         }
+        // The following metadata lookup may need a new stable view when the
+        // group cache is cold or contains multiple sessions. Release the row
+        // retirement view first, including with one worker snapshot permit.
+        drop(snapshot);
         self.remove_session(group, session).await?;
         if self.next_session(group, None).await?.is_none() {
             let counter = prefix(COUNTER, group)?;
@@ -971,6 +975,10 @@ pub(super) mod tests {
     };
 
     fn store_with_decoded(decoded_value_bytes: usize) -> SessionStore {
+        store_with_snapshot_limit(decoded_value_bytes, 8)
+    }
+
+    fn store_with_snapshot_limit(decoded_value_bytes: usize, max_snapshots: usize) -> SessionStore {
         let resources = WorkerStateResources::new(ResourceConfig {
             block_cache_bytes: 1024 * 1024,
             memtable_bytes: 1024 * 1024,
@@ -978,7 +986,7 @@ pub(super) mod tests {
             decoded_value_bytes,
             scan_page_bytes: 1024 * 1024,
             max_blocking_operations: 2,
-            max_snapshots: 8,
+            max_snapshots,
             max_open_databases: 1,
             disk_reserve_bytes: 0,
         })
@@ -1518,8 +1526,9 @@ pub(super) mod tests {
     }
 
     #[tokio::test]
-    async fn acknowledged_closure_survives_cancelled_retirement_and_fresh_owner() {
-        let (mut store, backend) = observed_store();
+    async fn acknowledged_closure_one_snapshot_survives_cancelled_retirement_and_fresh_owner() {
+        let mut store = store_with_snapshot_limit(1024 * 1024, 1);
+        let backend = observe(&mut store);
         store.limits.page_entries = 1;
         for time in [0, 1, 2, 40, 41] {
             store
@@ -1633,7 +1642,13 @@ pub(super) mod tests {
             recovered.first_due(Some(13)).await.unwrap(),
             Some((b"reused".to_vec(), closed))
         );
-        recovered.retire(b"reused", closed).await.unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            recovered.retire(b"reused", closed),
+        )
+        .await
+        .expect("retirement retained the sole snapshot while looking up the next session")
+        .unwrap();
         assert_eq!(
             recovered.first_due(None).await.unwrap(),
             Some((b"reused".to_vec(), open))
