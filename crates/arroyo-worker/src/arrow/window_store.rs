@@ -1,4 +1,4 @@
-//! Backend-neutral, paged partial state for native fixed-width windows.
+//! Backend-neutral, paged partial state for native fixed-width and exact-timestamp windows.
 //!
 //! One registered live table owns all three indexes, so the operator checkpoint
 //! captures the partials, group catalogue, and expiry cursor at one boundary.
@@ -85,6 +85,16 @@ impl Write for CappedWriter {
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
     }
+}
+
+// Exclusive upper bound for all keys with this nonempty index/time prefix.
+// The index byte guarantees a successor even at i64::MAX.
+fn prefix_end(mut prefix: Vec<u8>) -> Vec<u8> {
+    while prefix.last() == Some(&0xff) {
+        prefix.pop();
+    }
+    *prefix.last_mut().expect("index prefix has a successor") += 1;
+    prefix
 }
 
 fn time_key(time: i64) -> [u8; 8] {
@@ -444,6 +454,67 @@ impl WindowStore {
     }
 
     #[cfg(test)]
+    pub async fn checkpoint_restore_for_test(self, directory: &std::path::Path) -> Self {
+        let storage =
+            arroyo_state::get_storage_provider(&arroyo_state::StorageProviderFor::Controller {
+                storage_url: Some(format!("file://{}", directory.display())),
+            })
+            .await
+            .unwrap();
+        let config = arroyo_rpc::grpc::rpc::DiskKeyedTableConfig {
+            table_name: "window".into(),
+            encoding_version: 1,
+            schema_identity: b"native-exact-operator-test".to_vec(),
+        };
+        let snapshot = self.snapshot().await.unwrap();
+        let checkpoint = Box::pin(arroyo_state::live::checkpoint::export(
+            &snapshot.snapshot,
+            self.table.namespace(),
+            &config,
+            &storage,
+            "checkpoint/operator",
+            1,
+            0,
+            0,
+        ))
+        .await
+        .unwrap();
+        drop(snapshot);
+        let resources = self.resources.clone();
+        let limits = self.limits;
+        let schema = self.schema.clone();
+        let old_backend = self.backend.clone();
+        drop(self);
+        old_backend.close().await.unwrap();
+        let backend: Arc<dyn LiveStateBackend> = Arc::new(
+            arroyo_state::live::memory::MemoryLiveState::bounded(
+                resources.clone(),
+                limits.max_resident_bytes,
+            )
+            .unwrap(),
+        );
+        let mut tables = arroyo_state::live::table::LiveTableManager::new(
+            backend.clone(),
+            arroyo_state::live::Ownership::PartitionLocal {
+                subtask: 0,
+                parallelism: 1,
+            },
+        )
+        .unwrap();
+        let table = tables.register("window").unwrap();
+        Box::pin(arroyo_state::live::checkpoint::restore(
+            backend.as_ref(),
+            table.namespace(),
+            &config,
+            &checkpoint,
+            &storage,
+        ))
+        .await
+        .unwrap();
+        WindowStore::new(backend, table, resources, schema, limits).unwrap()
+    }
+
+    #[cfg(test)]
     pub async fn expire_page(&self, before: i64) -> Result<usize> {
         let snapshot = self.backend.snapshot().await?;
         let mut end = vec![EXPIRY];
@@ -493,6 +564,18 @@ impl WindowStore {
         before: i64,
         after: &mut Option<Vec<u8>>,
     ) -> Result<usize> {
+        self.expire_range_snapshot(snapshot, before, false, after)
+            .await
+    }
+
+    /// Retire a bounded range, including the endpoint only for exact bins.
+    pub async fn expire_range_snapshot(
+        &self,
+        snapshot: &WindowSnapshot,
+        before: i64,
+        inclusive: bool,
+        after: &mut Option<Vec<u8>>,
+    ) -> Result<usize> {
         let max_key = self.table.key(vec![0; self.limits.key_bytes], None);
         let max_delete_bytes = encoding::encoded_key_size(&max_key)?;
         let per_entry = max_delete_bytes
@@ -509,6 +592,9 @@ impl WindowStore {
         );
         let mut end = vec![EXPIRY];
         end.extend_from_slice(&time_key(before));
+        if inclusive {
+            end = prefix_end(end);
+        }
         let range = ScanRange {
             namespace: self.table.namespace().clone(),
             prefix: Some(vec![EXPIRY]),
@@ -560,7 +646,8 @@ impl WindowStore {
                         value.len() == 9 && value[0] == VERSION,
                         "native window group index version changed"
                     );
-                    if i64::from_be_bytes(value[1..9].try_into()?) < before {
+                    let latest = i64::from_be_bytes(value[1..9].try_into()?);
+                    if latest < before || (inclusive && latest == before) {
                         writes.delete(&self.table.key(catalogue, None))?;
                     }
                 }
@@ -603,7 +690,8 @@ impl WindowStore {
             value.len() == 9 && value[0] == VERSION,
             "native window group index version changed"
         );
-        if i64::from_be_bytes(value[1..9].try_into()?) < before {
+        let latest = i64::from_be_bytes(value[1..9].try_into()?);
+        if latest < before {
             let mut writes = AdmittedWriteBatch::try_reserve(
                 self.resources.clone(),
                 self.limits.write_bytes,
@@ -697,11 +785,24 @@ impl WindowSnapshot {
     }
 
     /// Fetches one bounded partial in `[start, end)` for a single group.
+    #[cfg(test)]
     pub async fn next_partial(
         &self,
         group: &[u8],
         start: i64,
         end: i64,
+        after: Option<&[u8]>,
+    ) -> Result<Option<WindowPartial>> {
+        self.next_partial_range(group, start, end, false, after)
+            .await
+    }
+
+    pub async fn next_partial_range(
+        &self,
+        group: &[u8],
+        start: i64,
+        end: i64,
+        exact: bool,
         after: Option<&[u8]>,
     ) -> Result<Option<WindowPartial>> {
         ensure!(start <= end, "native window scan range is reversed");
@@ -710,6 +811,13 @@ impl WindowSnapshot {
         lower.extend_from_slice(&time_key(start));
         let mut upper = prefix.clone();
         upper.extend_from_slice(&time_key(end));
+        if exact {
+            ensure!(
+                start == end,
+                "exact native window scan must name one timestamp"
+            );
+            upper = prefix_end(upper);
+        }
         let scan_start = after.map(<[u8]>::to_vec).unwrap_or(lower);
         ensure!(
             scan_start.starts_with(&prefix),
@@ -847,6 +955,328 @@ mod tests {
             vec![Arc::new(Int64Array::from(vec![value]))],
         )
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn exact_nonempty_and_empty_epochs_restore_into_fresh_owner() {
+        exact_checkpoint_epochs(false).await;
+        exact_checkpoint_epochs(true).await;
+    }
+
+    async fn exact_test_backend(
+        rocks: bool,
+        root: &std::path::Path,
+        attempt: u32,
+        resources: WorkerStateResources,
+        limit: usize,
+    ) -> Arc<dyn LiveStateBackend> {
+        if rocks {
+            Arc::new(
+                arroyo_state::live::rocks::RocksLiveState::open(
+                    arroyo_state::live::lifecycle::RocksStateConfig {
+                        root: root.join("live"),
+                        job_id: "exact-test".into(),
+                        operator_id: "window".into(),
+                        subtask: 0,
+                        generation: 1,
+                        attempt,
+                    },
+                    resources,
+                )
+                .await
+                .unwrap(),
+            )
+        } else {
+            Arc::new(MemoryLiveState::bounded(resources, limit).unwrap())
+        }
+    }
+
+    async fn exact_checkpoint_epochs(rocks: bool) {
+        let mut store = store();
+        let directory = std::env::temp_dir().join(format!(
+            "streamr-exact-restore-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let storage =
+            arroyo_state::get_storage_provider(&arroyo_state::StorageProviderFor::Controller {
+                storage_url: Some(format!("file://{}", directory.display())),
+            })
+            .await
+            .unwrap();
+        let config = arroyo_rpc::grpc::rpc::DiskKeyedTableConfig {
+            table_name: "window".into(),
+            encoding_version: 1,
+            schema_identity: b"exact-test".to_vec(),
+        };
+        // Standalone export has no worker configuration and uses default
+        // 1 MiB checkpoint pages. Admit the adapter's 4x scan/request bound and
+        // default restore batch; operator pages/values/state limits stay fixed.
+        let resources = WorkerStateResources::new(ResourceConfig {
+            scan_page_bytes: 8 * 1024 * 1024,
+            queued_write_bytes: 8 * 1024 * 1024,
+            ..store.resources.config().clone()
+        })
+        .unwrap();
+        let limits = store.limits;
+        let schema = store.schema.clone();
+        let old_backend = store.backend.clone();
+        drop(store);
+        old_backend.close().await.unwrap();
+        let backend = exact_test_backend(
+            rocks,
+            &directory,
+            0,
+            resources.clone(),
+            limits.max_resident_bytes,
+        )
+        .await;
+        let mut tables = LiveTableManager::new(
+            backend.clone(),
+            Ownership::PartitionLocal {
+                subtask: 0,
+                parallelism: 1,
+            },
+        )
+        .unwrap();
+        store = WindowStore::new(
+            backend,
+            tables.register("window").unwrap(),
+            resources,
+            schema,
+            limits,
+        )
+        .unwrap();
+        drop(tables);
+        store.append(b"same", 17, &partial(3)).await.unwrap();
+        store.append(b"same", 18, &partial(9)).await.unwrap();
+        for epoch in 1..=2 {
+            let snapshot = store.snapshot().await.unwrap();
+            let checkpoint = arroyo_state::live::checkpoint::export(
+                &snapshot.snapshot,
+                store.table.namespace(),
+                &config,
+                &storage,
+                &format!("checkpoint/exact-{epoch}"),
+                epoch,
+                0,
+                0,
+            )
+            .await
+            .unwrap();
+            drop(snapshot);
+            let resources = store.resources.clone();
+            let limits = store.limits;
+            let schema = store.schema.clone();
+            let old_backend = store.backend.clone();
+            drop(store);
+            old_backend.close().await.unwrap();
+            let backend = exact_test_backend(
+                rocks,
+                &directory,
+                epoch,
+                resources.clone(),
+                limits.max_resident_bytes,
+            )
+            .await;
+            let mut tables = LiveTableManager::new(
+                backend.clone(),
+                Ownership::PartitionLocal {
+                    subtask: 0,
+                    parallelism: 1,
+                },
+            )
+            .unwrap();
+            let table = tables.register("window").unwrap();
+            arroyo_state::live::checkpoint::restore(
+                backend.as_ref(),
+                table.namespace(),
+                &config,
+                &checkpoint,
+                &storage,
+            )
+            .await
+            .unwrap();
+            store = WindowStore::new(backend, table, resources, schema, limits).unwrap();
+            let snapshot = store.snapshot().await.unwrap();
+            if epoch == 1 {
+                assert_eq!(store.earliest_time().await.unwrap(), Some(17));
+                for (time, value) in [(17, 3), (18, 9)] {
+                    let row = snapshot
+                        .next_partial_range(b"same", time, time, true, None)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(
+                        row.batch
+                            .column(0)
+                            .as_any()
+                            .downcast_ref::<Int64Array>()
+                            .unwrap()
+                            .value(0),
+                        value
+                    );
+                }
+                store
+                    .expire_range_snapshot(&snapshot, 18, true, &mut None)
+                    .await
+                    .unwrap();
+                store.set_progress(18).await.unwrap();
+            } else {
+                assert_eq!(store.earliest_time().await.unwrap(), None);
+                assert_eq!(store.progress().await.unwrap(), Some(18));
+                assert!(snapshot.next_group(None).await.unwrap().is_none());
+            }
+        }
+        let backend = store.backend.clone();
+        drop(store);
+        backend.close().await.unwrap();
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn exact_many_key_retirement_is_paged_and_keeps_equal_watermark_bin() {
+        let store = store();
+        for index in 0..48 {
+            let key = format!("key-{index}");
+            for _ in 0..if index == 0 { 128 } else { 1 } {
+                store
+                    .append(key.as_bytes(), 17, &partial(index))
+                    .await
+                    .unwrap();
+            }
+            store
+                .append(key.as_bytes(), 18, &partial(index + 1))
+                .await
+                .unwrap();
+        }
+        let snapshot = store.snapshot().await.unwrap();
+        let mut after = None;
+        assert_eq!(
+            store
+                .expire_range_snapshot(&snapshot, 17, true, &mut after)
+                .await
+                .unwrap(),
+            175
+        );
+        assert_eq!(store.earliest_time().await.unwrap(), Some(18));
+        let remaining = store.snapshot().await.unwrap();
+        let mut after_group = None;
+        let mut count = 0;
+        while let Some((key, time)) = remaining.next_group(after_group.as_deref()).await.unwrap() {
+            assert_eq!(time, 18);
+            assert!(
+                remaining
+                    .next_partial_range(&key, 17, 17, true, None)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                remaining
+                    .next_partial_range(&key, 18, 18, true, None)
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+            after_group = Some(key);
+            count += 1;
+        }
+        assert_eq!(count, 48);
+        store
+            .expire_range_snapshot(&snapshot, 18, true, &mut after)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .snapshot()
+                .await
+                .unwrap()
+                .next_group(None)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        drop(
+            store
+                .resources
+                .try_decoded_value(store.resources.config().decoded_value_bytes)
+                .unwrap(),
+        );
+    }
+
+    #[tokio::test]
+    async fn exact_bins_preserve_nanoseconds_signed_extremes_and_future_indexes() {
+        let store = store();
+        for time in [i64::MIN, -1, 0, 1, i64::MAX] {
+            store.append(b"key", time, &partial(time)).await.unwrap();
+        }
+        let snapshot = store.snapshot().await.unwrap();
+        for time in [i64::MIN, -1, 0, 1, i64::MAX] {
+            let row = snapshot
+                .next_partial_range(b"key", time, time, true, None)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                row.batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .value(0),
+                time
+            );
+            assert!(
+                snapshot
+                    .next_partial_range(b"key", time, time, true, Some(&row.key))
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        let mut retired = None;
+        assert_eq!(
+            store
+                .expire_range_snapshot(&snapshot, 0, true, &mut retired)
+                .await
+                .unwrap(),
+            3
+        );
+        assert_eq!(store.earliest_time().await.unwrap(), Some(1));
+        assert_eq!(
+            store
+                .snapshot()
+                .await
+                .unwrap()
+                .next_group(None)
+                .await
+                .unwrap()
+                .unwrap()
+                .1,
+            i64::MAX
+        );
+        assert_eq!(
+            store
+                .expire_range_snapshot(&snapshot, i64::MAX, true, &mut retired)
+                .await
+                .unwrap(),
+            2
+        );
+        assert_eq!(store.earliest_time().await.unwrap(), None);
+        assert!(
+            store
+                .snapshot()
+                .await
+                .unwrap()
+                .next_group(None)
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]

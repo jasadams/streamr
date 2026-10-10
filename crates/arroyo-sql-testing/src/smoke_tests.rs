@@ -1816,6 +1816,23 @@ async fn external_sql_checkpoint_capture() {
 #[path = "smoke_schedule_tests.rs"]
 mod smoke_schedule_tests;
 
+async fn wait_for_capture_state_cleanup() {
+    let Some(resources) = arroyo_state::live::worker::configured_worker_resources().unwrap() else {
+        return;
+    };
+    // TaskFinished precedes operator destruction; native database destruction
+    // finishes on the bounded cleanup queue. Admit every slot before starting
+    // the next engine so its fresh owners cannot race the previous close.
+    tokio::time::timeout(test_runtime_timeout(), async {
+        let mut permits = Vec::new();
+        for _ in 0..resources.config().max_open_databases {
+            permits.push(resources.database().await.unwrap());
+        }
+    })
+    .await
+    .expect("external SQL native state cleanup timed out");
+}
+
 async fn external_sql_checkpoint_capture_inner() {
     let capture = CaptureCounts::from_env().expect("invalid external SQL capture configuration");
     let idle = CaptureIdle::from_env(&capture).expect("invalid external SQL idle configuration");
@@ -1970,6 +1987,7 @@ async fn external_sql_checkpoint_capture_inner() {
         assert!(after_bytes.starts_with(&before_bytes) && after_rows >= before_rows);
     }
     run_until_finished(&running, &mut control_rx).await;
+    wait_for_capture_state_cleanup().await;
     let initial_rows = capture_rows(
         &output_path,
         capture.expected_initial_rows,
@@ -2124,6 +2142,7 @@ async fn external_sql_checkpoint_capture_inner() {
     .await
     .expect("external SQL worker cancellation timed out");
     drop(running);
+    wait_for_capture_state_cleanup().await;
     let (control_tx, mut control_rx) = channel(128);
     let program = local_program(
         &job_id,

@@ -55,8 +55,7 @@ fn native_fixed_window_enabled(name: &OperatorName, bytes: &[u8], configured: bo
     }
     match name {
         OperatorName::TumblingWindowAggregate => {
-            api::TumblingWindowAggregateOperator::decode(bytes)
-                .is_ok_and(|window| window.width_micros > 0)
+            api::TumblingWindowAggregateOperator::decode(bytes).is_ok()
         }
         OperatorName::SlidingWindowAggregate => true,
         OperatorName::SessionWindowAggregate => true,
