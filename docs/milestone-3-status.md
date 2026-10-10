@@ -84,8 +84,9 @@ current dispatch instructions. No implementation worker is claimed by this reset
   Includes real native cancellation/clone/compaction/no-flush and one-permit
   SQL window/session regressions. Same prebuilt image as STR-71.
 - Exact logs, source patch/hash and image receipt:
-  `/home/jason/qa-evidence/str72-native-views-20261010/`. Next: publish dependent
-  PR after #27; CI/merge pending. No heavy STR-32 qualification batch or measured
+  `/home/jason/qa-evidence/str72-native-views-20261010/`. Published as
+  [PR #28](https://github.com/jasadams/streamr/pull/28), based on #27;
+  CI/merge pending. No heavy STR-32 qualification batch or measured
   capacity speedup claim.
 
 ## Available features
