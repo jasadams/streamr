@@ -1287,9 +1287,16 @@ impl IncrementalAggregatingFunc {
         // Index presence distinguishes an absent deadline from the valid
         // Unix-epoch boundary zero. G alone cannot make that distinction.
         let mut validity_deadline = None;
-        if !expired && self.event_time_expiry.is_some()
+        if !expired
+            && self.event_time_expiry.is_some()
             && let Some(group) = &previous
-            && scope.get(&native_validity_key(group.validity_deadline_nanos, group_key)?).await?.is_some()
+            && scope
+                .get(&native_validity_key(
+                    group.validity_deadline_nanos,
+                    group_key,
+                )?)
+                .await?
+                .is_some()
         {
             validity_deadline = Some(group.validity_deadline_nanos);
         }
@@ -1435,7 +1442,8 @@ impl IncrementalAggregatingFunc {
             && !retract
         {
             let stamped = stamp.saturating_add(expiry.delay_nanos);
-            validity_deadline = Some(validity_deadline.map_or(stamped, |prior: i64| prior.max(stamped)));
+            validity_deadline =
+                Some(validity_deadline.map_or(stamped, |prior: i64| prior.max(stamped)));
         }
         if next_group_rows == Some(0) {
             validity_deadline = None;
@@ -1469,11 +1477,10 @@ impl IncrementalAggregatingFunc {
                 &[1],
             )?;
         }
-        if self.event_time_expiry.is_some() && let Some(deadline) = validity_deadline {
-            scope.put(
-                &native_validity_key(deadline, group_key)?,
-                &[1],
-            )?;
+        if self.event_time_expiry.is_some()
+            && let Some(deadline) = validity_deadline
+        {
+            scope.put(&native_validity_key(deadline, group_key)?, &[1])?;
         }
         Ok(())
     }
@@ -4180,6 +4187,24 @@ mod tests {
                     context_id: "generic-test-clock".into(),
                 });
         }
+        // The shared state-only fixture uses a NULL metadata placeholder.
+        // Calendar watermark probes exercise real CDC output, so compile the
+        // typed metadata expression consumed by set_retract_metadata.
+        let metadata = StructArray::new(
+            updating_meta_fields(),
+            vec![
+                Arc::new(BooleanArray::from(vec![false])),
+                ScalarValue::FixedSizeBinary(16, Some(vec![1; 16]))
+                    .to_array()
+                    .unwrap(),
+            ],
+            None,
+        );
+        let metadata: Arc<dyn PhysicalExpr> =
+            Arc::new(Literal::new(ScalarValue::Struct(Arc::new(metadata))));
+        config.metadata_expr = serialize_physical_expr(&metadata, &codec)
+            .unwrap()
+            .encode_to_vec();
         config.retain_indefinitely = Some(true);
         let mut input_fields = SchemaBuilder::from(input_schema().as_ref().clone());
         input_fields.push(Field::new(
@@ -4545,17 +4570,33 @@ mod tests {
         calendar_test_event(&mut operator, -2, -2, Some(true), false, &[1; 16]).await;
         let mut ctx = native_input_context(input_schema()).await;
         let mut fields = operator.schema_without_metadata.fields().to_vec();
-        fields.push(Arc::new(Field::new(UPDATING_META_FIELD,
-            DataType::Struct(updating_meta_fields()), false)));
-        ctx.out_schema = Some(Arc::new(ArroyoSchema::from_schema_unkeyed(
-            Arc::new(Schema::new(fields))).unwrap()));
+        fields.push(Arc::new(Field::new(
+            UPDATING_META_FIELD,
+            DataType::Struct(updating_meta_fields()),
+            false,
+        )));
+        ctx.out_schema = Some(Arc::new(
+            ArroyoSchema::from_schema_unkeyed(Arc::new(Schema::new(fields))).unwrap(),
+        ));
         let mut collector = AggregateCollector::default();
-        operator.handle_watermark(Watermark::EventTime(
-            arroyo_types::event_time::from_signed_nanos(-86_400_000_000_000).unwrap()),
-            &mut ctx, &mut collector).await.unwrap();
-        assert_eq!(calendar_test_values(&operator).await, vec![
-            ScalarValue::Int64(Some(1)), ScalarValue::Int64(Some(0)), ScalarValue::Int64(Some(1)),
-        ]);
+        operator
+            .handle_watermark(
+                Watermark::EventTime(
+                    arroyo_types::event_time::from_signed_nanos(-86_400_000_000_000).unwrap(),
+                ),
+                &mut ctx,
+                &mut collector,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            calendar_test_values(&operator).await,
+            vec![
+                ScalarValue::Int64(Some(1)),
+                ScalarValue::Int64(Some(0)),
+                ScalarValue::Int64(Some(1)),
+            ]
+        );
         assert_eq!(collector.batches.len(), 2);
     }
 
@@ -7570,16 +7611,31 @@ mod tests {
     #[tokio::test]
     async fn event_time_expiry_orders_negative_zero_and_positive_deadlines() {
         let (operator, _) = event_time_expiry_operator();
-        let input = batch_at(&[Some("past"), Some("epoch"), Some("future")], &[1, 2, 3], &[-4, -2, 10]);
+        let input = batch_at(
+            &[Some("past"), Some("epoch"), Some("future")],
+            &[1, 2, 3],
+            &[-4, -2, 10],
+        );
         let inputs = operator.compute_inputs(&input).unwrap();
-        let groups = operator.key_converter.convert_columns(&[
-            Arc::new(StringArray::from(vec!["past", "epoch", "future"]))
-        ]).unwrap();
+        let groups = operator
+            .key_converter
+            .convert_columns(&[Arc::new(StringArray::from(vec!["past", "epoch", "future"]))])
+            .unwrap();
         let store = operator.native_store.as_ref().unwrap();
         for (row, stamp) in [-4, -2, 10].into_iter().enumerate() {
             let mut scope = store.begin().await.unwrap();
-            operator.native_process_event(&mut scope, groups.row(row).as_ref(), &inputs,
-                row, false, Some(&test_row_id(&input, row)), Some(stamp)).await.unwrap();
+            operator
+                .native_process_event(
+                    &mut scope,
+                    groups.row(row).as_ref(),
+                    &inputs,
+                    row,
+                    false,
+                    Some(&test_row_id(&input, row)),
+                    Some(stamp),
+                )
+                .await
+                .unwrap();
             scope.commit().await.unwrap();
         }
         {
@@ -7587,8 +7643,20 @@ mod tests {
             // Calendar's independent singleton frontier cannot be scanned as
             // a current-result deadline, even in the same native namespace.
             scope.put(b"V", b"independent-cleanup-frontier").unwrap();
-            assert!(scope.get(&native_validity_key(-2, groups.row(0).as_ref()).unwrap()).await.unwrap().is_some());
-            assert!(scope.get(&native_validity_key(0, groups.row(1).as_ref()).unwrap()).await.unwrap().is_some());
+            assert!(
+                scope
+                    .get(&native_validity_key(-2, groups.row(0).as_ref()).unwrap())
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+            assert!(
+                scope
+                    .get(&native_validity_key(0, groups.row(1).as_ref()).unwrap())
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
             scope.commit().await.unwrap();
         }
         assert!(!operator.expire_native_event_time(-3).await.unwrap());
@@ -7597,7 +7665,13 @@ mod tests {
         assert!(operator.expire_native_event_time(0).await.unwrap());
         assert!(!operator.expire_native_event_time(0).await.unwrap());
         let scope = store.begin().await.unwrap();
-        assert!(scope.get(&native_validity_key(12, groups.row(2).as_ref()).unwrap()).await.unwrap().is_some());
+        assert!(
+            scope
+                .get(&native_validity_key(12, groups.row(2).as_ref()).unwrap())
+                .await
+                .unwrap()
+                .is_some()
+        );
         assert!(scope.get(b"V").await.unwrap().is_some());
     }
 

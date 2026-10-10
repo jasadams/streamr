@@ -324,15 +324,14 @@ fn composition(projection: &Projection) -> Option<&UpdatingAggregateExtension> {
 }
 
 fn contains_current(plan: &LogicalPlan, current: &UpdatingAggregateExtension) -> bool {
-    if let LogicalPlan::Extension(extension) = plan {
-        if extension
+    if let LogicalPlan::Extension(extension) = plan
+        && extension
             .node
             .as_any()
             .downcast_ref::<UpdatingAggregateExtension>()
             == Some(current)
-        {
-            return true;
-        }
+    {
+        return true;
     }
     plan.inputs()
         .into_iter()
@@ -340,14 +339,13 @@ fn contains_current(plan: &LogicalPlan, current: &UpdatingAggregateExtension) ->
 }
 
 fn remote_names(plan: &LogicalPlan, names: &mut HashSet<TableReference>) {
-    if let LogicalPlan::Extension(extension) = plan {
-        if let Some(remote) = extension
+    if let LogicalPlan::Extension(extension) = plan
+        && let Some(remote) = extension
             .node
             .as_any()
             .downcast_ref::<RemoteTableExtension>()
-        {
-            names.insert(remote.name.clone());
-        }
+    {
+        names.insert(remote.name.clone());
     }
     for input in plan.inputs() {
         remote_names(input, names);
@@ -373,43 +371,41 @@ fn specialize(
             .node
             .as_any()
             .downcast_ref::<UpdatingAggregateExtension>()
+            && node == current
         {
-            if node == current {
-                let mut node = node.clone();
-                node.event_time_expiry = candidate_expiry(&node);
-                return Ok(Transformed::new(
-                    LogicalPlan::Extension(Extension {
-                        node: Arc::new(node),
-                    }),
-                    true,
-                    TreeNodeRecursion::Continue,
-                ));
-            }
+            let mut node = node.clone();
+            node.event_time_expiry = candidate_expiry(&node);
+            return Ok(Transformed::new(
+                LogicalPlan::Extension(Extension {
+                    node: Arc::new(node),
+                }),
+                true,
+                TreeNodeRecursion::Continue,
+            ));
         }
         if let Some(remote) = extension
             .node
             .as_any()
             .downcast_ref::<RemoteTableExtension>()
+            && remote.materialize
+            && contains_current(&remote.input, current)
         {
-            if remote.materialize && contains_current(&remote.input, current) {
-                let mut remote = remote.clone();
-                loop {
-                    let name =
-                        TableReference::bare(format!("__arroyo_current_result_{}", *next_name));
-                    *next_name += 1;
-                    if names.insert(name.clone()) {
-                        remote.name = name;
-                        break;
-                    }
+            let mut remote = remote.clone();
+            loop {
+                let name = TableReference::bare(format!("__arroyo_current_result_{}", *next_name));
+                *next_name += 1;
+                if names.insert(name.clone()) {
+                    remote.name = name;
+                    break;
                 }
-                return Ok(Transformed::new(
-                    LogicalPlan::Extension(Extension {
-                        node: Arc::new(remote),
-                    }),
-                    true,
-                    TreeNodeRecursion::Continue,
-                ));
             }
+            return Ok(Transformed::new(
+                LogicalPlan::Extension(Extension {
+                    node: Arc::new(remote),
+                }),
+                true,
+                TreeNodeRecursion::Continue,
+            ));
         }
         Ok(Transformed::no(plan))
     })
