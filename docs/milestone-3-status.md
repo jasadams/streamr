@@ -6,6 +6,37 @@ current dispatch instructions. No implementation worker is claimed by this reset
 
 ## Available features
 
+## Active STR-62
+
+- Worker: Codex `/root`; branch `jason/str-62-calendar-2147`, base `67c242f5`.
+  Started 2026-10-09 21:47 UTC; no automatic time limit.
+  [PR #23](https://github.com/jasadams/streamr/pull/23) delivers the reviewed feature;
+  current-head CI and merge handoff remain publication gates.
+- Decision: user instructed acceptance revision and implementation of common
+  watermark finality. Existing AS is the sole control: drop late source changes
+  atomically, preserve admitted CDC trigger context, prune recent buckets from
+  finite real progress, retain lifetime/correction metadata. No calendar-only rule.
+  Optional additional lateness/corrections is separate STR-69.
+- Implementation: source-only envelope marker consumed at common watermark
+  admission; signed optional emitted boundary checkpoints in existing state.
+  Calendar W/V progress and cursor prune one bounded page at a time, with
+  per-family horizon floors; equality/future buckets and G/J survive.
+- Publication: reviewed source is pushed in ready PR #23. Next: current-head
+  active CI gate, then `/merge-sweeper` owns merge and the Done transition.
+  Executable qualification used optimized main `48ceb3fe`; integration onto
+  `8cbd443d` preserves every recorded engine/harness hash (`post-rebase-audit.json`).
+  No build remains in flight.
+- Evidence: locked affected check, formatting and strict Clippy passed; planner
+  162/162, calendar worker 12/12 and admission 7/7 passed. Actual SQL 40/40 passed:
+  pruning 8, default calendar 16 and expression shapes 16, with 40 fresh-worker
+  recovery receipts and 136 live observations. Receipts and pinned binary:
+  `/home/jason/qa-evidence/streamr-str62-2147/optimized-pruning-retry3/`.
+  `final-matrix-audit.json` and exact test-only patch audit link current passes.
+  Independent source/evidence review approved; failed/cancelled attempts preserved.
+- Composition: STR-29 retains quiet-key traversal/output ownership; shared full
+  capacity/fault qualification remains STR-32, external parity ARC-15/16.
+  Separate window CDC deficiency remains STR-68. No remaining retention decision.
+
 At the 2026-10-09 reset, all eight tickets were Todo, agent-ready and unblocked.
 STR-16 now has [PR #15](https://github.com/jasadams/streamr/pull/15) open awaiting
 final CI and merge. Independent agents may work in parallel in separate worktrees

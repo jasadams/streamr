@@ -8,7 +8,7 @@ use datafusion::common::{
 use std::{collections::HashSet, sync::Arc};
 
 use aggregate::AggregateRewriter;
-pub(crate) use aggregate::COLLECTION_LIMIT_PREFIX;
+pub(crate) use aggregate::{COLLECTION_LIMIT_PREFIX, CalendarAggregate};
 use datafusion::functions::core::expr_fn::get_field;
 use datafusion::logical_expr::{
     Aggregate, Expr, Extension, Filter, LogicalPlan, Projection, SubqueryAlias, expr::Alias, lit,
@@ -468,16 +468,6 @@ impl TreeNodeRewriter for ArroyoRewriter<'_> {
                 return AsyncUdfRewriter::new(self.schema_provider).f_up(node);
             }
             LogicalPlan::Aggregate(aggregate) => {
-                if aggregate
-                    .aggr_expr
-                    .iter()
-                    .chain(&aggregate.group_expr)
-                    .any(|expression| depends_on_event_clock(expression, aggregate.input.schema()))
-                {
-                    return plan_err!(
-                        "WATERMARK_TIMESTAMP()/WATERMARK_DATE() requires current-trigger clock metadata for maintained aggregates (STR-62); retained contribution time is a distinct input"
-                    );
-                }
                 return AggregateRewriter {
                     schema_provider: self.schema_provider,
                 }

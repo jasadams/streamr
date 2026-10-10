@@ -341,6 +341,9 @@ pub fn without_event_clock_provenance(field: &Field) -> Field {
     field.clone().with_metadata(metadata)
 }
 
+/// Source-local CDC envelope provenance, consumed by the watermark admission operator.
+pub const SOURCE_ENVELOPE_FIELD: &str = "__arroyo_source_envelope";
+
 pub fn updating_meta_fields() -> Fields {
     static UPDATING_META_FIELDS: OnceLock<Fields> = OnceLock::new();
 

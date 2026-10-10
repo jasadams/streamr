@@ -129,6 +129,20 @@ message UpdatingAggregateOperator {
   optional bool retain_indefinitely = 9;
   // Planner-proven exclusive prefix consumption, indexed by aggregate ordinal.
   map<uint32, uint64> collection_output_limits = 10;
+  repeated CalendarAggregateDescriptor calendar_aggregates = 11;
+}
+
+// A maintained inclusive UTC calendar FILTER, indexed by aggregate ordinal.
+// Physical expressions are evaluated against the operator input schema. The
+// reference expression retains the raw triggering FOR clock, not AS progress.
+message CalendarAggregateDescriptor {
+  uint32 aggregate_index = 1;
+  bytes argument = 2;
+  optional bytes static_filter = 3;
+  bytes contribution_date = 4;
+  bytes reference_date = 5;
+  uint32 horizon_days = 6;
+  string context_id = 7;
 }
 
 // Retained, caller-schema state access. SQL planning creates these descriptors;
@@ -247,6 +261,7 @@ message SessionWindow {
 }
 
 message ExpressionWatermarkConfig {
+  optional uint32 source_envelope_index = 5;
   uint64 period_micros = 1;
   optional uint64 idle_time_micros = 2;
   ArroyoSchema input_schema = 3;
