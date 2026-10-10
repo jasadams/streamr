@@ -28,9 +28,10 @@
 - Existing test overrides provide scan 16 MiB and queued writes 64 MiB for the
   declared graph; product limits/checkpoint contracts are unchanged. Independent
   source reviews approved all material repairs; pre-rebase evidence approval passed.
-- Rebased onto main `4e881205` after independent approval; original acceptance
-  evidence remains preserved. Next: combined-source gates/matrix, integration
-  review, publish and current-head CI. Heavy capacity/RSS,
+- Rebased onto main `4e881205`; integration source review passed. Fresh affected
+  gates and all 32 SQL cases passed on committed source `e8e7c82c`; receipts in
+  `sql-matrix-rebased/`. Next: final evidence approval, publish and current-head
+  CI. Heavy capacity/RSS,
   slow-consumer/fault/soak qualification remains the existing STR-32 shared batch;
   this feature increment does not establish milestone qualification. No user
   decision pending.

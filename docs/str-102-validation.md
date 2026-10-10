@@ -70,3 +70,30 @@ Larger-than-RAM capacity, measured RSS, broader slow-consumer/fault and soak
 qualification remain in the existing STR-32 shared batch, as required by the
 milestone feature plan and backlog-fast workflow. This increment establishes
 functional regressions and reviewed bounds, not full milestone qualification.
+
+## Final rebased source — 2026-10-11
+
+Main advanced to `4e881205ad8a8964c45a6f4424b547fc8af42f14` while review
+ran. The implementation was rebased cleanly in executable files; the ledger
+conflict retained both ticket updates. Instructions were reread and integration
+source review approved. The new main capture harness synchronizes native state
+cleanup before starting fresh workers.
+
+The complete gate and fresh SQL build/pinning/matrix ran sequentially within
+queue reservation `11696a03ec59`, which exited 0. `str102-rebased-gates.log`
+records affected locked check, seven join tests, one admission test, planner
+219 passed/one existing ignored, strict Clippy and formatting, all exit 0.
+`sql-matrix-rebased/summary.json` and all 32 case receipts independently record
+passing complete-value/CDC/checkpoint/fresh-worker checks. The queue log is
+`rebased-gates-and-matrix.log`.
+
+- Validated source: `e8e7c82cf56b669a7befeddb81aa76751471871c`, clean committed
+  tree (empty source patch), based on the main commit above.
+- Build receipt: `sql-matrix-rebased/source-build-receipt.json`.
+- Pinned executable SHA-256:
+  `5ad16486a7ff655f887c605b13e66a84d5dc73d0a6ef7db000d3ffd779cf8636`.
+- Image ID and shared target are the same as recorded above.
+
+Only validation/ledger prose is updated after this final executable build.
+Earlier captures and failures remain supporting evidence, not substitutes for
+this current-source run. PR CI and STR-32 qualification are separate gates.
