@@ -9,7 +9,7 @@ current dispatch instructions. No implementation worker is claimed by this reset
 ## Active STR-29 continuation
 
 - Codex `/root`, resumed 2026-10-10 from reviewed local commit `d7b9dbf2`
-  in `jason/str-29-watermark-zero-084313`. Fetched main remains `67c242f5`;
+  in `jason/str-29-watermark-zero-084313`. Current main integration is `8cbd443d`;
   published STR-62 core `2afd82c8` is the calendar dependency. No time limit.
 - Acceptance: watermark-driven quiet retained-key zero, silence unchanged,
   retaining-key deletion, exact typed CDC and persistent bounded maintenance.
@@ -17,13 +17,15 @@ current dispatch instructions. No implementation worker is claimed by this reset
   preserve shared historical consumers, fixture rows and required silence/CDC
   prefixes are exact, and bounded calendar due traversal is implemented.
   Independent source review is clean, including signed/zero-deadline index
-  repairs; current-source Rust gates pending.
+  repairs. Source-bound gates pass: fmt/strict Clippy/locked check, planner
+  15/15, calendar 12/12, expiry 8/8, capture 1/1; Python comparator 9/9.
+  Evidence: `/home/jason/qa-evidence/str29-continuation-20261010/`.
 - Ownership: planner proof (`planner`), native due scheduler (`implement`),
   generic fixtures/capture harness (`fixtures`). Builds remain serialized.
 - Resumed on user direction after build-process optimization. Use the updated
-  dev wrapper/shared target and pinned prebuilt-RocksDB image; optimization
-  edits remain separately owned and are excluded from this feature commit.
-- Next after resume: complete current-source container gates, integrate final published
+  dev wrapper/shared target and pinned prebuilt-RocksDB image. Optimization
+  source is now integrated from upstream; no separate dirty tooling retained.
+- Next: integrate final published
   STR-62 pruning/admission source, re-review and validate combined source, publish
   with explicit PR #23 dependency, await active CI.
   Full runtime/resource matrix remains STR-32; no prepared test is a pass.

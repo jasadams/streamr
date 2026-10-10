@@ -162,3 +162,24 @@ timed out. Preserve both the original compiler error and cleanup result.
 Never stop containers or builds merely because their names resemble this run.
 Use the shared build queue, preserve unrelated work and retain successful
 build caches when further validation is expected.
+
+## Generated protobuf output across shared-target worktrees — 2026-10-10
+
+STR-29 at `2d780f3`, with its reviewed planner/test repairs, failed strict Clippy
+with missing `EventTimeExpiry`, `CalendarAggregateDescriptor` and aggregate
+fields despite those definitions being present in its `api.proto`. The same
+source had previously compiled. Different worktrees mount their source at `/app`
+and reuse one target, so generated outputs can survive a switch to a checkout
+whose protobuf input timestamps are older. This is build-artifact evidence, not
+a reason to remove valid source fields or change operator semantics.
+
+Inside the same shared queue reservation, refreshing this checkout's
+`crates/arroyo-rpc/proto/api.proto` and `rpc.proto` timestamps before Cargo forced
+fresh generation without changing file contents or clearing caches. With image
+`a95d0ca27fc16ae428c9b0df8d02b603dacab71ebf3a915aad85c94b422cf9ab`, the
+retry passed formatting, strict Clippy, affected-crate check, calendar tests
+12/12, expiry tests 8/8 and capture test 1/1. Logs and exact source patch are
+under `/home/jason/qa-evidence/str29-continuation-20261010/`; `attempt-5`
+preserves the failed Clippy output and `validate-worker-repair.sh` records the
+queued regeneration workaround. Local evidence is source-specific. This does
+not establish final STR-62 integration or the STR-32 runtime/resource matrix.
