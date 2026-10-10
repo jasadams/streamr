@@ -703,9 +703,11 @@ async fn restore_parquet_file(
     {
         // The checksum pass is complete before the decoded reader or backend
         // write permits are held, so it cannot invert their acquisition order.
-        let _checksum_buffer = resources
-            .map(|r| r.try_scan_page(CHECKSUM_BUFFER_BYTES))
-            .transpose()?;
+        let _checksum_buffer = if let Some(resources) = resources {
+            Some(resources.scan_page(CHECKSUM_BUFFER_BYTES).await?)
+        } else {
+            None
+        };
         ensure!(
             checksum_file(storage, &file.path, file.size_bytes).await? == file.checksum,
             "checkpoint Parquet checksum mismatch"
@@ -1079,6 +1081,152 @@ mod tests {
             .as_ref()
             .unwrap()
             .value() as usize
+    }
+
+    #[tokio::test]
+    async fn restore_checksum_waits_for_scan_admission_and_cancellation_allows_fresh_retry() {
+        let resources = WorkerStateResources::new(ResourceConfig {
+            block_cache_bytes: PAGE_BYTES,
+            memtable_bytes: PAGE_BYTES,
+            queued_write_bytes: 16 * PAGE_BYTES,
+            decoded_value_bytes: 16 * PAGE_BYTES,
+            scan_page_bytes: 2 * PAGE_BYTES,
+            max_blocking_operations: 2,
+            max_snapshots: 4,
+            max_open_databases: 4,
+            disk_reserve_bytes: 0,
+        })
+        .unwrap();
+        let registry = prometheus::Registry::new();
+        resources.register_metrics(&registry).unwrap();
+        drop(resources.decoded_value(0).await.unwrap());
+        drop(resources.queued_write(0).await.unwrap());
+        let usage =
+            |resource: &str, measurement: &str| resource_usage(&registry, resource, measurement);
+        let directory = tempfile::tempdir().unwrap();
+        let storage = storage(&directory).await;
+        let source = MemoryLiveState::new();
+        source
+            .put(key(1), b"restored".to_vec(), 1024)
+            .await
+            .unwrap();
+        let snapshot = source.snapshot().await.unwrap();
+        let namespace = namespace();
+        let config = config();
+        let observation = CheckpointObservation::new(None, CheckpointDirection::Export);
+        let metadata = export_snapshot_inner(
+            &snapshot,
+            &namespace,
+            &config.table_name,
+            config.table_name.as_bytes(),
+            &config.schema_identity,
+            1,
+            &storage,
+            "J/checkpoints/checkpoint-0000001/operator-o/table-map-000",
+            1,
+            0,
+            0,
+            MAX_FILES,
+            Some(resources.clone()),
+            &observation,
+        )
+        .await
+        .unwrap();
+        let held = resources
+            .try_scan_page(resources.config().scan_page_bytes)
+            .unwrap();
+        // A large queued scan models another owner's fresh-backend emptiness
+        // probe. The checksum must join its admission queue, not refuse it.
+        let mut preceding_scan = Box::pin(resources.scan_page(PAGE_BYTES + 1));
+        assert!(futures::poll!(&mut preceding_scan).is_pending());
+        let cancelled = MemoryLiveState::new();
+        let restore_observation = CheckpointObservation::new(None, CheckpointDirection::Restore);
+        {
+            let mut restore = Box::pin(restore_snapshot_inner(
+                &cancelled,
+                &namespace,
+                1,
+                &config.schema_identity,
+                &metadata,
+                &storage,
+                Some(resources.clone()),
+                &restore_observation,
+            ));
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                tokio::select! {
+                    result = &mut restore => panic!("restore unexpectedly completed: {result:?}"),
+                    _ = async {
+                        while usage("scan_page_bytes", "waiting") != 2 {
+                            tokio::task::yield_now().await;
+                        }
+                    } => {}
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(usage("decoded_value_bytes", "used"), 0);
+            assert_eq!(usage("queued_write_bytes", "used"), 0);
+        }
+        assert_eq!(usage("scan_page_bytes", "waiting"), 1);
+        assert_eq!(
+            cancelled
+                .get(&key(1), ReadOptions { max_bytes: 1024 })
+                .await
+                .unwrap(),
+            None
+        );
+        drop(held);
+        let preceding = preceding_scan.await.unwrap();
+        drop(preceding);
+        assert_eq!(usage("scan_page_bytes", "used"), 0);
+        assert_eq!(usage("scan_page_bytes", "waiting"), 0);
+
+        let fresh = MemoryLiveState::new();
+        let held = resources
+            .try_scan_page(resources.config().scan_page_bytes)
+            .unwrap();
+        let mut restore = Box::pin(restore_snapshot_inner(
+            &fresh,
+            &namespace,
+            1,
+            &config.schema_identity,
+            &metadata,
+            &storage,
+            Some(resources.clone()),
+            &restore_observation,
+        ));
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            tokio::select! {
+                result = &mut restore => panic!("restore unexpectedly completed: {result:?}"),
+                _ = async {
+                    while usage("scan_page_bytes", "waiting") != 1 {
+                        tokio::task::yield_now().await;
+                    }
+                } => {}
+            }
+        })
+        .await
+        .unwrap();
+        drop(held);
+        tokio::time::timeout(std::time::Duration::from_secs(10), restore)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            fresh
+                .get(&key(1), ReadOptions { max_bytes: 1024 })
+                .await
+                .unwrap(),
+            Some(b"restored".to_vec())
+        );
+        for resource in [
+            "scan_page_bytes",
+            "decoded_value_bytes",
+            "queued_write_bytes",
+        ] {
+            assert_eq!(usage(resource, "used"), 0);
+            assert_eq!(usage(resource, "waiting"), 0);
+        }
     }
 
     #[tokio::test]
