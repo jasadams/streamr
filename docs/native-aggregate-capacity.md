@@ -6,16 +6,16 @@ checkpoint capture. It has not been executed as part of this preparation.
 The coordinating agent runs the built executable serially in the required
 development container. Small fixture success is not a larger-than-RAM result.
 
-The current native aggregate harness uses **78 MiB**, not the native window
-harness's 50 MiB: executor16 + block cache8 + memtable4 + queued writes32 +
+The current native aggregate harness uses **62 MiB** of backend pools, compared with the native window
+harness's 34 MiB: block cache8 + memtable4 + queued writes32 +
 decoded16 + scan2. These existing settings remain unchanged, including aggregate
 key512 bytes, value32 KiB, scan page128 KiB, write scope2 MiB and output512 KiB.
 No test resource overrides are set. `--require-10x` checks both declared retained
-floors against ten times78 MiB **before any fixture writes**.
+floors against ten times62 MiB **before any fixture writes**.
 
 | Scenario | Existing SQL | Checkpoint and retained payload premise |
 |---|---|---|
-| many | Indefinite COUNT(*) + MAX(payload) by opaque key, append-only input | Two independent payloads per key, followed by one empty-payload update for every key after checkpoint. At prefix199999 of300000 events every100000 keys exists; last key count1, all others2. Final count3 and exact MAX for every key require reading actual restored state. One complete current MAX value per key provides819200000 bytes, exceeding817889280 (10×78 MiB). Do not count both input payloads as retained history. |
+| many | Indefinite COUNT(*) + MAX(payload) by opaque key, append-only input | Two independent payloads per key, followed by one empty-payload update for every key after checkpoint. At prefix199999 of300000 events every100000 keys exists; last key count1, all others2. Final count3 and exact MAX for every key require reading actual restored state. One complete current MAX value per key provides819200000 bytes, exceeding650117120 (10×62 MiB). Do not count both input payloads as retained history. |
 | hot | CDC input, one opaque key, COUNT + indexed MIN(metric), MAX(metric), LAST_VALUE(payload ORDER BY ordinal) | Configurable `--rows`, default8, payload256 bytes. Inserts, then deletes minimum/maximum members and replaces the remaining last member. Checkpoint rows-minus-one is a proper input prefix. LAST_VALUE's indexed M/R stores actual args; an unused input payload or scalar COUNT alone is not a retained-byte premise. |
 
 The **large hot8192-byte shape has a demonstrated source-level admission gap**:
@@ -25,8 +25,8 @@ does not make this query admissible. This is a valid configured-limit contract,
 not evidence that the engine needs an architectural repair. An8192-byte small
 fixture can separately capture the exact refusal; it is not capacity evidence.
 Small64/192/256-byte values test the existing indexed path, with actual admission
-required before relying on the premise. About3.2 million256-byte members would
-be needed for10×78 MiB; root first uses small/intermediate runs to budget runtime
+required before relying on the premise. About2.54 million256-byte members would
+be needed for10×62 MiB; root first uses small/intermediate runs to budget runtime
 and disk before selecting that large scope. No key limit, SQL syntax, timer or
 collection gate is changed. No ARRAY_AGG materialization is used. Passing scalar
 indexed capacity would not solve the separate hot-profile top5 full-array

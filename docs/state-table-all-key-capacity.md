@@ -18,8 +18,8 @@ prepared before execution and never derived from captured output.
 
 The default 65,000-key × 8,192-byte configuration retains 532,480,000 payload
 bytes at full insertion and **532,471,808 bytes at the 64,999-row checkpoint**.
-Both exceed ten times the declared 48 MiB pool sum (503,316,480 bytes). The
-configured pool sum is executor 16, block cache 8, memtable 4, queued write 2,
+Both exceed ten times the declared 32 MiB backend pool sum (335,544,320 bytes). The
+configured pool sum is block cache 8, memtable 4, queued write 2,
 decoded values 16 and scan 2 MiB. This conservatively includes the memtable even
 though backend accounting also charges it against the shared cache resources.
 The raw-payload floor is justified by the INSERT-only prefix: one complete

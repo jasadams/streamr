@@ -56,7 +56,7 @@ Capacity fixtures keep RocksDB as their default backend. Omit `--binary` to prep
 Check free disk before the large case: input plus expected payload text already
 exceed 1 GiB, before live RocksDB and checkpoint storage. The 129,999-row large
 checkpoint has a conservative raw retained-payload floor of 532,475,904 bytes,
-a declared estimate above 10 times the 50 MiB executor/backend pool sum;
+a declared estimate above 10 times the 34 MiB backend pool sum;
 this estimate alone does not qualify actual retained checkpoint state. The floor counts
 source text once per retained input, without multiplying session metadata or
 index entries. The whole child SQL-test process has a declared 512 MiB RSS limit.
