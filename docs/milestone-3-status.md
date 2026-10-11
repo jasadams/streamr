@@ -1,5 +1,15 @@
 # Milestone 3 — agent backlog
 
+## STR-32 native RocksDB read snapshots — active 2026-10-11
+
+- User authorised aligning live state access with Flink before a focused throughput comparison; broad verification is deferred. Replace per-batch filesystem checkpoint/reopen with a lifetime-safe native stable snapshot. Preserve bounded backend reads/writes/scans and release-before-output, saved recovery protocol and SQL semantics.
+- Base: fetched main `682bea0d0955be2e021fe475b25228f3dacf7d5f`; fresh worktree `/home/jason/repos/streamr-str32-native-rocks-snapshot`, integrated validated cleanup dependency `777ea144`. Instructions read: AGENTS.md, .claude/build-test.md/team.md, this ledger/work-plan and current Trakkt STR-32. Current user approval supersedes historical read-view deferral; no automatic time limit or signing requirement.
+- Ownership: checkpoint_reader implements state rocks.rs/Cargo.toml; root owns lockfile, integration and serial build; pilot_review independently reviews lifecycle/consistency; coverage_audit prepares focused caller/evidence audit.
+- Acceptance now: reviewed native snapshot implementation, build/pin once in required container, existing 10000-key RocksDB/controller exact value/CDC/checkpoint continuation diagnostic against pinned baseline with same fixture/image/profile/budgets. No broad test suite, 100000-key rerun or production build first.
+- Previous shared-drain snapshot candidate `edd0d3fe` is HOLD due cross-operator snapshot-slot deadlock; do not inherit it. Its audited 10000-key SQL time was485.79s baseline versus341.41s candidate (single pair); smaller1024-key pair was slower. Evidence outside Cargo caches.
+- Next: complete native snapshot ownership implementation and independent source review, freeze source/hash, then benchmark-only build/pin/run. No user decision pending within this approved change. Full STR-32 qualification remains open.
+
+
 ## STR-32 MVP scope cleanup and qualification — 2026-10-11
 
 - Authorized scope: restore Arroyo graph/network row backpressure and DataFusion execution; remove added global execution admission and unused timer/ranked/history APIs. Keep native SQL/state tables, RocksDB backend limits and existing Kafka recovery. No replacement backpressure or Kafka redesign is authorized.

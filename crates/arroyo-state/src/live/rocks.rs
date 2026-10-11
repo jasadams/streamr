@@ -1,13 +1,12 @@
-//! RocksDB live state. Local checkpoints implement owned stable snapshots;
-//! they are not durable distributed checkpoints or restore artifacts.
-use super::lifecycle::{RocksStateConfig, directory_bytes};
+//! RocksDB live state with lifetime-safe owned native read snapshots.
+//! Pipeline checkpoint export and recovery remain separate from these read views.
+use super::lifecycle::RocksStateConfig;
 use super::resources::{CleanupPermit, ResourcePermit, WorkerStateResources};
 use super::{
     encoding::{decode_key, decode_value, encode_key, encode_value},
     *,
 };
 use async_trait::async_trait;
-use rocksdb::checkpoint::Checkpoint;
 use rocksdb::{BlockBasedIndexType, BlockBasedOptions, DB, DBRecoveryMode, Options, WriteOptions};
 use std::path::PathBuf;
 use std::sync::{
@@ -299,8 +298,8 @@ impl RocksLiveState {
         completion.await.map_err(backend)?
     }
 
-    /// Remove only this attempt's live database. Snapshot checkpoints are siblings
-    /// and retain their own cleanup guard until their last reader finishes.
+    /// Remove only this attempt's database after its last native read view
+    /// releases the shared owner. No sibling snapshot databases are created.
     pub async fn close_and_remove(self) -> Result<()> {
         self.db.remove.store(true, Ordering::Relaxed);
         self.close().await
@@ -348,9 +347,18 @@ async fn read_many(
         .run_blocking(move || {
             let _latency = task_resources.operation_timer("read");
             let _permit = permit;
-            let snapshot = db.snapshot();
+            // Live multi-get takes one local sequence for the entire request;
+            // stable readers retain the sequence selected when the view began.
+            let live_snapshot = match &db {
+                DbHandle::Live(db) => Some(db.snapshot()),
+                DbHandle::Snapshot(_) => None,
+            };
+            let snapshot = match &db {
+                DbHandle::Live(_) => live_snapshot.as_ref().expect("live read snapshot"),
+                DbHandle::Snapshot(view) => view.snapshot.borrow_dependent(),
+            };
             let mut native_read = rocksdb::ReadOptions::default();
-            native_read.set_snapshot(&snapshot);
+            native_read.set_snapshot(snapshot);
             let mut used = 0usize;
             let mut values = Vec::with_capacity(keys.len());
             for key in keys {
@@ -449,60 +457,17 @@ impl LiveStateBackend for RocksLiveState {
             .snapshot()
             .await
             .map_err(LiveStateError::from)?;
-        let cleanup = self
-            .resources
-            .cleanup()
-            .await
-            .map_err(LiveStateError::from)?;
         let id = super::memory::next_snapshot_id();
-        let path = self.path.with_file_name(format!(
-            "{}-snapshot-{}-{id}",
-            self.path
-                .file_name()
-                .expect("attempt directory")
-                .to_string_lossy(),
-            std::process::id()
-        ));
         let db = self.db.clone();
         let resources = self.resources.clone();
-        let live_path = self.path.clone();
         self.resources
             .run_blocking(move || {
                 let _latency = resources.operation_timer("snapshot");
-                resources
-                    .ensure_disk_space(&live_path, directory_bytes(&live_path)?)
-                    .map_err(LiveStateError::from)?;
-                if path.try_exists().map_err(lifecycle::io_error)? {
-                    return Err(backend("snapshot directory already exists"));
-                }
-                // rust-rocksdb 0.24 passes a zero flush threshold here. This
-                // flushes memtables, including WAL-disabled worker writes,
-                // before opening the independent checkpoint database.
-                if let Err(error) =
-                    Checkpoint::new(&db).and_then(|checkpoint| checkpoint.create_checkpoint(&path))
-                {
-                    let _ = std::fs::remove_dir_all(&path);
-                    return Err(backend(error));
-                }
-                let snapshot_db =
-                    match DB::open_for_read_only(&options(&resources, false), &path, false) {
-                        Ok(db) => db,
-                        Err(error) => {
-                            let _ = std::fs::remove_dir_all(&path);
-                            return Err(backend(error));
-                        }
-                    };
+                let snapshot = OwnedNativeSnapshot::new(db, |owner| owner.snapshot());
                 Ok(StateSnapshot(Arc::new(RocksSnapshot {
-                    db: Arc::new(NativeDb {
-                        db: Some(snapshot_db),
-                        write_lock: Mutex::new(()),
-                        health: None,
-                        path,
-                        remove: AtomicBool::new(true),
-                        permit: Some(permit),
-                        resources: Some(resources.clone()),
-                        cleanup: Some(cleanup),
-                        finished: None,
+                    view: Arc::new(NativeReadView {
+                        snapshot,
+                        _permit: permit,
                     }),
                     id,
                     resources,
@@ -515,13 +480,14 @@ impl LiveStateBackend for RocksLiveState {
 
 enum DbHandle {
     Live(Arc<NativeDb>),
-    Snapshot(Arc<NativeDb>),
+    Snapshot(Arc<NativeReadView>),
 }
 impl std::ops::Deref for DbHandle {
     type Target = DB;
     fn deref(&self) -> &DB {
         match self {
-            Self::Live(db) | Self::Snapshot(db) => db,
+            Self::Live(db) => db,
+            Self::Snapshot(view) => view.snapshot.borrow_owner(),
         }
     }
 }
@@ -569,13 +535,30 @@ impl Drop for NativeDb {
                         tracing::error!(%error, "live-state cleanup failed after close cancellation");
                     }
                 } else if let Err(error) = result {
-                    tracing::error!(%error, "live-state snapshot cleanup failed");
+                    tracing::error!(%error, "live-state database cleanup failed");
                 }
             });
     }
 }
+type NativeSnapshot<'a> = rocksdb::Snapshot<'a>;
+
+self_cell::self_cell!(
+    struct OwnedNativeSnapshot {
+        owner: Arc<NativeDb>,
+        #[covariant]
+        dependent: NativeSnapshot,
+    }
+);
+
+/// The permit follows every blocking reader, including cancelled futures.
+/// self_cell drops the native snapshot before releasing its database owner.
+struct NativeReadView {
+    snapshot: OwnedNativeSnapshot,
+    _permit: ResourcePermit,
+}
+
 struct RocksSnapshot {
-    db: Arc<NativeDb>,
+    view: Arc<NativeReadView>,
     id: u64,
     resources: WorkerStateResources,
 }
@@ -595,7 +578,7 @@ impl SnapshotReader for RocksSnapshot {
         read: ReadOptions,
     ) -> Result<Vec<Option<Vec<u8>>>> {
         read_many(
-            DbHandle::Snapshot(self.db.clone()),
+            DbHandle::Snapshot(self.view.clone()),
             self.resources.clone(),
             keys,
             read,
@@ -605,7 +588,7 @@ impl SnapshotReader for RocksSnapshot {
     }
     async fn try_get(&self, key: &StateKey, read: ReadOptions) -> Result<Option<Vec<u8>>> {
         Ok(read_many(
-            DbHandle::Snapshot(self.db.clone()),
+            DbHandle::Snapshot(self.view.clone()),
             self.resources.clone(),
             std::slice::from_ref(key),
             read,
@@ -626,7 +609,7 @@ impl RocksSnapshot {
     async fn scan_admission(&self, request: ScanRequest, fail_fast: bool) -> Result<ScanPage> {
         request.validate(self.id)?;
         let id = self.id;
-        let db = DbHandle::Snapshot(self.db.clone());
+        let db = DbHandle::Snapshot(self.view.clone());
         let namespace_bytes = encoding::encoded_namespace_size(&request.range.namespace)?;
         let request_bytes = namespace_bytes.saturating_mul(5).saturating_add(
             request
@@ -687,7 +670,12 @@ impl RocksSnapshot {
                 {
                     lower = cursor.last_key.clone();
                 }
-                let mut iterator = db.raw_iterator();
+                let mut native_read = rocksdb::ReadOptions::default();
+                let DbHandle::Snapshot(view) = &db else {
+                    unreachable!("stable scan requires a snapshot view")
+                };
+                native_read.set_snapshot(view.snapshot.borrow_dependent());
+                let mut iterator = db.raw_iterator_opt(native_read);
                 iterator.seek(&lower);
                 let mut first = true;
                 let mut entries = Vec::new();
@@ -1209,7 +1197,8 @@ mod tests {
             .put(deleted.clone(), b"newer".to_vec(), 1024)
             .await
             .unwrap();
-        state.close_and_remove().await.unwrap();
+        let mut closing = Box::pin(state.close_and_remove());
+        assert!(futures::poll!(&mut closing).is_pending());
         let read = ReadOptions { max_bytes: 1024 };
         assert_eq!(
             snapshot.get(&key(), read).await.unwrap(),
@@ -1217,6 +1206,7 @@ mod tests {
         );
         assert_eq!(snapshot.get(&deleted, read).await.unwrap(), None);
         drop(snapshot);
+        closing.await.unwrap();
         drain_cleanup(&resources).await;
         std::fs::remove_dir_all(config.root).unwrap();
     }
@@ -1242,7 +1232,8 @@ mod tests {
                 .unwrap(),
             Some(b"newer".to_vec())
         );
-        state.close_and_remove().await.unwrap();
+        let mut closing = Box::pin(state.close_and_remove());
+        assert!(futures::poll!(&mut closing).is_pending());
         assert_eq!(
             snapshot
                 .get(&key(), ReadOptions { max_bytes: 9 })
@@ -1251,6 +1242,7 @@ mod tests {
             Some(b"committed".to_vec())
         );
         drop(snapshot);
+        closing.await.unwrap();
         drain_cleanup(&resources).await;
         std::fs::remove_dir_all(config.root).unwrap();
     }
@@ -1271,7 +1263,17 @@ mod tests {
                 .is_err()
         );
         let snapshot = state.snapshot().await.unwrap();
-        state.close().await.unwrap();
+        let mut closing = Box::pin(state.close());
+        assert!(futures::poll!(&mut closing).is_pending());
+        assert_eq!(
+            snapshot
+                .get(&key(), ReadOptions { max_bytes: 9 })
+                .await
+                .unwrap(),
+            Some(b"persisted".to_vec())
+        );
+        drop(snapshot);
+        closing.await.unwrap();
         let reopened = RocksLiveState::reopen(config.clone(), resources.clone())
             .await
             .unwrap();
@@ -1283,6 +1285,7 @@ mod tests {
                 .unwrap(),
             Some(b"persisted".to_vec())
         );
+        let snapshot = reopened.snapshot().await.unwrap();
         reopened
             .put(key(), b"changed".to_vec(), 1024)
             .await
@@ -1294,8 +1297,8 @@ mod tests {
                 .unwrap(),
             Some(b"persisted".to_vec())
         );
-        reopened.close().await.unwrap();
         drop(snapshot);
+        reopened.close().await.unwrap();
         drain_cleanup(&resources).await;
         std::fs::remove_dir_all(config.root).unwrap();
     }
@@ -1348,6 +1351,128 @@ mod tests {
         std::fs::remove_dir_all(config.root).unwrap();
     }
     #[tokio::test]
+    async fn native_snapshot_preserves_point_multiget_and_paged_scan_sequence() {
+        let config = config();
+        let resources = resources();
+        let state = RocksLiveState::open_worker_with_resources(config.clone(), resources.clone())
+            .await
+            .unwrap();
+        let logical_key = |name: &[u8]| {
+            let mut value = key();
+            value.key = name.to_vec();
+            value
+        };
+        let keys = [
+            logical_key(b"a"),
+            logical_key(b"b"),
+            logical_key(b"c"),
+            logical_key(b"d"),
+        ];
+        for (key, value) in keys[..3].iter().zip([b"old-a", b"old-b", b"old-c"]) {
+            state.put(key.clone(), value.to_vec(), 1024).await.unwrap();
+        }
+        let snapshot = state.snapshot().await.unwrap();
+        let request = ScanRequest {
+            range: ScanRange {
+                namespace: keys[0].namespace.clone(),
+                prefix: None,
+                start: None,
+                end: None,
+            },
+            max_entries: 1,
+            max_bytes: 1024,
+            cursor: None,
+        };
+        let first = snapshot.scan(request.clone()).await.unwrap();
+        assert_eq!(first.entries.len(), 1);
+        assert_eq!(first.entries[0].key, keys[0]);
+        assert_eq!(first.entries[0].value, b"old-a");
+        state
+            .write_batch(WriteBatch {
+                operations: vec![
+                    WriteOperation::Delete {
+                        key: keys[0].clone(),
+                    },
+                    WriteOperation::Put {
+                        key: keys[1].clone(),
+                        value: b"new-b".to_vec(),
+                    },
+                    WriteOperation::Put {
+                        key: keys[3].clone(),
+                        value: b"new-d".to_vec(),
+                    },
+                ],
+                max_bytes: 1024,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            snapshot
+                .get(&keys[0], ReadOptions { max_bytes: 1024 })
+                .await
+                .unwrap(),
+            Some(b"old-a".to_vec())
+        );
+        assert_eq!(
+            snapshot
+                .multi_get(&keys, ReadOptions { max_bytes: 1024 })
+                .await
+                .unwrap(),
+            vec![
+                Some(b"old-a".to_vec()),
+                Some(b"old-b".to_vec()),
+                Some(b"old-c".to_vec()),
+                None
+            ]
+        );
+        let mut cursor = first.next_cursor.clone();
+        drop(first);
+        let mut tail = Vec::new();
+        while let Some(next) = cursor {
+            let page = snapshot
+                .scan(ScanRequest {
+                    cursor: Some(next),
+                    ..request.clone()
+                })
+                .await
+                .unwrap();
+            for entry in &page.entries {
+                tail.push((entry.key.clone(), entry.value.clone()));
+            }
+            cursor = page.next_cursor.clone();
+        }
+        assert_eq!(
+            tail,
+            vec![
+                (keys[1].clone(), b"old-b".to_vec()),
+                (keys[2].clone(), b"old-c".to_vec())
+            ]
+        );
+        assert_eq!(
+            state
+                .multi_get(&keys, ReadOptions { max_bytes: 1024 })
+                .await
+                .unwrap(),
+            vec![
+                None,
+                Some(b"new-b".to_vec()),
+                Some(b"old-c".to_vec()),
+                Some(b"new-d".to_vec())
+            ]
+        );
+        assert_eq!(
+            std::fs::read_dir(config.path().parent().unwrap())
+                .unwrap()
+                .count(),
+            1,
+            "native snapshot must not create a filesystem checkpoint database"
+        );
+        drop(snapshot);
+        state.close_and_remove().await.unwrap();
+        std::fs::remove_dir_all(config.root).unwrap();
+    }
+
+    #[tokio::test]
     async fn removal_preserves_snapshot_until_last_reader_and_drop_unlocks_db() {
         let config = config();
         let resources = resources();
@@ -1356,8 +1481,16 @@ mod tests {
             .unwrap();
         state.put(key(), b"retained".to_vec(), 1024).await.unwrap();
         let snapshot = state.snapshot().await.unwrap();
-        state.close_and_remove().await.unwrap();
-        assert!(!config.path().exists());
+        let mut closing = Box::pin(state.close_and_remove());
+        assert!(futures::poll!(&mut closing).is_pending());
+        assert!(config.path().exists());
+        assert_eq!(
+            std::fs::read_dir(config.path().parent().unwrap())
+                .unwrap()
+                .count(),
+            1,
+            "native read views must not create sibling database directories"
+        );
         assert_eq!(
             snapshot
                 .get(&key(), ReadOptions { max_bytes: 8 })
@@ -1366,6 +1499,8 @@ mod tests {
             Some(b"retained".to_vec())
         );
         drop(snapshot);
+        closing.await.unwrap();
+        assert!(!config.path().exists());
         drain_cleanup(&resources).await;
         assert_eq!(
             std::fs::read_dir(config.path().parent().unwrap())
