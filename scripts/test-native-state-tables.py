@@ -37,7 +37,6 @@ if args.lifecycle:
                 if args.prepare_only:
                     continue
                 environment = dict(os.environ,
-                    STREAMR_TEST_EXECUTION_BYTES='16777216',
                     STREAMR_TEST_TYPED_SQL='1',
                     STREAMR_TEST_SOURCE_BATCH_ROWS=str(batch),
                     STREAMR_TEST_BACKEND=backend,
@@ -198,7 +197,6 @@ for backend in ['memory', 'rocksdb']:
             case = f'{backend}-{batch}-{mode}'
             directory = root / case
             environment = dict(os.environ,
-                STREAMR_TEST_EXECUTION_BYTES='16777216',
                 STREAMR_TEST_TYPED_SQL='1',
                 STREAMR_TEST_SOURCE_BATCH_ROWS=str(batch),
                 STREAMR_TEST_BACKEND=backend,

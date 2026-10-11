@@ -141,8 +141,7 @@ def run_case(binary, fixture, directory, backend, mode, batch, source_receipt):
                STREAMR_TEST_SOURCE_BATCH_ROWS=str(batch), STREAMR_TEST_NATIVE_AGGREGATES='1',
                STREAMR_TEST_NATIVE_UPDATING_JOINS='1', STREAMR_TEST_SCAN_PAGE_BYTES='16777216',
                STREAMR_TEST_QUEUED_WRITE_BYTES='67108864',
-               STREAMR_TEST_AGGREGATE_FLUSH_SECONDS='3600', STREAMR_TEST_EXECUTION_BYTES='16777216',
-               STREAMR_CAPTURE_QUERY=str(directory / 'query.sql'), STREAMR_CAPTURE_OUTPUT=str(directory / 'output.jsonl'),
+               STREAMR_TEST_AGGREGATE_FLUSH_SECONDS='3600', STREAMR_CAPTURE_QUERY=str(directory / 'query.sql'), STREAMR_CAPTURE_OUTPUT=str(directory / 'output.jsonl'),
                STREAMR_CAPTURE_INPUT_ROWS_BEFORE_CHECKPOINT=str(fixture['checkpoint']),
                STREAMR_CAPTURE_EXPECTED_INITIAL_ROWS='0', STREAMR_CAPTURE_EXPECTED_CHECKPOINT_ROWS='0',
                STREAMR_CAPTURE_EXPECTED_ROWS='0', STREAMR_CAPTURE_CHECKPOINT_EPOCH='1')

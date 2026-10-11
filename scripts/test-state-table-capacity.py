@@ -3,7 +3,7 @@
 
 Use the rebuilt Bookworm SQL-testing executable. Small fixtures remain selectable;
 --require-10x admits only configurations whose checkpoint AND full retained payload
-floors reach ten times the fixed 48 MiB pool sum. No other operator/live/fault claim.
+floors reach ten times the fixed 32 MiB pool sum. No other operator/live/fault claim.
 """
 import argparse
 import hashlib
@@ -19,7 +19,7 @@ _spec = importlib.util.spec_from_file_location(
     "window_capacity", Path(__file__).with_name("test-native-window-capacity.py"))
 capacity = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(capacity)
-WORKER_BUDGET_MIB = 48
+WORKER_BUDGET_MIB = 32
 
 
 def payload_for(item, size):
@@ -188,7 +188,7 @@ def main():
                     checkpoint_rows=checkpoint, logical_payload_bytes=full_bytes,
                     checkpoint_retained_payload_floor_bytes=checkpoint_bytes,
                     declared_worker_budget_mib=WORKER_BUDGET_MIB,
-                    pool_budget_mib=dict(execution=16, block_cache=8, memtable=4,
+                    pool_budget_mib=dict(block_cache=8, memtable=4,
                                          queued_write=2, decoded=16, scan=2),
                     full_state_exceeds_10x_pool_budget=full_bytes>=threshold,
                     checkpoint_state_exceeds_10x_pool_budget=checkpoint_bytes>=threshold,
@@ -210,7 +210,7 @@ def main():
         for name in list(environment):
             if name.startswith("STREAMR_CAPTURE_") or name.startswith("STREAMR_TEST_"):
                 environment.pop(name)
-        environment.update(STREAMR_TEST_EXECUTION_BYTES="16777216", STREAMR_TEST_TYPED_SQL="1",
+        environment.update(STREAMR_TEST_TYPED_SQL="1",
             STREAMR_TEST_SOURCE_BATCH_ROWS="32", STREAMR_TEST_BACKEND="rocksdb",
             STREAMR_TEST_CHECKPOINT_MODE=mode, STREAMR_TEST_RUNTIME_TIMEOUT_SECONDS=str(args.timeout_seconds),
             STREAMR_CAPTURE_QUERY=str(query_path), STREAMR_CAPTURE_OUTPUT=str(output_path),

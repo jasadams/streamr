@@ -100,7 +100,6 @@ def run(binary, directory, backend, batch, protocol, late_input=False, nested_gr
         env.pop(flag, None)
     env.update(STREAMR_TEST_NATIVE_WINDOWS="1", STREAMR_TEST_BACKEND=backend,
         STREAMR_TEST_CHECKPOINT_MODE=protocol, STREAMR_TEST_SOURCE_BATCH_ROWS=str(batch),
-        STREAMR_TEST_EXECUTION_BYTES="16777216",
         STREAMR_CAPTURE_QUERY=str(directory / "query.sql"),
         STREAMR_CAPTURE_OUTPUT=str(directory / "output.jsonl"),
         STREAMR_CAPTURE_INPUT_ROWS_BEFORE_CHECKPOINT="1",

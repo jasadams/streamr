@@ -141,7 +141,6 @@ def run_case(binary: Path, directory: Path, backend: str, batch: int, mode: str)
         # plus per-operation metadata before any write.
         STREAMR_TEST_QUEUED_WRITE_BYTES="67108864",
         STREAMR_TEST_AGGREGATE_FLUSH_SECONDS="3600",
-        STREAMR_TEST_EXECUTION_BYTES="16777216",
         STREAMR_TEST_BACKEND=backend,
         STREAMR_TEST_CHECKPOINT_MODE=mode,
         STREAMR_TEST_SOURCE_BATCH_ROWS=str(batch),

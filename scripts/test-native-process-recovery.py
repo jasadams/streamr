@@ -425,7 +425,6 @@ def prepare(args):
               'controller': {'scheduler':'process','bind-address':'127.0.0.1'}, 'process-scheduler': {'slots-per-process':64, 'shutdown-with-controller':True},
               'api': {'run-http-port':args.port, 'bind-address':'127.0.0.1'},
               'worker': {'bind-address':'127.0.0.1','sql-state-backend':args.backend, 'queue-size':128,
-                         'execution-resources': {'memory-bytes':16777216, 'max-batch-bytes':1048576},
                          'aggregate-state': {'key-bytes':512,'value-bytes':32768,'page-bytes':131072,'page-entries':64,
                                              'write-bytes':2097152,'write-operations':128,'overlay-bytes':2097152,
                                              'max-pending-output-rows':64,'max-pending-output-bytes':524288,'max-resident-bytes':134217728}}}

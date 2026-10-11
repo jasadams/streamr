@@ -56,7 +56,7 @@ Capacity fixtures keep RocksDB as their default backend. Omit `--binary` to prep
 Check free disk before the large case: input plus expected payload text already
 exceed 1 GiB, before live RocksDB and checkpoint storage. The 129,999-row large
 checkpoint has a conservative raw retained-payload floor of 532,475,904 bytes,
-a declared estimate above 10 times the 50 MiB executor/backend pool sum;
+a declared estimate above 10 times the 34 MiB backend pool sum;
 this estimate alone does not qualify actual retained checkpoint state. The floor counts
 source text once per retained input, without multiplying session metadata or
 index entries. The whole child SQL-test process has a declared 512 MiB RSS limit.
@@ -88,7 +88,8 @@ Paths are relative to the manifest, or absolute. SQL uses `{{INPUT}}` and
 with SQL-escaped absolute paths. The query must satisfy the existing harness's
 single control-waiting file source, singleton graph and JSON file sink contract.
 The driver sets the configured native-windows route, selected memory/RocksDB
-backend, protocol and 16 MiB execution pool identically for each run.
+backend and protocol identically for each run. Operator execution uses upstream
+Arroyo behavior; the added execution admission pool has been removed.
 
 ```json
 {
@@ -152,16 +153,13 @@ be a direct Boolean input column. The typed fixtures materialize their Boolean
 member in the source rather than expanding an expression during collection.
 Array ordering, element types and nulls follow DataFusion semantics.
 
-Collection admission pages all retained rows before evaluation and bounds the
-sum of decoded input memory by `window.partial_bytes`; the final aggregate must
-also fit that limit. Collection and sorting scratch is admitted separately in
-the configured execution memory pool, using checked multiplication of retained
-input memory by 16 and the sum of each collection's value and ordering column
-counts. This reservation may exceed `partial_bytes`; insufficient execution
-pool capacity returns an admission error before collection evaluation. Oversized input returns
-`native SESSION collection input exceeds configured value limit`; oversized
-output returns `native SESSION output aggregate exceeds configured value limit`.
-Limits are not increased and output is not truncated.
+The native backend adapter retains limits on individual stored rows and actual
+final output values while paging retained rows for evaluation. It does not reject
+a collection based on the cumulative size of its input rows. Collection and sorting
+execution uses upstream DataFusion contexts; the added shared execution-memory
+admission and scratch multiplier have been removed. Backend value limits do not
+bound sorting scratch or whole-process RSS. Limits are not increased and output
+is not truncated.
 
 The typed collection/reused-key cases are prepared regressions, not current-source
 runtime passes. Slow-output backpressure, source idleness/markers, sink delivery

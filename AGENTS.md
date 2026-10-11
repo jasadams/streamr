@@ -59,6 +59,41 @@ Arcstream is an external consumer, not part of this engine.
   invariants, or required application checkouts. Application-specific preparation
   and oracle comparison belong in the application repository.
 
+## Arcstream MVP scope direction — 2026-10-11
+
+The immediate goal is to fast-track Arcstream MVP using Streamr's native SQL,
+state tables and configurable memory/RocksDB state, including state larger than
+RAM and correct checkpoint recovery. RocksDB cache, read, write and backend
+resource limits are core project requirements, not optional extras.
+
+- Use upstream Arroyo execution and row-based queue backpressure. The user has
+  authorized removing the added graph/network byte admission and operator
+  execution-memory admission, including their configuration and failure paths.
+  Do not reintroduce these through another pool, wrapper or test workaround.
+  A more sophisticated resource-management/backpressure design is a separate
+  feature requiring an explicit user discussion and agreement.
+- Remove the unused standalone timer, ranked-collection and Arrow-history
+  helper APIs. Do not recreate them as MVP dependencies. Native SQL windows,
+  ranking and state-table behavior remain in scope; removing unused helpers
+  does not authorize deleting working SQL capabilities.
+- Keep Kafka recovery. The user requested a full architecture review of its
+  checkpoint/transaction/replay design, failure and resource limits, and actual
+  recovery evidence before deciding design changes. This is authorization to
+  review, not to redesign or replace the protocol.
+- A test failure is evidence to investigate, not permission to add a feature.
+  Trace the established contract and upstream implementation first. For a
+  proposed new capability or changed behavior, explain the concrete MVP need,
+  existing behavior, smallest change and tradeoffs, then obtain agreement
+  before implementation. Do not add ad-hoc hybrids to make one test pass.
+- Deliver the smallest reviewed and tested change needed for the current MVP
+  path. Do not expand it into general engine infrastructure or post-MVP
+  qualification. Preserve independent resource/recovery correctness and exact
+  evidence; do not call omitted or pending checks passed.
+
+This direction supersedes conflicting older milestone plans, ticket comments
+and validation summaries. Already authorized removals proceed without asking
+again. Arcstream business logic and application SQL remain in Arcstream.
+
 ## Scope of engine changes
 
 Work is limited to configurable live-state backends (including state larger than

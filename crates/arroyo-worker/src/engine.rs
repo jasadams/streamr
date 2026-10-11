@@ -18,9 +18,7 @@ use arroyo_datastream::logical::{
     LogicalEdge, LogicalEdgeType, LogicalGraph, LogicalNode, OperatorChain, OperatorName,
 };
 use arroyo_operator::ErasedConstructor;
-use arroyo_operator::context::{
-    BatchReceiver, BatchSender, OperatorContext, batch_bounded, batch_bounded_accounted,
-};
+use arroyo_operator::context::{BatchReceiver, BatchSender, OperatorContext, batch_bounded};
 use arroyo_operator::operator::Registry;
 use arroyo_operator::operator::{ChainedOperator, ConstructedOperator, OperatorNode, SourceNode};
 use arroyo_planner::physical::new_registry;
@@ -337,12 +335,7 @@ impl Program {
             }
         }
         let worker_config = config().worker.clone();
-        if let Some(resources) = &worker_config.execution_resources {
-            resources.validate().map_err(|error| StateError::Other {
-                table: "execution resources".into(),
-                error: error.to_string(),
-            })?;
-        }
+
         worker_config
             .validate_sql_state()
             .map_err(|error| StateError::Other {
@@ -540,27 +533,7 @@ impl Program {
         }
 
         let queue_size = config().worker.queue_size;
-        let execution =
-            crate::arrow::execution::configured_execution_resources().map_err(|error| {
-                StateError::Other {
-                    table: "execution graph".into(),
-                    error: error.to_string(),
-                }
-            })?;
-        let new_queue = || {
-            match &execution {
-                Some(resources) => batch_bounded_accounted(
-                    queue_size,
-                    resources.runtime.clone(),
-                    resources.limits.max_batch_bytes,
-                ),
-                None => Ok(batch_bounded(queue_size)),
-            }
-            .map_err(|error| StateError::Other {
-                table: "execution graph".into(),
-                error: error.to_string(),
-            })
-        };
+        let new_queue = || batch_bounded(queue_size);
 
         for idx in logical.edge_indices() {
             let edge = logical.edge_weight(idx).unwrap();
@@ -587,7 +560,7 @@ impl Program {
                         );
                     }
                     for (f, t) in from_nodes.iter().zip(&to_nodes) {
-                        let (tx, rx) = new_queue()?;
+                        let (tx, rx) = new_queue();
                         let edge = PhysicalGraphEdge {
                             edge_idx: 0,
                             in_logical_idx: logical_in_node_idx.index(),
@@ -605,7 +578,7 @@ impl Program {
                 | LogicalEdgeType::RightJoin => {
                     for f in &from_nodes {
                         for (idx, t) in to_nodes.iter().enumerate() {
-                            let (tx, rx) = new_queue()?;
+                            let (tx, rx) = new_queue();
                             let edge = PhysicalGraphEdge {
                                 edge_idx: idx,
                                 in_logical_idx: logical_in_node_idx.index(),

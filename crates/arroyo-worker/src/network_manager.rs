@@ -1,5 +1,4 @@
 #![allow(clippy::redundant_slicing)]
-use crate::arrow::execution::{ExecutionResources, configured_execution_resources};
 use anyhow::{Context, anyhow, bail};
 use arrow::buffer::MutableBuffer;
 use arrow::ipc::reader::read_record_batch;
@@ -10,8 +9,6 @@ use arroyo_rpc::ControlResp;
 use arroyo_rpc::errors::{DataflowError, DataflowResult};
 use arroyo_types::{ArrowMessage, SignalMessage};
 use bincode::config;
-use datafusion::common::DataFusionError;
-use datafusion::execution::memory_pool::MemoryReservation;
 use std::net::SocketAddr;
 use std::{collections::HashMap, mem::size_of, pin::Pin, sync::Arc, time::Duration};
 use tokio::{
@@ -70,28 +67,6 @@ impl NetworkTasks {
     }
 }
 
-// All network permits use the configured operator/graph pool, never a separate
-// transfer allowance. They fail immediately: waiting for memory while holding
-// upstream/output permits can deadlock a full pipeline.
-fn reserve_network(
-    resources: Option<&ExecutionResources>,
-    name: &str,
-    bytes: usize,
-) -> DataflowResult<Option<MemoryReservation>> {
-    resources
-        .map(|resources| {
-            let bytes = bytes.checked_add(256).ok_or_else(network_size_overflow)?;
-            resources
-                .reserve_bytes(name, bytes)
-                .map_err(DataflowError::from)
-        })
-        .transpose()
-}
-
-fn network_size_overflow() -> DataflowError {
-    DataFusionError::ResourcesExhausted("network buffer admission size overflow".into()).into()
-}
-
 fn network_io_error(error: io::Error) -> DataflowError {
     DataflowError::ExternalError(format!("network I/O: {error}"))
 }
@@ -128,78 +103,6 @@ impl NetworkFailureReporter {
     }
 }
 
-fn schema_depth(data_type: &arrow_schema::DataType) -> usize {
-    use arrow_schema::DataType;
-    let child = match data_type {
-        DataType::List(field)
-        | DataType::LargeList(field)
-        | DataType::FixedSizeList(field, _)
-        | DataType::Map(field, _) => schema_depth(field.data_type()),
-        DataType::Struct(fields) => fields
-            .iter()
-            .map(|field| schema_depth(field.data_type()))
-            .max()
-            .unwrap_or(0),
-        DataType::Union(fields, _) => fields
-            .iter()
-            .map(|(_, field)| schema_depth(field.data_type()))
-            .max()
-            .unwrap_or(0),
-        DataType::RunEndEncoded(left, right) => {
-            schema_depth(left.data_type()).max(schema_depth(right.data_type()))
-        }
-        DataType::Dictionary(_, value) => schema_depth(value),
-        _ => 0,
-    };
-    child.saturating_add(1)
-}
-
-fn reserve_encode(
-    resources: Option<&ExecutionResources>,
-    batch: &RecordBatch,
-) -> DataflowResult<Option<MemoryReservation>> {
-    let Some(resources) = resources else {
-        return Ok(None);
-    };
-    // Arrow55 writer.rs write_array_data creates validity bytes for all-valid
-    // arrays, normalized offset/bit buffers, IPC descriptors, a growing Vec and
-    // a growing flatbuffer. Include every child and ancestor clone, including
-    // zero-byte Null children. Eight copies cover growth + old/new allocations.
-    fn shape(data: &arrow::array::ArrayData, depth: usize) -> Option<usize> {
-        use arrow_schema::DataType;
-        let validity = if matches!(
-            data.data_type(),
-            DataType::Null | DataType::Union(_, _) | DataType::RunEndEncoded(_, _)
-        ) {
-            0
-        } else {
-            data.len().div_ceil(8)
-        };
-        let mut bytes = data
-            .buffers()
-            .len()
-            .checked_mul(128)?
-            .checked_add(1024)?
-            .checked_mul(depth)?
-            .checked_add(validity)?;
-        for child in data.child_data() {
-            bytes = bytes.checked_add(shape(child, depth.checked_add(1)?)?)?;
-        }
-        Some(bytes)
-    }
-    let mut bytes = batch.get_array_memory_size();
-    for column in batch.columns() {
-        bytes = bytes
-            .checked_add(shape(&column.to_data(), 1).ok_or_else(network_size_overflow)?)
-            .ok_or_else(network_size_overflow)?;
-    }
-    reserve_network(
-        Some(resources),
-        "network IPC encoding",
-        bytes.checked_mul(8).ok_or_else(network_size_overflow)?,
-    )
-}
-
 fn ipc_parts(data: &[u8]) -> anyhow::Result<(&[u8], &[u8])> {
     let prefix: [u8; 4] = data.get(..4).context("truncated IPC length")?.try_into()?;
     let length = u32::from_le_bytes(prefix) as usize;
@@ -210,80 +113,6 @@ fn ipc_parts(data: &[u8]) -> anyhow::Result<(&[u8], &[u8])> {
     ))
 }
 
-fn reserve_decode(
-    resources: Option<&ExecutionResources>,
-    schema: &SchemaRef,
-    data: &[u8],
-) -> DataflowResult<Option<MemoryReservation>> {
-    let Some(resources) = resources else {
-        return Ok(None);
-    };
-    let (metadata, body) = ipc_parts(data)?;
-    let message = arrow::ipc::root_as_message(metadata)
-        .map_err(|error| anyhow!("invalid IPC metadata: {error}"))?;
-    let batch = message
-        .header_as_record_batch()
-        .ok_or_else(|| anyhow!("expected IPC record batch"))?;
-    // Our writer uses uncompressed IPC. Without an audited decompression bound,
-    // an incoming compressed frame must fail before Arrow can allocate its body.
-    if batch.compression().is_some() {
-        return Err(DataFusionError::ResourcesExhausted(
-            "compressed network IPC has no configured allocation bound".into(),
-        )
-        .into());
-    }
-    let body_len = usize::try_from(message.bodyLength()).map_err(|_| network_size_overflow())?;
-    if body_len != body.len() {
-        return Err(anyhow!("IPC body length mismatch").into());
-    }
-    let depth = schema
-        .fields()
-        .iter()
-        .map(|field| schema_depth(field.data_type()))
-        .max()
-        .unwrap_or(1)
-        .checked_add(1)
-        .ok_or_else(network_size_overflow)?;
-    let nodes = batch.nodes().map(|nodes| nodes.len()).unwrap_or(0);
-    let buffers = batch
-        .buffers()
-        .ok_or_else(|| anyhow!("missing IPC buffers"))?;
-    let mut copied = 0usize;
-    for buffer in buffers {
-        let offset = usize::try_from(buffer.offset()).map_err(|_| network_size_overflow())?;
-        let len = usize::try_from(buffer.length()).map_err(|_| network_size_overflow())?;
-        if offset.checked_add(len).is_none_or(|end| end > body_len) {
-            return Err(anyhow!("IPC buffer outside body").into());
-        }
-        // Alignment repair may copy a buffer. Repeated/overlapping descriptors
-        // are counted independently rather than assuming bodyLength bounds them.
-        copied = copied
-            .checked_add(len.checked_add(63).ok_or_else(network_size_overflow)?)
-            .ok_or_else(network_size_overflow)?;
-    }
-    let metadata = nodes
-        .checked_mul(1024)
-        .and_then(|n| {
-            buffers
-                .len()
-                .checked_mul(128)
-                .and_then(|b| n.checked_add(b))
-        })
-        .and_then(|bytes| bytes.checked_mul(depth))
-        .ok_or_else(network_size_overflow)?;
-    let bytes = body_len
-        .checked_add(63)
-        .and_then(|bytes| {
-            copied
-                .checked_mul(2)
-                .and_then(|copied| bytes.checked_add(copied))
-        })
-        .and_then(|bytes| bytes.checked_add(metadata))
-        .ok_or_else(network_size_overflow)?;
-    reserve_network(Some(resources), "network IPC decoding", bytes)
-}
-
-// Abstraction for stream types that can be either TLS or plain TCP
 #[derive(Debug)]
 enum NetworkStream {
     Plain(TcpStream),
@@ -408,24 +237,14 @@ impl Senders {
         );
     }
 
-    async fn send(
-        &mut self,
-        header: Header,
-        data: Vec<u8>,
-        resources: Option<&ExecutionResources>,
-    ) -> DataflowResult<()> {
+    async fn send(&mut self, header: Header, data: Vec<u8>) -> DataflowResult<()> {
         let sender = self
             .senders
             .get(&header.as_quad())
             .ok_or_else(|| DataflowError::ArgumentError("unknown network destination".into()))?;
-        let mut decoded = None;
         let message = match header.message_type {
             MessageType::Data => {
-                decoded = reserve_decode(resources, &sender.schema, &data)?;
                 let batch = read_message(sender.schema.clone(), data)?;
-                if let Some(resources) = resources {
-                    resources.check_batch("network decoded input", &batch)?;
-                }
                 ArrowMessage::Data(batch)
             }
             MessageType::Signal => ArrowMessage::Signal(
@@ -438,8 +257,15 @@ impl Senders {
             ),
         };
         let end = message.is_end();
-        let result = sender.tx.send_checked(message).await;
-        drop(decoded);
+        let result =
+            sender
+                .tx
+                .send(message)
+                .await
+                .map_err(|_| DataflowError::InternalOperatorError {
+                    error: "downstream graph queue closed",
+                    message: "could not deliver network message".into(),
+                });
         match result {
             Err(
                 error @ DataflowError::InternalOperatorError {
@@ -459,8 +285,6 @@ pub struct InNetworkLink {
     _source: String,
     stream: BufReader<NetworkStream>,
     senders: Senders,
-    resources: Option<Arc<ExecutionResources>>,
-    _io: Option<MemoryReservation>,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -536,34 +360,11 @@ impl Header {
 }
 
 impl InNetworkLink {
-    #[cfg(test)]
-    fn new(
-        source: String,
-        stream: NetworkStream,
-        senders: Senders,
-        resources: Option<Arc<ExecutionResources>>,
-    ) -> DataflowResult<Self> {
-        let io = reserve_network(
-            resources.as_deref(),
-            "network input buffered I/O",
-            16 * 1024,
-        )?;
-        Ok(Self::with_io(source, stream, senders, resources, io))
-    }
-
-    fn with_io(
-        source: String,
-        stream: NetworkStream,
-        senders: Senders,
-        resources: Option<Arc<ExecutionResources>>,
-        io: Option<MemoryReservation>,
-    ) -> Self {
+    fn new(source: String, stream: NetworkStream, senders: Senders) -> Self {
         InNetworkLink {
             _source: source,
             stream: BufReader::new(stream),
             senders,
-            resources,
-            _io: io,
         }
     }
 
@@ -574,17 +375,12 @@ impl InNetworkLink {
             .map_err(network_io_error)?;
         let header = Header::from_bytes(&header_buf[..]);
         let result = async {
-            // The advertised wire length is charged before allocating or reading it.
-            let _wire =
-                reserve_network(self.resources.as_deref(), "network input frame", header.len)?;
             let mut buf = vec![0; header.len];
             self.stream
                 .read_exact(&mut buf)
                 .await
                 .map_err(network_io_error)?;
-            self.senders
-                .send(header, buf, self.resources.as_deref())
-                .await
+            self.senders.send(header, buf).await
         }
         .await;
         if let Err(error) = result {
@@ -633,20 +429,10 @@ struct NetworkReceiver {
 struct OutNetworkLink {
     stream: BufWriter<NetworkStream>,
     receivers: Vec<NetworkReceiver>,
-    resources: Option<Arc<ExecutionResources>>,
-    _io: Option<MemoryReservation>,
 }
 
 impl OutNetworkLink {
-    pub async fn connect(
-        dest: &str,
-        resources: Option<Arc<ExecutionResources>>,
-    ) -> DataflowResult<Self> {
-        let io = reserve_network(
-            resources.as_deref(),
-            "network output buffered I/O",
-            16 * 1024,
-        )?;
+    pub async fn connect(dest: &str) -> DataflowResult<Self> {
         let config = config();
         let mut rand = StdRng::from_os_rng();
 
@@ -673,8 +459,6 @@ impl OutNetworkLink {
                     return Ok(Self {
                         stream: BufWriter::new(network_stream),
                         receivers: vec![],
-                        resources,
-                        _io: io,
                     });
                 }
                 Err(e) => {
@@ -730,7 +514,6 @@ impl OutNetworkLink {
 
     pub fn start(mut self) -> tokio::task::AbortHandle {
         tokio::spawn(async move {
-            let _io = self._io;
             let failures: Vec<_> = self.receivers.iter().filter_map(|receiver| receiver.failure.clone()).collect();
             let mut sel = InQReader::new();
             for NetworkReceiver {
@@ -740,17 +523,9 @@ impl OutNetworkLink {
                 failure,
             } in self.receivers
             {
-                let resources = self.resources.clone();
                 let stream = async_stream::stream! {
                     while let Some(item) = rx.recv().await {
-                        // InQReader may retain a ready item while another socket write
-                        // is blocked. Acquire the replacement charge before yielding.
-                        let held = match &item {
-                            ArrowMessage::Data(batch) => resources.as_ref().map(|r|
-                                r.reserve_batch("network output input", batch)).transpose(),
-                            ArrowMessage::Signal(_) => Ok(None),
-                        };
-                        yield (quad, dictionary_tracker.clone(), failure.clone(), item, held);
+                        yield (quad, dictionary_tracker.clone(), failure.clone(), item);
                     }
                 };
                 sel.push(Box::pin(stream));
@@ -759,7 +534,7 @@ impl OutNetworkLink {
             loop {
                 select! {
                     next = sel.next() => {
-                        let Some(((quad, dictionary_tracker, failure, msg, held), s)) = next else {
+                        let Some(((quad, dictionary_tracker, failure, msg), s)) = next else {
                             if let Err(error) = self.stream.flush().await {
                                 if let Some(failure) = failures.first() { failure.report(network_io_error(error)).await; }
                                 else { warn!("Network output final flush failed: {error}"); }
@@ -767,13 +542,12 @@ impl OutNetworkLink {
                             break;
                         };
                         let result: DataflowResult<()> = async {
-                            let _held = held?;
                             match msg {
                                 ArrowMessage::Signal(signal) => {
-                                    write_accounted_signal(&mut Pin::new(&mut self.stream), quad, &signal, self.resources.as_deref()).await?;
+                                    write_signal(&mut Pin::new(&mut self.stream), quad, &signal).await?;
                                 }
                                 ArrowMessage::Data(data) => {
-                                    write_accounted_batch(&mut Pin::new(&mut self.stream), quad, &data, &dictionary_tracker, self.resources.as_deref()).await?;
+                                    write_batch(&mut Pin::new(&mut self.stream), quad, &data, &dictionary_tracker).await?;
                                 }
                             }
                             Ok(())
@@ -799,7 +573,7 @@ impl OutNetworkLink {
 }
 
 enum InStreamsOrSenders {
-    InStreams(Vec<(NetworkStream, Option<MemoryReservation>)>),
+    InStreams(Vec<NetworkStream>),
     Senders(Senders),
 }
 
@@ -808,7 +582,6 @@ pub struct NetworkManager {
     in_streams: Arc<Mutex<InStreamsOrSenders>>,
     out_streams: Arc<Mutex<HashMap<Quad, OutNetworkLink>>>,
     tls_acceptor: Option<TlsAcceptor>,
-    resources: Option<Arc<ExecutionResources>>,
     tasks: NetworkTasks,
 }
 
@@ -832,7 +605,6 @@ impl NetworkManager {
             in_streams: Arc::new(Mutex::new(InStreamsOrSenders::InStreams(vec![]))),
             out_streams: Arc::new(Mutex::new(HashMap::new())),
             tls_acceptor,
-            resources: configured_execution_resources()?,
             tasks: NetworkTasks::default(),
         })
     }
@@ -858,39 +630,12 @@ impl NetworkManager {
 
         let streams = Arc::clone(&self.in_streams);
         let tls_acceptor = self.tls_acceptor.clone();
-        let resources = self.resources.clone();
         let tasks = self.tasks.clone();
 
         let listener_task = shutdown_guard.into_spawn_task(async move {
             loop {
                 let (tcp_stream, _) = listener.accept().await?;
                 let ip = tcp_stream.local_addr().unwrap().to_string();
-                let io = match reserve_network(
-                    resources.as_deref(),
-                    "network input buffered I/O",
-                    16 * 1024,
-                ) {
-                    Ok(io) => io,
-                    Err(error) => {
-                        let failure = {
-                            let streams = streams.lock().await;
-                            match &*streams {
-                                InStreamsOrSenders::Senders(senders) => senders
-                                    .senders
-                                    .values()
-                                    .find_map(|sender| sender.failure.clone()),
-                                _ => None,
-                            }
-                        };
-                        if let Some(failure) = failure {
-                            failure.report(error).await;
-                        } else {
-                            warn!("Network input admission failed: {error}");
-                        }
-                        continue;
-                    }
-                };
-
                 let network_stream = if let Some(ref acceptor) = tls_acceptor {
                     match acceptor.accept(tcp_stream).await {
                         Ok(tls_stream) => NetworkStream::TlsServer(tls_stream),
@@ -906,15 +651,11 @@ impl NetworkManager {
                 let mut s = streams.lock().await;
 
                 match &mut *s {
-                    InStreamsOrSenders::InStreams(streams) => streams.push((network_stream, io)),
+                    InStreamsOrSenders::InStreams(streams) => streams.push(network_stream),
                     InStreamsOrSenders::Senders(senders) => {
                         let senders = senders.clone();
-                        let resources = resources.clone();
 
-                        tasks.register(
-                            InNetworkLink::with_io(ip, network_stream, senders, resources, io)
-                                .start(),
-                        );
+                        tasks.register(InNetworkLink::new(ip, network_stream, senders).start());
                     }
                 }
             }
@@ -931,18 +672,10 @@ impl NetworkManager {
 
         match &mut *sockets {
             InStreamsOrSenders::InStreams(in_streams) => {
-                for (s, io) in in_streams.drain(..) {
+                for s in in_streams.drain(..) {
                     let senders = senders.clone();
-                    let resources = self.resources.clone();
                     self.tasks.register(
-                        InNetworkLink::with_io(
-                            s.local_addr().unwrap().to_string(),
-                            s,
-                            senders,
-                            resources,
-                            io,
-                        )
-                        .start(),
+                        InNetworkLink::new(s.local_addr().unwrap().to_string(), s, senders).start(),
                     );
                 }
             }
@@ -970,7 +703,7 @@ impl NetworkManager {
         rx: BatchReceiver,
         failure: Option<NetworkFailureReporter>,
     ) {
-        let link = match OutNetworkLink::connect(addr, self.resources.clone()).await {
+        let link = match OutNetworkLink::connect(addr).await {
             Ok(link) => link,
             Err(error) => {
                 if let Some(failure) = failure {
@@ -1004,13 +737,11 @@ fn pad_to_8(len: u32) -> usize {
     (((len + 7) & !7) - len) as usize
 }
 
-async fn write_accounted_signal<W: AsyncWrite + AsyncWriteExt>(
+async fn write_signal<W: AsyncWrite + AsyncWriteExt>(
     writer: &mut Pin<&mut W>,
     quad: Quad,
     signal: &SignalMessage,
-    resources: Option<&ExecutionResources>,
 ) -> DataflowResult<()> {
-    let _encoded = reserve_network(resources, "network output signal", 256)?;
     let data = bincode::encode_to_vec(signal, config::standard())
         .map_err(|error| DataflowError::ExternalError(error.to_string()))?;
     let header = Header::from_quad(quad, data.len(), MessageType::Signal);
@@ -1019,14 +750,12 @@ async fn write_accounted_signal<W: AsyncWrite + AsyncWriteExt>(
     Ok(())
 }
 
-async fn write_accounted_batch<W: AsyncWrite + AsyncWriteExt>(
+async fn write_batch<W: AsyncWrite + AsyncWriteExt>(
     writer: &mut Pin<&mut W>,
     quad: Quad,
     batch: &RecordBatch,
     dictionary_tracker: &Mutex<DictionaryTracker>,
-    resources: Option<&ExecutionResources>,
 ) -> DataflowResult<()> {
-    let _encoding = reserve_encode(resources, batch)?;
     let (_, encoded_message) = {
         let mut dictionary_tracker = dictionary_tracker.lock().await;
         IpcDataGenerator {}.encoded_batch(
@@ -1101,7 +830,7 @@ pub async fn write_message_and_header<W: AsyncWrite + AsyncWriteExt>(
 }
 
 fn read_message(schema: SchemaRef, data: Vec<u8>) -> anyhow::Result<RecordBatch> {
-    // Borrow the already-accounted frame metadata rather than allocating an
+    // Borrow the frame metadata rather than allocating an
     // attacker-advertised second metadata Vec.
     let (metadata, body) = ipc_parts(&data)?;
     let message = arrow::ipc::root_as_message(metadata)
@@ -1143,24 +872,6 @@ mod test {
 
     use super::{Header, NetworkManager, Senders};
 
-    fn resources(memory_bytes: usize) -> Arc<super::ExecutionResources> {
-        Arc::new(
-            super::ExecutionResources::new(arroyo_rpc::config::ExecutionResourceConfig {
-                memory_bytes,
-                max_batch_bytes: memory_bytes,
-            })
-            .unwrap(),
-        )
-    }
-
-    fn batch() -> RecordBatch {
-        RecordBatch::try_from_iter(vec![(
-            "value",
-            Arc::new(UInt64Array::from(vec![1, 2, 3])) as ArrayRef,
-        )])
-        .unwrap()
-    }
-
     fn quad() -> Quad {
         Quad {
             src_id: 1,
@@ -1170,25 +881,9 @@ mod test {
         }
     }
 
-    fn encoded(batch: &RecordBatch) -> Vec<u8> {
-        let (_, encoded) = arrow::ipc::writer::IpcDataGenerator {}
-            .encoded_batch(
-                batch,
-                &mut arrow::ipc::writer::DictionaryTracker::new(true),
-                &arrow::ipc::writer::IpcWriteOptions::default(),
-            )
-            .unwrap();
-        let mut bytes = (encoded.ipc_message.len() as u32).to_le_bytes().to_vec();
-        bytes.extend_from_slice(&encoded.ipc_message);
-        bytes.extend_from_slice(&encoded.arrow_data);
-        bytes
-    }
-
     #[tokio::test]
     async fn network_setup_failure_does_not_wait_for_startup_control_consumer() {
-        let resources = resources(1024);
-        let mut network = NetworkManager::new(0).await.unwrap();
-        network.resources = Some(resources.clone());
+        let network = NetworkManager::new(0).await.unwrap();
         let (control, mut responses) = tokio::sync::mpsc::channel(128);
         for task_id in 0..128 {
             control
@@ -1201,10 +896,9 @@ mod test {
                 .unwrap();
         }
         let (_tx, rx) = batch_bounded(1);
-        // The configured budget cannot admit buffered network I/O. No TCP
-        // attempt or control receiver is needed to reproduce the startup cycle.
+        // A failed TCP setup must not wait for its full startup control queue.
         timeout(
-            Duration::from_secs(1),
+            Duration::from_secs(10),
             network.connect_reported(
                 "127.0.0.1:1",
                 quad(),
@@ -1214,7 +908,6 @@ mod test {
         )
         .await
         .expect("link setup must finish before the control consumer starts");
-        assert_eq!(resources.runtime.memory_pool.reserved(), 0);
 
         // Starting the consumer must deliver every queued event and the typed
         // failure exactly once, including its originating task identity.
@@ -1236,7 +929,7 @@ mod test {
             panic!("expected deferred setup failure");
         };
         assert_eq!((task_id, subtask_idx), (72, 3));
-        assert!(error.message.contains("network output buffered I/O"));
+        assert!(error.message.contains("failed to connect to"));
         assert_eq!(error.domain, arroyo_rpc::errors::ErrorDomain::External);
         assert_eq!(error.retry_hint, arroyo_rpc::errors::RetryHint::WithBackoff);
         drop(control);
@@ -1250,8 +943,7 @@ mod test {
 
     #[tokio::test]
     async fn network_setup_failure_report_is_cancelled_with_engine_network_tasks() {
-        let mut network = NetworkManager::new(0).await.unwrap();
-        network.resources = Some(resources(1024));
+        let network = NetworkManager::new(0).await.unwrap();
         let (control, mut responses) = tokio::sync::mpsc::channel(1);
         control
             .send(arroyo_rpc::ControlResp::TaskStarted {
@@ -1264,7 +956,7 @@ mod test {
         let tasks = network.task_registry();
         let (_tx, rx) = batch_bounded(1);
         timeout(
-            Duration::from_secs(1),
+            Duration::from_secs(10),
             network.connect_reported(
                 "127.0.0.1:1",
                 quad(),
@@ -1294,308 +986,31 @@ mod test {
     }
 
     #[tokio::test]
-    async fn network_frame_limit_fails_before_waiting_for_body_and_reports_task() {
-        let resources = resources(32 * 1024);
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mut writer = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
-            .await
-            .unwrap();
-        let (reader, _) = listener.accept().await.unwrap();
-        let (tx, _rx) = batch_bounded(1);
-        let (control, mut failures) = tokio::sync::mpsc::channel(1);
-        let mut senders = Senders::new();
-        senders.add_reported(
-            quad(),
-            batch().schema(),
-            tx,
-            super::NetworkFailureReporter::new(control, 72, 3),
-        );
-        let mut link = super::InNetworkLink::new(
-            "test".into(),
-            super::NetworkStream::Plain(reader),
-            senders,
-            Some(resources.clone()),
-        )
-        .unwrap();
-        Header::from_quad(quad(), 64 * 1024, MessageType::Data)
-            .write(&mut Pin::new(&mut writer))
-            .await
-            .unwrap();
-        // Deliberately send no body: admission must fail before read_exact.
-        let result = timeout(
-            Duration::from_secs(1),
-            link.next(&mut [0; std::mem::size_of::<Header>()]),
-        )
-        .await
-        .unwrap();
-        assert!(result.is_err());
-        let failure = failures.recv().await.unwrap();
-        let arroyo_rpc::ControlResp::TaskFailed {
-            task_id,
-            subtask_idx,
-            error,
-        } = failure
-        else {
-            panic!("expected task failure");
-        };
-        assert_eq!((task_id, subtask_idx), (72, 3));
-        assert!(
-            error.message.contains("network input frame"),
-            "{}",
-            error.message
-        );
-        assert_eq!(resources.runtime.memory_pool.reserved(), 16 * 1024 + 256);
-        drop(link);
-        assert_eq!(resources.runtime.memory_pool.reserved(), 0);
-    }
-
-    #[tokio::test]
-    async fn network_decoded_delivery_retains_budget_until_cancelled() {
-        let resources = resources(1024 * 1024);
-        let batch = batch();
-        let data = encoded(&batch);
-        let (tx, mut rx) = batch_bounded(1);
-        tx.send(ArrowMessage::Signal(SignalMessage::Watermark(
-            arroyo_types::Watermark::Idle,
-        )))
-        .await
-        .unwrap();
-        let mut senders = Senders::new();
-        senders.add(quad(), batch.schema(), tx);
-        let header = Header::from_quad(quad(), data.len(), MessageType::Data);
-        {
-            let sending = senders.send(header, data, Some(&resources));
-            tokio::pin!(sending);
-            assert!(
-                timeout(Duration::from_millis(20), &mut sending)
-                    .await
-                    .is_err()
-            );
-            assert!(resources.runtime.memory_pool.reserved() > batch.get_array_memory_size());
-        }
-        assert_eq!(resources.runtime.memory_pool.reserved(), 0);
-        assert!(matches!(rx.recv().await, Some(ArrowMessage::Signal(_))));
-        assert!(timeout(Duration::from_millis(20), rx.recv()).await.is_err());
-    }
-
-    #[tokio::test]
-    async fn network_accounted_delivery_cancel_close_and_success_preserve_exact_ownership() {
-        for signal in [false, true] {
-            let resources = resources(1024 * 1024);
-            let pool = resources.runtime.memory_pool.clone();
-            let batch = batch();
-            let signal_message = SignalMessage::Watermark(arroyo_types::Watermark::Idle);
-            let data = if signal {
-                bincode::encode_to_vec(&signal_message, bincode::config::standard()).unwrap()
-            } else {
-                encoded(&batch)
-            };
-            let message_type = if signal {
-                MessageType::Signal
-            } else {
-                MessageType::Data
-            };
-            let (tx, mut rx) = arroyo_operator::context::batch_bounded_accounted(
-                1,
-                resources.runtime.clone(),
-                resources.limits.max_batch_bytes,
-            )
-            .unwrap();
-            let baseline = pool.reserved();
-            let mut senders = Senders::new();
-            senders.add(quad(), batch.schema(), tx.clone());
-            senders
-                .send(
-                    Header::from_quad(quad(), data.len(), message_type),
-                    data.clone(),
-                    Some(&resources),
-                )
-                .await
-                .unwrap();
-            let queued = pool.reserved();
-            assert!(queued > baseline);
-            assert_eq!(tx.capacity(), 0);
-            {
-                let mut cancelled = Box::pin(senders.send(
-                    Header::from_quad(quad(), data.len(), message_type),
-                    data.clone(),
-                    Some(&resources),
-                ));
-                assert!(futures::poll!(&mut cancelled).is_pending());
-                assert!(pool.reserved() > queued);
-            }
-            assert_eq!(pool.reserved(), queued);
-            let received = rx.recv().await.unwrap();
-            assert_eq!(tx.capacity(), 1);
-            assert_eq!(tx.queued_bytes(), 0);
-            // Queue metadata can retain its first block high-water charge.
-            let empty = pool.reserved();
-            assert!(empty >= baseline);
-            assert!(empty < queued);
-            match received {
-                ArrowMessage::Data(received) => assert_eq!(received, batch),
-                ArrowMessage::Signal(received) => assert_eq!(received, signal_message),
-            }
-            senders
-                .send(
-                    Header::from_quad(quad(), data.len(), message_type),
-                    data.clone(),
-                    Some(&resources),
-                )
-                .await
-                .unwrap();
-            let mut blocked = Box::pin(senders.send(
-                Header::from_quad(quad(), data.len(), message_type),
-                data.clone(),
-                Some(&resources),
-            ));
-            assert!(futures::poll!(&mut blocked).is_pending());
-            drop(rx);
-            assert!(blocked.await.is_err());
-            assert_eq!(pool.reserved(), empty);
-            assert!(
-                senders
-                    .send(
-                        Header::from_quad(quad(), data.len(), message_type),
-                        data,
-                        Some(&resources)
-                    )
-                    .await
-                    .is_err()
-            );
-            assert_eq!(pool.reserved(), empty);
-            drop((senders, tx));
-            assert_eq!(pool.reserved(), 0);
-        }
-    }
-
-    #[tokio::test]
-    async fn network_signal_slow_write_cancel_and_error_release_exact_charge() {
-        let resources = resources(1024 * 1024);
-        let signal = SignalMessage::Watermark(arroyo_types::Watermark::Idle);
-        let (mut writer, reader) = tokio::io::duplex(1);
-        let mut writer = Pin::new(&mut writer);
-        {
-            let mut writing = Box::pin(super::write_accounted_signal(
-                &mut writer,
-                quad(),
-                &signal,
-                Some(&resources),
-            ));
-            assert!(futures::poll!(&mut writing).is_pending());
-            // 256 signal bytes plus the existing 256-byte network envelope.
-            assert_eq!(resources.runtime.memory_pool.reserved(), 512);
-        }
-        assert_eq!(resources.runtime.memory_pool.reserved(), 0);
-        drop(reader);
-        assert!(
-            super::write_accounted_signal(&mut writer, quad(), &signal, Some(&resources),)
-                .await
-                .is_err()
-        );
-        assert_eq!(resources.runtime.memory_pool.reserved(), 0);
-    }
-
-    #[test]
-    fn network_decode_admission_rejects_truncated_frame_without_allocation() {
-        let resources = resources(1024 * 1024);
-        let data = u32::MAX.to_le_bytes().to_vec();
-        assert!(super::reserve_decode(Some(&resources), &batch().schema(), &data).is_err());
-        assert_eq!(resources.runtime.memory_pool.reserved(), 0);
-    }
-
-    #[tokio::test]
-    async fn network_slow_writer_retains_encoding_budget_until_cancelled() {
-        let resources = resources(1024 * 1024);
-        let batch = batch();
-        let dictionary = tokio::sync::Mutex::new(arrow::ipc::writer::DictionaryTracker::new(true));
-        let (mut writer, _slow_reader) = tokio::io::duplex(8);
-        let mut writer = Pin::new(&mut writer);
-        {
-            let writing = super::write_accounted_batch(
-                &mut writer,
-                quad(),
-                &batch,
-                &dictionary,
-                Some(&resources),
-            );
-            tokio::pin!(writing);
-            assert!(
-                timeout(Duration::from_millis(20), &mut writing)
-                    .await
-                    .is_err()
-            );
-            assert!(resources.runtime.memory_pool.reserved() > batch.get_array_memory_size());
-        }
-        assert_eq!(resources.runtime.memory_pool.reserved(), 0);
-    }
-
-    #[test]
-    fn network_codec_admits_nullable_struct_and_releases_successful_scopes() {
-        use arrow_array::{NullArray, StructArray};
-        let fields = arrow_schema::Fields::from(vec![
-            Field::new("empty", arrow_schema::DataType::Null, true),
-            Field::new("value", arrow_schema::DataType::UInt64, true),
-        ]);
-        let value = StructArray::new(
-            fields,
-            vec![
-                Arc::new(NullArray::new(3)),
-                Arc::new(UInt64Array::from(vec![Some(7), None, Some(11)])),
-            ],
-            None,
-        );
-        let batch =
-            RecordBatch::try_from_iter(vec![("record", Arc::new(value) as ArrayRef)]).unwrap();
-        let resources = resources(1024 * 1024);
-        let encoding = super::reserve_encode(Some(&resources), &batch).unwrap();
-        let data = encoded(&batch);
-        let decoding = super::reserve_decode(Some(&resources), &batch.schema(), &data).unwrap();
-        let result = super::read_message(batch.schema(), data).unwrap();
-        assert_eq!(result, batch);
-        assert!(resources.runtime.memory_pool.reserved() > result.get_array_memory_size());
-        drop((encoding, decoding));
-        assert_eq!(resources.runtime.memory_pool.reserved(), 0);
-    }
-
-    #[tokio::test]
-    async fn network_task_abort_releases_permits_and_cancels_late_registration() {
-        let resources = resources(1024);
+    async fn network_task_abort_cancels_late_registration() {
         let tasks = super::NetworkTasks::default();
-        let held = resources.reserve_bytes("test network task", 512).unwrap();
         let task = tokio::spawn(async move {
-            let _held = held;
             std::future::pending::<()>().await;
         });
         tasks.register(task.abort_handle());
         tasks.abort();
         assert!(task.await.unwrap_err().is_cancelled());
-        assert_eq!(resources.runtime.memory_pool.reserved(), 0);
-        let held = resources.reserve_bytes("late network task", 512).unwrap();
         let late = tokio::spawn(async move {
-            let _held = held;
             std::future::pending::<()>().await;
         });
         tasks.register(late.abort_handle());
         assert!(late.await.unwrap_err().is_cancelled());
-        assert_eq!(resources.runtime.memory_pool.reserved(), 0);
     }
 
     #[tokio::test]
-    async fn network_output_exits_and_releases_io_budget_when_inputs_close() {
-        let resources = resources(1024 * 1024);
+    async fn network_output_exits_when_inputs_close() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let stream = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
             .await
             .unwrap();
         let (_peer, _) = listener.accept().await.unwrap();
-        let io = super::reserve_network(Some(&resources), "network output buffered I/O", 16 * 1024)
-            .unwrap();
         let mut link = super::OutNetworkLink {
             stream: tokio::io::BufWriter::new(super::NetworkStream::Plain(stream)),
             receivers: vec![],
-            resources: Some(resources.clone()),
-            _io: io,
         };
         let (tx, rx) = batch_bounded(1);
         link.add_receiver(quad(), rx, None).await;
@@ -1608,7 +1023,6 @@ mod test {
         })
         .await
         .unwrap();
-        assert_eq!(resources.runtime.memory_pool.reserved(), 0);
     }
 
     #[tokio::test]

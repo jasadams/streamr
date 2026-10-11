@@ -5,7 +5,6 @@ use calendar_native::{CalendarAggregate, CalendarContributionChange, CalendarInp
 use crate::arrow::aggregate_codec::{EncodedGroup, decode_group, encode_group};
 use crate::arrow::aggregate_store::{AggregateScope, AggregateStore, AggregateStoreLimits};
 use crate::arrow::decode_aggregate;
-use crate::arrow::execution::{ExecutionResources, configured_execution_resources};
 use crate::arrow::updating_cache::{Key, UpdatingCache};
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use arrow::compute::{SortOptions, filter, max_array};
@@ -43,7 +42,6 @@ use arroyo_state::live::{
 use arroyo_state::timestamp_table_config;
 use arroyo_types::{CheckpointBarrier, SignalMessage, to_nanos};
 use datafusion::common::{Result as DFResult, ScalarValue};
-use datafusion::execution::memory_pool::MemoryConsumer;
 use datafusion::functions_aggregate::min_max::Max;
 use datafusion::physical_expr::expressions::Column;
 use datafusion::physical_plan::aggregates::{AggregateMode, aggregate_expressions};
@@ -384,7 +382,6 @@ pub struct IncrementalAggregatingFunc {
     key_converter: RowConverter,
     new_generation: u64,
     native_config: Option<AggregateStateConfig>,
-    native_execution_resources: Option<Arc<ExecutionResources>>,
     native_store: Option<AggregateStore>,
     retain_indefinitely: bool,
     native_schema_identity: Vec<u8>,
@@ -1427,12 +1424,6 @@ impl IncrementalAggregatingFunc {
             .native_store
             .as_ref()
             .ok_or_else(|| anyhow!("native aggregate store was not initialized"))?;
-        let execution = self
-            .native_execution_resources
-            .as_ref()
-            .context("native aggregate requires worker.execution-resources")?;
-        let max_input_batch_bytes = execution.limits.max_batch_bytes;
-        let _source = execution.reserve_batch("native aggregate input", batch)?;
         let input_schema = &ctx.in_schemas[0];
         let keys = if input_schema
             .routing_keys()
@@ -1454,39 +1445,6 @@ impl IncrementalAggregatingFunc {
         let inputs = self.compute_inputs(batch)?;
         let calendar_inputs = self.calendar_inputs(batch)?;
         self.validate_calendar_inputs(&calendar_inputs).await?;
-        let input_working_bytes = inputs.iter().try_fold(0usize, |total, input| {
-            let total = input.values.iter().try_fold(total, |total, value| {
-                total.checked_add(value.get_array_memory_size())
-            })?;
-            total.checked_add(
-                input
-                    .filter
-                    .as_ref()
-                    .map_or(0, |filter| filter.get_array_memory_size()),
-            )
-        });
-        let calendar_bytes = calendar_inputs.iter().fold(0usize, |bytes, input| {
-            bytes
-                .saturating_add(input.contribution.get_array_memory_size())
-                .saturating_add(input.reference.get_array_memory_size())
-        });
-        let input_working_bytes = input_working_bytes
-            .and_then(|bytes| bytes.checked_add(calendar_bytes))
-            .and_then(|total| {
-                keys.iter()
-                    .try_fold(total, |total, key| total.checked_add(key.len()))
-            })
-            .ok_or_else(|| anyhow!("native aggregate input working-set size overflow"))?;
-        ensure!(
-            input_working_bytes <= max_input_batch_bytes,
-            "native aggregate expressions exceed configured max-batch-bytes"
-        );
-        // Expressions have the same cooperative boundary as projection: their
-        // resulting buffers can be measured once evaluated. Keep the charge
-        // through every state scope/commit, including blocked snapshot waits.
-        let mut _working = MemoryConsumer::new("native aggregate expressions and keys")
-            .register(&execution.runtime.memory_pool);
-        _working.try_grow(input_working_bytes)?;
         ensure!(
             !self.native_append_only || batch.column_by_name(UPDATING_META_FIELD).is_none(),
             "append-only native aggregate received changelog metadata",
@@ -3511,11 +3469,6 @@ impl IncrementalAggregatingConstructor {
             batch_state_schema,
             new_generation: 0,
             native_config,
-            native_execution_resources: if native_config.is_some() {
-                configured_execution_resources()?
-            } else {
-                None
-            },
             native_store: None,
             retain_indefinitely: config.retain_indefinitely == Some(true),
             native_schema_identity,
@@ -4837,13 +4790,6 @@ mod tests {
                 limits,
                 3 * write_scope_bytes,
             ));
-            operator.native_execution_resources = Some(Arc::new(
-                ExecutionResources::new(arroyo_rpc::config::ExecutionResourceConfig {
-                    memory_bytes: 1024 * 1024,
-                    max_batch_bytes: 128 * 1024,
-                })
-                .unwrap(),
-            ));
             let store = operator.native_store.as_ref().unwrap();
             let first = store.begin().await.unwrap();
             let second = store.begin().await.unwrap();
@@ -5049,72 +4995,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn native_input_and_expressions_share_execution_budget_before_state_mutation() {
-        let input = batch(&[Some("value")], &[1], &[Some(true)]);
-        let source_bytes = input.get_array_memory_size();
-        let resources = Arc::new(
-            ExecutionResources::new(arroyo_rpc::config::ExecutionResourceConfig {
-                memory_bytes: 128 * 1024,
-                max_batch_bytes: 128 * 1024,
-            })
-            .unwrap(),
-        );
-        let mut operator = native_append_only_operator();
-        operator.native_store = Some(native_test_store());
-        operator.native_execution_resources = Some(resources.clone());
-        let mut ctx = native_input_context(input.schema()).await;
-        let mut occupied = MemoryConsumer::new("other concurrent operator")
-            .register(&resources.runtime.memory_pool);
-        occupied
-            .try_grow(resources.limits.memory_bytes - source_bytes)
-            .unwrap();
-        let error = operator
-            .process_native_batch(&input, &mut ctx)
-            .await
-            .unwrap_err();
-        assert!(matches!(
-            error.downcast_ref::<datafusion::common::DataFusionError>(),
-            Some(datafusion::common::DataFusionError::ResourcesExhausted(_))
-        ));
-        assert_eq!(
-            resources.runtime.memory_pool.reserved(),
-            resources.limits.memory_bytes - source_bytes
-        );
-        let store = operator.native_store.as_ref().unwrap();
-        let scope = store.begin().await.unwrap();
-        let group_key = native_group_key(b'G', &GLOBAL_KEY).unwrap();
-        assert!(scope.get(&group_key).await.unwrap().is_none());
-        drop(scope);
-        drop(occupied);
-        operator
-            .process_native_batch(&input, &mut ctx)
-            .await
-            .unwrap();
-        assert_eq!(resources.runtime.memory_pool.reserved(), 0);
-        assert!(
-            store
-                .begin()
-                .await
-                .unwrap()
-                .get(&group_key)
-                .await
-                .unwrap()
-                .is_some()
-        );
-    }
-
-    #[tokio::test]
-    async fn native_input_cancellation_releases_execution_and_pending_state_scope() {
+    async fn native_input_cancellation_releases_pending_state_scope() {
         let base = batch(&[Some("value")], &[1], &[Some(true)]);
         let input = native_test_changelog(&base, &[true]);
         let seed = native_test_changelog(&base, &[false]);
-        let resources = Arc::new(
-            ExecutionResources::new(arroyo_rpc::config::ExecutionResourceConfig {
-                memory_bytes: 1024 * 1024,
-                max_batch_bytes: 128 * 1024,
-            })
-            .unwrap(),
-        );
         let mut operator = native_operator();
         let limits = AggregateStoreLimits {
             key_bytes: 256,
@@ -5134,7 +5018,6 @@ mod tests {
             limits,
             3 * write_scope_bytes,
         ));
-        operator.native_execution_resources = Some(resources.clone());
         let store = operator.native_store.as_ref().unwrap();
         let mut ctx = native_input_context(input.schema()).await;
         // A real matching retraction still needs a stable scan. Seed its
@@ -5144,7 +5027,7 @@ mod tests {
             .await
             .unwrap();
         // Exhaust the real backend's snapshot permits so processing suspends
-        // after admitting input/expressions and acquiring its state scope.
+        // after acquiring its state scope.
         let first = store.begin().await.unwrap();
         let second = store.begin().await.unwrap();
         let scope_bytes = store.limits().overlay_bytes + 3 * store.limits().value_bytes;
@@ -5158,11 +5041,9 @@ mod tests {
         );
         let mut processing = Box::pin(operator.process_native_batch(&input, &mut ctx));
         assert!(futures::poll!(&mut processing).is_pending());
-        assert!(resources.runtime.memory_pool.reserved() > input.get_array_memory_size());
         assert!(store.resources().try_decoded_value(otherwise_free).is_err());
         assert!(store.resources().try_queued_write(1).is_err());
         drop(processing);
-        assert_eq!(resources.runtime.memory_pool.reserved(), 0);
         assert!(store.resources().try_decoded_value(otherwise_free).is_ok());
         assert!(
             store
@@ -5176,7 +5057,6 @@ mod tests {
             .process_native_batch(&input, &mut ctx)
             .await
             .unwrap();
-        assert_eq!(resources.runtime.memory_pool.reserved(), 0);
         assert!(
             store
                 .resources()
@@ -5218,16 +5098,8 @@ mod tests {
 
         for cancel in [false, true] {
             let input = batch(&[Some("value")], &[1], &[Some(true)]);
-            let resources = Arc::new(
-                ExecutionResources::new(arroyo_rpc::config::ExecutionResourceConfig {
-                    memory_bytes: 1024 * 1024,
-                    max_batch_bytes: 128 * 1024,
-                })
-                .unwrap(),
-            );
             let mut operator = native_append_only_operator();
             operator.native_store = Some(native_test_store());
-            operator.native_execution_resources = Some(resources.clone());
             let metadata = StructArray::new(
                 updating_meta_fields(),
                 vec![
@@ -5246,7 +5118,6 @@ mod tests {
                 .process_native_batch(&input, &mut ctx)
                 .await
                 .unwrap();
-            assert_eq!(resources.runtime.memory_pool.reserved(), 0);
             let (started_tx, mut started_rx) = tokio::sync::oneshot::channel();
             let (release_tx, release_rx) = tokio::sync::oneshot::channel();
             let mut collector = SlowCollector {
@@ -5278,7 +5149,6 @@ mod tests {
                     .try_decoded_value(state_resources.config().decoded_value_bytes)
                     .is_ok()
             );
-            assert_eq!(resources.runtime.memory_pool.reserved(), 0);
         }
     }
 

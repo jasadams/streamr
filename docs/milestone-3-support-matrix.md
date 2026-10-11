@@ -6,8 +6,9 @@ application-specific operator design. Applications depend on Streamr's generic
 interfaces; Streamr must not depend on an application repository or its models.
 Interface gaps require discussion before implementation.
 
-The starting implementation is milestone 2 `fbd5179a`. Milestone 3 adds generic
-execution accounting, durable timer indexes and ranked collections. Storage
+The starting implementation is milestone 2 `fbd5179a`. The added execution-admission pool and unused timer, ranked-collection and
+history helper APIs were removed by user direction on 2026-10-11. Native SQL
+operators and configured backend limits remain. Storage
 capability tests and an external workload capture do not establish migration of
 all retained-state operators, delivery guarantees or unrestricted beyond-RAM
 execution. See [validation evidence](milestone-3-validation.md).
@@ -71,8 +72,9 @@ RocksDB currently requires **all graph nodes** at parallelism one and counts
 execution owners against the worker's `max-open-databases`. State-table and
 SESSION singleton restrictions also apply to memory. Fixed ownership is part of
 the checkpoint contract; constructor acceptance of a subtask index is not a
-rescaling qualification. Worker-wide live budgets and cooperative execution
-memory are separate from each operator's value/output limits. The memory
+rescaling qualification. Worker-wide backend budgets are separate from each
+operator's state/value/output limits. The added execution admission pool has been
+removed; upstream execution memory is not included in the backend budget sum. The memory
 adapter additionally enforces `max-resident-bytes`; RocksDB does not use that
 field to cap logical state. Neither resource sum is a process RSS limit.
 
@@ -174,11 +176,7 @@ full profile/session, lifetime ranking and broader milestone gates remain open.
 | Path / node | Retained working state | Current support and limitation |
 | --- | --- | --- |
 | `crates/arroyo-state/src/live/{mod,rocks,memory,table}.rs` | Namespaced key/value state, atomic multi-key batches and stable snapshots | Reusable backend interfaces with owned bounded reads and cursor scans. `LiveTable::write_batch` rejects cross-table operations; cross-namespace atomic batches require the shared backend and caller serialization/admission. |
-| `crates/arroyo-state/src/live/timers.rs` / `DurableTimers` | Primary timer records and deadline indexes inside one namespace | Atomic replacement/cancellation, separate clock kinds, bounded due pages and stale-entry revalidation. This is storage support; no worker callback scheduler or SQL timer functions are supplied. |
-| `crates/arroyo-state/src/live/collections.rs` / `RankedCounts` | Separate member counters and ranking records inside one namespace | Checked counters, atomic prepared updates, bounded member/rank scans, exact bounded top-K and incremental cleanup. Collection values are not growing serialized blobs. SQL exposure requires a native operator adapter. |
-| `crates/arroyo-state/src/live/time.rs` / `ArrowHistory` | Chunked Arrow history and timestamp-first expiry records in derived namespaces | Bounded chunks, history pages and expiry batches. This is not a timer scheduler or a migrated window operator. Its derived namespaces need explicit checkpoint integration; creating a history from a registered table does not automatically register/export those namespaces. |
 | `crates/arroyo-state/src/tables/table_manager.rs`, `live/checkpoint.rs` | Registered disk namespaces, shared barrier snapshots and exclusive logical page files | Restores selected remote state into a fresh attempt and exports full registered namespaces with checksums/schema/ownership. Sharing a database does not make unregistered namespaces durable. |
-| `crates/arroyo-worker/src/arrow/execution.rs`, `arrow/sync/streams.rs`, `StatelessPhysicalExecutor` | Shared DataFusion runtime, input/output reservations and bounded batch delivery | Opt-in cooperative execution accounting and per-batch checks. Spilling is disabled. Arbitrary UDF allocations, queues and legacy retained structures are not universally covered. |
 | `crates/arroyo-operator/src/operator.rs` / `ArrowOperator` | Serialized batch, watermark, tick and checkpoint callbacks | Generic execution hooks exist. Their presence does not provide durable timer registration, dispatch or application callback transactions. |
 | `arrow/session_aggregating_window.rs`, `session_native.rs`, `session_store.rs` | Legacy per-key maps; selected native path uses paged raw rows, session/deadline metadata and bounded final-input delivery | Native memory/RocksDB value and fresh-worker recovery captures pass for scalar aggregates and exact-gap/bridge handling; direct late-drop probes also pass at batch target 1. A 65,000-row hot SESSION passes both checkpoint protocols with a retained-payload floor above 10× the declared 50 MiB pool sum, including a 64,999-row checkpoint. High-cardinality sessions, broader late/idleness behavior, collections, backpressure and fault qualification remain open. |
 | `arrow/tumbling_aggregating_window.rs`, `sliding_aggregating_window.rs`, `window_native.rs`, `window_store.rs` | Legacy per-bin maps; selected native path uses paged panes/partials and closure/expiry indexes | Scalar and ordered memory/RocksDB SQL and recovery captures pass. An earlier snapshot-reuse candidate passed 65,000-key TUMBLE initial and recovered full-payload/RSS checks in both protocols, but its halfway checkpoint was below 10×. On `d19c30e3`, the stronger 64,999-row RocksDB checkpoint passed controller restore and all 65,000 full-payload comparisons above the 10× floor at 355,414,016-byte peak RSS; leader failed the unchanged 3 MiB checkpoint-metadata cap. The subsequent compact-basename and bounded idle-harness build passed workspace checks and 614 library tests (four ignored), then repeated the 64,999-row checkpoint under the leader protocol: all 65,000 full payloads matched after fresh-worker recovery at 361,074,688-byte peak RSS. The later test-only idle pre-match build passed 616 library tests (four ignored), but the leader capacity run used the earlier binary. These controller and leader results are from their respective tested source revisions; the 3 MiB metadata cap remains unchanged. A stronger HOP controller run on the later fused source passed the 10× checkpoint floor and full-payload recovery at 355,061,760-byte peak RSS; the subsequent bounded Parquet adapter at `4fbd740a` passed the strong 65,000-key HOP case in both protocols: all 130,000 initial/recovered item-window pairs and full payloads matched, controller/leader peak RSS was 356,876,288/352,108,544 bytes, and both 1,476-file inventories fit the unchanged metadata cap. Broader quiet-key/idleness qualification remains open. Selected collection cases for ARRAY_AGG, DISTINCT aggregates and single-column UNNEST pass, including oversized-value rejection; broader collection shapes, capacity and backpressure remain open. |
@@ -202,9 +200,6 @@ to 1,024 bytes. Table names must satisfy registration/path validation.
 
 Every namespace containing durable records must be represented in restore and
 checkpoint metadata. Namespace bytes must match the configured table name.
-Timer and collection indexes deliberately stay inside their view's namespace.
-History uses derived namespaces, so its factory alone is insufficient to connect
-it to the current registered-table export path.
 
 Configured row/value, encoded batch, read, scan, snapshot, database and disk
 budgets apply to their respective operations. They do not cap total process RSS.
@@ -214,64 +209,13 @@ pages, but checkpoint duration and metadata still grow with state size.
 Controller/leader checkpoint selection and fencing are authoritative; local WAL
 is not a source for selecting committed state.
 
-### Durable timers
+### Execution behavior
 
-`DurableTimers` accepts bounded IDs and payloads and caller-defined signed
-deadline units. `TimerClock::Event` and `TimerClock::Processing` are independent
-indexes. `replace` and `cancel` update primary/index records in atomic batches.
-Prepared operations allow a serial caller to combine timer changes with other
-state mutations in one backend batch. The caller must exclude competing writers
-from preparation through commit; there is no backend compare-and-swap here.
-
-`TimerSnapshot::due(clock, through, cursor)` returns deadlines at or before the
-cutoff in bounded pages, including many IDs at the same timestamp. Cursors belong
-to one snapshot, clock and cutoff. Before acting on a snapshot entry, the caller
-must revalidate it against live state and serialize the subsequent mutation.
-`TimerPage::entries()` borrows admitted buffers; copies retained beyond the page
-need separate admission.
-
-`with_resources` validates room for one retained page plus revalidation reads
-and for native scans, including escaped keys and cursor overhead. Multiple held
-pages, concurrent producers and composed transactions require additional caller
-admission. The view does not choose watermark progression, clock recovery,
-callback ordering, overdue dispatch or output delivery policy.
-
-### Ranked collections
-
-`RankedCounts` stores unsigned 64-bit nonzero counters separately from ranking
-records; zero is represented by absence. Addition checks overflow/underflow.
-Ranking is count descending, then member bytes ascending. This ordering is a
-generic API contract, not a promise of compatibility with another runtime's
-iteration order.
-
-Entity/member, page, top-K and encoded-batch limits are explicit.
-`PreparedCountUpdate::append_to` validates a combined batch before transferring
-operations; keep its reservation alive through commit. One serial view must own
-updates between the initial read and commit. Pages and top-K results expose
-borrowed entries while retaining their reservations. `with_resources` accounts
-for simultaneous prepared/result buffers and native read/scan headroom.
-
-`clear_page` removes one bounded page and both indexes atomically. It is
-incremental deletion, not an atomic logical reset. Callers must prevent writes
-to the entity being cleared and persist any logical retirement/cleanup progress
-they require. A checkpoint can capture an intermediate cleanup state; whether
-that state is logically retired is a caller-owned contract.
-
-### Histories and execution
-
-`ArrowHistory` applies chunk-byte/row, page-byte/entry and batch limits. Primary
-history and expiry records update together, and snapshot reads are stable.
-Appending multiple chunks can leave a committed prefix after cancellation;
-caller-supplied key/time/sequence identities govern retries. Its resource
-reservations and derived-namespace export requirements must be reviewed for the
-particular integration rather than inferred from timer/collection tests.
-
-`worker.execution-resources` provides a shared cooperative DataFusion memory
-pool and `max-batch-bytes`. Reservations accompany the selected executor's input
-lifecycle and yielded output. Output checking happens after the producer has
-allocated a batch; cooperative operators must use the same pool. Holding/cloning
-outputs beyond their consumption boundary needs caller accounting. This does not
-bound arbitrary UDF allocations, channel contents or legacy window/join state.
+Operator execution uses upstream Arroyo/DataFusion contexts. Graph queues use
+upstream row backpressure. The removed execution admission pool and helper APIs
+are not prerequisites for native SQL or RocksDB; older source-bound receipts in
+the validation record retain their historical scope. Whole-process RSS is a
+separate runtime measurement.
 
 ## Unresolved generic interface gaps — discussion items
 
@@ -290,8 +234,7 @@ or implementing a design. They are not approved application integrations:
   protocol variants or built-in worker operators?
 - **Coordinated state and checkpoint assembly:** how are namespaces registered for
   export/restore, producer reservations retained, multiple prepared operations
-  admitted and related state/output/checkpoint boundaries expressed? This also
-  needs a supported integration for derived history namespaces.
+  admitted and related state/output/checkpoint boundaries expressed?
 
 Any proposed extension must identify its retained structures, resource limits,
 error behavior and recovery semantics. Generic storage atomicity does not by

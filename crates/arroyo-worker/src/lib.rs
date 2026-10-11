@@ -1490,10 +1490,8 @@ impl JobStatusGrpc for LeaderServer {
 #[cfg(test)]
 mod engine_lifetime_tests {
     use super::*;
-    use arroyo_operator::context::batch_bounded_accounted;
+    use arroyo_operator::context::batch_bounded;
     use arroyo_server_common::shutdown::{Shutdown, SignalBehavior};
-    use datafusion::execution::memory_pool::FairSpillPool;
-    use datafusion::execution::runtime_env::RuntimeEnvBuilder;
     use petgraph::graph::DiGraph;
     use std::sync::RwLock;
     use tokio::net::TcpStream;
@@ -1656,13 +1654,7 @@ mod engine_lifetime_tests {
             state.job_controller_tx.set(leader_tx).unwrap();
         }
 
-        let runtime = RuntimeEnvBuilder::new()
-            .with_memory_pool(Arc::new(FairSpillPool::new(1024 * 1024)))
-            .build_arc()
-            .unwrap();
-        let (queue_tx, queue_rx) = batch_bounded_accounted(4, runtime.clone(), 64 * 1024).unwrap();
-        let queue_allowance = runtime.memory_pool.reserved();
-        assert!(queue_allowance > 0);
+        let (queue_tx, queue_rx) = batch_bounded(4);
         let peer_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let mut network = NetworkManager::new(0).await.unwrap();
         let data_port = network
@@ -1778,7 +1770,6 @@ mod engine_lifetime_tests {
                 rpc::JobState::JobFinished as i32
             );
             assert!(!control_tx.is_closed());
-            assert_eq!(runtime.memory_pool.reserved(), queue_allowance);
             drop(
                 timeout(
                     Duration::from_secs(1),
@@ -1831,7 +1822,7 @@ mod engine_lifetime_tests {
         let closed = timeout(Duration::from_secs(1), async {
             loop {
                 if let Err(error) = queue_tx
-                    .send_checked(arroyo_types::ArrowMessage::Signal(
+                    .send(arroyo_types::ArrowMessage::Signal(
                         arroyo_types::SignalMessage::Stop,
                     ))
                     .await
@@ -1843,21 +1834,11 @@ mod engine_lifetime_tests {
         })
         .await
         .expect("network teardown retained its queue receiver");
-        assert!(matches!(
-            closed,
-            arroyo_rpc::errors::DataflowError::InternalOperatorError {
-                error: "downstream graph queue closed",
-                ..
-            }
-        ));
+        assert_eq!(
+            closed.0,
+            arroyo_types::ArrowMessage::Signal(arroyo_types::SignalMessage::Stop)
+        );
         drop(queue_tx);
-        timeout(Duration::from_secs(1), async {
-            while runtime.memory_pool.reserved() != 0 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("network teardown retained queue reservations");
         timeout(Duration::from_secs(1), async {
             while TcpStream::connect(("127.0.0.1", data_port)).await.is_ok() {
                 tokio::task::yield_now().await;

@@ -18,8 +18,6 @@ underscores become hyphens. For example:
 | `worker.sql-state-backend` | `ARROYO__WORKER__SQL_STATE_BACKEND` | `memory` or `rocksdb`; selection occurs in the construction adapter |
 | `worker.disk-sql-state.directory` | `ARROYO__WORKER__DISK_SQL_STATE__DIRECTORY` | Local live RocksDB scratch root |
 | `worker.disk-sql-state.max-row-bytes` | `ARROYO__WORKER__DISK_SQL_STATE__MAX_ROW_BYTES` | Disk SQL row/adapter admission limit |
-| `worker.execution-resources.memory-bytes` | `ARROYO__WORKER__EXECUTION_RESOURCES__MEMORY_BYTES` | Shared cooperative DataFusion/graph/network pool |
-| `worker.execution-resources.max-batch-bytes` | `ARROYO__WORKER__EXECUTION_RESOURCES__MAX_BATCH_BYTES` | Supported emitted/input batch allowance |
 | `worker.live-state-resources.disk-reserve-bytes` | `ARROYO__WORKER__LIVE_STATE_RESOURCES__DISK_RESERVE_BYTES` | Free filesystem headroom required at admission |
 | `checkpoint-url` | `ARROYO__CHECKPOINT_URL` | Existing remote/filesystem checkpoint store, separate from local scratch |
 | `job-controller` | `ARROYO__JOB_CONTROLLER` | Existing `controller` or `worker` mode; test harness calls worker mode `leader` |
@@ -51,10 +49,6 @@ sql-state-backend = "rocksdb"
 [worker.disk-sql-state]
 directory = "/tmp/streamr-live"
 max-row-bytes = 24576
-
-[worker.execution-resources]
-memory-bytes = 16777216
-max-batch-bytes = 1048576
 
 [worker.live-state-resources]
 block-cache-bytes = 8388608
@@ -150,8 +144,7 @@ or switch backend/schema/key ownership without explicit compatibility evidence.
 
 ## Admission failures and sizing
 
-Construction rejects nonpositive/incompatible limits; execution requires
-`0 < max-batch-bytes <= memory-bytes <= isize::MAX`. Aggregate admission needs
+Construction rejects nonpositive/incompatible backend and state limits. Aggregate admission needs
 room for a maximum key/value, two output rows and at least two writes. Window
 admission needs one partial plus indexes and at least four writes. Typed state
 admission requires compatible row/decoded, event/capture and output limits.
@@ -163,11 +156,11 @@ RocksDB requires disk configuration and explicit live resources. Its row limit
 is 1..262144 bytes and must fit derived decoded/write/scan/checkpoint bounds.
 Memtable limits must fit the cache limit to which they are charged. Pool budget
 changes while active handles exist are rejected to prevent two incompatible
-worker pools. Budget exhaustion returns limit errors rather than implicit spill;
-execution spill is disabled. Supported graph/network admission shares execution
-resources and may reject startup or message delivery when that pool cannot fit
-queue metadata, actual payloads and retained work. Arbitrary UDF allocations and
-TLS internals are not thereby bounded.
+worker pools. Backend budget exhaustion returns explicit limit errors. Operator execution and
+graph/network queues use upstream Arroyo behavior; the added shared execution
+admission pool and maximum-batch checks have been removed. Graph queues wait for
+row capacity. These backend limits and queue row counts do not cap whole-process
+memory; measure process RSS separately.
 
 ### Invalid configuration examples
 
@@ -181,7 +174,6 @@ configuration is expected to fail, not silently fall back to memory.
 | Remove `[worker.disk-sql-state]` with backend `rocksdb` | RocksDB SQL requires `worker.disk-sql-state` |
 | Remove `[worker.live-state-resources]` with backend `rocksdb` | RocksDB SQL requires explicit worker resources |
 | Set `worker.disk-sql-state.max-row-bytes = 262145` | Maximum disk SQL row is 262144 bytes |
-| Set `worker.execution-resources.max-batch-bytes = 16777217` | Batch allowance exceeds the 16777216-byte execution pool |
 | Set `worker.live-state-resources.max-open-databases = 0` | Live resources must be positive; owner capacity also must fit the actual graph |
 | Set `worker.live-state-resources.memtable-bytes = 8388609` | Memtable allowance exceeds the 8388608-byte cache allowance |
 | Set `worker.aggregate-state.max-pending-output-rows = 1` | Aggregate admission requires two output rows |
@@ -196,8 +188,9 @@ a value fitting `row-bytes` alone can still fail a stricter operation allowance.
 
 Measure retained logical payload, checkpoint-prefix state and whole-process RSS
 separately. Existing fixture budgets are examples, not production defaults:
-state-table capacity uses a conservative 48 MiB pool sum; window/SESSION capacity
-uses 50 MiB; the examples declare a 512 MiB SQL-test-process RSS envelope.
+historical source-specific state-table capacity used a conservative 48 MiB pool
+sum, and window/SESSION capacity used 50 MiB including the since-removed execution
+pool; current runs must declare the backend budgets separately; the examples declare a 512 MiB SQL-test-process RSS envelope.
 Membership/history size, number of active owners, output width and checkpoint
 transfer concurrency determine required headroom. See the all-key table and
 SESSION qualification documents for exact floors, value oracles and pending
@@ -225,7 +218,7 @@ current-candidate production scrape.
 | Signal | Current evidence/source | Limit or remaining gap |
 | --- | --- | --- |
 | `arroyo_live_state_resources{resource,measurement}` | Admission `used`, `limit`, `waiting`; native cache/memtable refresh; pinned cache, disk available/refusals | Disk available reflects the last admission check, not a continuously refreshed filesystem gauge; use the separate logical and native health families below |
-| `arroyo_live_state_admission_refusals_total{resource,reason}` | Existing oversized, closed and exhausted admission errors; reasons are `oversized`, `closed`, `exhausted` | Counts only returned refusals, never cancelled waits; excludes disk/configuration failures and execution-pool admission |
+| `arroyo_live_state_admission_refusals_total{resource,reason}` | Existing oversized, closed and exhausted admission errors; reasons are `oversized`, `closed`, `exhausted` | Counts only returned refusals, never cancelled waits; excludes disk/configuration failures |
 | `arroyo_live_state_admission_duration_seconds{resource}` | Async admission from first poll through acquisition, refusal or cancellation, including immediate outcomes | Includes validation and semaphore wait; excludes time before first poll, synchronous try-admission, permit holding and native work; cancellation contributes a duration sample without a refusal |
 | `arroyo_live_state_operation_latency_seconds{operation}` | Fixed read/write/scan/snapshot/open histogram | Native operation time after admission; does not separately report total queue wait or RocksDB write-stall duration |
 | `arroyo_live_state_checkpoint_duration_seconds{direction,outcome}` | Logical namespace export/restore durations, success/error/cancelled outcomes | Not entire controller barrier/publication duration or worker startup latency |
@@ -234,10 +227,8 @@ current-candidate production scrape.
 | `arroyo_live_state_logical_keys{backend}` / `arroyo_live_state_logical_bytes{backend,part}` | Current live record count and unencoded key/value payload bytes (`part=key,value`), summed across known memory/RocksDB attempts | Includes internal index/metadata records in registered namespaces. Excludes namespace, routing, encoding and allocation overhead. Check `health_observations{measurement="logical"}` before treating the sum as complete |
 | `arroyo_live_state_native_health{measurement}` | Cached `sst_bytes`, `free_bytes`, `write_stopped`, `delayed_write_bytes_per_second`, `sample_age_milliseconds` | Sampled at admitted RocksDB open/write completion. SST is total SST file lengths, excluding WAL/manifests/snapshots; free bytes is the minimum filesystem free space across observed attempts, never summed for shared disks. Stopped databases and delayed-write byte/second rates are summed; sample age is maximum monotonic milliseconds |
 | `arroyo_live_state_health_observations{measurement,outcome}` | Live database counts with `available` / `unavailable` measurements | Memory participates only in logical observations. Unsupported/error properties are unavailable, excluded from aggregate values; a zero aggregate with unavailable observations is not a measured zero. Native sample age makes idle/background-compaction staleness explicit |
-| `arroyo_worker_execution_memory_bytes{measurement}` | Actual shared pool reserved bytes (`used`), limits (`limit`, `max_batch`) and reservation classes (`spillable`, `nonspillable`), refreshed on scrape | Cooperative reservations in the latest configured pool, not RSS. Class means DataFusion consumer spillability; it does not enable disk spill. Concurrent updates can briefly make class sums differ from `used`. All values read zero after the observed pool dies |
-| `arroyo_worker_execution_admission_refusals_total{operation,outcome}` | Cumulative actual pool `try_grow` failures and checked `batch_limit` failures, with `outcome=refused` | No wait queue exists in this execution pool; cancellation is not a refusal. Does not cover untracked allocations or queue-local validation failures that never call the pool |
 | `arroyo_worker_lifecycle_duration_seconds{phase,outcome}` / `arroyo_worker_lifecycle_operations_total{phase,outcome}` | Monotonic stage elapsed seconds and success/error/cancelled counts for protocol/metadata publication, worker initialization and startup/restart readiness | Exact boundaries below; phase labels are finite. Neither publication timing includes the preceding distributed barrier nor readiness the preceding controller/process scheduling |
-| `arroyo_worker_tx_bytes`, `arroyo_worker_tx_queue_size`, `arroyo_worker_tx_queue_rem` | Payload bytes, configured row capacity, and remaining row capacity respectively | Collector-attached graph queues refresh on admission, drain, failed delivery and receiver teardown (including signals); total capacity is the queue row limit and remains constant when empty. These are payload/row gauges, not shared-pool reservation totals |
+| `arroyo_worker_tx_bytes`, `arroyo_worker_tx_queue_size`, `arroyo_worker_tx_queue_rem` | Payload bytes, configured row capacity, and remaining row capacity respectively | Collector samples queue counters when sending; these gauges are not continuous drain/teardown observations. Total capacity is the configured row limit. Payload bytes are measurements, not shared-pool reservations or byte admission limits |
 | `process_resident_memory_bytes` | Server-common enables Prometheus's process collector feature | Verify actual candidate scrape; harness `wait4`/`/proc` RSS is separate test-process evidence |
 
 Admission labels are limited to `queued_write_bytes`, `decoded_value_bytes`,
@@ -288,13 +279,12 @@ local worker readiness, not process boot, controller scheduling, global sink
 readiness or end-to-end outage duration. Namespace export/restore remains the
 separate existing live-state checkpoint metric.
 
-Queue payload/row gauges above and execution reservation classes provide distinct
-queue/reservation views. Queue metadata, retained consumer batches, operator and
-network transfer reservations are included in their actual DataFusion consumer
-classes; per-resource attribution of these reservations is not exposed, and
-subtracting payload gauges from total reservations does not produce such a
-measurement. Transfer byte rates come from successfully transferred checkpoint
-objects and exclude manifest/transport/failed bytes.
+Queue payload/row gauges measure occupancy using upstream Arroyo row-based
+backpressure; payload byte counters do not enforce byte admission. There is no
+added operator execution admission pool. Backend resource metrics describe their
+own bounded operations; verify process RSS separately. Transfer byte rates come
+from successfully transferred checkpoint objects and exclude
+manifest/transport/failed bytes.
 
 Actual candidate `/metrics` scrapes under load, restoration, resource pressure
 and cancellation, and measured production sizing/defaults remain the shared

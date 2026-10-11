@@ -1,4 +1,3 @@
-use super::execution::{ExecutionResources, configured_execution_resources};
 use arrow::compute::kernels;
 use arrow_array::{Array, BooleanArray, RecordBatch, TimestampNanosecondArray, UInt64Array};
 use arroyo_operator::context::{Collector, OperatorContext};
@@ -47,7 +46,6 @@ pub struct WatermarkGenerator {
     expression: Arc<dyn PhysicalExpr>,
     timestamp_index: usize,
     source_envelope_index: Option<usize>,
-    resources: Option<Arc<ExecutionResources>>,
 }
 
 impl WatermarkGenerator {
@@ -67,7 +65,6 @@ impl WatermarkGenerator {
             expression,
             timestamp_index,
             source_envelope_index,
-            resources: None,
         }
     }
 }
@@ -79,21 +76,6 @@ impl WatermarkGenerator {
         task_index: u32,
         collector: &mut dyn Collector,
     ) -> DataflowResult<()> {
-        let _input_reservation = self
-            .resources
-            .as_ref()
-            .map(|resources| resources.reserve_batch("watermark admission input", &record))
-            .transpose()?;
-        let scratch_bytes = admission_scratch_bytes(
-            record.get_array_memory_size(),
-            record.num_rows(),
-            record.num_columns(),
-        )?;
-        let mut scratch_reservation = self
-            .resources
-            .as_ref()
-            .map(|resources| resources.reserve_bytes("watermark admission scratch", scratch_bytes))
-            .transpose()?;
         let timestamps = record
             .column(self.timestamp_index)
             .as_any()
@@ -150,12 +132,7 @@ impl WatermarkGenerator {
             .expression
             .evaluate(&admitted)?
             .into_array(admitted.num_rows())?;
-        if let Some(reservation) = scratch_reservation.as_mut() {
-            let actual = scratch_bytes
-                .checked_add(watermark.get_array_memory_size())
-                .ok_or_else(|| admission_error("watermark admission progress size overflow"))?;
-            reservation.try_resize(actual)?;
-        }
+
         let watermark = watermark
             .as_any()
             .downcast_ref::<TimestampNanosecondArray>()
@@ -172,21 +149,7 @@ impl WatermarkGenerator {
             .downcast_ref::<TimestampNanosecondArray>()
             .unwrap();
         let max_timestamp = kernels::aggregate::max(timestamps);
-        if let Some(resources) = self.resources.as_ref() {
-            resources.check_batch("watermark admission output", &output)?;
-            let measured = [
-                record.get_array_memory_size(),
-                admitted.get_array_memory_size(),
-                keep.get_array_memory_size(),
-                representatives.get_array_memory_size(),
-                timestamps.get_array_memory_size(),
-            ]
-            .into_iter()
-            .try_fold(0_usize, |sum, bytes| sum.checked_add(bytes))
-            .ok_or_else(|| admission_error("watermark admission buffer size overflow"))?;
-            let reservation = scratch_reservation.as_mut().unwrap();
-            reservation.try_resize(reservation.size().max(measured))?;
-        }
+
         let progress = watermark.map(|watermark| {
             self.state_cache
                 .max_watermark
@@ -266,14 +229,13 @@ impl OperatorConstructor for WatermarkGeneratorConstructor {
             &DefaultPhysicalExtensionCodec {},
         )?;
 
-        let mut generator = WatermarkGenerator::expression(
+        let generator = WatermarkGenerator::expression(
             Duration::from_micros(config.period_micros),
             config.idle_time_micros.map(Duration::from_micros),
             expression,
             input_schema.timestamp_index,
             config.source_envelope_index.map(|i| i as usize),
         );
-        generator.resources = configured_execution_resources()?;
         Ok(ConstructedOperator::from_operator(Box::new(generator)))
     }
 }
@@ -383,28 +345,6 @@ impl ArrowOperator for WatermarkGenerator {
     }
 }
 
-// Preflight masks, ordinal indices, timestamp normalization/filter intermediates,
-// duplicated admitted payload buffers and Arrow/schema overhead before allocation.
-fn admission_scratch_bytes(
-    input_bytes: usize,
-    rows: usize,
-    columns: usize,
-) -> DataflowResult<usize> {
-    input_bytes
-        .checked_mul(2)
-        .and_then(|bytes| {
-            rows.checked_mul(64)
-                .and_then(|scratch| bytes.checked_add(scratch))
-        })
-        .and_then(|bytes| {
-            columns
-                .checked_add(8)
-                .and_then(|columns| columns.checked_mul(256))
-                .and_then(|overhead| bytes.checked_add(overhead))
-        })
-        .ok_or_else(|| admission_error("watermark admission scratch size overflow"))
-}
-
 fn admission_error(message: &str) -> arroyo_rpc::errors::DataflowError {
     arroyo_rpc::errors::DataflowError::ArgumentError(message.into())
 }
@@ -469,86 +409,6 @@ fn signed_timestamp(nanos: i64) -> DataflowResult<SystemTime> {
 #[cfg(test)]
 mod signed_timestamp_tests {
     use super::*;
-
-    struct BudgetCollector {
-        resources: Arc<ExecutionResources>,
-        calls: usize,
-        fail_budget: bool,
-    }
-    #[async_trait]
-    impl Collector for BudgetCollector {
-        async fn collect(&mut self, _: RecordBatch) -> DataflowResult<()> {
-            self.calls += 1;
-            if self.fail_budget {
-                assert!(
-                    self.resources
-                        .reserve_bytes(
-                            "backpressure competitor",
-                            self.resources.limits.memory_bytes
-                        )
-                        .is_err()
-                );
-                tokio::task::yield_now().await;
-                assert!(
-                    self.resources
-                        .reserve_bytes(
-                            "backpressure competitor",
-                            self.resources.limits.memory_bytes
-                        )
-                        .is_err()
-                );
-            }
-            Ok(())
-        }
-        async fn broadcast_watermark(&mut self, _: Watermark) -> DataflowResult<()> {
-            Ok(())
-        }
-    }
-
-    #[tokio::test]
-    async fn resource_refusal_is_before_forwarding_and_reservations_cover_collection() {
-        use arroyo_rpc::config::ExecutionResourceConfig;
-        use datafusion::physical_expr::expressions::Column;
-        let batch = RecordBatch::try_from_iter(vec![(
-            "_timestamp",
-            Arc::new(TimestampNanosecondArray::from(vec![12])) as arrow_array::ArrayRef,
-        )])
-        .unwrap();
-        for (budget, refused) in [(1024, true), (65536, false)] {
-            let resources = Arc::new(
-                ExecutionResources::new(ExecutionResourceConfig {
-                    memory_bytes: budget,
-                    max_batch_bytes: budget.min(65536),
-                })
-                .unwrap(),
-            );
-            let mut gate = WatermarkGenerator::expression(
-                Duration::from_secs(1),
-                None,
-                Arc::new(Column::new("_timestamp", 0)),
-                0,
-                None,
-            );
-            gate.resources = Some(resources.clone());
-            let prior = gate.state_cache;
-            let mut collector = BudgetCollector {
-                resources: resources.clone(),
-                calls: 0,
-                fail_budget: !refused,
-            };
-            let result = gate.admit_batch(batch.clone(), 0, &mut collector).await;
-            assert_eq!(result.is_err(), refused);
-            assert_eq!(collector.calls, usize::from(!refused));
-            if refused {
-                assert_eq!(gate.state_cache, prior);
-            }
-            let entire_budget = resources
-                .reserve_bytes("reacquire released gate budget", budget)
-                .unwrap();
-            drop(entire_budget);
-        }
-        assert!(admission_scratch_bytes(usize::MAX, 1, 1).is_err());
-    }
 
     #[test]
     fn admission_preserves_update_envelopes_and_does_not_pair_equal_keys() {

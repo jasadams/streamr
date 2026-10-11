@@ -50,14 +50,6 @@ the legacy manager. Live snapshots have no remote checkpoint publication API yet
 Do not attach these handles to a pipeline that expects legacy checkpoints to
 include their content.
 
-Ordinary table names beginning with `streamr.history.v1` are reserved and rejected
-by `LiveTableManager::register`. That prefix identifies the internal primary and
-expiry tables used by Arrow histories; allowing an ordinary table to claim it
-would break logical-table isolation. The restriction preserves the existing
-stored-data format. Previously accepted caller names with this prefix must be
-renamed before registration; other table names and existing history encodings
-are unchanged.
-
 ## Admission and lifecycle
 
 Requests exceeding byte budgets fail; capacity saturation awaits admission.
@@ -104,32 +96,6 @@ results, SQL overlays and operator execution remain caller-owned memory. Later
 operator migrations must account for those allocations; this foundation does not
 claim a larger-than-RAM pipeline guarantee.
 
-## Arrow histories
-
-`ArrowHistory` atomically maintains primary key/time/sequence and timestamp-first
-expiry indexes. Full keys are escaped; signed timestamp suffixes are sortable.
-The caller supplies timestamp units and unique sequence numbers per key/time.
-Each chunk contains one Arrow IPC batch, preserving schema, nulls and timestamps.
-Inputs must have bounded source buffers before IPC serialization. Serialized
-chunks, scan pages, row counts and write batches are bounded separately; oversized
-single rows fail explicitly. Appends commit a chunk at a time, so cancellation
-may leave a committed prefix. Repeating the same identifiers replaces that chunk.
-
-Snapshot scans paginate a single hot key over a half-open timestamp range.
-Before copying a lookup key, histories reject it if the minimum encoded matching
-record exceeds the configured page-byte limit. This applies on both backends,
-with or without attached resource accounting; an oversized missing-key lookup
-returns a limit error rather than an empty page. Other lookups retain their
-existing bounds and result semantics.
-Cursors bind to the snapshot and exact namespace/prefix/range. Expiry removes at
-most one page at a time, committing a prefix of complete primary/expiry delete
-pairs that fits the write-batch limit. Repeated calls make progress without
-breaking either index. Records exactly at the cutoff are retained, matching
-legacy table retention. IPC frame/body/row bounds are checked before decoding and compressed
-IPC is rejected. With shared resources attached via `with_resources`, decoded
-page reservations last until the page is dropped; copying or retaining extracted
-batches still requires caller accounting. Routed histories require a future
-operator routing adapter and are rejected explicitly.
 
 ## Native build and validation
 

@@ -1,0 +1,148 @@
+{
+  "status": "cleanup increment validation PASS; full STR-32 qualification open",
+  "source_commit": "e4aec059035ca4b03ef05167c8d1a1491ef2ddcd",
+  "binary_sha256": "381f04bebcc76351c870542158447a73e180af2591d8e90060f008fde07f8133",
+  "initial": {
+    "rows": 100000,
+    "complete_keys": 100000,
+    "strict_before_images": true,
+    "exact_full_payloads": true,
+    "committed_prefix_verified": false
+  },
+  "checkpoint_full_typed_keys": 100000,
+  "checkpoint_output_sha256": "b2642751c5d4e9a46c5facff7bb4c349525117c58abec20b1dd71b54108abc2a",
+  "checkpoint_source_prefix": 199999,
+  "initial_output_sha256": "e4af612bd8c09a5d3de72844bbc1baa4ef137c3b9c29c5f8a123b26d0853ccb4",
+  "selected_metadata": "/home/jason/qa-evidence/str32-arroyo-queues-20261011/checkpoints-7200s/external-sql-capture-2-1791676927249086273/checkpoints/checkpoint-0000001/metadata",
+  "selected_metadata_sha256": "ae20db723770a3fbebde665c8a458aaf04456f23a51ce2ec5a3c855d9df68c2d",
+  "logical_payload_floor": 819200000,
+  "retention_proof_scope": "Full independent all-key checkpoint sink snapshot confirms COUNT/MAX values. Append-onlyMAX must retain one8192-byte payload perkey. NativeParquet bytes are opaque inventory, not decoded logicalstate proof.",
+  "recovered_output": "Complete200000-row output qualified by primary and independent full-value/CDC checks; exact100000-row checkpoint byte prefix plus100000fresh rows.",
+  "timeout": 7200,
+  "scope": "one RocksDB/controller/batch32 aggregate capacity case plus48smallSQLfresh-worker configurations; not process-loss, combined capacity or full Arcstream qualification",
+  "native_parquet_file_count": 2025,
+  "library_test_counts": {
+    "operator": 8,
+    "worker": 163,
+    "state": 72,
+    "rpc": 35
+  },
+  "gate_results": {
+    "check": 0,
+    "fmt": 0,
+    "clippy": 0,
+    "operator-tests": 0,
+    "worker-tests": 0,
+    "state-tests": 0,
+    "rpc-tests": 0,
+    "sql-build": 0,
+    "capacity-original-batch32": 1
+  },
+  "current_capacity_reservation": "fdab74cda49a",
+  "current_capacity_status": "primary and independent full-value/CDC/RSS/checkpoint audits PASS",
+  "publication": "https://github.com/jasadams/streamr/pull/36 (draft)",
+  "capacity_result": {
+    "artifacts": {
+      "capture.log": "7970f9cf24f948785d32b549dae3d905a90ab25daeac85f642b7c9e396bedf4f",
+      "output.initial.jsonl": "e4af612bd8c09a5d3de72844bbc1baa4ef137c3b9c29c5f8a123b26d0853ccb4",
+      "output.jsonl": "ba1a975cf3b3c5e67d5f4135f8456e26dd1b8c6a2fed281c16bdeb55532c5c28"
+    },
+    "backend": "rocksdb",
+    "checkpoint_exceeds_10x_pool": true,
+    "checkpoint_floor_bytes": 819200000,
+    "elapsed_seconds": 5937.16061258316,
+    "initial": {
+      "committed_prefix_verified": false,
+      "complete_keys": 100000,
+      "exact_full_payloads": true,
+      "rows": 100000,
+      "strict_before_images": true
+    },
+    "live_exceeds_10x_pool": true,
+    "live_floor_bytes": 819200000,
+    "peak_child_rss_bytes": 366641152,
+    "protocol": "controller",
+    "recovered": {
+      "committed_prefix_verified": true,
+      "complete_keys": 100000,
+      "exact_full_payloads": true,
+      "rows": 200000,
+      "strict_before_images": true
+    },
+    "status": "pass"
+  },
+  "current_functional_reservation": "d16dbf8839bc",
+  "functional_matrix_status": "all48 configurations PASS with independent output/receipt audit",
+  "functional_results": {
+    "source_commit": "e4aec059035ca4b03ef05167c8d1a1491ef2ddcd",
+    "binary_sha256": "381f04bebcc76351c870542158447a73e180af2591d8e90060f008fde07f8133",
+    "results": [
+      {
+        "name": "aggregates",
+        "command": [
+          "python3",
+          "/app/scripts/test-native-aggregates.py",
+          "/results/functional-matrices/aggregates",
+          "--binary",
+          "/results/pinned-sql-tests"
+        ],
+        "exit_code": 0,
+        "error": null,
+        "seconds": 7.148468776023947,
+        "log_sha256": "a5f02eed4677c3c5dd78a91ff17114bbfa7300992ec3c8fd0ed251493bb87ffc"
+      },
+      {
+        "name": "updating-joins",
+        "command": [
+          "python3",
+          "/app/scripts/test-native-updating-joins.py",
+          "/results/functional-matrices/updating-joins",
+          "--binary",
+          "/results/pinned-sql-tests",
+          "--source-receipt",
+          "/results/source-manifest.json"
+        ],
+        "exit_code": 0,
+        "error": null,
+        "seconds": 156.60391926497687,
+        "log_sha256": "63c500cadcfd7801612417b5668dc7ccfbf335f8c09c331852a0cf9d808623bd"
+      },
+      {
+        "name": "state-tables",
+        "command": [
+          "python3",
+          "/app/scripts/test-native-state-tables.py",
+          "/results/pinned-sql-tests",
+          "--directory",
+          "/results/functional-matrices/state-tables"
+        ],
+        "exit_code": 0,
+        "error": null,
+        "seconds": 8.834634418948554,
+        "log_sha256": "48d52a02c21d54a12fb3160e865a958f3e19efb46059edcdb2fd57d6a4b5ad89"
+      }
+    ],
+    "scope": "Small native SQL value/CDC and fresh-worker recovery matrices; not process-loss/capacity qualification"
+  },
+  "source_after_validation_changes": "delivery documentation and two Python capacity-driver docstrings only; production code and executable unchanged",
+  "independent_reports": {
+    "capacity-7200s-full-value-independent-audit.json": {
+      "path": "/home/jason/qa-evidence/str32-arroyo-queues-20261011/capacity-7200s-full-value-independent-audit.json",
+      "sha256": "d913ba52773750253a97e74fbb74f7b7ae85da19c133494ff5a95428d8b253f4"
+    },
+    "capacity-checkpoint-independent-audit.json": {
+      "path": "/home/jason/qa-evidence/str32-arroyo-queues-20261011/capacity-checkpoint-independent-audit.json",
+      "sha256": "82f2e8b6bff04406e5d3b1fd50c9aca85623b93284ed42d56dc94b13ea48c0ae"
+    },
+    "functional-matrices-independent-audit.json": {
+      "path": "/home/jason/qa-evidence/str32-arroyo-queues-20261011/functional-matrices-independent-audit.json",
+      "sha256": "dd4a1a9b263d8769e634e8ed85c4a6f082d842ac302046a7320be35de2c1835c"
+    },
+    "corrected-capacity-auditor-review.json": {
+      "path": "/home/jason/qa-evidence/str32-arroyo-queues-20261011/corrected-capacity-auditor-review.json",
+      "sha256": "3e9250ad6ec2d04ab29d0f47e3cc67ccc04e28c9f37cfa7978a55b2cae9c7c40"
+    }
+  },
+  "initial_receipt_path": "/home/jason/qa-evidence/str32-arroyo-queues-20261011/capacity-7200s-initial-checkpoint-independent-audit.json",
+  "initial_receipt_sha256": "fa52cb534c6d117fa85436a1e8ec811f9e5ad626323c6cc96a6a1a1af562687c"
+}
