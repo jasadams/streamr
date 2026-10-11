@@ -1,3 +1,11 @@
+## STR-58 finite local expressions — 2026-10-11
+
+- Base `a2c823f1e216c1a5bd888e57d1818cbef50902e5`; workspace `/home/jason/repos/streamr-worktrees/str-58-local-subqueries-20261011`. Current ticket and fetched instructions read; no signing, historical time limit or new execution admission.
+- Implements finite native ARRAY/scalar/EXISTS rowsets, immutable typed bindings and serial MERGE evaluation/CASE laziness, reusing current native operators/backend/checkpoint protocol.
+- Core planned/physical-roundtrip SQL and native memory/Rocks MERGE/checkpoint continuation are implemented; source-specific passing receipts and repaired failures are in [STR-58 validation](str-58-validation.md). Final locked check/strict Clippy/fmt pass; local planner12/worker3, neighbor MERGE24/state29/JSON9, and decoded fixture-worker5 pass. Source review approved; publication/CI remain separate.
+- Explicit user deferral: keep the current dependency; ancestor correlation beyond one level is STR-105, not passed. Nested local subqueries in JOIN ON fail planning precisely and remain STR-106. STR-63 owns persisted arrays/typed-empty CAST; STR-66 owns JSON_OBJECTAGG/map composition.
+- Next: coordinator audits exact final evidence, publishes and verifies current-head PR CI. No other new feature or architectural change is requested.
+
 ## STR-57 JSON_TABLE implementation — 2026-10-11
 
 - Base `299f17f37fb0eb28709bb4bcc50e69743fa7b131`; workspace `/home/jason/repos/streamr-worktrees/str-57-json-table-20261011`. Read AGENTS.md, .claude/build-test.md/team.md, this ledger/work-plan and current STR-57. No signing or automatic elapsed-time limit.

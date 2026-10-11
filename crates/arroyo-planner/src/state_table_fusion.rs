@@ -16,8 +16,8 @@ use datafusion::common::{DataFusionError, Result};
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_plan::{ExecutionPlan, filter::FilterExec, projection::ProjectionExec};
+use datafusion_proto::physical_plan::AsExecutionPlan;
 use datafusion_proto::physical_plan::from_proto::parse_physical_expr;
-use datafusion_proto::physical_plan::{AsExecutionPlan, DefaultPhysicalExtensionCodec};
 use datafusion_proto::protobuf::{PhysicalExprNode, PhysicalPlanNode};
 use petgraph::Direction::{Incoming, Outgoing};
 use petgraph::graph::NodeIndex;
@@ -120,7 +120,21 @@ fn admit_expression(expr: &dyn PhysicalExpr, uuid_value_root: bool) -> Result<()
             || implementation
                 .as_any()
                 .is::<crate::sql_json::kernels::JsonObjectFunc>();
-        if !bounded_uuid
+        let local_query = implementation
+            .as_any()
+            .is::<crate::local_physical::LocalQueryUdf>();
+        let native_array = implementation
+            .as_any()
+            .is::<datafusion::functions_nested::cardinality::Cardinality>()
+            || implementation
+                .as_any()
+                .is::<datafusion::functions_nested::concat::ArrayConcat>()
+            || implementation
+                .as_any()
+                .is::<datafusion::functions_nested::make_array::MakeArray>();
+        if !local_query
+            && !native_array
+            && !bounded_uuid
             && !bounded_concat
             && !sql_json
             && !implementation
@@ -352,7 +366,7 @@ impl ScalarPlanAdmission for BoundedScalarAdmission<'_> {
                 &proto,
                 self.registry,
                 input.schema.as_ref(),
-                &DefaultPhysicalExtensionCodec {},
+                &crate::physical::ArroyoPhysicalExtensionCodec::default(),
             )?;
             admit_expression(expr.as_ref(), true)?;
         }

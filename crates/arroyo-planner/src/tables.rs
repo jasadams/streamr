@@ -144,13 +144,22 @@ pub(crate) fn produce_optimized_plan(
     // SqlToRel sees them; DataFusion rejects the sqlparser Json* variants.
     let mut statement = statement.clone();
     crate::sql_json::lowering::rewrite_statement(&mut statement)?;
+    crate::local_sql::lower_array_queries(&mut statement)
+        .map_err(|error| DataFusionError::Plan(error.to_string()))?;
     let sql_to_rel = SqlToRel::new(schema_provider);
 
     let plan = sql_to_rel.sql_statement_to_plan(statement)?;
     let plan = crate::sql_json::table::bind_rowsets(plan)?;
 
+    let mut typed = plan;
+    if crate::local_planning::contains_queries(&typed)? {
+        for rule in &schema_provider.analyzer.rules {
+            typed = rule.analyze(typed, &ConfigOptions::default())?;
+        }
+    }
+    let typed = crate::local_planning::lower_plan(typed, schema_provider)?;
     let analyzed_plan = schema_provider.analyzer.execute_and_check(
-        plan,
+        typed,
         &ConfigOptions::default(),
         |_plan, _rule| {},
     )?;

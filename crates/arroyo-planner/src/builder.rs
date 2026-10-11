@@ -35,7 +35,6 @@ use crate::physical::{
     ToDebeziumExec,
 };
 use crate::schemas::add_timestamp_field_arrow;
-use datafusion_proto::physical_plan::DefaultPhysicalExtensionCodec;
 use datafusion_proto::physical_plan::to_proto::serialize_physical_expr;
 use datafusion_proto::{
     physical_plan::AsExecutionPlan,
@@ -111,13 +110,28 @@ impl<'a> Planner<'a> {
 
         rx.try_recv().unwrap()
     }
+
+    pub(crate) fn sync_local_plan(&self, plan: &LogicalPlan) -> Result<Arc<dyn ExecutionPlan>> {
+        let mut config = datafusion::prelude::SessionConfig::new().with_target_partitions(1);
+        config.options_mut().optimizer.repartition_aggregations = false;
+        config.options_mut().optimizer.repartition_joins = false;
+        config.options_mut().optimizer.repartition_sorts = false;
+        let state = datafusion::execution::SessionStateBuilder::new()
+            .with_config(config)
+            .with_default_features()
+            .build();
+        crate::local_physical::normalize_finite_partitions(
+            Planner::new(self.schema_provider, &state).sync_plan(plan)?,
+        )
+    }
     pub(crate) fn create_physical_expr(
         &self,
         expr: &Expr,
         input_dfschema: &DFSchema,
     ) -> Result<Arc<dyn PhysicalExpr>> {
+        let expr = crate::local_planning::lower_expression(expr.clone(), input_dfschema, self)?;
         self.planner
-            .create_physical_expr(expr, input_dfschema, self.session_state)
+            .create_physical_expr(&expr, input_dfschema, self.session_state)
     }
 
     pub(crate) fn serialize_as_physical_expr(
@@ -126,7 +140,7 @@ impl<'a> Planner<'a> {
         schema: &DFSchema,
     ) -> Result<Vec<u8>> {
         let physical = self.create_physical_expr(expr, schema)?;
-        let proto = serialize_physical_expr(&physical, &DefaultPhysicalExtensionCodec {})?;
+        let proto = serialize_physical_expr(&physical, &ArroyoPhysicalExtensionCodec::default())?;
         Ok(proto.encode_to_vec())
     }
 
@@ -220,7 +234,7 @@ impl<'a> Planner<'a> {
         ]);
 
         let binning_function = self.create_physical_expr(&date_bin, &input_schema)?;
-        serialize_physical_expr(&binning_function, &DefaultPhysicalExtensionCodec {})
+        serialize_physical_expr(&binning_function, &ArroyoPhysicalExtensionCodec::default())
     }
 }
 

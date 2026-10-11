@@ -13,7 +13,6 @@ use datafusion::common::{DFSchemaRef, DataFusionError, Result, TableReference, i
 use datafusion::logical_expr::{
     Expr, LogicalPlan, UserDefinedLogicalNode, UserDefinedLogicalNodeCore,
 };
-use datafusion_proto::physical_plan::DefaultPhysicalExtensionCodec;
 use datafusion_proto::physical_plan::to_proto::serialize_physical_expr;
 use prost::Message;
 use watermark_node::WatermarkNode;
@@ -232,7 +231,10 @@ impl ArroyoExtension for AsyncUDFExtension {
             .iter()
             .map(|e| {
                 let p = planner.create_physical_expr(e, self.input.schema())?;
-                Ok(serialize_physical_expr(&p, &DefaultPhysicalExtensionCodec {})?.encode_to_vec())
+                if crate::local_physical::contains_local(&p) {
+                    return datafusion::common::plan_err!("finite local SQL expressions cannot compose with asynchronous UDF arguments or results");
+                }
+                Ok(serialize_physical_expr(&p, &datafusion_proto::physical_plan::DefaultPhysicalExtensionCodec {})?.encode_to_vec())
             })
             .collect::<Result<Vec<_>>>()?;
 
@@ -250,7 +252,10 @@ impl ArroyoExtension for AsyncUDFExtension {
             .iter()
             .map(|e| {
                 let p = planner.create_physical_expr(e, &post_udf_schema)?;
-                Ok(serialize_physical_expr(&p, &DefaultPhysicalExtensionCodec {})?.encode_to_vec())
+                if crate::local_physical::contains_local(&p) {
+                    return datafusion::common::plan_err!("finite local SQL expressions cannot compose with asynchronous UDF arguments or results");
+                }
+                Ok(serialize_physical_expr(&p, &datafusion_proto::physical_plan::DefaultPhysicalExtensionCodec {})?.encode_to_vec())
             })
             .collect::<Result<Vec<_>>>()?;
 

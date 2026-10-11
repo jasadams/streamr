@@ -321,7 +321,14 @@ impl StatelessPhysicalExecutor {
         let result = self
             .plan
             .reset()
-            .and_then(|_| self.plan.execute(0, self.task_context.clone()));
+            .and_then(|_| {
+                if arroyo_planner::local_physical::plan_contains_local(self.plan.as_ref()) {
+                    arroyo_planner::local_physical::wrap_local_execution(self.plan.clone())
+                } else {
+                    Ok(self.plan.clone())
+                }
+            })
+            .and_then(|plan| plan.execute(0, self.task_context.clone()));
         let stream = match result {
             Ok(stream) => stream,
             Err(error) => return failed_execution_stream(self.plan.schema(), error),

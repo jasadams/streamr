@@ -18,7 +18,6 @@ use arroyo_rpc::grpc::api::{
 };
 use arroyo_state::live::typed_table::{TableDescriptor, TypedTable, WorkingScope};
 use datafusion::physical_expr::PhysicalExpr;
-use datafusion_proto::physical_plan::DefaultPhysicalExtensionCodec;
 use datafusion_proto::physical_plan::from_proto::parse_physical_expr;
 use datafusion_proto::protobuf::PhysicalExprNode;
 use prost::Message;
@@ -137,8 +136,13 @@ fn decode_expr(
     allowance: &Arc<ConcatAllowance>,
 ) -> Result<Arc<dyn PhysicalExpr>> {
     let node = PhysicalExprNode::decode(bytes)?;
-    let expression =
-        parse_physical_expr(&node, registry, schema, &DefaultPhysicalExtensionCodec {})?;
+    let expression = parse_physical_expr(
+        &node,
+        registry,
+        schema,
+        &arroyo_planner::physical::ArroyoPhysicalExtensionCodec::default(),
+    )?;
+    arroyo_planner::local_physical::validate_local_expression(&expression, schema)?;
     guard_expression(expression, allowance).map_err(Into::into)
 }
 
@@ -357,7 +361,7 @@ impl StateTableStep {
         Ok(!values.is_null(0) && values.value(0))
     }
 
-    fn apply_values(
+    async fn apply_values(
         &self,
         clause: &MutationClause,
         expression_input: &RecordBatch,
@@ -368,6 +372,9 @@ impl StateTableStep {
             None => vec![None; self.table_schema.fields().len()],
         };
         for (index, expr) in &clause.values {
+            let expr =
+                arroyo_planner::local_physical::resolve_expression(expr.clone(), expression_input)
+                    .await?;
             columns[*index] = Some(expr.evaluate(expression_input)?.into_array(1)?);
         }
         let columns = columns
@@ -530,13 +537,23 @@ impl StateTableStep {
                     continue;
                 }
                 if let Some(predicate) = &clause.predicate
-                    && !Self::predicate_is_true(predicate.as_ref(), &expression_input)?
+                    && !Self::predicate_is_true(
+                        arroyo_planner::local_physical::resolve_expression(
+                            predicate.clone(),
+                            &expression_input,
+                        )
+                        .await?
+                        .as_ref(),
+                        &expression_input,
+                    )?
                 {
                     continue;
                 }
                 match clause.action {
                     MutationAction::Insert | MutationAction::Update => {
-                        let value = self.apply_values(clause, &expression_input, old_batch)?;
+                        let value = self
+                            .apply_values(clause, &expression_input, old_batch)
+                            .await?;
                         ensure!(
                             &value.project(&self.primary_key)? == key,
                             "state-table mutation changed its matched primary key"
@@ -1044,8 +1061,6 @@ mod tests {
     /// Parse SQL and decode exactly the fused worker plan emitted by the
     /// planner. These tests exercise MERGE, rather than invoking JSON UDFs.
     async fn planned_json_merge(expression: &str) -> (FusedEventProgram, SchemaRef) {
-        use arroyo_rpc::grpc::api::FusedStateTableOperator;
-        use prost::Message;
         let sql = format!(
             r#"
 CREATE TABLE json_events (k TEXT NOT NULL, payload TEXT NOT NULL)
@@ -1059,8 +1074,13 @@ RETURNING source AS source,old AS old,new AS new,action AS action;
 SELECT * FROM applied;
 "#
         );
+        planned_merge(&sql).await
+    }
+
+    async fn planned_merge(sql: &str) -> (FusedEventProgram, SchemaRef) {
+        use arroyo_rpc::grpc::api::FusedStateTableOperator;
         let compiled = arroyo_planner::parse_and_get_program(
-            &sql,
+            sql,
             arroyo_planner::ArroyoSchemaProvider::new(),
             arroyo_planner::SqlConfig {
                 default_parallelism: 1,
@@ -1428,6 +1448,118 @@ SELECT * FROM applied;
                     .await
                     .unwrap();
                 std::fs::remove_dir_all(root).unwrap();
+            }
+        }
+    }
+    #[tokio::test]
+    async fn local_scalar_merge_preserves_prior_snapshot_memory_rocks_batches_1_8() {
+        const SQL: &str = "CREATE TABLE exit_events (canonical_id VARCHAR NOT NULL, exit_time TIMESTAMP) WITH (connector='single_file',path='/tmp/local-exits.jsonl',format='json',type='source'); CREATE STATE TABLE exit_profiles (canonical_id VARCHAR PRIMARY KEY, latest_exit TIMESTAMP) PARTITION BY canonical_id; CREATE VIEW applied AS MERGE INTO exit_profiles AS previous USING exit_events AS incoming ON previous.canonical_id=incoming.canonical_id WHEN MATCHED THEN UPDATE SET latest_exit=(SELECT MAX(candidate.t) FROM (VALUES (previous.latest_exit),(incoming.exit_time)) AS candidate(t)) WHEN NOT MATCHED THEN INSERT (canonical_id,latest_exit) VALUES (incoming.canonical_id,incoming.exit_time) RETURNING source AS source,old AS old,new AS new,action AS action; SELECT * FROM applied;";
+        for rocks in [false, true] {
+            for batch_size in [1, 8] {
+                let (mut program, schema) = planned_merge(SQL).await;
+                let (tables, _, cleanup) = json_tables(&program, rocks).await;
+                let table = tables.values().next().unwrap();
+                let values = [
+                    ("p1", 3_i64),
+                    ("p1", 1),
+                    ("p2", 2),
+                    ("p1", 2),
+                    ("p2", 1),
+                    ("p1", 3),
+                    ("p2", 2),
+                    ("p1", 1),
+                ];
+                let mut captures = Vec::new();
+                for chunk in values.chunks(batch_size) {
+                    let columns = schema
+                        .fields()
+                        .iter()
+                        .map(|field| match field.name().as_str() {
+                            "canonical_id" => Arc::new(StringArray::from(
+                                chunk.iter().map(|(key, _)| *key).collect::<Vec<_>>(),
+                            )) as ArrayRef,
+                            "exit_time" => arrow::compute::cast(
+                                &TimestampNanosecondArray::from(
+                                    chunk
+                                        .iter()
+                                        .map(|(_, value)| value * 86_400_000_000_000)
+                                        .collect::<Vec<_>>(),
+                                ),
+                                field.data_type(),
+                            )
+                            .unwrap(),
+                            "_timestamp" => {
+                                Arc::new(TimestampNanosecondArray::from(vec![0; chunk.len()]))
+                                    as ArrayRef
+                            }
+                            name => panic!("unexpected source column {name}"),
+                        })
+                        .collect();
+                    let batch = RecordBatch::try_new(schema.clone(), columns).unwrap();
+                    let mut scope = table.begin().await.unwrap();
+                    for row in 0..batch.num_rows() {
+                        let captured = program
+                            .execute_event(&batch.slice(row, 1), &tables, &mut scope)
+                            .await
+                            .unwrap();
+                        captures.push(
+                            extract_capture(&captured, 0, program.capture_schemas[0].clone())
+                                .unwrap(),
+                        );
+                    }
+                    scope.commit().await.unwrap();
+                }
+                for (index, capture) in captures.iter().enumerate() {
+                    let old = capture
+                        .column(1)
+                        .as_any()
+                        .downcast_ref::<StructArray>()
+                        .unwrap();
+                    let new = capture
+                        .column(2)
+                        .as_any()
+                        .downcast_ref::<StructArray>()
+                        .unwrap();
+                    let latest = arrow::compute::cast(
+                        new.column(1),
+                        &DataType::Timestamp(TimeUnit::Nanosecond, None),
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        latest
+                            .as_any()
+                            .downcast_ref::<TimestampNanosecondArray>()
+                            .unwrap()
+                            .value(0),
+                        if values[index].0 == "p1" { 3 } else { 2 } * 86_400_000_000_000
+                    );
+                    if index == 1 {
+                        let prior = arrow::compute::cast(
+                            old.column(1),
+                            &DataType::Timestamp(TimeUnit::Nanosecond, None),
+                        )
+                        .unwrap();
+                        assert_eq!(
+                            prior
+                                .as_any()
+                                .downcast_ref::<TimestampNanosecondArray>()
+                                .unwrap()
+                                .value(0),
+                            3 * 86_400_000_000_000
+                        );
+                    }
+                }
+                drop(captures);
+                drop(tables);
+                drop(program);
+                if let Some(JsonBackendCleanup { root, backend }) = cleanup {
+                    Arc::try_unwrap(backend)
+                        .unwrap_or_else(|_| panic!("retained test backend"))
+                        .close()
+                        .await
+                        .unwrap();
+                    std::fs::remove_dir_all(root).unwrap();
+                }
             }
         }
     }
