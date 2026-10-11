@@ -6,7 +6,7 @@ rows//2 payloads; --checkpoint-rows selects another positive prefix smaller
 than the total row count. A high prefix can qualify a 10x checkpoint while
 leaving rows for replay. Full pre-EOF state holds all rows. Report checkpoint
 and full-state payload floors separately; each reaches 10x only when it
-contains ten times the fixed, conservative 50 MiB pool sum. RSS includes the
+contains ten times the fixed, conservative 34 MiB pool sum. RSS includes the
 whole SQL-test process. HOP overlaps do not multiply the per-input retained
 payload floor. No rescaling is tested.
 """

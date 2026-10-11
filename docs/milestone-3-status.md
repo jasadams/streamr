@@ -1,12 +1,18 @@
 # Milestone 3 — agent backlog
 
-## STR-32 MVP scope cleanup and Kafka review — 2026-10-11
+## STR-32 MVP scope cleanup and qualification — 2026-10-11
 
-- User authorized removal of graph/network byte admission, operator execution admission and unused timer/ranked/history helper APIs. Keep native SQL, RocksDB backend limits and Kafka recovery; review Kafka architecture before proposing changes.
-- Fresh fetched base682bea0d remains current. Worktree /home/jason/repos/streamr-str32-arroyo-queues; guidance AGENTS.md, .claude/build-test.md/team.md, this ledger/work-plan, current STR32. Historical in-flight records are root-owned, no competing claim.
-- Full removal source review approved on86d3fdf5; initial check failed on a leftover SESSION output-bound local, corrected and freshly reviewed in8a03fb98. Current locked five-crate check and fmt passed; strict Clippy/tests/capacity pending. Superseded queue-only check cancelled143, not a pass. Kafka architecture review is written; its crash/catch-up qualification gaps remain explicit.
-- Acceptance: complete obsolete API/config/dispatch/test removal, preserve backend/current SQL/recovery contracts; fresh independent review, container gates, exact value/checkpoint/closure tests and original100k/batch32/RSS512MiB capacity regression. No replacement backpressure design or Kafka redesign.
-- Next: finish serialized strict Clippy and runtime gates, pin current-source SQL executable and rerun original100k/batch32 capacity. Actual aggregate backend pool sum62MiB; original payload still exceeds prior10x78MiB threshold. MVP scope guidance saved in AGENTS/feature plan and Trakkt project/milestone/STR32. Full application lifecycle/live journal/combined capacity qualification remains open; no pending user decision for these removals.
+- Authorized scope: restore Arroyo graph/network row backpressure and DataFusion execution; remove added global execution admission and unused timer/ranked/history APIs. Keep native SQL/state tables, RocksDB backend limits and existing Kafka recovery. No replacement backpressure or Kafka redesign is authorized.
+- Base: fetched main `682bea0d`; worktree `/home/jason/repos/streamr-str32-arroyo-queues`, implementation source `e4aec059`. Guidance: AGENTS.md, .claude/build-test.md/team.md, this ledger/work-plan and current Trakkt STR-32. No automatic ticket time limit or signing requirement.
+- Delivery: independent source review approved; required-container locked checks, fmt and strict Clippy passed; operator8/worker163/state72/RPC35 library tests passed (278 total). Published [PR36](https://github.com/jasadams/streamr/pull/36); all six current-head CI checks pass. Not merged or deployed.
+- Capacity: original100000-key/batch32 attempt failed its1800s watchdog, preserved. Same executable rerun with only caller timeout7200s, reservation `fdab74cda49a`; input/payload/batch/backend budgets/RSS cap unchanged. Full initial/recovered value/CDC and independent physical checkpoint audits passed:100000keys,200000recovered rows,819200000-byte logical floor,366641152-byte whole-child peak RSS (<512MiB). Evidence: `/home/jason/qa-evidence/str32-arroyo-queues-20261011/`.
+- All48 small aggregate8/updating-join32/state-table8 SQL matrices passed independent exact-output/prefix/receipt audits. Next: publish reviewed delivery evidence, verify final-head CI and reconcile remaining STR-32/application acceptance. Recovery here recreates workers in one SQL-test process; it is not a process-loss qualification gate. No new build is required.
+- Kafka architecture and independent evidence reviews are complete. Keep the existing mechanism; encoded-journal live catch-up and broader crash/fanout scenarios remain explicit qualification gaps. User requested stopping the CPU-heavy Arcstream demo container; stopped with state preserved.
+- Throughput: ingestion logged RocksDB compaction-related throttling under4MiB memtable; current output drain repeatedly creates internal filesystem read snapshots/flushes. Exact stage-time dominance unmeasured; no tuning or redesign applied. Full Arcstream lifecycle/live journal/combined-capacity qualification remains open. No user decision pending for the approved cleanup.
+
+## Historical feature delivery receipts
+
+The following source-bound notes preserve earlier feature delivery. Their “active”/“next” labels are historical, not worker assignments. The original STR-101 feature PR33 and STR-102 PR34 are merged. The subsequent ordered-window repair PR35 remains unmerged; the current task above controls.
 
 ## Active STR-102 — 2026-10-10
 

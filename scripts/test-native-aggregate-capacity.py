@@ -2,7 +2,7 @@
 """Exact native updating-aggregate capacity fixtures; no captured-value oracles.
 
 Preparation alone is not qualification. Run one child/protocol at a time in the
-required container. No resource overrides: current native aggregate pool sum78MiB.
+required container. No resource overrides: current native aggregate pool sum62MiB.
 """
 import argparse
 from datetime import datetime, timedelta
