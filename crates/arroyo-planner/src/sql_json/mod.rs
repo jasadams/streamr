@@ -13,3 +13,5 @@
 pub mod kernels;
 pub mod lowering;
 pub mod path;
+
+pub(crate) mod table;

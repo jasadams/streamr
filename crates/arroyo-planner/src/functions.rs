@@ -119,6 +119,10 @@ pub fn register_all(registry: &mut dyn FunctionRegistry) {
 
     registry.register_udf(multi_hash()).unwrap();
 
+    registry
+        .register_udf(crate::sql_json::kernels::json_table_rows())
+        .unwrap();
+
     // ANSI SQL/JSON kernels. Registered here — the single choke point for
     // planner and worker (`physical::new_registry`) — so both sides always
     // resolve the same implementations. Names are lowercase because

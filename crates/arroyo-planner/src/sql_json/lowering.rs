@@ -83,6 +83,19 @@ impl SqlJsonLowering {
 impl VisitorMut for SqlJsonLowering {
     type Break = ();
 
+    fn post_visit_table_factor(
+        &mut self,
+        relation: &mut sqlparser::ast::TableFactor,
+    ) -> ControlFlow<()> {
+        match super::table::lower_relation(relation) {
+            Ok(()) => ControlFlow::Continue(()),
+            Err(error) => {
+                self.error = Some(error);
+                ControlFlow::Break(())
+            }
+        }
+    }
+
     fn post_visit_expr(&mut self, expr: &mut Expr) -> ControlFlow<()> {
         // Children (documents, JSON_OBJECT values) were already rewritten by
         // the time this node is visited, so nesting works at any depth.
@@ -151,14 +164,14 @@ fn take_expr(expr: &mut Expr) -> Expr {
     std::mem::replace(expr, Expr::Value(Value::Null.into()))
 }
 
-fn string_literal(value: &str) -> Expr {
+pub(super) fn string_literal(value: &str) -> Expr {
     Expr::Value(Value::SingleQuotedString(value.to_string()).into())
 }
 
 /// Build `name(args)` as an ordinary sqlparser function call. DataFusion's
 /// generic function path resolves the lowercase name through the schema
 /// provider's registry, where the SQL/JSON kernels are registered.
-fn function_call(name: &str, args: Vec<Expr>) -> Expr {
+pub(super) fn function_call(name: &str, args: Vec<Expr>) -> Expr {
     Expr::Function(Function {
         name: ObjectName(vec![ObjectNamePart::Identifier(Ident::new(name))]),
         uses_odbc_syntax: false,

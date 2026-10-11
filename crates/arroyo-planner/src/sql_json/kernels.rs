@@ -21,12 +21,13 @@ use std::sync::Arc;
 
 use arrow_array::{
     Array, ArrayRef, BooleanArray, Float64Array, LargeStringArray, StringArray, StringViewArray,
+    builder::{ListBuilder, StringBuilder},
 };
 use arrow_schema::DataType;
 use datafusion::common::{DataFusionError, Result, ScalarValue};
 use datafusion::logical_expr::{
-    ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, TypeSignature,
-    Volatility,
+    ColumnarValue, ReturnFieldArgs, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature,
+    TypeSignature, Volatility,
 };
 use serde_json::{Number, Value};
 
@@ -279,28 +280,61 @@ fn parse_numeric_string(raw: &str) -> Option<ScalarValue> {
 /// A matched JSON null item serializes to the four-character text `null`,
 /// distinct from SQL NULL (which means no match).
 fn serialize_query_item(item: &PathItem<'_>) -> Result<String> {
-    let text = match item {
-        PathItem::Value(value) => serde_json::to_string(value).map_err(|error| {
-            DataFusionError::Internal(format!("JSON_QUERY serialization failed: {error}"))
-        })?,
-        PathItem::Str(s) => serde_json::to_string(s).map_err(|error| {
-            DataFusionError::Internal(format!("JSON_QUERY serialization failed: {error}"))
-        })?,
-        PathItem::Id(id) => id.to_string(),
-        PathItem::KeyValue { key, value, id } => {
-            let key = serde_json::to_string(key).map_err(|error| {
-                DataFusionError::Internal(format!("JSON_QUERY serialization failed: {error}"))
-            })?;
-            let value = serde_json::to_string(value).map_err(|error| {
-                DataFusionError::Internal(format!("JSON_QUERY serialization failed: {error}"))
-            })?;
-            format!("{{\"key\":{key},\"value\":{value},\"id\":{id}}}")
-        }
-    };
-    if text.len() > MAX_OUTPUT_BYTES {
-        return Err(output_too_large("JSON_QUERY", text.len()));
+    serialize_query_item_bounded(item, MAX_OUTPUT_BYTES)
+}
+
+/// JSON serialization that checks the byte bound before allocation grows.
+/// The writer is invocation-owned and drops on either error or cancellation.
+fn serialize_query_item_bounded(item: &PathItem<'_>, maximum: usize) -> Result<String> {
+    use std::io::Write;
+    struct BoundedWriter {
+        bytes: Vec<u8>,
+        maximum: usize,
     }
-    Ok(text)
+    impl Write for BoundedWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if bytes.len() > self.maximum.saturating_sub(self.bytes.len()) {
+                return Err(std::io::Error::other("SQL/JSON output byte bound exceeded"));
+            }
+            self.bytes.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut writer = BoundedWriter {
+        bytes: Vec::new(),
+        maximum,
+    };
+    let written = (|| -> std::result::Result<(), serde_json::Error> {
+        match item {
+            PathItem::Value(value) => serde_json::to_writer(&mut writer, value)?,
+            PathItem::Str(value) => serde_json::to_writer(&mut writer, value)?,
+            PathItem::Id(id) => serde_json::to_writer(&mut writer, id)?,
+            PathItem::KeyValue { key, value, id } => {
+                use serde::ser::{SerializeMap, Serializer};
+                let mut serializer = serde_json::Serializer::new(&mut writer);
+                let mut map = serializer.serialize_map(Some(3))?;
+                map.serialize_entry("key", key)?;
+                map.serialize_entry("value", value)?;
+                map.serialize_entry("id", id)?;
+                map.end()?;
+            }
+        }
+        Ok(())
+    })();
+    if let Err(error) = written {
+        if error.is_io() {
+            return Err(DataFusionError::ResourcesExhausted(format!(
+                "SQL/JSON serialization exceeds the remaining output byte budget of {maximum} bytes (maximum event output {MAX_OUTPUT_BYTES} bytes)"
+            )));
+        }
+        return Err(DataFusionError::Internal(format!(
+            "SQL/JSON serialization failed: {error}"
+        )));
+    }
+    String::from_utf8(writer.bytes).map_err(|error| DataFusionError::Internal(error.to_string()))
 }
 
 impl JsonValueFunc {
@@ -750,6 +784,20 @@ impl ScalarUDFImpl for JsonExistsFunc {
         Ok(DataType::Boolean)
     }
 
+    fn return_field_from_args(&self, args: ReturnFieldArgs) -> Result<arrow_schema::FieldRef> {
+        // Only a SQL-null document makes JSON_EXISTS SQL NULL; malformed
+        // documents and absent paths follow FALSE ON ERROR/empty semantics.
+        let nullable = args
+            .arg_fields
+            .first()
+            .is_none_or(|field| field.is_nullable());
+        Ok(Arc::new(arrow_schema::Field::new(
+            self.name(),
+            DataType::Boolean,
+            nullable,
+        )))
+    }
+
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
         self.invoke(args)
     }
@@ -837,15 +885,105 @@ pub fn json_object() -> Arc<ScalarUDF> {
     Arc::new(ScalarUDF::new_from_impl(JsonObjectFunc::new()))
 }
 
+/// Invocation-local finite JSON_TABLE row sequence. Column extraction reuses
+/// the typed SQL/JSON kernels after native UNNEST expands these row documents.
+#[derive(Debug)]
+pub struct JsonTableRowsFunc {
+    signature: Signature,
+}
+
+impl ScalarUDFImpl for JsonTableRowsFunc {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "json_table_rows"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _: &[DataType]) -> Result<DataType> {
+        Ok(DataType::List(Arc::new(arrow_schema::Field::new(
+            "item",
+            DataType::Utf8,
+            false,
+        ))))
+    }
+    fn return_field_from_args(&self, args: ReturnFieldArgs) -> Result<arrow_schema::FieldRef> {
+        match args.scalar_arguments.get(1).and_then(|argument| *argument) {
+            Some(ScalarValue::Utf8(Some(path))) => {
+                super::path::compile_literal_path(path)?;
+            }
+            _ => {
+                return Err(DataFusionError::Plan(
+                    "JSON_TABLE row path must be a non-null UTF8 literal".into(),
+                ));
+            }
+        }
+        Ok(Arc::new(arrow_schema::Field::new(
+            self.name(),
+            self.return_type(&[])?,
+            false,
+        )))
+    }
+
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+        if args.args.len() != 2 {
+            return Err(DataFusionError::Execution(
+                "JSON_TABLE row kernel requires document and literal path".into(),
+            ));
+        }
+        let path = compiled_path(&args.args[1], "JSON_TABLE")?;
+        let documents = args.args[0].clone().into_array(args.number_rows)?;
+        let mut builder = ListBuilder::new(StringBuilder::new()).with_field(Arc::new(
+            arrow_schema::Field::new("item", DataType::Utf8, false),
+        ));
+        for row in 0..args.number_rows {
+            let mut output_bytes = 0usize;
+            with_extraction(
+                row_str(&documents, row)?,
+                &path,
+                "JSON_TABLE",
+                |extraction| {
+                    if let Extraction::Items(items) = extraction {
+                        for item in items {
+                            // Enforce the per-document output bound before extending Arrow
+                            // buffers. Path evaluation independently bounds row cardinality.
+                            let text = serialize_query_item_bounded(
+                                &item,
+                                MAX_OUTPUT_BYTES - output_bytes,
+                            )?;
+                            output_bytes += text.len();
+                            builder.values().append_value(text);
+                        }
+                    }
+                    Ok(())
+                },
+            )?;
+            // SQL NULL and malformed documents produce a valid empty list,
+            // never a null list (native UNNEST preserves null lists).
+            builder.append(true);
+        }
+        Ok(ColumnarValue::Array(Arc::new(builder.finish())))
+    }
+}
+
+pub fn json_table_rows() -> Arc<ScalarUDF> {
+    Arc::new(ScalarUDF::new_from_impl(JsonTableRowsFunc {
+        signature: extraction_signature(),
+    }))
+}
+
 /// The reserved builtin names. User UDF registration must never shadow these
 /// (see `ArroyoSchemaProvider::add_rust_udf` / `add_python_udf`).
-pub const RESERVED_SQL_JSON_UDF_NAMES: [&str; 6] = [
+pub const RESERVED_SQL_JSON_UDF_NAMES: [&str; 7] = [
     "json_value",
     "json_value_boolean",
     "json_value_double",
     "json_query",
     "json_exists",
     "json_object",
+    "json_table_rows",
 ];
 
 pub fn is_reserved_sql_json_udf_name(name: &str) -> bool {
@@ -910,6 +1048,118 @@ mod tests {
     }
 
     const P1: &str = r#"{"traits":{"name":null,"quality_score":0,"steam_wishlisted":false,"linked_accounts":{"discord":{"external_id":"d1"}}},"identifiers":[{"identity_type":"email","value":"a@example.test"}]}"#;
+
+    #[test]
+    fn table_rows_preserve_false_null_and_empty_defaults() {
+        use arrow_array::ListArray;
+        let udf = json_table_rows();
+        for (document, expected) in [
+            (Some(r#"{"vip":true,"old":false,"gone":null}"#), 3),
+            (Some("{}"), 0),
+            (Some("null"), 0),
+            (Some("bad"), 0),
+            (None, 0),
+        ] {
+            let output = invoke(
+                &udf,
+                vec![
+                    ScalarValue::Utf8(document.map(str::to_string)),
+                    ScalarValue::Utf8(Some("$.keyvalue()".into())),
+                ],
+            )
+            .unwrap();
+            let ColumnarValue::Array(array) = output else {
+                panic!("expected list array")
+            };
+            let list = array.as_any().downcast_ref::<ListArray>().unwrap();
+            assert!(!list.is_null(0));
+            assert_eq!(list.value_length(0), expected);
+            if expected == 3 {
+                let values = list.value(0);
+                let strings = values.as_any().downcast_ref::<StringArray>().unwrap();
+                let members: Vec<Value> = strings
+                    .iter()
+                    .map(|value| serde_json::from_str(value.unwrap()).unwrap())
+                    .collect();
+                assert!(
+                    members
+                        .iter()
+                        .any(|item| item["key"] == "old" && item["value"] == false)
+                );
+                assert!(
+                    members
+                        .iter()
+                        .any(|item| item["key"] == "gone" && item["value"].is_null())
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn table_rows_output_bounds_are_per_event_at_batches_1_and_8() {
+        use arrow_array::ListArray;
+        let document = serde_json::json!({"x": "a".repeat(MAX_OUTPUT_BYTES / 8)}).to_string();
+        let udf = json_table_rows();
+        for rows in [1, 8] {
+            let arguments = vec![
+                ColumnarValue::Array(Arc::new(StringArray::from(vec![document.as_str(); rows]))),
+                ColumnarValue::Scalar(ScalarValue::Utf8(Some("$.keyvalue()".into()))),
+            ];
+            let output = udf
+                .invoke_with_args(ScalarFunctionArgs {
+                    args: arguments,
+                    arg_fields: vec![
+                        Arc::new(arrow_schema::Field::new("doc", DataType::Utf8, false)),
+                        Arc::new(arrow_schema::Field::new("path", DataType::Utf8, false)),
+                    ],
+                    number_rows: rows,
+                    return_field: Arc::new(arrow_schema::Field::new(
+                        "rows",
+                        udf.return_type(&[DataType::Utf8, DataType::Utf8]).unwrap(),
+                        false,
+                    )),
+                })
+                .unwrap();
+            let ColumnarValue::Array(output) = output else {
+                panic!("expected rows")
+            };
+            let output = output.as_any().downcast_ref::<ListArray>().unwrap();
+            assert_eq!(output.len(), rows);
+            assert!((0..rows).all(|row| output.value_length(row) == 1));
+        }
+        let excessive = serde_json::json!({"x": "a".repeat(MAX_DOCUMENT_BYTES - 16)}).to_string();
+        assert!(excessive.len() <= MAX_DOCUMENT_BYTES);
+        let error = invoke(
+            &udf,
+            vec![
+                ScalarValue::Utf8(Some(excessive)),
+                ScalarValue::Utf8(Some("$.keyvalue()".into())),
+            ],
+        )
+        .unwrap_err();
+        assert!(matches!(error, DataFusionError::ResourcesExhausted(_)));
+    }
+
+    #[test]
+    fn table_rows_bounds_are_engine_errors_without_partial_results() {
+        let doc =
+            serde_json::to_string(&(0..=super::super::path::MAX_PATH_ITEMS).collect::<Vec<_>>())
+                .unwrap();
+        let error = invoke(
+            &json_table_rows(),
+            vec![
+                ScalarValue::Utf8(Some(doc)),
+                ScalarValue::Utf8(Some("$[*]".into())),
+            ],
+        )
+        .unwrap_err();
+        assert!(matches!(error, DataFusionError::ResourcesExhausted(_)));
+        let item = PathItem::Value(&Value::String("large".into()));
+        assert!(matches!(
+            serialize_query_item_bounded(&item, 2),
+            Err(DataFusionError::ResourcesExhausted(_))
+        ));
+    }
 
     #[test]
     fn value_missing_json_null_and_scalars() {

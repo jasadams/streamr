@@ -26,14 +26,11 @@ use std::{
 };
 
 use crate::functions::MultiHashFunction;
-use crate::rewriters::UNNESTED_COL;
 use crate::schemas::window_arrow_struct;
 use crate::{make_udf_function, register_functions};
 use arrow_array::types::{TimestampNanosecondType, UInt64Type};
 use arroyo_operator::operator::Registry;
-use arroyo_rpc::grpc::api::{
-    ArroyoExecNode, DebeziumEncodeNode, MemExecNode, UnnestExecNode, arroyo_exec_node,
-};
+use arroyo_rpc::grpc::api::{ArroyoExecNode, DebeziumEncodeNode, MemExecNode, arroyo_exec_node};
 use arroyo_rpc::{
     TIMESTAMP_FIELD, UPDATING_META_FIELD,
     grpc::api::{DebeziumDecodeNode, arroyo_exec_node::Node},
@@ -47,7 +44,7 @@ use datafusion::logical_expr::{
 use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_plan::PlanProperties;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
-use datafusion::physical_plan::unnest::{ListUnnest, UnnestExec};
+use datafusion::physical_plan::unnest::UnnestExec;
 use datafusion_proto::physical_plan::PhysicalExtensionCodec;
 use futures::{
     ready,
@@ -211,6 +208,120 @@ fn make_properties(schema: SchemaRef) -> PlanProperties {
     )
 }
 
+fn unnest_output_schema(input: &Schema, column: usize) -> Result<Schema> {
+    let field = input
+        .fields()
+        .get(column)
+        .ok_or_else(|| DataFusionError::Internal("unnest input index exceeds schema".into()))?;
+    let DataType::List(element) = field.data_type() else {
+        return Err(DataFusionError::Internal(
+            "unnest input column must be a List".into(),
+        ));
+    };
+    let mut fields = input.fields().to_vec();
+    fields[column] = Arc::new(element.as_ref().clone().with_name(field.name()));
+    Ok(Schema::new_with_metadata(fields, input.metadata().clone()))
+}
+
+/// Validate the SQL/JSON extraction contracts after native physical decoding.
+/// DataFusion's decoder trusts serialized UDF return fields rather than calling
+/// return_field_from_args. The standard JSON_TABLE lowering emits these kernels
+/// in projections; filters can also contain the shared column expressions.
+/// No document, compiled path or schema allocation is retained by this check.
+pub fn validate_json_table_execution_plan(plan: &dyn ExecutionPlan) -> Result<()> {
+    use datafusion::physical_expr::{PhysicalExpr, ScalarFunctionExpr, expressions::Literal};
+    use datafusion::physical_plan::{filter::FilterExec, projection::ProjectionExec};
+    fn expression(expr: &Arc<dyn PhysicalExpr>, input: &Schema) -> Result<()> {
+        if let Some(function) = expr.as_any().downcast_ref::<ScalarFunctionExpr>() {
+            let expected = match function.name() {
+                "json_table_rows" => Some(DataType::List(Arc::new(arrow_schema::Field::new(
+                    "item",
+                    DataType::Utf8,
+                    false,
+                )))),
+                "json_value" | "json_query" => Some(DataType::Utf8),
+                "json_value_boolean" | "json_exists" => Some(DataType::Boolean),
+                "json_value_double" => Some(DataType::Float64),
+                _ => None,
+            };
+            if let Some(expected) = expected {
+                if function.args().len() != 2 {
+                    return Err(DataFusionError::Plan(format!(
+                        "{} physical decode requires document and literal path",
+                        function.name()
+                    )));
+                }
+                if function.args()[0].data_type(input)? != DataType::Utf8 {
+                    return Err(DataFusionError::Plan(format!(
+                        "{} physical decode document must be UTF8",
+                        function.name()
+                    )));
+                }
+                let Some(literal) = function.args()[1].as_any().downcast_ref::<Literal>() else {
+                    return Err(DataFusionError::Plan(format!(
+                        "{} physical decode path must be a non-null UTF8 literal",
+                        function.name()
+                    )));
+                };
+                let ScalarValue::Utf8(Some(path)) = literal.value() else {
+                    return Err(DataFusionError::Plan(format!(
+                        "{} physical decode path must be a non-null UTF8 literal",
+                        function.name()
+                    )));
+                };
+                crate::sql_json::path::compile_literal_path(path)?;
+                let nullable = match function.name() {
+                    "json_table_rows" => false,
+                    "json_exists" => function.args()[0].nullable(input)?,
+                    _ => true,
+                };
+                if function.return_type() != &expected || function.nullable() != nullable {
+                    return Err(DataFusionError::Plan(format!(
+                        "{} physical decode return schema/nullability disagrees with kernel",
+                        function.name()
+                    )));
+                }
+            }
+        }
+        for child in expr.children() {
+            expression(child, input)?;
+        }
+        Ok(())
+    }
+    if let Some(unnest) = plan.as_any().downcast_ref::<UnnestExec>() {
+        if unnest.list_column_indices().len() != 1
+            || unnest.list_column_indices()[0].depth != 1
+            || !unnest.struct_column_indices().is_empty()
+            || unnest.options() != &UnnestOptions::default()
+        {
+            return Err(DataFusionError::NotImplemented(
+                "unnest supports one depth-1 List with default options".into(),
+            ));
+        }
+        let expected = unnest_output_schema(
+            unnest.input().schema().as_ref(),
+            unnest.list_column_indices()[0].index_in_input_schema,
+        )?;
+        if unnest.schema().as_ref() != &expected {
+            return Err(DataFusionError::Plan(
+                "unnest decoded output schema disagrees with input".into(),
+            ));
+        }
+    }
+    if let Some(projection) = plan.as_any().downcast_ref::<ProjectionExec>() {
+        for (expr, _) in projection.expr() {
+            expression(expr, projection.input().schema().as_ref())?;
+        }
+    }
+    if let Some(filter) = plan.as_any().downcast_ref::<FilterExec>() {
+        expression(filter.predicate(), filter.input().schema().as_ref())?;
+    }
+    for input in plan.children() {
+        validate_json_table_execution_plan(input.as_ref())?;
+    }
+    Ok(())
+}
+
 impl PhysicalExtensionCodec for ArroyoPhysicalExtensionCodec {
     fn try_decode(
         &self,
@@ -282,33 +393,6 @@ impl PhysicalExtensionCodec for ArroyoPhysicalExtensionCodec {
                     }
                 }
             }
-            Node::UnnestExec(unnest) => {
-                let schema: Schema = serde_json::from_str(&unnest.schema).map_err(|e| {
-                    DataFusionError::Internal(format!("invalid schema in exec codec: {e:?}"))
-                })?;
-
-                let column = schema.index_of(UNNESTED_COL).map_err(|_| {
-                    DataFusionError::Internal(format!(
-                        "unnest node schema does not contain {UNNESTED_COL} col"
-                    ))
-                })?;
-
-                Ok(Arc::new(UnnestExec::new(
-                    inputs
-                        .first()
-                        .ok_or_else(|| {
-                            DataFusionError::Internal("no input for unnest node".to_string())
-                        })?
-                        .clone(),
-                    vec![ListUnnest {
-                        index_in_input_schema: column,
-                        depth: 1,
-                    }],
-                    vec![],
-                    Arc::new(schema),
-                    UnnestOptions::default(),
-                )))
-            }
             Node::DebeziumDecode(debezium) => {
                 let schema = Arc::new(serde_json::from_str::<Schema>(&debezium.schema).map_err(
                     |e| DataFusionError::Internal(format!("invalid schema in exec codec: {e:?}")),
@@ -363,14 +447,6 @@ impl PhysicalExtensionCodec for ArroyoPhysicalExtensionCodec {
             });
         }
 
-        let unnest: Option<&UnnestExec> = node.as_any().downcast_ref();
-        if let Some(unnest) = unnest {
-            proto = Some(ArroyoExecNode {
-                node: Some(arroyo_exec_node::Node::UnnestExec(UnnestExecNode {
-                    schema: serde_json::to_string(&unnest.schema()).unwrap(),
-                })),
-            });
-        }
         let debezium_decode: Option<&DebeziumUnrollingExec> = node.as_any().downcast_ref();
         if let Some(decode) = debezium_decode {
             proto = Some(ArroyoExecNode {

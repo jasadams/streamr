@@ -341,12 +341,12 @@ impl TreeNodeRewriter for SourceRewriter<'_> {
     }
 }
 
-pub const UNNESTED_COL: &str = "__unnested";
+const UNNESTED_COL: &str = "__unnested";
 
 pub struct UnnestRewriter {}
 
 impl UnnestRewriter {
-    fn split_unnest(expr: Expr) -> DFResult<(Expr, Option<Expr>)> {
+    fn split_unnest(expr: Expr, output_name: &str) -> DFResult<(Expr, Option<Expr>)> {
         let mut c: Option<Expr> = None;
 
         let expr = expr.transform_up(&mut |e| {
@@ -362,7 +362,7 @@ impl UnnestRewriter {
                         };
 
                         return Ok(Transformed::yes(Expr::Column(Column::new_unqualified(
-                            UNNESTED_COL,
+                            output_name,
                         ))));
                     }
                     n => {
@@ -383,13 +383,42 @@ impl TreeNodeRewriter for UnnestRewriter {
     fn f_up(&mut self, node: Self::Node) -> DFResult<Transformed<Self::Node>> {
         let LogicalPlan::Projection(projection) = &node else {
             if node.expressions().iter().any(|e| {
-                let e = Self::split_unnest(e.clone());
+                let e = Self::split_unnest(e.clone(), UNNESTED_COL);
                 e.is_err() || e.unwrap().1.is_some()
             }) {
                 return plan_err!("unnest is only supported in SELECT statements");
             }
+            // DataFusion's child traversal retains cached alias schemas. An
+            // unnested child can refine its field nullability, so rebind the
+            // alias from the rewritten input before planning its parent.
+            if let LogicalPlan::SubqueryAlias(alias) = &node {
+                let rebound = datafusion::logical_expr::SubqueryAlias::try_new(
+                    alias.input.clone(),
+                    alias.alias.clone(),
+                )?;
+                let changed = rebound.schema != alias.schema;
+                return Ok(Transformed::new(
+                    LogicalPlan::SubqueryAlias(rebound),
+                    changed,
+                    TreeNodeRecursion::Continue,
+                ));
+            }
             return Ok(Transformed::no(node));
         };
+
+        // The generated column must not shadow either a source or projected
+        // user field, including qualified source columns with the same name.
+        let mut output_name = UNNESTED_COL.to_string();
+        while projection
+            .input
+            .schema()
+            .fields()
+            .iter()
+            .chain(projection.schema.fields().iter())
+            .any(|field| field.name() == &output_name)
+        {
+            output_name.push('_');
+        }
 
         let mut unnest = None;
         let exprs = projection
@@ -398,7 +427,7 @@ impl TreeNodeRewriter for UnnestRewriter {
             .into_iter()
             .enumerate()
             .map(|(i, expr)| {
-                let (expr, opt) = Self::split_unnest(expr)?;
+                let (expr, opt) = Self::split_unnest(expr, &output_name)?;
                 let typ = if let Some(e) = opt {
                     if let Some(prev) = unnest.replace((e, i))
                         && &prev != unnest.as_ref().unwrap()
@@ -417,23 +446,20 @@ impl TreeNodeRewriter for UnnestRewriter {
             .collect::<DFResult<Vec<_>>>()?;
 
         if let Some((unnest_inner, unnest_idx)) = unnest {
-            let produce_list = Arc::new(LogicalPlan::Projection(
-                Projection::try_new(
-                    exprs
-                        .iter()
-                        .cloned()
-                        .map(|(e, is_unnest)| {
-                            if is_unnest {
-                                unnest_inner.clone().alias(UNNESTED_COL)
-                            } else {
-                                e
-                            }
-                        })
-                        .collect(),
-                    projection.input.clone(),
-                )
-                .unwrap(),
-            ));
+            let produce_list = Arc::new(LogicalPlan::Projection(Projection::try_new(
+                exprs
+                    .iter()
+                    .cloned()
+                    .map(|(e, is_unnest)| {
+                        if is_unnest {
+                            unnest_inner.clone().alias(output_name.clone())
+                        } else {
+                            e
+                        }
+                    })
+                    .collect(),
+                projection.input.clone(),
+            )?));
 
             let unnest_fields = fields_with_qualifiers(produce_list.schema())
                 .iter()
@@ -448,7 +474,7 @@ impl TreeNodeRewriter for UnnestRewriter {
                         };
 
                         Ok(DFField::new_unqualified(
-                            UNNESTED_COL,
+                            &output_name,
                             inner.data_type().clone(),
                             inner.is_nullable(),
                         ))
@@ -467,7 +493,7 @@ impl TreeNodeRewriter for UnnestRewriter {
                 list_type_columns: vec![(
                     unnest_idx,
                     ColumnUnnestList {
-                        output_column: Column::new_unqualified(UNNESTED_COL),
+                        output_column: Column::new_unqualified(&output_name),
                         depth: 1,
                     },
                 )],
@@ -497,7 +523,15 @@ impl TreeNodeRewriter for UnnestRewriter {
 
             Ok(Transformed::yes(output_node))
         } else {
-            Ok(Transformed::no(LogicalPlan::Projection(projection.clone())))
+            // Parent projections also retain their pre-rewrite schema during
+            // child traversal; infer it again from the current input.
+            let rebound = Projection::try_new(projection.expr.clone(), projection.input.clone())?;
+            let changed = rebound.schema != projection.schema;
+            Ok(Transformed::new(
+                LogicalPlan::Projection(rebound),
+                changed,
+                TreeNodeRecursion::Continue,
+            ))
         }
     }
 }
