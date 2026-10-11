@@ -163,10 +163,12 @@ fn expression(
     // rather than via produce_optimized_plan.
     let mut sql = sql.clone();
     crate::sql_json::lowering::rewrite_expr(&mut sql)?;
+    crate::local_sql::lower_array_queries(&mut sql)
+        .map_err(|error| datafusion::common::DataFusionError::Plan(error.to_string()))?;
     let expr = SqlToRel::new(provider).sql_to_expr(sql, schema, &mut PlannerContext::new())?;
     expr.apply(|expr| {
         match expr {
-            Expr::AggregateFunction(_) | Expr::WindowFunction(_) | Expr::ScalarSubquery(_) | Expr::Exists(_) | Expr::InSubquery(_) => {
+            Expr::AggregateFunction(_) | Expr::WindowFunction(_) | Expr::InSubquery(_) => {
                 return plan_err!("MERGE clauses support scalar expressions only; subqueries, aggregates and windows are unsupported");
             }
             _ => {}

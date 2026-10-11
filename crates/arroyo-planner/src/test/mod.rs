@@ -64,3 +64,5 @@ async fn test_udf() {
         .await
         .unwrap();
 }
+
+mod local_subqueries;

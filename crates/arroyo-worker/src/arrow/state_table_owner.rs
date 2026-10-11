@@ -14,7 +14,6 @@ use arroyo_rpc::grpc::api::{FusedStateTableOperator, ProjectionOperator, ValuePl
 use arroyo_state::live::resources::ResourcePermit;
 use arroyo_state::live::typed_table::{TypedTable, WorkingScope};
 use datafusion::physical_expr::PhysicalExpr;
-use datafusion_proto::physical_plan::DefaultPhysicalExtensionCodec;
 use datafusion_proto::physical_plan::from_proto::parse_physical_expr;
 use datafusion_proto::protobuf::PhysicalExprNode;
 use futures::StreamExt;
@@ -263,8 +262,9 @@ impl FusedEventProgram {
                                     &proto,
                                     registry,
                                     input.schema.as_ref(),
-                                    &DefaultPhysicalExtensionCodec {},
+                                    &arroyo_planner::physical::ArroyoPhysicalExtensionCodec::default(),
                                 )?;
+                                arroyo_planner::local_physical::validate_local_expression(&expression, input.schema.as_ref())?;
                                 Ok(guard_expression(expression, &concat_allowance)?)
                             })
                             .collect::<Result<Vec<_>>>()?;
@@ -399,10 +399,15 @@ impl FusedEventProgram {
                             input.schema().as_ref() == input_schema.as_ref(),
                             "fused projection input schema changed"
                         );
-                        let columns = expressions
-                            .iter()
-                            .map(|expression| expression.evaluate(input)?.into_array(1))
-                            .collect::<std::result::Result<Vec<_>, _>>()?;
+                        let mut columns = Vec::with_capacity(expressions.len());
+                        for expression in expressions {
+                            let expression = arroyo_planner::local_physical::resolve_expression(
+                                expression.clone(),
+                                input,
+                            )
+                            .await?;
+                            columns.push(expression.evaluate(input)?.into_array(1)?);
+                        }
                         Some(RecordBatch::try_new(output_schema.clone(), columns)?)
                     }
                     EventOperation::Value {

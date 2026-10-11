@@ -6,7 +6,7 @@ use arrow::{
 use arrow_array::{Array, PrimitiveArray, RecordBatch, StringArray, StructArray, array};
 use arrow_schema::{DataType, Schema, SchemaRef, TimeUnit};
 use datafusion::common::{
-    DataFusionError, Result, ScalarValue, Statistics, UnnestOptions, not_impl_err, plan_err,
+    DataFusionError, Result, ScalarValue, Statistics, not_impl_err, plan_err,
 };
 use datafusion::execution::{RecordBatchStream, SendableRecordBatchStream};
 use datafusion::{
@@ -223,85 +223,131 @@ fn unnest_output_schema(input: &Schema, column: usize) -> Result<Schema> {
     Ok(Schema::new_with_metadata(fields, input.metadata().clone()))
 }
 
+/// Validate one SQL/JSON kernel at any native expression placement. Callers
+/// traverse children; this check does not recursively validate local query plans.
+pub(crate) fn validate_json_table_physical_expression(
+    expr: &Arc<dyn datafusion::physical_expr::PhysicalExpr>,
+    input: &Schema,
+) -> Result<()> {
+    use datafusion::physical_expr::{ScalarFunctionExpr, expressions::Literal};
+    if let Some(function) = expr.as_any().downcast_ref::<ScalarFunctionExpr>() {
+        let expected = match function.name() {
+            "json_table_rows" => Some(DataType::List(Arc::new(arrow_schema::Field::new(
+                "item",
+                DataType::Utf8,
+                false,
+            )))),
+            "json_value" | "json_query" => Some(DataType::Utf8),
+            "json_value_boolean" | "json_exists" => Some(DataType::Boolean),
+            "json_value_double" => Some(DataType::Float64),
+            _ => None,
+        };
+        if let Some(expected) = expected {
+            if function.args().len() != 2 {
+                return Err(DataFusionError::Plan(format!(
+                    "{} physical decode requires document and literal path",
+                    function.name()
+                )));
+            }
+            if function.args()[0].data_type(input)? != DataType::Utf8 {
+                return Err(DataFusionError::Plan(format!(
+                    "{} physical decode document must be UTF8",
+                    function.name()
+                )));
+            }
+            let Some(literal) = function.args()[1].as_any().downcast_ref::<Literal>() else {
+                return Err(DataFusionError::Plan(format!(
+                    "{} physical decode path must be a non-null UTF8 literal",
+                    function.name()
+                )));
+            };
+            let ScalarValue::Utf8(Some(path)) = literal.value() else {
+                return Err(DataFusionError::Plan(format!(
+                    "{} physical decode path must be a non-null UTF8 literal",
+                    function.name()
+                )));
+            };
+            crate::sql_json::path::compile_literal_path(path)?;
+            let nullable = match function.name() {
+                "json_table_rows" => false,
+                "json_exists" => function.args()[0].nullable(input)?,
+                _ => true,
+            };
+            if function.return_type() != &expected || function.nullable() != nullable {
+                return Err(DataFusionError::Plan(format!(
+                    "{} physical decode return schema/nullability disagrees with kernel",
+                    function.name()
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Validate the SQL/JSON extraction contracts after native physical decoding.
 /// DataFusion's decoder trusts serialized UDF return fields rather than calling
 /// return_field_from_args. The standard JSON_TABLE lowering emits these kernels
 /// in projections; filters can also contain the shared column expressions.
 /// No document, compiled path or schema allocation is retained by this check.
 pub fn validate_json_table_execution_plan(plan: &dyn ExecutionPlan) -> Result<()> {
-    use datafusion::physical_expr::{PhysicalExpr, ScalarFunctionExpr, expressions::Literal};
+    validate_json_table_plan(plan, false)
+}
+
+/// Finite local plans also admit native FROM UNNEST's depth-one options.
+/// Ordinary JSON_TABLE plans retain their stricter generated options contract.
+pub(crate) fn validate_local_json_table_execution_plan(plan: &dyn ExecutionPlan) -> Result<()> {
+    validate_json_table_plan(plan, true)
+}
+
+fn validate_json_table_plan(plan: &dyn ExecutionPlan, native_local: bool) -> Result<()> {
+    use datafusion::physical_expr::PhysicalExpr;
     use datafusion::physical_plan::{filter::FilterExec, projection::ProjectionExec};
     fn expression(expr: &Arc<dyn PhysicalExpr>, input: &Schema) -> Result<()> {
-        if let Some(function) = expr.as_any().downcast_ref::<ScalarFunctionExpr>() {
-            let expected = match function.name() {
-                "json_table_rows" => Some(DataType::List(Arc::new(arrow_schema::Field::new(
-                    "item",
-                    DataType::Utf8,
-                    false,
-                )))),
-                "json_value" | "json_query" => Some(DataType::Utf8),
-                "json_value_boolean" | "json_exists" => Some(DataType::Boolean),
-                "json_value_double" => Some(DataType::Float64),
-                _ => None,
-            };
-            if let Some(expected) = expected {
-                if function.args().len() != 2 {
-                    return Err(DataFusionError::Plan(format!(
-                        "{} physical decode requires document and literal path",
-                        function.name()
-                    )));
-                }
-                if function.args()[0].data_type(input)? != DataType::Utf8 {
-                    return Err(DataFusionError::Plan(format!(
-                        "{} physical decode document must be UTF8",
-                        function.name()
-                    )));
-                }
-                let Some(literal) = function.args()[1].as_any().downcast_ref::<Literal>() else {
-                    return Err(DataFusionError::Plan(format!(
-                        "{} physical decode path must be a non-null UTF8 literal",
-                        function.name()
-                    )));
-                };
-                let ScalarValue::Utf8(Some(path)) = literal.value() else {
-                    return Err(DataFusionError::Plan(format!(
-                        "{} physical decode path must be a non-null UTF8 literal",
-                        function.name()
-                    )));
-                };
-                crate::sql_json::path::compile_literal_path(path)?;
-                let nullable = match function.name() {
-                    "json_table_rows" => false,
-                    "json_exists" => function.args()[0].nullable(input)?,
-                    _ => true,
-                };
-                if function.return_type() != &expected || function.nullable() != nullable {
-                    return Err(DataFusionError::Plan(format!(
-                        "{} physical decode return schema/nullability disagrees with kernel",
-                        function.name()
-                    )));
-                }
-            }
-        }
+        crate::local_physical::validate_local_expression(expr, input)?;
+        validate_json_table_physical_expression(expr, input)?;
         for child in expr.children() {
             expression(child, input)?;
         }
         Ok(())
     }
     if let Some(unnest) = plan.as_any().downcast_ref::<UnnestExec>() {
+        if !native_local
+            && (!unnest.options().preserve_nulls || !unnest.options().recursions.is_empty())
+        {
+            return Err(DataFusionError::Plan(
+                "JSON_TABLE decoded UNNEST options disagree with generated contract".into(),
+            ));
+        }
         if unnest.list_column_indices().len() != 1
             || unnest.list_column_indices()[0].depth != 1
             || !unnest.struct_column_indices().is_empty()
-            || unnest.options() != &UnnestOptions::default()
+            || unnest
+                .options()
+                .recursions
+                .iter()
+                .any(|recursion| recursion.depth != 1)
         {
-            return Err(DataFusionError::NotImplemented(
-                "unnest supports one depth-1 List with default options".into(),
-            ));
+            return Err(DataFusionError::NotImplemented(format!(
+                "unnest supports one depth-1 List without recursive options: {:?}; {:?}",
+                unnest.list_column_indices(),
+                unnest.options()
+            )));
         }
-        let expected = unnest_output_schema(
+        let mut expected = unnest_output_schema(
             unnest.input().schema().as_ref(),
             unnest.list_column_indices()[0].index_in_input_schema,
         )?;
+        if let Some(recursion) = unnest.options().recursions.first() {
+            let mut fields = expected.fields().to_vec();
+            let index = unnest.list_column_indices()[0].index_in_input_schema;
+            fields[index] = Arc::new(
+                fields[index]
+                    .as_ref()
+                    .clone()
+                    .with_name(&recursion.output_column.name),
+            );
+            expected = Schema::new_with_metadata(fields, expected.metadata().clone());
+        }
         if unnest.schema().as_ref() != &expected {
             return Err(DataFusionError::Plan(
                 "unnest decoded output schema disagrees with input".into(),
@@ -317,12 +363,35 @@ pub fn validate_json_table_execution_plan(plan: &dyn ExecutionPlan) -> Result<()
         expression(filter.predicate(), filter.input().schema().as_ref())?;
     }
     for input in plan.children() {
-        validate_json_table_execution_plan(input.as_ref())?;
+        validate_json_table_plan(input.as_ref(), native_local)?;
     }
     Ok(())
 }
 
 impl PhysicalExtensionCodec for ArroyoPhysicalExtensionCodec {
+    fn try_encode_udf(
+        &self,
+        node: &datafusion::logical_expr::ScalarUDF,
+        buf: &mut Vec<u8>,
+    ) -> Result<()> {
+        if let Some(encoded) = crate::local_physical::encode_local_udf(node, self)? {
+            buf.extend(encoded);
+        }
+        Ok(())
+    }
+
+    fn try_decode_udf(
+        &self,
+        name: &str,
+        buf: &[u8],
+    ) -> Result<Arc<datafusion::logical_expr::ScalarUDF>> {
+        crate::local_physical::decode_local_udf(name, buf, self)?.ok_or_else(|| {
+            DataFusionError::NotImplemented(format!(
+                "no local physical codec for scalar function {name}"
+            ))
+        })
+    }
+
     fn try_decode(
         &self,
         buf: &[u8],

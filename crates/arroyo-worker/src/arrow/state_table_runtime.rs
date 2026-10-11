@@ -860,3 +860,7 @@ mod tests {
         assert!(event.get_array_memory_size() < 1024);
     }
 }
+
+#[cfg(test)]
+#[path = "local_subquery_recovery_tests.rs"]
+mod local_subquery_recovery_tests;

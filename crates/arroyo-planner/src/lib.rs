@@ -5,6 +5,9 @@ pub(crate) mod continuous_merge;
 pub(crate) mod extension;
 pub mod external;
 mod functions;
+pub mod local_physical;
+mod local_planning;
+mod local_sql;
 pub mod logical;
 pub mod physical;
 mod plan;
@@ -136,6 +139,11 @@ pub struct ArroyoSchemaProvider {
 }
 
 pub fn register_functions(registry: &mut dyn FunctionRegistry) {
+    registry
+        .register_udf(Arc::new(ScalarUDF::from(
+            local_physical::ArrayQueryMarker::default(),
+        )))
+        .unwrap();
     datafusion_functions_json::register_all(registry).unwrap();
 
     functions::register_all(registry);
