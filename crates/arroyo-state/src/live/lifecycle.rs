@@ -2,7 +2,7 @@
 //! `reopen`, never silently reused by a fresh attempt.
 use super::{LiveStateError, Result};
 use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 #[derive(Debug, Clone)]
 pub struct RocksStateConfig {
