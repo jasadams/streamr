@@ -9527,7 +9527,7 @@ dependencies = [
 [[package]]
 name = "sqlparser"
 version = "0.55.0"
-source = "git+https://github.com/jasadams/sqlparser-rs?branch=0.55.0%2Farroyo-sql-json#ce7ab531cb7d5a53688ffc99c5a108b42f69c990"
+source = "git+https://github.com/jasadams/sqlparser-rs?rev=bc7f08176c80f8fae443e69add9489b7627cbacb#bc7f08176c80f8fae443e69add9489b7627cbacb"
 dependencies = [
  "log",
  "recursive",
@@ -9547,7 +9547,7 @@ dependencies = [
 [[package]]
 name = "sqlparser_derive"
 version = "0.3.0"
-source = "git+https://github.com/jasadams/sqlparser-rs?branch=0.55.0%2Farroyo-sql-json#ce7ab531cb7d5a53688ffc99c5a108b42f69c990"
+source = "git+https://github.com/jasadams/sqlparser-rs?rev=bc7f08176c80f8fae443e69add9489b7627cbacb#bc7f08176c80f8fae443e69add9489b7627cbacb"
 dependencies = [
  "proc-macro2",
  "quote",

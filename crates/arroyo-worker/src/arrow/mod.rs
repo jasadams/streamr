@@ -292,6 +292,7 @@ impl StatelessPhysicalExecutor {
 
         let runtime = RuntimeEnvBuilder::new().build_arc()?;
         let plan = plan.try_into_physical_plan(registry, &runtime, &codec)?;
+        arroyo_planner::physical::validate_json_table_execution_plan(plan.as_ref())?;
         let task_context =
             SessionContext::new_with_config_rt(Default::default(), runtime).task_ctx();
 
@@ -405,3 +406,6 @@ pub fn decode_aggregate(
         _ => internal_err!("Invalid aggregate expression for AggregateExec"),
     }
 }
+
+#[cfg(test)]
+mod json_table_tests;

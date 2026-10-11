@@ -1,3 +1,11 @@
+## STR-57 JSON_TABLE implementation — 2026-10-11
+
+- Base `299f17f37fb0eb28709bb4bcc50e69743fa7b131`; workspace `/home/jason/repos/streamr-worktrees/str-57-json-table-20261011`. Read AGENTS.md, .claude/build-test.md/team.md, this ledger/work-plan and current STR-57. No signing or automatic elapsed-time limit.
+- Implements the approved typed/lateral JSON_TABLE subset using shared SQL/JSON kernels and native UnnestExec. Preserves ordinary aliases, false/null rows and per-document resource bounds; no application policy, retained history or new execution admission.
+- Local gates PASS: locked RPC/planner/worker check, strict Clippy, formatting; 8 JSON_TABLE, 60 shared SQL/JSON and 1 existing UNNEST planner tests; 7 exported SQL fixtures; 5 decoded worker tests with batches 1/8 and 50 malformed-plan rejections. Independent source review approved; final evidence review and PR CI are separate remaining gates.
+- Exact commands, source/image/binary hashes and preserved failed attempts: [STR-57 validation](str-57-validation.md), evidence `/home/jason/repos/streamr-validation/str-57-json-table-20261011`. STR-58 owns dependent composed finite-query/MERGE integration; no new user decision or unrelated implementation is included.
+- Next: final focused independent review, publish the feature PR, wait for current-head CI, then hand off to merge-sweeper without merging. Full server/browser QA remains batch verification.
+
 ## Current STR-32 scope split — explicit user direction 2026-10-11
 
 - Remaining combined capacity/resources now STR-103 (Todo, agent-ready).
