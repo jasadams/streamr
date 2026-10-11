@@ -149,6 +149,7 @@ pub(crate) fn produce_optimized_plan(
     let sql_to_rel = SqlToRel::new(schema_provider);
 
     let plan = sql_to_rel.sql_statement_to_plan(statement)?;
+    let plan = crate::like_regex::bind_plan(plan)?;
     let plan = crate::sql_json::table::bind_rowsets(plan)?;
 
     let mut typed = plan;

@@ -175,7 +175,7 @@ fn expression(
         }
         Ok(TreeNodeRecursion::Continue)
     })?;
-    Ok(expr)
+    crate::like_regex::bind_expr(expr)
 }
 
 /// Require exactly one equality binding for every PK field, without residual

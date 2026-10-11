@@ -108,6 +108,9 @@ fn admit_expression(expr: &dyn PhysicalExpr, uuid_value_root: bool) -> Result<()
         // CONCAT (input, temporary and output bytes are charged through the
         // owner's reservation before state writes); path expansion/depth and
         // output construction are hard-bounded in the kernels themselves.
+        let like_regex = implementation
+            .as_any()
+            .is::<crate::like_regex::LikeRegexFunc>();
         let sql_json = implementation
             .as_any()
             .is::<crate::sql_json::kernels::JsonValueFunc>()
@@ -137,6 +140,7 @@ fn admit_expression(expr: &dyn PhysicalExpr, uuid_value_root: bool) -> Result<()
             && !bounded_uuid
             && !bounded_concat
             && !sql_json
+            && !like_regex
             && !implementation
                 .as_any()
                 .is::<datafusion_functions::core::getfield::GetFieldFunc>()
@@ -260,6 +264,28 @@ mod sql_json_admission_tests {
             crate::sql_json::kernels::json_exists(),
             crate::sql_json::kernels::json_object(),
         ]
+    }
+
+    #[test]
+    fn like_regex_concrete_only_admission() {
+        let args = extraction_args();
+        let trusted = Arc::new(ScalarUDF::new_from_impl(
+            crate::like_regex::LikeRegexFunc::new("$.a").unwrap(),
+        ));
+        let field = Arc::new(Field::new("matched", DataType::Boolean, true));
+        let expr = ScalarFunctionExpr::new("like_regex", trusted, args.clone(), field.clone());
+        admit_expression(&expr, false).unwrap();
+        for name in ["like_regex", "regexp_like"] {
+            let spoof = Arc::new(create_udf(
+                name,
+                vec![DataType::Utf8, DataType::Utf8],
+                DataType::Boolean,
+                Volatility::Immutable,
+                Arc::new(|_| panic!("do not evaluate spoof")),
+            ));
+            let expr = ScalarFunctionExpr::new(name, spoof, args.clone(), field.clone());
+            assert!(admit_expression(&expr, false).is_err());
+        }
     }
 
     #[test]

@@ -2,6 +2,7 @@ mod aggregate_retention;
 mod continuous_merge;
 mod event_clock;
 mod json_table;
+mod like_regex;
 mod native_capabilities;
 mod plan_tests;
 mod sql_json;

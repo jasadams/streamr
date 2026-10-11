@@ -100,6 +100,30 @@ impl VisitorMut for SqlJsonLowering {
         // Children (documents, JSON_OBJECT values) were already rewritten by
         // the time this node is visited, so nesting works at any depth.
         match expr {
+            Expr::LikeRegex {
+                negated,
+                expr: value,
+                pattern,
+                flags,
+            } => {
+                if flags.is_some() {
+                    return self.fail("LIKE_REGEX FLAG clauses are unsupported");
+                }
+                if !matches!(pattern.as_ref(), Expr::Value(value) if matches!(&value.value, Value::SingleQuotedString(_)))
+                {
+                    return self.fail("LIKE_REGEX pattern must be a non-null UTF8 literal");
+                }
+                let lowered =
+                    function_call("like_regex", vec![take_expr(value), take_expr(pattern)]);
+                *expr = if *negated {
+                    Expr::UnaryOp {
+                        op: sqlparser::ast::UnaryOperator::Not,
+                        expr: Box::new(lowered),
+                    }
+                } else {
+                    lowered
+                };
+            }
             Expr::JsonExists { doc, path } => {
                 self.validate_path(path)?;
                 let doc = take_expr(doc);

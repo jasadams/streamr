@@ -1,3 +1,13 @@
+## STR-59 LIKE_REGEX — 2026-10-11
+
+- Coordinator Codex `/root`, session `01a12b09-124d-7ed1-9075-41aeb7211aa4`; implementer `/root/implement`. Start 12:58 UTC. Base `34623ba2518bcf86cb13e994c46157cc9bed506a`; workspace `/home/jason/repos/streamr-worktrees/str-59-like-regex-20261011`.
+- Read current Trakkt STR-59, AGENTS.md, .claude/team.md/build-test.md and this ledger/work-plan. Approved nullable UTF8 literal-pattern predicate; no application policy, new execution admission, signing or automatic elapsed limit.
+- Ownership: implementer owns maintained parser grammar/pin, concrete kernel/planner/physical decode/fusion and focused owner fixtures; coordinator owns ledger, independent review and publication.
+- Acceptance: exact complete SQL oracles, null/precedence/escaped-dot/substring behavior, unsupported diagnostics, trusted concrete admission and actual guarded MERGE batches 1/8. Required affected-crate container checks/strict Clippy, focused test inventory and independent review precede PR CI.
+- Implemented: native predicate AST, literal compiled kernel, physical reconstruction and concrete owner admission. Final locked planner/worker check, strict Clippy and formatting passed; 94 selected tests passed, including decoded SQL fixtures and memory/Rocks MERGE batches 1/8 with error rollback. Independent source review approved. Exact receipts and preserved failures: [STR-59 validation](str-59-validation.md), `/home/jason/repos/streamr-validation/str-59-like-regex-20261011/`.
+- Parser pin `02d020901b65d048e97feae48083fcac38d343ca`: 477 maintained tests and formatting passed; full-suite/strict-Clippy failures reproduce on its unchanged base and remain failed gates. No production resource changes or replacement admission introduced.
+- Next: publish the reviewed increment and verify current-head PR CI, then hand the open PR to merge-sweeper. STR-60-dependent composed selector integration remains separate; no new deferrals or user decision pending. Full server/browser QA stays with batch verification.
+
 ## STR-58 finite local expressions — 2026-10-11
 
 - Base `a2c823f1e216c1a5bd888e57d1818cbef50902e5`; workspace `/home/jason/repos/streamr-worktrees/str-58-local-subqueries-20261011`. Current ticket and fetched instructions read; no signing, historical time limit or new execution admission.
