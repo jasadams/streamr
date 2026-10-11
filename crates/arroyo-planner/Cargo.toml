@@ -40,6 +40,7 @@ unicase = "2.7.0"
 xxhash-rust = { version = "0.8.12", features = ["xxh3", "std"] }
 itertools = { workspace = true }
 
+regex = { workspace = true }
 sqlparser = { workspace = true}
 
 [dev-dependencies]

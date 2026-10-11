@@ -13,9 +13,11 @@ use anyhow::{Result, anyhow};
 /// `kind` names the loading path in the error (e.g. `"dylib"`, `"Python"`,
 /// `"local"`) so the failure points at the right config entry.
 pub(crate) fn reject_shadowing_udf_name(kind: &str, name: &str) -> Result<()> {
-    if arroyo_planner::sql_json::kernels::is_reserved_sql_json_udf_name(name) {
+    if arroyo_planner::like_regex::is_reserved_name(name)
+        || arroyo_planner::sql_json::kernels::is_reserved_sql_json_udf_name(name)
+    {
         return Err(anyhow!(
-            "pipeline {kind} UDF '{name}' shadows the built-in ANSI SQL/JSON function of the same name"
+            "pipeline {kind} UDF '{name}' shadows the built-in SQL function of the same name"
         ));
     }
     Ok(())
@@ -29,6 +31,8 @@ mod tests {
     fn every_reserved_name_is_rejected_for_every_kind() {
         for kind in ["dylib", "Python", "local"] {
             for name in [
+                "like_regex",
+                "LIKE_REGEX",
                 "json_value",
                 "json_value_boolean",
                 "json_value_double",

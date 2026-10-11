@@ -820,6 +820,7 @@ dependencies = [
  "itertools 0.14.0",
  "petgraph 0.8.2",
  "prost",
+ "regex",
  "rstest",
  "serde",
  "serde_json",
@@ -9527,7 +9528,7 @@ dependencies = [
 [[package]]
 name = "sqlparser"
 version = "0.55.0"
-source = "git+https://github.com/jasadams/sqlparser-rs?rev=bc7f08176c80f8fae443e69add9489b7627cbacb#bc7f08176c80f8fae443e69add9489b7627cbacb"
+source = "git+https://github.com/jasadams/sqlparser-rs?rev=02d020901b65d048e97feae48083fcac38d343ca#02d020901b65d048e97feae48083fcac38d343ca"
 dependencies = [
  "log",
  "recursive",
@@ -9547,7 +9548,7 @@ dependencies = [
 [[package]]
 name = "sqlparser_derive"
 version = "0.3.0"
-source = "git+https://github.com/jasadams/sqlparser-rs?rev=bc7f08176c80f8fae443e69add9489b7627cbacb#bc7f08176c80f8fae443e69add9489b7627cbacb"
+source = "git+https://github.com/jasadams/sqlparser-rs?rev=02d020901b65d048e97feae48083fcac38d343ca#02d020901b65d048e97feae48083fcac38d343ca"
 dependencies = [
  "proc-macro2",
  "quote",

@@ -5,6 +5,7 @@ pub(crate) mod continuous_merge;
 pub(crate) mod extension;
 pub mod external;
 mod functions;
+pub mod like_regex;
 pub mod local_physical;
 mod local_planning;
 mod local_sql;
@@ -385,9 +386,11 @@ impl ArroyoSchemaProvider {
         // plans serialize scalar functions by name, so a same-named user UDF
         // would otherwise be deserialized in place of the builtin on both the
         // planner and the worker.
-        if crate::sql_json::kernels::is_reserved_sql_json_udf_name(&parsed.udf.name) {
+        if crate::like_regex::is_reserved_name(&parsed.udf.name)
+            || crate::sql_json::kernels::is_reserved_sql_json_udf_name(&parsed.udf.name)
+        {
             bail!(
-                "function name '{}' is reserved for the built-in ANSI SQL/JSON functions and cannot be redefined",
+                "function name '{}' is reserved for the built-in SQL functions and cannot be redefined",
                 parsed.udf.name
             );
         }
@@ -474,9 +477,11 @@ impl ArroyoSchemaProvider {
 
         // As in add_rust_udf: a user UDF must never shadow a trusted
         // SQL/JSON builtin, which is resolved by name after plan serialization.
-        if crate::sql_json::kernels::is_reserved_sql_json_udf_name(&name) {
+        if crate::like_regex::is_reserved_name(&name)
+            || crate::sql_json::kernels::is_reserved_sql_json_udf_name(&name)
+        {
             bail!(
-                "function name '{name}' is reserved for the built-in ANSI SQL/JSON functions and cannot be redefined"
+                "function name '{name}' is reserved for the built-in SQL functions and cannot be redefined"
             );
         }
 

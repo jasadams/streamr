@@ -458,6 +458,19 @@ pub fn validate_local_expression(
     expression: &Arc<dyn PhysicalExpr>,
     schema: &arrow_schema::Schema,
 ) -> Result<()> {
+    if expression
+        .as_any()
+        .downcast_ref::<ScalarFunctionExpr>()
+        .is_some_and(|function| {
+            function
+                .fun()
+                .inner()
+                .as_any()
+                .is::<crate::like_regex::LikeRegexFunc>()
+        })
+    {
+        crate::physical::validate_json_table_physical_expression(expression, schema)?;
+    }
     if let Some(function) = expression.as_any().downcast_ref::<ScalarFunctionExpr>()
         && let Some(query) = function
             .fun()
@@ -731,7 +744,8 @@ pub fn validate_local_physical(
                 let native = state.scalar_functions().values().any(|candidate| {
                     candidate.inner().as_any().type_id() == implementation.type_id()
                 });
-                let json = implementation.is::<JsonValueFunc>()
+                let json = implementation.is::<crate::like_regex::LikeRegexFunc>()
+                    || implementation.is::<JsonValueFunc>()
                     || implementation.is::<JsonQueryFunc>()
                     || implementation.is::<JsonExistsFunc>()
                     || implementation.is::<JsonObjectFunc>()

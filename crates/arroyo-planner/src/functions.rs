@@ -120,6 +120,9 @@ pub fn register_all(registry: &mut dyn FunctionRegistry) {
     registry.register_udf(multi_hash()).unwrap();
 
     registry
+        .register_udf(crate::like_regex::like_regex())
+        .unwrap();
+    registry
         .register_udf(crate::sql_json::kernels::json_table_rows())
         .unwrap();
 

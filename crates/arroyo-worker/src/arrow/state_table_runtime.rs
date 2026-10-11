@@ -864,3 +864,7 @@ mod tests {
 #[cfg(test)]
 #[path = "local_subquery_recovery_tests.rs"]
 mod local_subquery_recovery_tests;
+
+#[cfg(test)]
+#[path = "like_regex_tests.rs"]
+mod like_regex_tests;

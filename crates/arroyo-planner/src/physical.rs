@@ -231,6 +231,37 @@ pub(crate) fn validate_json_table_physical_expression(
 ) -> Result<()> {
     use datafusion::physical_expr::{ScalarFunctionExpr, expressions::Literal};
     if let Some(function) = expr.as_any().downcast_ref::<ScalarFunctionExpr>() {
+        if let Some(regex) = function
+            .fun()
+            .inner()
+            .as_any()
+            .downcast_ref::<crate::like_regex::LikeRegexFunc>()
+        {
+            let fields = function
+                .args()
+                .iter()
+                .map(|arg| arg.return_field(input))
+                .collect::<Result<Vec<_>>>()?;
+            let literals = function
+                .args()
+                .iter()
+                .map(|arg| arg.as_any().downcast_ref::<Literal>().map(Literal::value))
+                .collect::<Vec<_>>();
+            let expected = function.fun().return_field_from_args(
+                datafusion::logical_expr::ReturnFieldArgs {
+                    arg_fields: &fields,
+                    scalar_arguments: &literals,
+                },
+            )?;
+            if regex.pattern().is_none()
+                || expected.data_type() != function.return_type()
+                || expected.is_nullable() != function.nullable()
+            {
+                return Err(DataFusionError::Plan(
+                    "LIKE_REGEX physical return schema or compiled literal mismatch".into(),
+                ));
+            }
+        }
         let expected = match function.name() {
             "json_table_rows" => Some(DataType::List(Arc::new(arrow_schema::Field::new(
                 "item",
@@ -374,6 +405,21 @@ impl PhysicalExtensionCodec for ArroyoPhysicalExtensionCodec {
         node: &datafusion::logical_expr::ScalarUDF,
         buf: &mut Vec<u8>,
     ) -> Result<()> {
+        if let Some(regex) = node
+            .inner()
+            .as_any()
+            .downcast_ref::<crate::like_regex::LikeRegexFunc>()
+        {
+            let pattern = regex.pattern().ok_or_else(|| {
+                DataFusionError::Plan(
+                    "LIKE_REGEX physical encoding requires a compiled literal".into(),
+                )
+            })?;
+            buf.extend(serde_json::to_vec(pattern).map_err(|error| {
+                DataFusionError::Plan(format!("LIKE_REGEX pattern encoding failed: {error}"))
+            })?);
+            return Ok(());
+        }
         if let Some(encoded) = crate::local_physical::encode_local_udf(node, self)? {
             buf.extend(encoded);
         }
@@ -385,6 +431,29 @@ impl PhysicalExtensionCodec for ArroyoPhysicalExtensionCodec {
         name: &str,
         buf: &[u8],
     ) -> Result<Arc<datafusion::logical_expr::ScalarUDF>> {
+        if crate::like_regex::is_reserved_name(name) {
+            // JSON can expand one source byte to six encoded bytes. Refuse
+            // oversized untrusted metadata before deserializing an owned string.
+            let max_payload = crate::sql_json::path::MAX_PATH_LENGTH * 6 + 2;
+            if buf.len() > max_payload {
+                return Err(DataFusionError::Plan(format!(
+                    "LIKE_REGEX physical pattern payload exceeds {max_payload} bytes"
+                )));
+            }
+            let text = std::str::from_utf8(buf).map_err(|_| {
+                DataFusionError::Plan("LIKE_REGEX physical pattern is not UTF8".into())
+            })?;
+            let pattern: String = serde_json::from_str(text).map_err(|error| {
+                DataFusionError::Plan(format!(
+                    "LIKE_REGEX physical pattern encoding is invalid: {error}"
+                ))
+            })?;
+            return Ok(Arc::new(
+                datafusion::logical_expr::ScalarUDF::new_from_impl(
+                    crate::like_regex::LikeRegexFunc::new(&pattern)?,
+                ),
+            ));
+        }
         crate::local_physical::decode_local_udf(name, buf, self)?.ok_or_else(|| {
             DataFusionError::NotImplemented(format!(
                 "no local physical codec for scalar function {name}"
