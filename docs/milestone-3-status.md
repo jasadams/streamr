@@ -1,4 +1,43 @@
-# Milestone 3 — agent backlog
+## Current STR-32 scope split — explicit user direction 2026-10-11
+
+- Remaining combined capacity/resources now STR-103 (Todo, agent-ready).
+- Existing six production process-loss qualification cases now STR-104 (Todo, agent-ready); active `production-recovery-rerun.py`/`process-recovery-attempt-2` must be coordinated and completed results reused, not duplicated.
+- These related follow-ups do not block closing STR-32 as the reviewed implemented engine increment. Comprehensive fault/operator qualification belongs to STR-27; application live/backfill/dashboard work belongs to ARC-17. Do not launch further broad campaigns under STR-32.
+- Preserve actual source-bound passes/failures/not-run receipts. Scope transfer is not a production pass or merge/deployment authorization. Current Trakkt descriptions and `docs/str-32-follow-up-tickets.md` in invoking repo contain acceptance/runner/pin/ownership handoff.
+- Prior active notes below are historical where they conflict with this split.
+
+## Active STR-32 final qualification — 2026-10-11
+
+- User authorized finishing remaining STR-32 after optimized throughput passed1.20× Flink. Acceptance current ticket, functional correctness/bounded resources first; standalone24h waived for Arcstream integration. No newfeatures/backpressure/protocol redesign authorized.
+- Freshworktree `/home/jason/repos/streamr-str32-final-qualification`, fetchedbase682bea0d; integrated cleanup/nativecabf plus independently approved surviving ordered ARRAY_AGG delta and obsoletehelper removal. Frozen source75e430b4e2473c15a5fa752c5196be7b5e249ef1. Guidance AGENTS.md, .claude/build-test.md/team.md, ledger/workplan; no signing/automaticelapsedlimit.
+- Current-source fmt/checkstate+worker/strictClippy PASS. All71 state and165 worker library tests PASS (236 total). Draft PR37 published, six CI checks PASS, depends on cleanup PR36; neither merged. Previouslintfailures unusedoldhelpers/Path import and superseded SQLbuild stop are preserved under QA attempts; no failed attempt relabeledpass.
+- Reviewedsource-bound SQL/app/nativefault/capacity/production-loss callers prepared; final SQL source/caller refreeze independently approved; optimized SQL build/pin completed. Production prerequisite actualwebUI asset hashcopy complete, privatePG supervisor reviewed. Combined four-owner >=10x capacity, isolatedKafka live/broker interruption and extra26 semantic callers approved; preserve budgets/real retainedproof.
+- Runtime: optimized SQL build/pin PASS; aggregate8/join32/defaulttables8 independently exactvaluePASS. Nativefault12 independently PASS (saved full values/CDC/physical prefixes). Originallifecycle wildcardplanningFAIL preserved; fixture-only explicitpayloadprojection lifecycle8 native/switched3epochs independentlyPASS. Defaulttable fresh8 independent fullvalues/prefix/config/operator/checkpointlogs PASS closes original archivalgap. Production optimized CLI build/pin PASS3607.91s; separate host-only O0/runtime O3 Rocks archives require corrected evidence classification without rebuilding; untouchedsemantic/app,100k,combined>=10x,Kafka/PG/diskfull cases pending.
+- Next: complete production build/pin/sixprocesscases; serialize approved remainingmatrices/capacity/live/fault callers against preserved pins and independently audit actualoutputs/limits. No userdecision pending; fullqualification notclaimed.
+
+## STR-32 native RocksDB read snapshots — active 2026-10-11
+
+- User authorised aligning live state access with Flink before a focused throughput comparison; broad verification is deferred. Replace per-batch filesystem checkpoint/reopen with a lifetime-safe native stable snapshot. Preserve bounded backend reads/writes/scans and release-before-output, saved recovery protocol and SQL semantics.
+- Base: fetched main `682bea0d0955be2e021fe475b25228f3dacf7d5f`; fresh worktree `/home/jason/repos/streamr-str32-native-rocks-snapshot`, integrated validated cleanup dependency `777ea144`. Instructions read: AGENTS.md, .claude/build-test.md/team.md, this ledger/work-plan and current Trakkt STR-32. Current user approval supersedes historical read-view deferral; no automatic time limit or signing requirement.
+- Ownership: checkpoint_reader implements state rocks.rs/Cargo.toml; root owns lockfile, integration and serial build; pilot_review independently reviews lifecycle/consistency; coverage_audit prepares focused caller/evidence audit.
+- Acceptance now: reviewed native snapshot implementation, build/pin once in required container, existing 10000-key RocksDB/controller exact value/CDC/checkpoint continuation diagnostic against pinned baseline with same fixture/image/profile/budgets. No broad test suite, 100000-key rerun or production build first.
+- Previous shared-drain snapshot candidate `edd0d3fe` is HOLD due cross-operator snapshot-slot deadlock; do not inherit it. Its audited 10000-key SQL time was485.79s baseline versus341.41s candidate (single pair); smaller1024-key pair was slower. Evidence outside Cargo caches.
+- Next: complete native snapshot ownership implementation and independent source review, freeze source/hash, then benchmark-only build/pin/run. No user decision pending within this approved change. Full STR-32 qualification remains open.
+
+
+## STR-32 MVP scope cleanup and qualification — 2026-10-11
+
+- Authorized scope: restore Arroyo graph/network row backpressure and DataFusion execution; remove added global execution admission and unused timer/ranked/history APIs. Keep native SQL/state tables, RocksDB backend limits and existing Kafka recovery. No replacement backpressure or Kafka redesign is authorized.
+- Base: fetched main `682bea0d`; worktree `/home/jason/repos/streamr-str32-arroyo-queues`, implementation source `e4aec059`. Guidance: AGENTS.md, .claude/build-test.md/team.md, this ledger/work-plan and current Trakkt STR-32. No automatic ticket time limit or signing requirement.
+- Delivery: independent source review approved; required-container locked checks, fmt and strict Clippy passed; operator8/worker163/state72/RPC35 library tests passed (278 total). Published [PR36](https://github.com/jasadams/streamr/pull/36); all six current-head CI checks pass. Not merged or deployed.
+- Capacity: original100000-key/batch32 attempt failed its1800s watchdog, preserved. Same executable rerun with only caller timeout7200s, reservation `fdab74cda49a`; input/payload/batch/backend budgets/RSS cap unchanged. Full initial/recovered value/CDC and independent physical checkpoint audits passed:100000keys,200000recovered rows,819200000-byte logical floor,366641152-byte whole-child peak RSS (<512MiB). Evidence: `/home/jason/qa-evidence/str32-arroyo-queues-20261011/`.
+- All48 small aggregate8/updating-join32/state-table8 SQL matrices passed independent exact-output/prefix/receipt audits. Next: publish reviewed delivery evidence, verify final-head CI and reconcile remaining STR-32/application acceptance. Recovery here recreates workers in one SQL-test process; it is not a process-loss qualification gate. No new build is required.
+- Kafka architecture and independent evidence reviews are complete. Keep the existing mechanism; encoded-journal live catch-up and broader crash/fanout scenarios remain explicit qualification gaps. User requested stopping the CPU-heavy Arcstream demo container; stopped with state preserved.
+- Throughput: ingestion logged RocksDB compaction-related throttling under4MiB memtable; current output drain repeatedly creates internal filesystem read snapshots/flushes. Exact stage-time dominance unmeasured; no tuning or redesign applied. Full Arcstream lifecycle/live journal/combined-capacity qualification remains open. No user decision pending for the approved cleanup.
+
+## Historical feature delivery receipts
+
+The following source-bound notes preserve earlier feature delivery. Their “active”/“next” labels are historical, not worker assignments. The original STR-101 feature PR33 and STR-102 PR34 are merged. The subsequent ordered-window repair PR35 remains unmerged; the current task above controls.
 
 ## STR-32 MVP scope cleanup and qualification — 2026-10-11
 
