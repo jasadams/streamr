@@ -1,4 +1,19 @@
-# Milestone 3 — agent backlog
+## Current STR-32 scope split — explicit user direction 2026-10-11
+
+- Remaining combined capacity/resources now STR-103 (Todo, agent-ready).
+- Existing six production process-loss qualification cases now STR-104 (Todo, agent-ready); active `production-recovery-rerun.py`/`process-recovery-attempt-2` must be coordinated and completed results reused, not duplicated.
+- These related follow-ups do not block closing STR-32 as the reviewed implemented engine increment. Comprehensive fault/operator qualification belongs to STR-27; application live/backfill/dashboard work belongs to ARC-17. Do not launch further broad campaigns under STR-32.
+- Preserve actual source-bound passes/failures/not-run receipts. Scope transfer is not a production pass or merge/deployment authorization. Current Trakkt descriptions and `docs/str-32-follow-up-tickets.md` in invoking repo contain acceptance/runner/pin/ownership handoff.
+- Prior active notes below are historical where they conflict with this split.
+
+## Active STR-32 final qualification — 2026-10-11
+
+- User authorized finishing remaining STR-32 after optimized throughput passed1.20× Flink. Acceptance current ticket, functional correctness/bounded resources first; standalone24h waived for Arcstream integration. No newfeatures/backpressure/protocol redesign authorized.
+- Freshworktree `/home/jason/repos/streamr-str32-final-qualification`, fetchedbase682bea0d; integrated cleanup/nativecabf plus independently approved surviving ordered ARRAY_AGG delta and obsoletehelper removal. Frozen source75e430b4e2473c15a5fa752c5196be7b5e249ef1. Guidance AGENTS.md, .claude/build-test.md/team.md, ledger/workplan; no signing/automaticelapsedlimit.
+- Current-source fmt/checkstate+worker/strictClippy PASS. All71 state and165 worker library tests PASS (236 total). Draft PR37 published, six CI checks PASS, depends on cleanup PR36; neither merged. Previouslintfailures unusedoldhelpers/Path import and superseded SQLbuild stop are preserved under QA attempts; no failed attempt relabeledpass.
+- Reviewedsource-bound SQL/app/nativefault/capacity/production-loss callers prepared; final SQL source/caller refreeze independently approved; optimized SQL build/pin completed. Production prerequisite actualwebUI asset hashcopy complete, privatePG supervisor reviewed. Combined four-owner >=10x capacity, isolatedKafka live/broker interruption and extra26 semantic callers approved; preserve budgets/real retainedproof.
+- Runtime: optimized SQL build/pin PASS; aggregate8/join32/defaulttables8 independently exactvaluePASS. Nativefault12 independently PASS (saved full values/CDC/physical prefixes). Originallifecycle wildcardplanningFAIL preserved; fixture-only explicitpayloadprojection lifecycle8 native/switched3epochs independentlyPASS. Defaulttable fresh8 independent fullvalues/prefix/config/operator/checkpointlogs PASS closes original archivalgap. Production optimized CLI build/pin PASS3607.91s; separate host-only O0/runtime O3 Rocks archives require corrected evidence classification without rebuilding; untouchedsemantic/app,100k,combined>=10x,Kafka/PG/diskfull cases pending.
+- Next: complete production build/pin/sixprocesscases; serialize approved remainingmatrices/capacity/live/fault callers against preserved pins and independently audit actualoutputs/limits. No userdecision pending; fullqualification notclaimed.
 
 ## STR-32 native RocksDB read snapshots — active 2026-10-11
 

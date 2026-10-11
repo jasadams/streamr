@@ -267,7 +267,7 @@ def checkpoint(root, epoch, owner, protocol):
             operator_id = one(info,2,b'').decode()
             path_prefix = f'{base}/operator-{operator_id}/table-{name.decode()}-000/'
             if kind == 1:
-                require(name in (b'i',b'f',b's') and one(wrapper,3,0) == 0,'unsupported global table/state version')
+                require(name in (b'i',b'f',b's') and one(wrapper,3,0) == {b'i':0,b'f':0,b's':2}[name],'unsupported global table/state version')
                 files = [(x.decode(), None) for x in payload.get(1, [])]
             elif kind == 3:
                 require(name == b'native-aggregate-v1' and one(wrapper,3,0) == 1
