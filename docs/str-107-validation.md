@@ -114,8 +114,8 @@ executable (`4c23b41ca251b2212789ee86630662f85823c3a10768a9c18f65c3dae153074f`).
 7. **PASS:** obsolete call rejection tests and maintained-name audit; historical
    evidence stays attributed to its original source and hashes.
 8. **PARTIAL pending coordinator delivery:** affected check/strict lint and focused
-   collected inventory pass; independent final-diff/evidence review and current-head
-   PR CI are still required. No acceptance1–7 is deferred to manual QA.
+   collected inventory pass; independent final-diff/evidence review approved all21 files with no remaining findings; current-head
+   PR CI is still required. No acceptance1–7 is deferred to manual QA.
 
 ## Separate limitation and publication
 
@@ -129,5 +129,4 @@ expressions are validated through an evaluated view and explicit public sink
 projection in all eight backend/batch/recovery configurations. This separate
 limitation does not defer STR-107 acceptance or authorize a dependency redesign.
 
-Independent final-diff/evidence review, current-head PR CI and publication belong
-to the coordinator. STR-103 capacity qualification remains separate and NOT RUN.
+Independent final-diff/evidence review approved the full21-file diff and raw acceptance evidence with no remaining findings. Written review is preserved in the canonical review log for2026-10-12. [PR #41](https://github.com/jasadams/streamr/pull/41) is published; current-head CI and merge handoff belong to the coordinator. STR-103 capacity qualification remains separate and NOT RUN.
