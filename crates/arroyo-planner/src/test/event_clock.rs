@@ -47,9 +47,9 @@ async fn event_clock_projection_view_filter_and_physical_round_trip() {
         "{SOURCE}
         CREATE VIEW renamed AS SELECT id, event_time AS renamed_time FROM events;
         CREATE VIEW hidden AS SELECT id FROM renamed;
-        SELECT id, WATERMARK_TIMESTAMP() AS reference, WATERMARK_DATE() AS reference_date,
+        SELECT id, EVENT_TIMESTAMP() AS reference, EVENT_DATE() AS reference_date,
             CURRENT_TIMESTAMP AS processing_timestamp, CURRENT_DATE AS processing_date
-        FROM hidden WHERE WATERMARK_DATE() >= DATE '1969-12-31'"
+        FROM hidden WHERE EVENT_DATE() >= DATE '1969-12-31'"
     );
     let compiled = compile(&sql).await;
     let provider = ArroyoSchemaProvider::new();
@@ -73,13 +73,10 @@ async fn event_clock_projection_view_filter_and_physical_round_trip() {
                 datafusion::physical_plan::displayable(physical.as_ref()).indent(true)
             );
             assert!(
-                !display.contains("watermark_timestamp("),
+                !display.contains("event_timestamp("),
                 "unbound clock: {display}"
             );
-            assert!(
-                !display.contains("watermark_date("),
-                "unbound clock: {display}"
-            );
+            assert!(!display.contains("event_date("), "unbound clock: {display}");
             decoded += 1;
         }
     }
@@ -90,7 +87,7 @@ async fn event_clock_projection_view_filter_and_physical_round_trip() {
 async fn event_clock_cdc_allows_independent_for_and_as_columns() {
     let source = SOURCE.replace("format='json'", "format='debezium_json'");
     compile(&format!(
-        "{source} SELECT id, WATERMARK_TIMESTAMP(), WATERMARK_DATE() FROM events"
+        "{source} SELECT id, EVENT_TIMESTAMP(), EVENT_DATE() FROM events"
     ))
     .await;
     let source = source.replace(
@@ -98,7 +95,7 @@ async fn event_clock_cdc_allows_independent_for_and_as_columns() {
         "WATERMARK FOR completeness_time",
     );
     compile(&format!(
-        "{source} SELECT id, WATERMARK_TIMESTAMP(), WATERMARK_DATE() FROM events"
+        "{source} SELECT id, EVENT_TIMESTAMP(), EVENT_DATE() FROM events"
     ))
     .await;
 }
@@ -109,37 +106,47 @@ async fn event_clock_lookup_keeps_trigger_designation() {
         "{SOURCE}
         CREATE STATE TABLE retained (id BIGINT PRIMARY KEY, _timestamp TIMESTAMP) PARTITION BY id;
         SELECT events.id, target._timestamp AS retained_time,
-            WATERMARK_TIMESTAMP() AS event_reference, WATERMARK_DATE() AS date_reference
+            EVENT_TIMESTAMP() AS event_reference, EVENT_DATE() AS date_reference
         FROM events LEFT JOIN retained AS target ON events.id=target.id
-        WHERE events.id > 0 AND WATERMARK_DATE() >= DATE '1969-12-31'"
+        WHERE events.id > 0 AND EVENT_DATE() >= DATE '1969-12-31'"
     ))
     .await;
 }
 
 #[test(tokio::test)]
-async fn event_clock_missing_and_ambiguous_designation_are_errors() {
+async fn event_clock_missing_and_ambiguous_context_are_errors() {
     rejects(
-        "SELECT WATERMARK_DATE()",
-        "requires a source with WATERMARK FOR",
+        "SELECT EVENT_DATE()",
+        "requires a current triggering event source",
     )
     .await;
     let no_designation = "CREATE TABLE events WITH (connector='impulse', event_rate='1');
-        SELECT WATERMARK_TIMESTAMP() FROM events";
-    rejects(no_designation, "requires a source with WATERMARK FOR").await;
+        SELECT EVENT_TIMESTAMP() FROM events";
+    compile(no_designation).await;
     let second = SOURCE.replace("events", "other_events");
-    rejects(&format!("{SOURCE}{second}
-        SELECT WATERMARK_TIMESTAMP() FROM events INNER JOIN other_events ON events.id=other_events.id"),
-        "ambiguous WATERMARK FOR sources").await;
+    rejects(
+        &format!(
+            "{SOURCE}{second}
+        SELECT EVENT_TIMESTAMP() FROM events INNER JOIN other_events ON events.id=other_events.id"
+        ),
+        "ambiguous triggering sources",
+    )
+    .await;
 }
 
 #[test(tokio::test)]
 async fn event_clock_aggregate_dependency_is_not_lowered_to_contribution_time() {
-    rejects(&format!("{SOURCE} SELECT COUNT(*) FILTER (WHERE WATERMARK_DATE() > DATE '2026-10-10') FROM events"),
-        "retained contribution time is a distinct input").await;
+    rejects(
+        &format!(
+            "{SOURCE} SELECT COUNT(*) FILTER (WHERE EVENT_DATE() > DATE '2026-10-10') FROM events"
+        ),
+        "retained contribution time is a distinct input",
+    )
+    .await;
     rejects(
         &format!(
             "{SOURCE} CREATE VIEW counts AS SELECT COUNT(*) AS n FROM events;
-        SELECT n, WATERMARK_DATE() FROM counts"
+        SELECT n, EVENT_DATE() FROM counts"
         ),
         "aggregate output time is not an event clock",
     )
@@ -152,7 +159,7 @@ async fn event_clock_rejects_a_view_that_overwrites_trigger_time() {
         &format!(
             "{SOURCE} CREATE VIEW replaced AS
         SELECT id, completeness_time AS _timestamp FROM events;
-        SELECT WATERMARK_TIMESTAMP() FROM replaced"
+        SELECT EVENT_TIMESTAMP() FROM replaced"
         ),
         "triggering timestamp was replaced by a projection",
     )
@@ -164,7 +171,7 @@ async fn event_clock_view_alias_retains_aggregate_dependency() {
     rejects(
         &format!(
             "{SOURCE}
-        CREATE VIEW clock_rows AS SELECT id, WATERMARK_DATE() AS d FROM events;
+        CREATE VIEW clock_rows AS SELECT id, EVENT_DATE() AS d FROM events;
         CREATE VIEW renamed_clock AS SELECT id, d AS reference_date FROM clock_rows;
         SELECT COUNT(*) FILTER (WHERE reference_date = DATE '2026-10-10') FROM renamed_clock"
         ),
@@ -185,9 +192,9 @@ async fn calendar_filter_serializes_horizons_static_gates_and_raw_clock() {
     let horizons = [1, 7, 14, 30, 90];
     let expressions = horizons.iter().map(|days| {
         let temporal = if *days == 1 {
-            "CAST(event_time AS DATE) = WATERMARK_DATE()".to_string()
+            "CAST(event_time AS DATE) = EVENT_DATE()".to_string()
         } else {
-            format!("CAST(event_time AS DATE) BETWEEN WATERMARK_DATE() - INTERVAL '{}' DAY AND WATERMARK_DATE()", days - 1)
+            format!("CAST(event_time AS DATE) BETWEEN EVENT_DATE() - INTERVAL '{}' DAY AND EVENT_DATE()", days - 1)
         };
         format!("COUNT(*) FILTER (WHERE id > 0 AND ({temporal})) AS count_{days}")
     }).collect::<Vec<_>>().join(",");
@@ -233,11 +240,11 @@ async fn calendar_filter_serializes_horizons_static_gates_and_raw_clock() {
 #[test(tokio::test)]
 async fn calendar_filter_rejects_unsupported_clock_predicates() {
     for predicate in [
-        "CAST(event_time AS DATE) > WATERMARK_DATE()",
-        "CAST(event_time AS DATE) BETWEEN WATERMARK_DATE() - INTERVAL '6' HOUR AND WATERMARK_DATE()",
-        "CAST(event_time AS DATE) BETWEEN WATERMARK_DATE() - INTERVAL '1' MONTH AND WATERMARK_DATE()",
-        "CAST(event_time AS DATE) = WATERMARK_DATE() OR id > 0",
-        "CAST(event_time AS DATE) BETWEEN WATERMARK_DATE() - INTERVAL '-1' DAY AND WATERMARK_DATE()",
+        "CAST(event_time AS DATE) > EVENT_DATE()",
+        "CAST(event_time AS DATE) BETWEEN EVENT_DATE() - INTERVAL '6' HOUR AND EVENT_DATE()",
+        "CAST(event_time AS DATE) BETWEEN EVENT_DATE() - INTERVAL '1' MONTH AND EVENT_DATE()",
+        "CAST(event_time AS DATE) = EVENT_DATE() OR id > 0",
+        "CAST(event_time AS DATE) BETWEEN EVENT_DATE() - INTERVAL '-1' DAY AND EVENT_DATE()",
     ] {
         rejects(
             &format!(
@@ -277,10 +284,10 @@ async fn calendar_filter_serializes_twenty_five_independent_outputs() {
     for gate in 0..5 {
         for days in [1, 7, 14, 30, 90] {
             let predicate = if days == 1 {
-                "CAST(completeness_time AS DATE) = WATERMARK_DATE()".to_string()
+                "CAST(completeness_time AS DATE) = EVENT_DATE()".to_string()
             } else {
                 format!(
-                    "CAST(completeness_time AS DATE) BETWEEN WATERMARK_DATE() - INTERVAL '{}' DAY AND WATERMARK_DATE()",
+                    "CAST(completeness_time AS DATE) BETWEEN EVENT_DATE() - INTERVAL '{}' DAY AND EVENT_DATE()",
                     days - 1
                 )
             };
@@ -338,8 +345,8 @@ async fn calendar_filter_cdc_alias_projection_coalesce_and_ordinal_mapping() {
         SET updating_ttl = NULL;
         CREATE VIEW projected AS SELECT id, CAST(completeness_time AS DATE) AS contribution_day FROM events;
         SELECT e.id, COUNT(e.id) AS lifetime,
-          COUNT(*) FILTER (WHERE e.id > 0 AND e.contribution_day = WATERMARK_DATE()) AS recent_count,
-          COALESCE(SUM(e.id) FILTER (WHERE e.id > 1 AND e.contribution_day BETWEEN WATERMARK_DATE() - INTERVAL '6' DAY AND WATERMARK_DATE()), 0) AS recent_sum
+          COUNT(*) FILTER (WHERE e.id > 0 AND e.contribution_day = EVENT_DATE()) AS recent_count,
+          COALESCE(SUM(e.id) FILTER (WHERE e.id > 1 AND e.contribution_day BETWEEN EVENT_DATE() - INTERVAL '6' DAY AND EVENT_DATE()), 0) AS recent_sum
         FROM projected AS e GROUP BY e.id")).await;
     let config = compiled
         .program
@@ -424,7 +431,7 @@ async fn calendar_filter_serializes_coerced_numeric_aggregate_arguments() {
             "id BIGINT PRIMARY KEY, amount BIGINT,",
         );
         let compiled = compile(&format!("{source} SET updating_ttl = NULL;
-            SELECT id, SUM(CAST(amount AS {data_type})) FILTER (WHERE CAST(event_time AS DATE) = WATERMARK_DATE()) AS recent
+            SELECT id, SUM(CAST(amount AS {data_type})) FILTER (WHERE CAST(event_time AS DATE) = EVENT_DATE()) AS recent
             FROM events GROUP BY id")).await;
         let config = compiled
             .program
@@ -507,4 +514,57 @@ async fn cdc_source_envelope_marker_is_consumed_at_watermark_boundary() {
     }
     assert_eq!(watermarks, 1);
     assert_eq!(aggregates, 1);
+}
+
+#[test(tokio::test)]
+async fn obsolete_event_clock_names_are_not_registered() {
+    for name in ["WATERMARK_DATE", "WATERMARK_TIMESTAMP"] {
+        rejects(
+            &format!("{SOURCE} SELECT {name}() FROM events"),
+            "Invalid function",
+        )
+        .await;
+    }
+}
+
+#[test(tokio::test)]
+async fn event_clock_implicit_source_calendar_and_local_expressions() {
+    let source = "CREATE TABLE events WITH (connector='impulse', event_rate='1', message_count='4', event_time_interval='1000');";
+    compile(&format!(
+        "{source} CREATE VIEW hidden AS SELECT counter FROM events;
+        SELECT counter, EVENT_TIMESTAMP(), EVENT_DATE() FROM hidden"
+    ))
+    .await;
+    compile(&format!(
+        "{source} CREATE VIEW contributions AS SELECT counter, ROW_TIME() AS contribution_time FROM events;
+        SELECT counter, COUNT(*) FILTER (WHERE CAST(contribution_time AS DATE) = EVENT_DATE()) AS recent,
+        SUM(counter) FILTER (WHERE CAST(contribution_time AS DATE) = EVENT_DATE()) AS recent_sum
+        FROM contributions GROUP BY counter"
+    ))
+    .await;
+    compile(&format!(
+        "{source} SELECT counter,
+        array[EVENT_DATE()], COALESCE(EVENT_TIMESTAMP(), ROW_TIME()) FROM events"
+    ))
+    .await;
+}
+
+#[test(tokio::test)]
+async fn event_clock_finite_local_expression_preserves_bound_argument() {
+    compile(&format!("{SOURCE}
+        CREATE VIEW clocks AS SELECT id, EVENT_TIMESTAMP() AS clock, EVENT_DATE() AS day FROM events;
+        SELECT id, (SELECT MAX(v) FROM (VALUES (clocks.clock)) AS local(v)) AS reference,
+            (SELECT d FROM (VALUES (clocks.day)) AS local(d)) AS reference_date FROM clocks")).await;
+}
+
+#[test(tokio::test)]
+async fn event_clock_local_view_insert_preserves_correlated_values() {
+    compile(&format!("{SOURCE}
+        CREATE TABLE output (id BIGINT, reference TEXT, reference_date TEXT)
+        WITH (connector='single_file', path='/tmp/event-clock-output.jsonl', format='json', type='sink');
+        CREATE VIEW clocks AS SELECT id, EVENT_TIMESTAMP() AS clock, EVENT_DATE() AS day FROM events;
+        CREATE VIEW evaluated AS SELECT id,
+            CAST((SELECT MAX(v) FROM (VALUES (clocks.clock)) AS local(v)) AS TEXT) AS reference,
+            CAST((SELECT d FROM (VALUES (clocks.day)) AS local(d)) AS TEXT) AS reference_date FROM clocks;
+        INSERT INTO output SELECT id, reference, reference_date FROM evaluated")).await;
 }

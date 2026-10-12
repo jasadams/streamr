@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Execute STR-61 SQL through the worker checkpoint harness; never builds Rust.
+"""Execute STR-107 SQL through the worker checkpoint harness; never builds Rust.
 
 Use --prepare-only to inspect SQL and independent expected images. Otherwise
 pass the freshly built arroyo-sql-testing executable as the positional argument.
@@ -60,6 +60,9 @@ def query(directory, case):
     field = 'start_time' if case == 'cdc-start' else 'end_time'
     fmt = 'debezium_json' if updating else 'json'
     primary = ' PRIMARY KEY' if updating else ''
+    # Fixtures use an independent pre-epoch AS column to keep the precision,
+    # backwards-reference and CDC images admitted under common finality.
+    # Late/equality controls are exercised by test-native-calendar-pruning.py.
     source = f"""CREATE TABLE clock_input (
  session_id BIGINT{primary}, duration BIGINT NOT NULL,
  start_time TIMESTAMP NOT NULL, end_time TIMESTAMP NOT NULL,
@@ -71,7 +74,7 @@ CREATE TABLE clock_output (session_id BIGINT, duration BIGINT, event_reference T
  date_reference TEXT, progress_expression TEXT)
 WITH (connector='single_file', path='{directory}/output.jsonl', format='{fmt}', type='sink');
 """
-    projection = "session_id, duration, CAST(WATERMARK_TIMESTAMP() AS TEXT) AS event_reference, CAST(WATERMARK_DATE() AS TEXT) AS date_reference, CAST(completeness_time - INTERVAL '5' SECOND AS TEXT) AS progress_expression"
+    projection = "session_id, duration, CAST(EVENT_TIMESTAMP() AS TEXT) AS event_reference, CAST(EVENT_DATE() AS TEXT) AS date_reference, CAST(completeness_time - INTERVAL '5' SECOND AS TEXT) AS progress_expression"
     if case == 'append-lookup':
         source += '''CREATE STATE TABLE retained (session_id BIGINT PRIMARY KEY, _timestamp TIMESTAMP) PARTITION BY session_id;
 CREATE VIEW applied AS MERGE INTO retained AS target USING clock_input AS source
@@ -84,7 +87,12 @@ CREATE VIEW triggered AS SELECT source.session_id AS session_id, source.duration
         relation = "triggered LEFT JOIN retained AS target ON triggered.session_id=target.session_id"
         projection = projection.replace('session_id, duration,', 'triggered.session_id AS session_id, duration,')
         return source + f"INSERT INTO clock_output SELECT {projection} FROM {relation} WHERE target._timestamp=completeness_time - INTERVAL '1' DAY;\n"
-    if case == 'append-view':
+    if case == 'append-local':
+        source += 'CREATE VIEW clocks AS SELECT session_id, duration, completeness_time, EVENT_TIMESTAMP() AS clock, EVENT_DATE() AS day FROM clock_input;\n'
+        projection = "session_id, duration, CAST((SELECT MAX(v) FROM (VALUES (clocks.clock)) AS local(v)) AS TEXT) AS event_reference, CAST((SELECT d FROM (VALUES (clocks.day)) AS local(d)) AS TEXT) AS date_reference, CAST(completeness_time - INTERVAL '5' SECOND AS TEXT) AS progress_expression"
+        source += f'CREATE VIEW evaluated AS SELECT {projection} FROM clocks;\n'
+        return source + 'INSERT INTO clock_output SELECT session_id, duration, event_reference, date_reference, progress_expression FROM evaluated;\n'
+    elif case == 'append-view':
         source += 'CREATE VIEW renamed AS SELECT session_id, duration, end_time AS renamed_time, completeness_time FROM clock_input;\n'
         source += 'CREATE VIEW hidden AS SELECT session_id, duration, completeness_time FROM renamed;\n'
         relation = 'hidden'
@@ -101,11 +109,11 @@ def prepare(directory):
     cases = {}
     for backend in ('memory', 'rocksdb'):
         for mode in ('controller', 'leader'):
-            for case in ('append', 'append-negative-progress', 'append-view', 'append-lookup', 'cdc-end', 'cdc-start'):
+            for case in ('append', 'append-negative-progress', 'append-view', 'append-local', 'append-lookup', 'cdc-end', 'cdc-start'):
                 for batch in (1, 8):
                     path = directory / f'{backend}-{mode}-batch{batch}-{case}'
                     path.mkdir(parents=True, exist_ok=True)
-                    input_case = 'append' if case in ('append-view', 'append-lookup') else case
+                    input_case = 'append' if case in ('append-view', 'append-local', 'append-lookup') else case
                     (path / 'input.jsonl').write_text((ROOT / f'{input_case}.input.jsonl').read_text())
                     (path / 'query.sql').write_text(query(path, case))
                     oracle = expected(input_case)
@@ -163,15 +171,15 @@ def compare_probe(path, case, env, oracle, prefix):
                     'recovered': [third, fourth] if batch == 1 else [third]}
     elif case.startswith('cdc'):
         # One source envelope unrolls into both images even at source batch 1.
-        # A day move emits the minimum old/new AS while advancing the raw FOR maximum.
-        first = '2026-10-10T00:00:05'
+        # A day move advances the raw FOR maximum; independent low AS keeps correction images admitted.
+        first = '1969-12-31T23:59:54'
         controls = {'initial': [first, first] if batch == 1 else [first],
                     'checkpoint': [first], 'recovered': [first]}
     else:
-        first = '2026-10-09T23:59:58'
-        controls = {'initial': [first, '2026-10-10T00:00:25', '2026-10-10T00:00:27'] if batch == 1 else ['1970-01-01T00:00:00'],
-                    'checkpoint': [first] if batch == 1 else ['2026-10-09T23:59:45'],
-                    'recovered': ['2026-10-10T00:00:25', '2026-10-10T00:00:27'] if batch == 1 else ['1970-01-01T00:00:00']}
+        first = '1969-12-31T23:59:54'
+        controls = {'initial': [first, first, first] if batch == 1 else [first],
+                    'checkpoint': [first],
+                    'recovered': [first, first] if batch == 1 else [first]}
     for phase, values in controls.items():
         starting = [r['nanos'] for r in traces[phase] if r['kind'] == 'start_watermark']
         restored = str(timestamp_nanos(controls['checkpoint'][-1])) if phase == 'recovered' else None
@@ -187,33 +195,39 @@ def compare_probe(path, case, env, oracle, prefix):
 
 
 def execute(binary, cases):
+    failures = []
     for name, (path, case, env, oracle, prefix) in cases.items():
-        with (path / 'capture.log').open('w') as output:
-            result = subprocess.run([str(binary), 'external_sql_checkpoint_capture', '--ignored',
-                '--test-threads=1', '--nocapture'], env=dict(os.environ, **env), stdout=output, stderr=subprocess.STDOUT)
-        log = (path / 'capture.log').read_text()
-        if result.returncode or '1 passed' not in log:
-            raise RuntimeError(f'{name}: worker capture failed ({result.returncode}); {path}/capture.log')
-        marker = re.search(r'CAPTURE_RESULT phase=recovered checkpoint=1 input_rows_before_checkpoint=2 committed_rows=(\d+) rows=(\d+)', log)
-        if marker is None:
-            raise ValueError(f'{name}: missing fresh-worker checkpoint marker')
-        coalesced = case.startswith('cdc') and env['STREAMR_TEST_SOURCE_BATCH_ROWS'] == '8'
-        # Exact sink contract: one same-ID batch collapses create-to-delete to
-        # no output. Checkpoint creates corrected b; restored suffix deletes b.
-        sink_oracle = [oracle[2], oracle[3]] if coalesced else oracle
-        for filename in ('output.initial.jsonl', 'output.jsonl'):
-            rows = read_rows(path / filename)
-            actual = changes(rows, case.startswith('cdc'))
-            expected_sink = [] if coalesced and filename == 'output.initial.jsonl' else sink_oracle
-            if actual != expected_sink:
-                raise ValueError(f'{name}/{filename}: ordered sink images differ\nactual={actual}\nexpected={expected_sink}')
-        restored = read_rows(path / 'output.jsonl')
-        committed = int(marker[1])
-        if changes(restored[:committed], case.startswith('cdc')) != sink_oracle[:1 if coalesced else prefix]:
-            raise ValueError(f'{name}: checkpoint committed sink image prefix differs')
-        compare_probe(path, case, env, oracle, prefix)
-        print(f'PASS {name}: exact sink images, raw metadata/IDs/progress and checkpoint prefix; fresh worker restore', flush=True)
-
+        try:
+            with (path / 'capture.log').open('w') as output:
+                result = subprocess.run([str(binary), 'external_sql_checkpoint_capture', '--ignored',
+                    '--test-threads=1', '--nocapture'], env=dict(os.environ, **env), stdout=output, stderr=subprocess.STDOUT)
+            log = (path / 'capture.log').read_text()
+            if result.returncode or '1 passed' not in log:
+                raise RuntimeError(f'{name}: worker capture failed ({result.returncode}); {path}/capture.log')
+            marker = re.search(r'CAPTURE_RESULT phase=recovered checkpoint=1 input_rows_before_checkpoint=2 committed_rows=(\d+) rows=(\d+)', log)
+            if marker is None:
+                raise ValueError(f'{name}: missing fresh-worker checkpoint marker')
+            coalesced = case.startswith('cdc') and env['STREAMR_TEST_SOURCE_BATCH_ROWS'] == '8'
+            # Exact sink contract: one same-ID batch collapses create-to-delete to
+            # no output. Checkpoint creates corrected b; restored suffix deletes b.
+            sink_oracle = [oracle[2], oracle[3]] if coalesced else oracle
+            for filename in ('output.initial.jsonl', 'output.jsonl'):
+                rows = read_rows(path / filename)
+                actual = changes(rows, case.startswith('cdc'))
+                expected_sink = [] if coalesced and filename == 'output.initial.jsonl' else sink_oracle
+                if actual != expected_sink:
+                    raise ValueError(f'{name}/{filename}: ordered sink images differ\nactual={actual}\nexpected={expected_sink}')
+            restored = read_rows(path / 'output.jsonl')
+            committed = int(marker[1])
+            if changes(restored[:committed], case.startswith('cdc')) != sink_oracle[:1 if coalesced else prefix]:
+                raise ValueError(f'{name}: checkpoint committed sink image prefix differs')
+            compare_probe(path, case, env, oracle, prefix)
+            print(f'PASS {name}: exact sink images, raw metadata/IDs/progress and checkpoint prefix; fresh worker restore', flush=True)
+        except (RuntimeError, ValueError, OSError) as error:
+            failures.append(str(error))
+            print(f"FAIL {error}", flush=True)
+    if failures:
+        raise RuntimeError(f"{len(failures)} scenario(s) failed: " + "; ".join(failures))
 
 def self_test():
     assert normalize('1969-12-31 23:59:59.999999999') == '1969-12-31T23:59:59.999999999'
@@ -227,13 +241,13 @@ def self_test():
     with tempfile.TemporaryDirectory(prefix='event-clock-comparator-') as directory:
         path = Path(directory)
         oracle = expected('cdc-end')
-        for phase, images, controls in [('initial', oracle, ['2026-10-10T00:00:05', '2026-10-10T00:00:05']),
-                                        ('checkpoint', oracle[:3], ['2026-10-10T00:00:05']),
-                                        ('recovered', oracle[3:], ['2026-10-10T00:00:05'])]:
+        for phase, images, controls in [('initial', oracle, ['1969-12-31T23:59:54', '1969-12-31T23:59:54']),
+                                        ('checkpoint', oracle[:3], ['1969-12-31T23:59:54']),
+                                        ('recovered', oracle[3:], ['1969-12-31T23:59:54'])]:
             rows = [dict(kind='row', session_id=row['session_id'], raw_nanos=timestamp_nanos(row['event_reference']),
                          retract=sign == '-', id='ab' * 16) for sign, row in images]
             rows += [dict(kind='watermark', nanos=str(timestamp_nanos(value))) for value in controls]
-            rows.append(dict(kind='start_watermark', nanos=str(timestamp_nanos('2026-10-10T00:00:05')) if phase == 'recovered' else None))
+            rows.append(dict(kind='start_watermark', nanos=str(timestamp_nanos('1969-12-31T23:59:54')) if phase == 'recovered' else None))
             if phase != 'checkpoint':
                 rows.append(dict(kind='watermark', nanos=str(2**64 - 1)))
             (path / f'output.{phase}.probe.jsonl').write_text(''.join(json.dumps(row) + '\n' for row in rows))
@@ -241,7 +255,7 @@ def self_test():
         compare_probe(path, 'cdc-end', env, oracle, 3)
         probe = path / 'output.recovered.probe.jsonl'
         original = probe.read_text()
-        for wrong in (original.replace('abababab', 'cdcdcdcd'), original.replace(str(timestamp_nanos('2026-10-10T00:00:05')), '123'), original.replace('"kind": "start_watermark", "nanos": "'+str(timestamp_nanos('2026-10-10T00:00:05'))+'"', '"kind": "start_watermark", "nanos": "0"')):
+        for wrong in (original.replace('abababab', 'cdcdcdcd'), original.replace(str(timestamp_nanos('1969-12-31T23:59:54')), '123'), original.replace('"kind": "start_watermark", "nanos": "'+str(timestamp_nanos('1969-12-31T23:59:54'))+'"', '"kind": "start_watermark", "nanos": "0"')):
             probe.write_text(wrong)
             try:
                 compare_probe(path, 'cdc-end', env, oracle, 3)

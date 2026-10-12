@@ -99,6 +99,10 @@ struct ProbeCollector<'a> {
 #[async_trait]
 impl Collector for ProbeCollector<'_> {
     async fn collect(&mut self, batch: RecordBatch) -> DataflowResult<()> {
+        write(
+            &self.trace,
+            json!({"kind":"batch", "rows":batch.num_rows()}),
+        );
         let time = batch
             .column_by_name("_timestamp")
             .unwrap()
@@ -107,6 +111,7 @@ impl Collector for ProbeCollector<'_> {
             .unwrap();
         let pk = batch
             .column_by_name("session_id")
+            .or_else(|| batch.column_by_name("counter"))
             .unwrap()
             .as_any()
             .downcast_ref::<Int64Array>()

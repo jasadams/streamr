@@ -14,8 +14,11 @@ hashes are preserved in `post-rebase-audit.json`.
 ## Contract and ownership
 
 COUNT/SUM calendar FILTERs use inclusive UTC dates `[D-(N-1), D]`.
-The contribution DATE expression is independent of the declared FOR column.
-Event triggers use their own raw FOR reference date, including backwards dates;
+The contribution DATE expression is independent of the internal trigger clock.
+`EVENT_DATE()` uses the current triggering event's internal UTC date, including
+backwards dates; explicit `WATERMARK FOR` selects that internal clock when present.
+Without it the established source timestamp remains the clock.
+Event triggers use this reference date;
 static eligibility remains attached to each contribution. Ordinary lifetime
 aggregates retain their own state. Unsupported clock-dependent predicates fail
 instead of becoming arrival-only filters.
