@@ -198,7 +198,7 @@ def query(directory, updating):
             argument = 'SUM(amount)' if total else 'COUNT(*)'
             clauses = [gate] if gate else []
             if horizon is not None:
-                temporal = f'CAST({date_field} AS DATE) = WATERMARK_DATE()' if horizon == 1 else f"CAST({date_field} AS DATE) BETWEEN WATERMARK_DATE() - INTERVAL '{horizon - 1}' DAY AND WATERMARK_DATE()"
+                temporal = f'CAST({date_field} AS DATE) = EVENT_DATE()' if horizon == 1 else f"CAST({date_field} AS DATE) BETWEEN EVENT_DATE() - INTERVAL '{horizon - 1}' DAY AND EVENT_DATE()"
                 clauses.append(temporal)
             if clauses:
                 argument += ' FILTER (WHERE ' + ' AND '.join(f'({clause})' for clause in clauses) + ')'
@@ -208,7 +208,7 @@ def query(directory, updating):
     else:
         for metric in METRICS:
             for days in HORIZONS:
-                temporal = 'CAST(contribution_time AS DATE) = WATERMARK_DATE()' if days == 1 else f"CAST(contribution_time AS DATE) BETWEEN WATERMARK_DATE() - INTERVAL '{days - 1}' DAY AND WATERMARK_DATE()"
+                temporal = 'CAST(contribution_time AS DATE) = EVENT_DATE()' if days == 1 else f"CAST(contribution_time AS DATE) BETWEEN EVENT_DATE() - INTERVAL '{days - 1}' DAY AND EVENT_DATE()"
                 gate = 'eligible AND ' if metric.startswith('eligible_') else ''
                 expressions.append(f'{arguments[metric]} FILTER (WHERE {gate}({temporal})) AS {metric}_{days}d')
         for metric in METRICS:
@@ -318,54 +318,60 @@ def read_records(path):
 
 
 def execute(binary, cases):
+    failures = []
     for path, backend, batch, mode, checkpoint, snapshots, checkpoint_steps in cases:
-        environment = dict(os.environ, STREAMR_TEST_NATIVE_AGGREGATES='1',
-                           STREAMR_TEST_BACKEND=backend, STREAMR_TEST_CHECKPOINT_MODE=mode,
-                           STREAMR_TEST_SOURCE_BATCH_ROWS=str(batch), STREAMR_TEST_AGGREGATE_FLUSH_SECONDS='3600',
-                           STREAMR_TEST_RUNTIME_TIMEOUT_SECONDS='120', STREAMR_CAPTURE_QUERY=str(path / 'query.sql'),
-                           STREAMR_CAPTURE_OUTPUT=str(path / 'output.jsonl'),
-                           STREAMR_CAPTURE_INPUT_ROWS_BEFORE_CHECKPOINT=str(checkpoint),
-                           STREAMR_CAPTURE_CHECKPOINT_EPOCH='1', STREAMR_CAPTURE_EXPECTED_INITIAL_ROWS='2',
-                           STREAMR_CAPTURE_EXPECTED_CHECKPOINT_ROWS='2', STREAMR_CAPTURE_EXPECTED_ROWS='2',
-                           STREAMR_CAPTURE_MAX_INITIAL_ROWS='192', STREAMR_CAPTURE_MAX_CHECKPOINT_ROWS='192',
-                           STREAMR_CAPTURE_MAX_ROWS='192')
-        # Batch-1 initial execution deliberately pauses source controls across
-        # aggregate flushes. Validate every CDC correction and both raw midnight
-        # references while the worker is live, before EOF or checkpoint flushing.
-        if batch == 1:
-            environment['STREAMR_CAPTURE_INITIAL_SCHEDULE'] = str(path / 'schedule.json')
-            environment['STREAMR_TEST_AGGREGATE_FLUSH_SECONDS'] = '1'
-        else:
-            environment.pop('STREAMR_CAPTURE_INITIAL_SCHEDULE', None)
-        log_path = path / 'capture.log'
-        with log_path.open('w') as log:
-            result = subprocess.run([str(binary), 'external_sql_checkpoint_capture', '--ignored', '--test-threads=1', '--nocapture'],
-                                    env=environment, stdout=log, stderr=subprocess.STDOUT)
-        log = log_path.read_text()
-        if result.returncode or '1 passed' not in log:
-            raise RuntimeError(f'{path.name}: engine capture failed ({result.returncode}); inspect {log_path}')
-        markers = re.findall(r'^CAPTURE_RESULT phase=recovered checkpoint=1 input_rows_before_checkpoint=(\d+) committed_rows=(\d+) rows=(\d+) bytes=\d+ path=(.+) job=\S+$', log, re.MULTILINE)
-        if len(markers) != 1:
-            raise ValueError(f'{path.name}: missing unique fresh-worker recovery receipt')
-        captured_checkpoint, committed, captured, output_path = markers[0]
-        if int(captured_checkpoint) != checkpoint or output_path != str(path / 'output.jsonl'):
-            raise ValueError(f'{path.name}: recovery receipt differs')
-        initial = read_records(path / 'output.initial.jsonl')
-        restored = read_records(path / 'output.jsonl')
-        committed, captured = int(committed), int(captured)
-        if not 2 <= committed <= len(restored) == captured <= 192:
-            raise ValueError(f'{path.name}: committed/captured row bounds differ')
-        if batch == 1:
-            observations = json.loads((path / 'expected.observations.json').read_text())
-            for label, end in observations.items():
-                records = read_records(path / f'output.schedule-initial-{label}.jsonl')
-                reduce_records(records, snapshots[:end], snapshots[end - 1])
-        reduce_records(initial, snapshots, snapshots[-1])
-        reduce_records(restored[:committed], snapshots[:checkpoint_steps], snapshots[checkpoint_steps - 1])
-        reduce_records(restored, snapshots, snapshots[-1])
-        coverage_label = '25 total catalog AST-shape' if CATALOG_SHAPES else '25 calendar plus 5 lifetime'
-        print(f'PASS {path.name}: generic {coverage_label} outputs, every CDC image, live batch-1 prefixes, checkpoint prefix and fresh-worker restore', flush=True)
-
+        try:
+            environment = dict(os.environ, STREAMR_TEST_NATIVE_AGGREGATES='1',
+                               STREAMR_TEST_BACKEND=backend, STREAMR_TEST_CHECKPOINT_MODE=mode,
+                               STREAMR_TEST_SOURCE_BATCH_ROWS=str(batch), STREAMR_TEST_AGGREGATE_FLUSH_SECONDS='3600',
+                               STREAMR_TEST_RUNTIME_TIMEOUT_SECONDS='120', STREAMR_CAPTURE_QUERY=str(path / 'query.sql'),
+                               STREAMR_CAPTURE_OUTPUT=str(path / 'output.jsonl'),
+                               STREAMR_CAPTURE_INPUT_ROWS_BEFORE_CHECKPOINT=str(checkpoint),
+                               STREAMR_CAPTURE_CHECKPOINT_EPOCH='1', STREAMR_CAPTURE_EXPECTED_INITIAL_ROWS='2',
+                               STREAMR_CAPTURE_EXPECTED_CHECKPOINT_ROWS='2', STREAMR_CAPTURE_EXPECTED_ROWS='2',
+                               STREAMR_CAPTURE_MAX_INITIAL_ROWS='192', STREAMR_CAPTURE_MAX_CHECKPOINT_ROWS='192',
+                               STREAMR_CAPTURE_MAX_ROWS='192')
+            # Batch-1 initial execution deliberately pauses source controls across
+            # aggregate flushes. Validate every CDC correction and both raw midnight
+            # references while the worker is live, before EOF or checkpoint flushing.
+            if batch == 1:
+                environment['STREAMR_CAPTURE_INITIAL_SCHEDULE'] = str(path / 'schedule.json')
+                environment['STREAMR_TEST_AGGREGATE_FLUSH_SECONDS'] = '1'
+            else:
+                environment.pop('STREAMR_CAPTURE_INITIAL_SCHEDULE', None)
+            log_path = path / 'capture.log'
+            with log_path.open('w') as log:
+                result = subprocess.run([str(binary), 'external_sql_checkpoint_capture', '--ignored', '--test-threads=1', '--nocapture'],
+                                        env=environment, stdout=log, stderr=subprocess.STDOUT)
+            log = log_path.read_text()
+            if result.returncode or '1 passed' not in log:
+                raise RuntimeError(f'{path.name}: engine capture failed ({result.returncode}); inspect {log_path}')
+            markers = re.findall(r'^CAPTURE_RESULT phase=recovered checkpoint=1 input_rows_before_checkpoint=(\d+) committed_rows=(\d+) rows=(\d+) bytes=\d+ path=(.+) job=\S+$', log, re.MULTILINE)
+            if len(markers) != 1:
+                raise ValueError(f'{path.name}: missing unique fresh-worker recovery receipt')
+            captured_checkpoint, committed, captured, output_path = markers[0]
+            if int(captured_checkpoint) != checkpoint or output_path != str(path / 'output.jsonl'):
+                raise ValueError(f'{path.name}: recovery receipt differs')
+            initial = read_records(path / 'output.initial.jsonl')
+            restored = read_records(path / 'output.jsonl')
+            committed, captured = int(committed), int(captured)
+            if not 2 <= committed <= len(restored) == captured <= 192:
+                raise ValueError(f'{path.name}: committed/captured row bounds differ')
+            if batch == 1:
+                observations = json.loads((path / 'expected.observations.json').read_text())
+                for label, end in observations.items():
+                    records = read_records(path / f'output.schedule-initial-{label}.jsonl')
+                    reduce_records(records, snapshots[:end], snapshots[end - 1])
+            reduce_records(initial, snapshots, snapshots[-1])
+            reduce_records(restored[:committed], snapshots[:checkpoint_steps], snapshots[checkpoint_steps - 1])
+            reduce_records(restored, snapshots, snapshots[-1])
+            coverage_label = '25 total catalog AST-shape' if CATALOG_SHAPES else '25 calendar plus 5 lifetime'
+            print(f'PASS {path.name}: generic {coverage_label} outputs, every CDC image, live batch-1 prefixes, checkpoint prefix and fresh-worker restore', flush=True)
+        except (RuntimeError, ValueError, OSError) as error:
+            failures.append(str(error))
+            print(f"FAIL {error}", flush=True)
+    if failures:
+        raise RuntimeError(f"{len(failures)} scenario(s) failed: " + "; ".join(failures))
 
 def synthetic_records(snapshots):
     current, records = {}, []
@@ -442,7 +448,7 @@ def self_test():
     with tempfile.TemporaryDirectory(prefix='calendar-oracle-self-test-') as directory:
         cases = prepare(Path(directory))
         assert len(cases) == 16
-        assert all((case[0] / 'query.sql').read_text().count('WATERMARK_DATE()') == (33 if CATALOG_SHAPES else 45) for case in cases)
+        assert all((case[0] / 'query.sql').read_text().count('EVENT_DATE()') == (33 if CATALOG_SHAPES else 45) for case in cases)
         if CATALOG_SHAPES:
             assert all("AND (subtype IS DISTINCT FROM 'blocked') AND (gate_tag NOT IN ('excluded', 'ignored'))" in (case[0] / 'query.sql').read_text() for case in cases)
         for path, _, batch, _, _, _, _ in cases:

@@ -1799,7 +1799,8 @@ fn idle_pre_match_checks_latest_complete_object_row() {
 }
 
 /// Capture externally supplied SQL as JSONL before and after checkpoint recovery.
-/// Requires a singleton graph and one control-waiting single-file source.
+/// Requires a singleton graph and one control-waiting single-file source,
+/// or the opt-in finite Impulse event-clock capture route.
 /// Input advancement and expected output counts are configured independently;
 /// fixture preparation and business-output comparison belong to the caller.
 /// Run alone because worker configuration and checkpoint storage are process-wide.
@@ -1898,19 +1899,39 @@ async fn external_sql_checkpoint_capture_inner() {
     let source: arroyo_rpc::grpc::api::ConnectorOp =
         prost::Message::decode(sources[0].0.operator_config.as_slice())
             .expect("capture source config must decode");
-    assert_eq!(
-        source.connector, "single_file",
-        "capture requires a single-file source"
-    );
+    let impulse = env::var("STREAMR_CAPTURE_IMPULSE").as_deref() == Ok("1");
     let source_config: arroyo_rpc::OperatorConfig =
         serde_json::from_str(&source.config).expect("capture source connector config must decode");
-    assert!(
-        source_config
-            .table
-            .get("wait_for_control")
-            .is_none_or(|value| value.is_null() || value.as_bool() == Some(true)),
-        "capture source must wait for control after each input row"
-    );
+    if impulse {
+        assert_eq!(source.connector, "impulse");
+        assert_eq!(selected_checkpoint, "controller");
+        assert!(idle.is_none() && schedule.is_none());
+        assert_eq!(
+            source_config.table["event_time_interval"].as_i64(),
+            Some(1000)
+        );
+        assert!(
+            source_config.table["message_count"]
+                .as_i64()
+                .is_some_and(|n| n > 0)
+        );
+        assert_eq!(
+            env::var("STREAMR_CAPTURE_EVENT_CLOCK_PROBE").as_deref(),
+            Ok("1")
+        );
+    } else {
+        assert_eq!(
+            source.connector, "single_file",
+            "capture requires a single-file source"
+        );
+        assert!(
+            source_config
+                .table
+                .get("wait_for_control")
+                .is_none_or(|value| value.is_null() || value.as_bool() == Some(true)),
+            "capture source must wait for control after each input row"
+        );
+    }
     if let Some(schedule) = &schedule {
         schedule
             .validate_input(
@@ -2043,9 +2064,17 @@ async fn external_sql_checkpoint_capture_inner() {
         1,
         "capture requires one source"
     );
-    advance(&running, capture.input_rows_before_checkpoint - 1).await;
-    // Stop at the barrier: a normal checkpoint resumes the source and reads
-    // another line, which could flush beyond the captured checkpoint prefix.
+    if impulse {
+        crate::impulse_capture::wait_for_rows(
+            &output_path,
+            capture.input_rows_before_checkpoint as usize,
+            test_runtime_timeout(),
+        )
+        .await;
+    } else {
+        advance(&running, capture.input_rows_before_checkpoint - 1).await;
+    }
+    // Stop at the barrier so neither source can emit beyond the captured prefix.
     let mut finished_tasks = HashSet::new();
     let checkpoint_bytes = checkpoint_with_stop(
         &mut SmokeTestContext {
@@ -2150,6 +2179,15 @@ async fn external_sql_checkpoint_capture_inner() {
         control_tx,
     )
     .await;
+    if impulse {
+        crate::impulse_capture::record_saved_source_state(
+            &program,
+            &job_id,
+            capture.checkpoint_epoch,
+            &output_path,
+        )
+        .await;
+    }
     crate::event_clock_probe::install(&program, &output_path, "recovered");
     let restored = Engine::for_local(program, "pipe-test".into(), job_id.clone())
         .await

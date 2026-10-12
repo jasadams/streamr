@@ -54,13 +54,13 @@ make_udf_function!(MultiHashFunction, MULTI_HASH, multi_hash);
 
 pub fn register_all(registry: &mut dyn FunctionRegistry) {
     // Context-bound markers: the planner replaces these with the triggering
-    // source row's declared FOR time. They must never execute as scalar UDFs.
+    // source row's internal event time. They must never execute as scalar UDFs.
     for (name, return_type) in [
         (
-            "watermark_timestamp",
+            "event_timestamp",
             DataType::Timestamp(arrow_schema::TimeUnit::Nanosecond, None),
         ),
-        ("watermark_date", DataType::Date32),
+        ("event_date", DataType::Date32),
     ] {
         registry
             .register_udf(Arc::new(create_udf(

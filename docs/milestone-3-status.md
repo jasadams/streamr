@@ -1,3 +1,13 @@
+## STR-107 event clock — 2026-10-12
+
+- Coordinator Codex `/root`; implementer `/root/implement`. Branch `jason/str-107-event-clock-20261012`, workspace `/home/jason/repos/streamr-worktrees/str-107-event-clock-20261012`; fetched base `1766a63d663210ee15b2925ae194d4be60a985f1`. STR-107 claim guard CLEAR; reservation `codex-str-107-20261012`.
+- Read current ticket, `AGENTS.md`, `.claude/build-test.md`/`team.md`, this ledger and feature plan. `CLAUDE.md` and `docs/CODING_STANDARDS.md` are absent at this base. User approves EVENT_DATE/EVENT_TIMESTAMP using the triggering internal timestamp without explicit FOR; no clock/admission/checkpoint redesign, signing or automatic time limit.
+- Ownership: implementer owns relevant production source, focused fixtures/harness and maintained function documentation; coordinator owns this entry, independent review, evidence audit and publication.
+- Acceptance: all eight STR-107 criteria, including precise UTC/nanosecond values, lineage/CDC/lateness, actual native calendar execution and finite Impulse, memory/RocksDB batches 1/8 fresh-worker checkpoint continuation. No broad STR-103 capacity run.
+- Validation: affected planner/worker/SQL-testing locked check and strict Clippy passed; final event-clock planner18, local8, calendar worker12 and admission6 tests passed. Actual SQL recovery matrices: event-clock56, calendar16, admission/pruning8, finite Impulse4 passed with exact values/prefixes/fresh workers; earlier compile and fixture failures remain preserved. Final narrow planner lint passed; independent evidence approval and publication gates remain pending.
+- Separate direct-INSERT nested VALUES sink-schema limitation tracked as [STR-108](https://trakkt.app/issues/STR-108); supported finite local view route passed, no STR-107 acceptance deferred. STR-103 capacity remains separate.
+- Next: finish final source/evidence review, publish PR and verify current-head CI. No user decision pending. Exact receipts/source/image/binary hashes: [STR-107 validation](str-107-validation.md), `/home/jason/repos/streamr-validation/str-107-event-clock-20261012/`.
+
 ## STR-59 LIKE_REGEX — 2026-10-11
 
 - Coordinator Codex `/root`, session `01a12b09-124d-7ed1-9075-41aeb7211aa4`; implementer `/root/implement`. Start 12:58 UTC. Base `34623ba2518bcf86cb13e994c46157cc9bed506a`; workspace `/home/jason/repos/streamr-worktrees/str-59-like-regex-20261011`.

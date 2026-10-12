@@ -828,7 +828,7 @@ pub(crate) fn depends_on_event_clock(expr: &Expr, schema: &datafusion::common::D
     expr.exists(|expr| {
         Ok(match expr {
             Expr::ScalarFunction(function) => {
-                matches!(function.name(), "watermark_timestamp" | "watermark_date")
+                matches!(function.name(), "event_timestamp" | "event_date")
             }
             Expr::Column(column) => schema
                 .field_from_column(column)
@@ -850,19 +850,17 @@ impl TreeNodeRewriter for EventClockRewriter<'_> {
         let Expr::ScalarFunction(function) = &node else {
             return Ok(Transformed::no(node));
         };
-        if !matches!(function.name(), "watermark_timestamp" | "watermark_date") {
+        if !matches!(function.name(), "event_timestamp" | "event_date") {
             return Ok(Transformed::no(node));
         }
 
-        let mut designated_sources = 0;
         let mut aggregate = false;
         let mut trigger_sources = 0;
         let mut overwritten = false;
         self.input.exists(|plan| {
             if let LogicalPlan::Extension(extension) = plan {
-                if let Some(source) = extension.node.as_any().downcast_ref::<TableSourceExtension>() {
+                if extension.node.as_any().is::<TableSourceExtension>() {
                     trigger_sources += 1;
-                    designated_sources += usize::from(source.table.event_time_field.is_some());
                 }
                 aggregate |= extension.node.as_any().is::<crate::extension::aggregate::AggregateExtension>();
             }
@@ -884,19 +882,19 @@ impl TreeNodeRewriter for EventClockRewriter<'_> {
             aggregate |= matches!(plan, LogicalPlan::Aggregate(_));
             Ok(false)
         })?;
-        if designated_sources == 0 {
+        if trigger_sources == 0 {
             return plan_err!(
-                "WATERMARK_TIMESTAMP()/WATERMARK_DATE() requires a source with WATERMARK FOR"
+                "EVENT_TIMESTAMP()/EVENT_DATE() requires a current triggering event source"
             );
         }
-        if designated_sources != 1 || trigger_sources != 1 {
+        if trigger_sources != 1 {
             return plan_err!(
-                "WATERMARK_TIMESTAMP()/WATERMARK_DATE() has ambiguous WATERMARK FOR sources; a single triggering source is required"
+                "EVENT_TIMESTAMP()/EVENT_DATE() has ambiguous triggering sources; a single triggering source is required"
             );
         }
         if aggregate {
             return plan_err!(
-                "WATERMARK_TIMESTAMP()/WATERMARK_DATE() requires current-trigger clock metadata across maintained aggregates (STR-62); aggregate output time is not an event clock"
+                "EVENT_TIMESTAMP()/EVENT_DATE() requires current-trigger clock metadata across maintained aggregates (STR-62); aggregate output time is not an event clock"
             );
         }
         if overwritten {
@@ -920,8 +918,8 @@ impl TreeNodeRewriter for EventClockRewriter<'_> {
             Column::new(qualifier.cloned(), field.name())
         };
         let timestamp = Expr::Column(column);
-        let expression = if function.name() == "watermark_date" {
-            // FOR is validated as a timezone-free UTC TIMESTAMP. Arrow's date
+        let expression = if function.name() == "event_date" {
+            // Internal event time is a timezone-free UTC TIMESTAMP. Arrow's date
             // cast uses floor division, including timestamps before the epoch.
             Expr::Cast(datafusion::logical_expr::expr::Cast {
                 expr: Box::new(timestamp),

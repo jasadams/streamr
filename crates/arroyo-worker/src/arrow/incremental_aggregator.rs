@@ -4253,7 +4253,7 @@ mod tests {
             }
             // The original business FOR field remains old on the before row;
             // common admission supplies current envelope _timestamp on BOTH
-            // images. WATERMARK_DATE binds that internal trigger context.
+            // images. EVENT_DATE binds that internal trigger context.
             let input = batch_at(
                 &[Some("original-business-for-day-199")],
                 &[1],

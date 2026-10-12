@@ -35,9 +35,9 @@ fn unalias(mut expression: &Expr) -> &Expr {
     expression
 }
 
-fn watermark_date(expression: &Expr) -> bool {
+fn event_date(expression: &Expr) -> bool {
     matches!(unalias(expression), Expr::ScalarFunction(function)
-        if function.name() == "watermark_date" && function.args.is_empty())
+        if function.name() == "event_date" && function.args.is_empty())
 }
 
 fn horizon_lower(expression: &Expr) -> Option<u32> {
@@ -46,7 +46,7 @@ fn horizon_lower(expression: &Expr) -> Option<u32> {
     let Expr::BinaryExpr(binary) = unalias(expression) else {
         return None;
     };
-    if binary.op != Operator::Minus || !watermark_date(&binary.left) {
+    if binary.op != Operator::Minus || !event_date(&binary.left) {
         return None;
     }
     let days = match unalias(&binary.right) {
@@ -67,15 +67,15 @@ fn temporal_clause(expression: &Expr) -> Option<(Expr, u32)> {
     use datafusion::logical_expr::Operator;
     match unalias(expression) {
         Expr::BinaryExpr(binary) if binary.op == Operator::Eq => {
-            if watermark_date(&binary.right) {
+            if event_date(&binary.right) {
                 Some((*binary.left.clone(), 1))
-            } else if watermark_date(&binary.left) {
+            } else if event_date(&binary.left) {
                 Some((*binary.right.clone(), 1))
             } else {
                 None
             }
         }
-        Expr::Between(between) if !between.negated && watermark_date(&between.high) => {
+        Expr::Between(between) if !between.negated && event_date(&between.high) => {
             Some((*between.expr.clone(), horizon_lower(&between.low)?))
         }
         _ => None,
@@ -138,7 +138,7 @@ fn calendar_filters(
             if depends_on_event_clock(&clause, input.schema()) {
                 let Some(candidate) = temporal_clause(&clause) else {
                     return plan_err!(
-                        "unsupported clock-dependent FILTER: expected DATE = WATERMARK_DATE() or DATE BETWEEN WATERMARK_DATE() - constant DAY AND WATERMARK_DATE(); retained contribution time is a distinct input"
+                        "unsupported clock-dependent FILTER: expected DATE = EVENT_DATE() or DATE BETWEEN EVENT_DATE() - constant DAY AND EVENT_DATE(); retained contribution time is a distinct input"
                     );
                 };
                 if temporal.replace(candidate).is_some() {
@@ -163,7 +163,7 @@ fn calendar_filters(
         }
         let mut reference = None;
         filter.apply(|expression| {
-            if watermark_date(expression) {
+            if event_date(expression) {
                 reference = Some(unalias(expression).clone());
             }
             Ok(TreeNodeRecursion::Continue)
