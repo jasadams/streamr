@@ -361,7 +361,7 @@ window/source/sink state, RocksDB overhead and RSS. The prior 120.24- and
 recovered captures in 166.55 and 143.94 seconds total, respectively. These are
 end-to-end observations, not a controlled CPU speedup measurement. See
 [native result composition](native-result-composition.md) and
-[checkpoint inventory](native-checkpoint-inventory.md) for the exact scope.
+[historical inventory evidence](native-checkpoint-inventory.md) for the exact scope.
 
 All eight unordered FIRST/LAST captures passed across memory/RocksDB, source
 batch targets 1/8 and controller/leader checkpoints at
@@ -1004,23 +1004,20 @@ The serial runner uses `set -e`, so the leader case did not run. The previous 12
 and 900 second attempts are failures, not completed captures or performance
 passes.
 
-The historical controller invocation inside `streamr-state-build` is reproduced
-here; it failed as described above:
-
-```sh
-STREAMR_TEST_RUNTIME_TIMEOUT_SECONDS=900 python3 /app/scripts/test-native-result-retention.py \
-  /app/target/native-result-retention-long-rocksdb/many-4096-rocksdb-8-controller \
-  --scenario many --groups 4096 \
-  --binary /app/target/milestone2-runtime/debug/deps/arroyo_sql_testing-df802a90a8396c4e \
-  --backend rocksdb --batch 8 --mode controller \
-  --checkpoint-root /app/target/native-result-checkpoints \
-  --inspector /app/scripts/checkpoint_inventory.py
-```
+The historical controller invocation inside `streamr-state-build` used the
+many-window fixture with 4,096 groups, RocksDB, source batch target 8 and the
+explicit `STREAMR_TEST_RUNTIME_TIMEOUT_SECONDS=900` override. Its executable was
+`/app/target/milestone2-runtime/debug/deps/arroyo_sql_testing-df802a90a8396c4e`,
+its checkpoint root was `/app/target/native-result-checkpoints`, and its incomplete
+capture is preserved at
+`target/native-result-retention-long-rocksdb/many-4096-rocksdb-8-controller/capture.log`.
+The obsolete inventory invocation has been retired; the original failed command
+remains in the recorded source history.
 
 At that historical source, the 4096-group RocksDB controller and leader scopes
 were pending; the 14 other scopes passed. See
 [the composition record](native-result-composition.md) and
-[checkpoint inventory](native-checkpoint-inventory.md).
+[historical inventory evidence](native-checkpoint-inventory.md).
 
 The final native captures used the existing `arroyo_sql_testing-df802a90a8396c4e`
 executable from the 606-library-test/full-workspace-build candidate; only

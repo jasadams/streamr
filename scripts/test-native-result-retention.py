@@ -220,7 +220,7 @@ def main():
     parser.add_argument("--checkpoint-root", type=Path,
                         help="persistent mounted local checkpoint directory inside test container")
     parser.add_argument("--inspector", type=Path,
-                        help="read-only checkpoint_inventory.py path inside test container")
+                        help="caller-supplied read-only inspector: accepts storage-root/job-id/epoch/mode/expected-owner-count and emits aggregate_owners JSON with prefix_counts and value_lengths")
     args = parser.parse_args()
     if args.scenario == "many":
         assert args.groups in (64, 4096), "--groups 64 or 4096 required"

@@ -273,14 +273,14 @@ in this attempt; bounded explicit test-only record counts and strict CDC/value
 assertions are under investigation, preserving exact defaults for callers.
 Memory artifacts are `target/native-result-composition-nullability/`.
 
-The independently reviewed `scripts/checkpoint_inventory.py` also read all
-four actual memory exports, validating selected metadata, checksums, framing
-and exact logical keys. The prefix-one checkpoint has lifetime `G=1`, latest
+The independently reviewed historical inventory also read all four actual
+memory exports at that recorded source, validating selected metadata, checksums,
+framing and exact logical keys. The prefix-one checkpoint has lifetime `G=1`, latest
 closed-window `G=0`, and outer `G=1,M=2,R=2`, with no dirty/expiry entries.
 NULL contributions are indexed too. With both UNION branches live, the
 proposed constant outer bound is `M=4,R=4`; a later many-window checkpoint must
 prove it. Inventories are saved beside each case as `checkpoint-inventory.json`.
-See `docs/native-checkpoint-inventory.md`; this early checkpoint does not
+See [the historical inventory evidence](native-checkpoint-inventory.md); this early checkpoint does not
 qualify bounded retention through repeated closed-window replacements.
 
 The reviewed current-result fixture then passed all eight memory/RocksDB × batch
@@ -343,17 +343,15 @@ physical checkpoint and open a read-only
 database. That is roughly four snapshot operations per emitted interval; about
 8,000 HOP intervals in the 4,096-group fixture would imply on the order of
 32,000 physical snapshot operations. This estimate is source-derived, not
-profiling evidence. The historical failing invocation was:
-
-```sh
-STREAMR_TEST_RUNTIME_TIMEOUT_SECONDS=900 python3 /app/scripts/test-native-result-retention.py \
-  /app/target/native-result-retention-long-rocksdb/many-4096-rocksdb-8-controller \
-  --scenario many --groups 4096 \
-  --binary /app/target/milestone2-runtime/debug/deps/arroyo_sql_testing-df802a90a8396c4e \
-  --backend rocksdb --batch 8 --mode controller \
-  --checkpoint-root /app/target/native-result-checkpoints \
-  --inspector /app/scripts/checkpoint_inventory.py
-```
+profiling evidence. That historical failing invocation used the many-window
+fixture with 4,096 groups, RocksDB, source batch target 8, controller checkpoints
+and the explicit `STREAMR_TEST_RUNTIME_TIMEOUT_SECONDS=900` override. It ran
+`arroyo_sql_testing-df802a90a8396c4e` from
+`/app/target/milestone2-runtime/debug/deps/`, retained checkpoints at
+`/app/target/native-result-checkpoints`, and wrote its incomplete capture to
+`target/native-result-retention-long-rocksdb/many-4096-rocksdb-8-controller/capture.log`.
+The obsolete inventory invocation has been retired; the original failed command
+remains in the recorded source history.
 
 The failed controller run stopped the serial runner before the leader case.
 That timeout is preserved and is not a baseline performance pass.

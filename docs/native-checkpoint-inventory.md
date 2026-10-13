@@ -1,49 +1,24 @@
-# Read-only native aggregate checkpoint inventory
+# Historical native aggregate checkpoint inventory evidence
 
-The inspector and captures below describe the historical `STRDS001` snapshot
-format. The current bounded adapter reuses Arroyo's format-2 Parquet checkpoints;
-use [native retained-checkpoint measurement](native-retained-checkpoint-measurement.md)
-for those artifacts. Historical results remain evidence for their recorded
-source revisions, not qualification of the current checkpoint format.
+These results describe the checkpoint and aggregate representations at their
+recorded historical source revisions. They do not qualify the current checkpoint
+format or current aggregate value sizes. Use
+[native retained-checkpoint measurement](native-retained-checkpoint-measurement.md)
+for the current format-2 Parquet object inventory and caller-projected row checks.
+That object inventory does not decode native aggregate groups or establish their
+logical G/M/R counts.
 
-`checkpoint_inventory.py` reads **one explicitly selected** local checkpoint. It parses the
-controller checkpoint metadata or leader manifest, each native aggregate owner's
-`native-aggregate-v1` table descriptor, the `STRDS001` full logical snapshot
-pages, escaped version-1 state keys, and `STRAGG02` group headers. It validates
-namespace/owner/epoch/generation, table schema identity, safe page paths,
+The historical inventories validated selected controller or leader metadata,
+namespace/owner/epoch/generation, table schema identity, safe object paths,
 SHA-256 and byte/row counts, sorted unique keys, and recognized key layouts.
-It reports exact `G/D/M/R/E/C` counts and stored value-length min/max/sum per
-operator. It does not decode Arrow IPC or prove output values.
+They reported exact `G/D/M/R/E/C` counts and stored value-length min/max/sum per
+operator; they did not decode Arrow IPC or prove output values.
 
-The SQL test harness ordinarily uses `/tmp/arroyo/checkpoints` from
-`crates/arroyo-rpc/default.toml`. A `podman run --rm` container loses that
-filesystem on exit. To retain pages without rebuilding or changing the engine,
-set `ARROYO__CHECKPOINT_URL` **inside the test process** to a mounted local
-path, e.g. `file:///app/target/native-result-checkpoints`, before running the
-existing SQL capture driver. `scripts/test-native-result-composition.py` inherits
-its environment for the test binary. The workspace mount maps `/app/target` to
-this worktree's `target` directory on the host.
-
-After a successful capture, read `job=<id>` from the case's `CAPTURE_RESULT`
-line in `capture.log` and invoke, from the host:
-
-```text
-python3 scripts/checkpoint_inventory.py \
-  --storage-root /home/jason/repos/worktrees/streamr/serene-basin/streamr/target/native-result-checkpoints \
-  --job-id <id-from-CAPTURE_RESULT> --epoch 1 --mode controller \
-  --expected-owner-count 3
-```
-
-For a leader checkpoint use `--mode leader --generation 0 --pipeline-id
-pipe-test`. The inspector never picks the newest directory by listing: the
-selected mode, job and epoch must be explicit. Run each case with its own
-checkpoint-root directory if that makes artifacts easier to archive. The SQL
-harness already emits its generated job ID in `CAPTURE_RESULT` and prints the
-selected metadata at `CAPTURE_CHECKPOINT`.
-
-`python3 scripts/test_checkpoint_inventory.py` exercises both metadata
-layouts, a valid framed page, checksum rejection, and malformed key rejection.
-It uses only the Python standard library and does not run or simulate SQL.
+The observations below retain their historical sequence, including checks that
+were pending at each point. "Fresh combined source" refers to the archived
+validation source, not the current checkout. Obsolete tooling and its invocation
+instructions have been removed; captured inventories and the measured evidence
+remain source-specific.
 
 For the one-key current-result UNION query with `SET updating_ttl = NULL`, a
 settled snapshot should have no `D/E/C` entries. An actual memory/controller
