@@ -1,3 +1,11 @@
+## STR-110 serialization throughput — 2026-10-14
+
+- Coordinator Codex `/root`, implementer `/root/implement`; branch `jason/str-110-throughput-20261014`, fetched base `c9c8363a3c772f3648a463278cf53ee348028734`. Task worktree instructions read: `AGENTS.md`, `.claude/build-test.md`/`team.md`, this ledger and feature plan. No signing or automatic time limit.
+- Current user correction requires straightforward native throughput before/after; special clocks, codec measurement fixtures and detailed checkpoint metrics are not prerequisites. Production scope: aggregate codec and directly necessary callers only.
+- Preselected pilot: existing native aggregate-capacity COUNT/MAX, 128 keys, 64-byte payload, 384 initial input rows, RocksDB/controller, batch 32, existing pools, 180s bound per arm; same dev/test profile/image. Time native child execution excluding compilation; disclose startup/checkpoint/recovery overhead and verify resumed row count from output.
+- Pilot passed both arms: 768 consumed source rows across initial384/checkpoint-prefix255/recovery129; baseline1.419096s (541.189603 rows/s), candidate1.319359s (582.100910 rows/s), +7.56%. Single short unoptimized dev/test pair includes startup/planning/checkpoint/recovery; no stable production speedup claim. Exact output checks passed; scheduling coalesced different CDC record counts with the same final128 keys.
+- Codec7, existing aggregate46 and checkpoint-inspector tests passed; locked worker check passed. Initial missing initializer/import compile failures remain recorded. Strict Clippy and final fmt passed; independent source/pilot review approved with no regressions. Final independent evidence verdict approved; next: publish PR and verify current-head CI. No qualification campaign or pending user decision. Logs/pinned binaries: `/home/jason/qa-evidence/str110-throughput-20261014/`.
+
 ## STR-107 event clock — 2026-10-12
 
 - Coordinator Codex `/root`; implementer `/root/implement`. Branch `jason/str-107-event-clock-20261012`, workspace `/home/jason/repos/streamr-worktrees/str-107-event-clock-20261012`; fetched base `1766a63d663210ee15b2925ae194d4be60a985f1`. STR-107 claim guard CLEAR; reservation `codex-str-107-20261012`.
