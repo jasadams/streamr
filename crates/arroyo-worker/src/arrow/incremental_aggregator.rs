@@ -2,7 +2,9 @@
 mod calendar_native;
 use calendar_native::{CalendarAggregate, CalendarContributionChange, CalendarInput};
 
-use crate::arrow::aggregate_codec::{EncodedGroup, decode_group, encode_group};
+use crate::arrow::aggregate_codec::{AggregateCodec, EncodedGroup};
+#[cfg(test)]
+use crate::arrow::aggregate_codec::{decode_group, encode_group};
 use crate::arrow::aggregate_store::{AggregateScope, AggregateStore, AggregateStoreLimits};
 use crate::arrow::decode_aggregate;
 use crate::arrow::updating_cache::{Key, UpdatingCache};
@@ -367,6 +369,7 @@ struct Aggregator {
     collection_output_limit: Option<usize>,
     collection_member_bound: usize,
     injected_timestamp: bool,
+    contribution_codec: AggregateCodec,
 }
 
 pub struct IncrementalAggregatingFunc {
@@ -385,6 +388,7 @@ pub struct IncrementalAggregatingFunc {
     native_store: Option<AggregateStore>,
     retain_indefinitely: bool,
     native_schema_identity: Vec<u8>,
+    native_codec: AggregateCodec,
     native_append_only: bool,
     calendars: Vec<CalendarAggregate>,
 }
@@ -829,6 +833,7 @@ impl IncrementalAggregatingFunc {
             .collect()
     }
 
+    #[cfg(test)]
     fn native_output_types(&self) -> Vec<DataType> {
         let fields = self.schema_without_metadata.fields();
         fields[fields.len() - self.aggregates.len()..]
@@ -1179,14 +1184,7 @@ impl IncrementalAggregatingFunc {
         let previous = scope
             .get(&storage_key)
             .await?
-            .map(|bytes| {
-                decode_group(
-                    &bytes,
-                    &self.native_state_types(),
-                    &self.native_output_types(),
-                    scope.limits().value_bytes,
-                )
-            })
+            .map(|bytes| self.native_codec.decode(&bytes, scope.limits().value_bytes))
             .transpose()?;
         let live_rows_key = self
             .native_has_group_keys()
@@ -1403,7 +1401,9 @@ impl IncrementalAggregatingFunc {
             accumulator_state: self.native_state_values(&mut accumulators)?,
             last_emitted: previous.and_then(|group| group.last_emitted),
         };
-        let encoded = encode_group(&next, scope.limits().value_bytes)?;
+        let encoded = self
+            .native_codec
+            .encode(&next, scope.limits().value_bytes)?;
         scope.put(&storage_key, &encoded)?;
         scope.put(&native_group_key(b'D', group_key)?, &[1])?;
         if !self.retain_indefinitely {
@@ -1563,12 +1563,9 @@ impl IncrementalAggregatingFunc {
             let group_key = &key[13..];
             let storage_key = native_group_key(b'G', group_key)?;
             if let Some(bytes) = scope.get(&storage_key).await? {
-                let mut group = decode_group(
-                    &bytes,
-                    &self.native_state_types(),
-                    &self.native_output_types(),
-                    scope.limits().value_bytes,
-                )?;
+                let mut group = self
+                    .native_codec
+                    .decode(&bytes, scope.limits().value_bytes)?;
                 if group.last_update_nanos.saturating_add(ttl_nanos) == deadline {
                     let old_generation = group.generation;
                     group.generation = group
@@ -1581,7 +1578,9 @@ impl IncrementalAggregatingFunc {
                     group.last_update_nanos = now;
                     scope.put(
                         &storage_key,
-                        &encode_group(&group, scope.limits().value_bytes)?,
+                        &self
+                            .native_codec
+                            .encode(&group, scope.limits().value_bytes)?,
                     )?;
                     scope.put(&native_group_key(b'D', group_key)?, &[1])?;
                     if self.native_has_group_keys() {
@@ -1824,12 +1823,9 @@ impl IncrementalAggregatingFunc {
                 let group_key = dirty_key[5..].to_vec();
                 let group_storage = native_group_key(b'G', &group_key)?;
                 if let Some(bytes) = scope.get(&group_storage).await? {
-                    let mut group = decode_group(
-                        &bytes,
-                        &self.native_state_types(),
-                        &self.native_output_types(),
-                        scope.limits().value_bytes,
-                    )?;
+                    let mut group = self
+                        .native_codec
+                        .decode(&bytes, scope.limits().value_bytes)?;
                     let mut accumulators = self.native_accumulators(Some(&group))?;
                     let mut next = Vec::with_capacity(self.aggregates.len());
                     for (index, state) in accumulators.iter_mut().enumerate() {
@@ -1921,7 +1917,9 @@ impl IncrementalAggregatingFunc {
                     }
                     scope.put(
                         &group_storage,
-                        &encode_group(&group, scope.limits().value_bytes)?,
+                        &self
+                            .native_codec
+                            .encode(&group, scope.limits().value_bytes)?,
                     )?;
                 }
                 scope.delete(&dirty_key)?;
@@ -3341,7 +3339,18 @@ impl IncrementalAggregatingConstructor {
                     ),
                 )|
                  -> Result<Aggregator> {
+                    let contribution_types = if agg.fun().name().eq_ignore_ascii_case("count") {
+                        vec![DataType::Boolean]
+                    } else {
+                        input_exprs
+                            .iter()
+                            .map(|expr| expr.data_type(&input_schema.schema))
+                            .collect::<DFResult<Vec<_>>>()?
+                    };
+                    let mut contribution_state_types = vec![DataType::Boolean, DataType::Date32];
+                    contribution_state_types.extend(contribution_types);
                     Ok(Aggregator {
+                        contribution_codec: AggregateCodec::new(&contribution_state_types, &[])?,
                         collection_member_bound: if collection {
                             native_collection_decode_bound(
                                 &input_exprs
@@ -3403,6 +3412,7 @@ impl IncrementalAggregatingConstructor {
             // source row ID. They cannot recover a CDC before row's old time.
             identity.update(b"\0injected-timestamp-row-id.v1");
         }
+        identity.update(b"\0schema-bound-aggregate.v3");
         let native_schema_identity = identity.finalize().to_vec();
 
         // An indexed-only plan has no sliding accumulator state to carry the
@@ -3456,13 +3466,31 @@ impl IncrementalAggregatingConstructor {
             Some(key_fields),
         ));
 
+        let schema_without_metadata = Arc::new(schema_without_metadata.finish());
+        let native_state_types = aggregates
+            .iter()
+            .flat_map(|aggregate| &aggregate.state_cols)
+            .map(|index| {
+                sliding_state_schema
+                    .schema
+                    .field(*index)
+                    .data_type()
+                    .clone()
+            })
+            .collect::<Vec<_>>();
+        let output_fields = schema_without_metadata.fields();
+        let native_output_types = output_fields[output_fields.len() - aggregates.len()..]
+            .iter()
+            .map(|field| field.data_type().clone())
+            .collect::<Vec<_>>();
+        let native_codec = AggregateCodec::new(&native_state_types, &native_output_types)?;
         Ok(IncrementalAggregatingFunc {
             flush_interval: Duration::from_micros(config.flush_interval_micros),
             metadata_expr,
             ttl,
             aggregates,
             accumulators: UpdatingCache::with_time_to_idle(ttl),
-            schema_without_metadata: Arc::new(schema_without_metadata.finish()),
+            schema_without_metadata,
             updated_keys: Default::default(),
             key_converter: RowConverter::new(input_schema.sort_fields(false))?,
             sliding_state_schema,
@@ -3472,6 +3500,7 @@ impl IncrementalAggregatingConstructor {
             native_store: None,
             retain_indefinitely: config.retain_indefinitely == Some(true),
             native_schema_identity,
+            native_codec,
             native_append_only,
             calendars,
         })

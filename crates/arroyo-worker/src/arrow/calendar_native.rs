@@ -27,6 +27,7 @@ pub(super) struct CalendarAggregate {
     contribution: Arc<dyn PhysicalExpr>,
     reference: Arc<dyn PhysicalExpr>,
     horizon: i32,
+    state_codec: AggregateCodec,
 }
 
 pub(super) struct CalendarInput {
@@ -150,7 +151,14 @@ impl CalendarAggregate {
                     descriptor.contribution_date.clone(),
                 );
                 let storage_index = *families.entry(family).or_insert(index);
+                let state_types = aggregate
+                    .func
+                    .sliding_state_fields()?
+                    .iter()
+                    .map(|field| field.data_type().clone())
+                    .collect::<Vec<_>>();
                 Ok(Self {
+                    state_codec: AggregateCodec::new(&state_types, &[])?,
                     aggregate_index: index,
                     storage_index,
                     contribution: decode(&descriptor.contribution_date)?,
@@ -474,6 +482,7 @@ impl IncrementalAggregatingFunc {
         // COUNT needs the original null flags, never the original payload. The
         // existing COUNT accumulator accepts any array type and uses only its
         // length/null count. SUM/AVG retain their original typed numeric values.
+        let contribution_codec = &self.aggregates[index].contribution_codec;
         let stored_types = if count {
             vec![DataType::Boolean]
         } else {
@@ -486,8 +495,12 @@ impl IncrementalAggregatingFunc {
                 .get(&key)
                 .await?
                 .context("calendar aggregate original contribution is missing")?;
-            let (original, original_day) =
-                decode_calendar_contribution(&bytes, &stored_types, scope.limits().value_bytes)?;
+            let (original, original_day) = decode_calendar_contribution(
+                &bytes,
+                &stored_types,
+                contribution_codec,
+                scope.limits().value_bytes,
+            )?;
             scope.delete(&key)?;
             Ok((original, original_day))
         } else {
@@ -513,20 +526,12 @@ impl IncrementalAggregatingFunc {
                 stored_values,
                 day,
                 &stored_types,
+                contribution_codec,
                 scope.limits().value_bytes,
             )?;
             scope.put(&key, &bytes)?;
             Ok((selected, day))
         }
-    }
-
-    fn calendar_state_types(&self, calendar: &CalendarAggregate) -> Result<Vec<DataType>> {
-        Ok(self.aggregates[calendar.aggregate_index]
-            .func
-            .sliding_state_fields()?
-            .iter()
-            .map(|field| field.data_type().clone())
-            .collect())
     }
 
     pub(super) async fn calendar_bucket_delta(
@@ -554,12 +559,9 @@ impl IncrementalAggregatingFunc {
         let key = bucket_key(group, generation, calendar.storage_index, day)?;
         let mut accumulator = aggregate.func.create_sliding_accumulator()?;
         if let Some(bytes) = scope.get(&key).await? {
-            let state = decode_group(
-                &bytes,
-                &self.calendar_state_types(calendar)?,
-                &[],
-                scope.limits().value_bytes,
-            )?;
+            let state = calendar
+                .state_codec
+                .decode(&bytes, scope.limits().value_bytes)?;
             accumulator.merge_batch(
                 &state
                     .accumulator_state
@@ -585,7 +587,12 @@ impl IncrementalAggregatingFunc {
             accumulator_state: accumulator.state()?,
             last_emitted: None,
         };
-        scope.put(&key, &encode_group(&state, scope.limits().value_bytes)?)?;
+        scope.put(
+            &key,
+            &calendar
+                .state_codec
+                .encode(&state, scope.limits().value_bytes)?,
+        )?;
         Ok(())
     }
 
@@ -636,12 +643,9 @@ impl IncrementalAggregatingFunc {
                 break;
             }
             ensure!(key.len() == prefix.len() + 4, "invalid calendar bucket key");
-            let state = decode_group(
-                &bytes,
-                &self.calendar_state_types(calendar)?,
-                &[],
-                scope.limits().value_bytes,
-            )?;
+            let state = calendar
+                .state_codec
+                .decode(&bytes, scope.limits().value_bytes)?;
             accumulator.merge_batch(
                 &state
                     .accumulator_state
@@ -711,12 +715,9 @@ impl IncrementalAggregatingFunc {
         let Some(bytes) = scope.get(&key).await? else {
             return Ok(None);
         };
-        let mut group = decode_group(
-            &bytes,
-            &self.native_state_types(),
-            &self.native_output_types(),
-            scope.limits().value_bytes,
-        )?;
+        let mut group = self
+            .native_codec
+            .decode(&bytes, scope.limits().value_bytes)?;
         let mut accumulators = self.native_accumulators(Some(&group))?;
         for calendar in &self.calendars {
             self.calendar_set_reference(scope, group_key, group.generation, calendar, reference)?;
@@ -727,7 +728,12 @@ impl IncrementalAggregatingFunc {
         self.calendar_schedule(scope, group_key, group.generation, reference)
             .await?;
         group.accumulator_state = self.native_state_values(&mut accumulators)?;
-        scope.put(&key, &encode_group(&group, scope.limits().value_bytes)?)?;
+        scope.put(
+            &key,
+            &self
+                .native_codec
+                .encode(&group, scope.limits().value_bytes)?,
+        )?;
         scope.put(&native_group_key(b'D', group_key)?, &[1])?;
         Ok(Some(Self::calendar_next_boundary(reference)?))
     }
