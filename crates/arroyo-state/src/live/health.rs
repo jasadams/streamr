@@ -4,7 +4,9 @@ use super::resources::available_disk_bytes;
 use prometheus::{IntGaugeVec, Opts};
 use std::path::Path;
 use std::sync::{Arc, Mutex, Weak};
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+const NATIVE_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Copy, Default)]
 pub(crate) struct LogicalSize {
@@ -37,17 +39,38 @@ impl BackendHealth {
         })
     }
 
-    /// Called only within existing admitted blocking work. Property failures are
-    /// represented as unavailable, never as a zero measurement.
+    /// Called only within existing admitted blocking work. Refresh at most once
+    /// per second: total SST size traverses all files across retained versions.
+    /// Property failures are unavailable, never a zero measurement. Resource
+    /// enforcement is separate and still checks every write.
     pub fn sample_native(&self, db: &rocksdb::DB, path: &Path) {
-        let property = |name| db.property_int_value(name).ok().flatten();
-        let sample = NativeSample {
-            at: Some(Instant::now()),
-            sst_bytes: property("rocksdb.total-sst-files-size"),
-            free_bytes: available_disk_bytes(path).ok(),
-            write_stopped: property("rocksdb.is-write-stopped"),
-            delayed_write_bytes_per_second: property("rocksdb.actual-delayed-write-rate"),
-        };
+        self.refresh_native(Instant::now(), || {
+            let property = |name| db.property_int_value(name).ok().flatten();
+            NativeSample {
+                at: None,
+                sst_bytes: property("rocksdb.total-sst-files-size"),
+                free_bytes: available_disk_bytes(path).ok(),
+                write_stopped: property("rocksdb.is-write-stopped"),
+                delayed_write_bytes_per_second: property("rocksdb.actual-delayed-write-rate"),
+            }
+        });
+    }
+
+    fn refresh_native(&self, now: Instant, measure: impl FnOnce() -> NativeSample) {
+        {
+            let cached = self.native.lock().unwrap_or_else(|e| e.into_inner());
+            if cached
+                .at
+                .is_some_and(|at| now.saturating_duration_since(at) < NATIVE_SAMPLE_INTERVAL)
+            {
+                return;
+            }
+        }
+        // Open samples before publishing the database; subsequent calls hold its
+        // write lock. Keep property and filesystem work outside the cache mutex
+        // so metric scrapes only wait for the short cache read or publication.
+        let mut sample = measure();
+        sample.at = Some(now);
         *self.native.lock().unwrap_or_else(|e| e.into_inner()) = sample;
     }
 }
@@ -79,7 +102,7 @@ impl HealthMetrics {
         let native = IntGaugeVec::new(
             Opts::new(
                 "arroyo_live_state_native_health",
-                "Cached native observations: total SST file lengths in bytes (excludes WAL/manifests/snapshots); minimum filesystem free bytes; stopped database count; delayed write bytes per second; maximum sample age in milliseconds. Consult availability; absent properties are excluded",
+                "Cached native observations, refreshed at most once per second during writes: total SST file lengths in bytes (excludes WAL/manifests/snapshots); minimum filesystem free bytes; stopped database count; delayed write bytes per second; maximum sample age in milliseconds. Consult availability; absent properties are excluded",
             ),
             &["measurement"],
         )?;
@@ -223,6 +246,34 @@ impl prometheus::core::Collector for HealthMetrics {
 mod tests {
     use super::*;
     use prometheus::core::Collector;
+
+    #[test]
+    fn native_refresh_preserves_cached_values_until_due_and_reports_unavailability() {
+        let health = BackendHealth::new("rocksdb", true);
+        let start = Instant::now();
+        health.refresh_native(start, || {
+            assert!(
+                health.native.try_lock().is_ok(),
+                "scrapes can read the cache during measurement"
+            );
+            NativeSample {
+                sst_bytes: Some(123),
+                ..NativeSample::default()
+            }
+        });
+        health.refresh_native(start + Duration::from_millis(999), || {
+            panic!("native properties must not be queried before the interval")
+        });
+        {
+            let cached = health.native.lock().unwrap();
+            assert_eq!(cached.sst_bytes, Some(123));
+            assert_eq!(cached.at, Some(start));
+        }
+        health.refresh_native(start + NATIVE_SAMPLE_INTERVAL, NativeSample::default);
+        let cached = health.native.lock().unwrap();
+        assert_eq!(cached.sst_bytes, None);
+        assert_eq!(cached.at, Some(start + NATIVE_SAMPLE_INTERVAL));
+    }
 
     #[test]
     fn fixed_series_aggregate_known_attempts_without_retaining_them() {
