@@ -46,7 +46,7 @@ pub(crate) struct SessionStore {
     /// One admitted group only. A proof is never serialized and starts cold
     /// after restore; all mutations pass through this serial owner.
     last_group: Mutex<Option<CachedGroup>>,
-    /// A negative expiry proof only; never persisted or shared with another owner.
+    /// Ephemeral expiry proofs for the serial owner; cold after restore.
     deadline: Mutex<Option<CachedDeadline>>,
 }
 
@@ -67,6 +67,8 @@ enum DeadlineProof {
 
 struct CachedDeadline {
     proof: DeadlineProof,
+    /// Inclusive logical key: retries must still see an unretired session.
+    minimum: Option<Vec<u8>>,
     _permit: ResourcePermit,
 }
 
@@ -193,15 +195,18 @@ impl SessionStore {
         );
         // Optional headroom only: a valid nine-row reader configuration must
         // retain its existing fallback rather than fail to construct a cache.
-        let charge = std::mem::size_of::<CachedDeadline>() + 128;
-        let deadline = limits
-            .partial_bytes
-            .checked_mul(9)
-            .and_then(|required| required.checked_add(charge))
-            .filter(|required| *required <= resources.config().decoded_value_bytes)
-            .and_then(|_| resources.try_decoded_value(charge).ok())
+        let deadline = Self::deadline_cache_charge(limits)
+            .and_then(|charge| {
+                limits
+                    .partial_bytes
+                    .checked_mul(9)?
+                    .checked_add(charge)
+                    .filter(|required| *required <= resources.config().decoded_value_bytes)?;
+                resources.try_decoded_value(charge).ok()
+            })
             .map(|permit| CachedDeadline {
                 proof: DeadlineProof::Unknown,
+                minimum: None,
                 _permit: permit,
             });
         Ok(Self {
@@ -214,6 +219,38 @@ impl SessionStore {
             last_group: Mutex::new(None),
             deadline: Mutex::new(deadline),
         })
+    }
+
+    fn deadline_cache_charge(limits: WindowStateConfig) -> Option<usize> {
+        // One retained key and one request copy; backend scan copies are
+        // accounted by the existing scan-page admission.
+        limits
+            .key_bytes
+            .checked_mul(2)?
+            .checked_add(std::mem::size_of::<CachedDeadline>() + 128)
+    }
+
+    fn deadline_minimum(&self) -> Result<Option<Vec<u8>>> {
+        Ok(self
+            .deadline
+            .lock()
+            .map_err(|_| anyhow::anyhow!("native SESSION deadline cache lock poisoned"))?
+            .as_ref()
+            .and_then(|cache| cache.minimum.clone()))
+    }
+
+    fn remember_deadline_minimum(&self, minimum: Option<&[u8]>) -> Result<()> {
+        if let Some(cache) = self
+            .deadline
+            .lock()
+            .map_err(|_| anyhow::anyhow!("native SESSION deadline cache lock poisoned"))?
+            .as_mut()
+        {
+            cache.minimum = minimum
+                .filter(|key| key.len() <= self.limits.key_bytes)
+                .map(<[u8]>::to_vec);
+        }
+        Ok(())
     }
 
     pub fn reserve_final_input_queue(&self) -> Result<ResourcePermit> {
@@ -301,7 +338,8 @@ impl SessionStore {
             .map_err(|_| anyhow::anyhow!("native SESSION deadline cache lock poisoned"))?
             .is_some()
         {
-            std::mem::size_of::<CachedDeadline>() + 128
+            Self::deadline_cache_charge(self.limits)
+                .context("native SESSION deadline cache charge overflow")?
         } else {
             0
         };
@@ -452,6 +490,9 @@ impl SessionStore {
         let mut value = vec![VERSION];
         value.extend_from_slice(&session.end.to_be_bytes());
         value.push(0);
+        // New and merged sessions can sort before the last observed minimum.
+        // Clear before awaiting, including cancellation and ambiguous failure.
+        self.remember_deadline_minimum(None)?;
         // Lower before awaiting: cancellation or an ambiguous write failure
         // must never preserve Empty or a bound above the possible new deadline.
         self.update_deadline(|proof| match proof {
@@ -653,7 +694,7 @@ impl SessionStore {
             range: ScanRange {
                 namespace: self.table.namespace().clone(),
                 prefix: Some(vec![DEADLINE]),
-                start: None,
+                start: self.deadline_minimum()?,
                 end: watermark.map(|time| {
                     let mut end = vec![DEADLINE];
                     end.extend_from_slice(&ordered_time(time));
@@ -733,6 +774,10 @@ impl SessionStore {
             end.checked_add(self.gap) == Some(deadline),
             "native SESSION deadline disagrees with metadata"
         );
+        // All earlier index keys were absent in this fresh snapshot. Keep the
+        // minimum inclusive until retirement, so cancellation cannot skip it.
+        // Insertions invalidate this proof before writing any earlier key.
+        self.remember_deadline_minimum(Some(&entry.key.key))?;
         Ok(Some((group, SessionMeta { start, end })))
     }
 
@@ -1104,6 +1149,95 @@ pub(super) mod tests {
     }
 
     #[tokio::test]
+    async fn deadline_minimum_is_inclusive_and_invalidated_by_earlier_insertions() {
+        let store = store();
+        for group in [b"b", b"c"] {
+            store
+                .insert(group, 100, &row(store.schema.clone(), 100))
+                .await
+                .unwrap();
+        }
+        let first = store.first_due(None).await.unwrap().unwrap();
+        assert_eq!(first.0, b"b");
+        // Unacknowledged/repeated reads may not skip the selected session.
+        assert_eq!(store.first_due(None).await.unwrap(), Some(first.clone()));
+        assert_eq!(store.first_due(Some(110)).await.unwrap(), None);
+        assert_eq!(store.first_due(Some(0)).await.unwrap(), None);
+        // Equal deadline but earlier full index key must invalidate the bound.
+        store
+            .insert(b"a", 100, &row(store.schema.clone(), 100))
+            .await
+            .unwrap();
+        assert_eq!(store.first_due(None).await.unwrap().unwrap().0, b"a");
+        // Earlier deadline also becomes visible, regardless of group order.
+        store
+            .insert(b"z", 0, &row(store.schema.clone(), 0))
+            .await
+            .unwrap();
+        let (group, session) = store.first_due(Some(11)).await.unwrap().unwrap();
+        assert_eq!(group, b"z");
+        store.mark_closing(&group, session).await.unwrap();
+        assert_eq!(
+            store.first_due(None).await.unwrap(),
+            Some((group.clone(), session))
+        );
+        store.retire(&group, session).await.unwrap();
+        for expected in [b"a", b"b", b"c"] {
+            let (group, session) = store.first_due(None).await.unwrap().unwrap();
+            assert_eq!(group, expected);
+            // A new store never inherits an ephemeral lower bound.
+            let recovered = SessionStore::new(
+                store.backend.clone(),
+                store.table.clone(),
+                store.resources.clone(),
+                store.schema.clone(),
+                store.limits,
+                store.gap,
+            )
+            .unwrap();
+            assert!(recovered.deadline_minimum().unwrap().is_none());
+            assert_eq!(
+                recovered.first_due(None).await.unwrap(),
+                Some((group.clone(), session))
+            );
+            store.retire(&group, session).await.unwrap();
+        }
+        assert!(store.first_due(None).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn cancelled_or_failed_earlier_insert_clears_deadline_minimum_before_write() {
+        let (mut store, backend) = observed_store();
+        store
+            .insert(b"later", 100, &row(store.schema.clone(), 100))
+            .await
+            .unwrap();
+        let later = store.first_due(None).await.unwrap();
+        assert!(store.deadline_minimum().unwrap().is_some());
+        backend.pause_writes(true);
+        let session = SessionMeta { start: 0, end: 0 };
+        let mut pending = Box::pin(store.add_session(b"earlier", session));
+        assert!(futures::poll!(&mut pending).is_pending());
+        assert!(store.deadline_minimum().unwrap().is_none());
+        drop(pending);
+        backend.pause_writes(false);
+        assert_eq!(store.first_due(None).await.unwrap(), later);
+        let write_bytes = store.limits.write_bytes;
+        store.limits.write_bytes = 1;
+        assert!(store.add_session(b"earlier", session).await.is_err());
+        assert!(store.deadline_minimum().unwrap().is_none());
+        store.limits.write_bytes = write_bytes;
+        store
+            .insert(b"earlier", 0, &row(store.schema.clone(), 0))
+            .await
+            .unwrap();
+        assert_eq!(
+            store.first_due(Some(11)).await.unwrap().unwrap().0,
+            b"earlier"
+        );
+    }
+
+    #[tokio::test]
     async fn deadline_proof_skips_snapshots_through_hot_extensions_but_not_expiry_or_eof() {
         let (store, backend) = observed_store();
         store
@@ -1245,7 +1379,7 @@ pub(super) mod tests {
 
     #[tokio::test]
     async fn deadline_and_group_caches_share_only_headroom_above_nine_row_reader() {
-        let deadline_charge = std::mem::size_of::<CachedDeadline>() + 128;
+        let deadline_charge = SessionStore::deadline_cache_charge(store().limits).unwrap();
         let group_charge = 2 + std::mem::size_of::<CachedGroup>() + 128;
         let budget = 9 * 1024 + deadline_charge + group_charge - 1;
         let store = store_with_decoded(budget);
@@ -1529,6 +1663,13 @@ pub(super) mod tests {
         }
         let closed = SessionMeta { start: 0, end: 2 };
         let open = SessionMeta { start: 40, end: 41 };
+        // Capture with a populated minimum after cancellation, then restore
+        // into a genuinely fresh backend; no ephemeral bound may survive.
+        assert_eq!(
+            store.first_due(Some(13)).await.unwrap(),
+            Some((b"reused".to_vec(), closed))
+        );
+        assert!(store.deadline_minimum().unwrap().is_some());
         assert!(!store.is_closing(b"reused", closed).await.unwrap());
         store.mark_closing(b"reused", closed).await.unwrap();
         // One committed page followed by a blocked next write models an
@@ -1627,6 +1768,7 @@ pub(super) mod tests {
             gap,
         )
         .unwrap();
+        assert!(recovered.deadline_minimum().unwrap().is_none());
         assert!(recovered.is_closing(b"reused", closed).await.unwrap());
         assert!(!recovered.is_closing(b"reused", open).await.unwrap());
         assert_eq!(
