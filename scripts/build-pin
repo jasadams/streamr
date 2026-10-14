@@ -44,6 +44,19 @@ def compiled(name):
     }
 
 
+def environment_overrides(env):
+    """Record native/profile inputs forwarded by cargo-dev, without host noise."""
+    names = {"CARGO_INCREMENTAL", "RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "CARGO_BUILD_TARGET", "CC", "CXX",
+             "CFLAGS", "CXXFLAGS", "HOST_CC", "HOST_CXX", "HOST_CFLAGS", "HOST_CXXFLAGS", "TARGET_CC", "TARGET_CXX",
+             "TARGET_CFLAGS", "TARGET_CXXFLAGS", "CRATE_CC_NO_DEFAULTS", "ROCKSDB_CXX_STD", "CARGO_BUILD_JOBS"}
+    prefixes = ("CARGO_PROFILE_", "CC_", "CXX_", "CFLAGS_", "CXXFLAGS_")
+    return {key: value for key, value in env.items() if key in names or key.startswith(prefixes)}
+
+
+def cache_namespace(env):
+    return env.get("STREAMR_CACHE_NAMESPACE") or "streamr"
+
+
 def inventory(root):
     result = {}
     for path in sorted(root.rglob("*")):
@@ -286,7 +299,12 @@ def cleanup_owned(root, cargo_name, database):
     failures = []
     for name, receipt_name in ((cargo_name, "build-container-cleanup.json"), (database, "build-db-cleanup.json")):
         try:
-            result = subprocess.run(["podman", "rm", "--force", "--ignore", name],
+            command = ["podman", "rm", "--force", "--ignore"]
+            if receipt_name == "build-db-cleanup.json":
+                # The disposable PostgreSQL image creates an anonymous data
+                # volume. Its lifecycle belongs to this owned build database.
+                command.append("--volumes")
+            result = subprocess.run([*command, name],
                                     capture_output=True, text=True, timeout=30)
             receipt = {"container": name, "exit_code": result.returncode, "stdout": result.stdout, "stderr": result.stderr}
             if result.returncode:
@@ -469,9 +487,9 @@ def main():
     selection = {"profile": args.profile, "purpose": args.purpose, "image_id": build_image,
                  "database_image_id": database_image, "native_mode": "source" if native_mode == "1" else "prebuilt",
                  "native_source_reason": args.native_source_reason, "shared_target": str(target),
+                 "cache_namespace": cache_namespace(env),
                  "cargo_features": ["arroyo-api/embedded-ui"],
-                 "environment_overrides": {k: v for k, v in env.items() if k.startswith("CARGO_PROFILE_") or k in {
-                     "CARGO_INCREMENTAL", "RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "CARGO_BUILD_TARGET", "CC", "CXX", "CFLAGS", "CXXFLAGS", "ROCKSDB_CXX_STD", "CARGO_BUILD_JOBS"}}}
+                 "environment_overrides": environment_overrides(env)}
     write(root / "build-selection.json", selection)
     print(json.dumps(selection, sort_keys=True), flush=True)
     native_image = native_image_receipt(build_image, root)

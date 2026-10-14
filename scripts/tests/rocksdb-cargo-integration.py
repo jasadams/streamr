@@ -22,7 +22,8 @@ version="0.17.3+10.4.2"
 edition="2021"
 [features]
 static=[]
-lz4=[]
+lz4=["lz4-sys"]
+lz4-sys=[]
 bindgen-runtime=[]
 ''')
     (native / 'src/lib.rs').write_text('pub fn native() {}\n')

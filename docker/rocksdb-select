@@ -22,6 +22,13 @@ def select(root, env):
     if env.get('CARGO_PKG_VERSION') != pin['version']:
         raise ValueError('native crate version differs from pinned source')
     features = sorted(k.removeprefix('CARGO_FEATURE_').lower().replace('_', '-') for k in env if k.startswith('CARGO_FEATURE_'))
+    # The checksum-pinned upstream Cargo.toml defines `lz4 = ["lz4-sys"]`.
+    # Cargo exposes that optional dependency as an implicit feature as well.
+    # It does not add another native mode: build.rs enables LZ4 only through
+    # cfg(feature = "lz4"). Normalize this redundant dependency activation,
+    # while still rejecting lz4-sys without lz4 and every other extra feature.
+    if 'lz4' in features and 'lz4-sys' in features:
+        features.remove('lz4-sys')
     if features != sorted(pin['features']):
         raise ValueError(f'native features {features} differ from pinned {pin["features"]}; select source mode with a reason')
     if env.get('TARGET') != pin['target']:

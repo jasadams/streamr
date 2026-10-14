@@ -81,6 +81,24 @@ class FreezeTests(unittest.TestCase):
         self.assertFalse(pin.compiled("docs/milestone-3-status.md"))
 
 
+class EnvironmentReceiptTests(unittest.TestCase):
+    def test_cache_namespace_matches_shell_unset_empty_and_custom_defaults(self):
+        self.assertEqual(pin.cache_namespace({}), "streamr")
+        self.assertEqual(pin.cache_namespace({"STREAMR_CACHE_NAMESPACE": ""}), "streamr")
+        self.assertEqual(pin.cache_namespace({"STREAMR_CACHE_NAMESPACE": "custom-cache"}), "custom-cache")
+
+    def test_exact_native_forwarding_filter_preserves_diagnostics(self):
+        forwarded = {name: "value-" + name for name in (
+            "CC_ENABLE_DEBUG_OUTPUT", "CC_x86_64_unknown_linux_gnu", "CXX_x86_64_unknown_linux_gnu",
+            "CFLAGS_x86_64_unknown_linux_gnu", "CXXFLAGS_x86_64_unknown_linux_gnu", "CARGO_PROFILE_RELEASE_DEBUG",
+            "HOST_CC", "HOST_CXX", "HOST_CFLAGS", "HOST_CXXFLAGS", "TARGET_CC", "TARGET_CXX", "TARGET_CFLAGS",
+            "TARGET_CXXFLAGS", "CRATE_CC_NO_DEFAULTS", "CARGO_INCREMENTAL", "CARGO_ENCODED_RUSTFLAGS",
+            "RUSTFLAGS", "CARGO_BUILD_TARGET", "CARGO_BUILD_JOBS", "ROCKSDB_CXX_STD", "CC", "CXX", "CFLAGS", "CXXFLAGS")}
+        env = {**forwarded, "HOME": "/host/home", "HOSTNAME": "unrelated-host", "TARGET_UNRELATED": "noise",
+               "DATABASE_URL": "private-database", "UNRELATED_SECRET": "never-record", "STREAMR_CACHE_NAMESPACE": "receipt-separate-field"}
+        self.assertEqual(pin.environment_overrides(env), forwarded)
+
+
 class NativeProofTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -182,6 +200,17 @@ class CleanupTests(unittest.TestCase):
             self.assertEqual(mocked.call_count, 2)
             self.assertIsNone(json.loads((root / "build-container-cleanup.json").read_text())["exit_code"])
             self.assertEqual(json.loads((root / "build-db-cleanup.json").read_text())["exit_code"], 0)
+
+    def test_only_owned_database_cleanup_removes_anonymous_volumes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ok = subprocess.CompletedProcess([], 0, stdout="", stderr="")
+            with patch.object(pin.subprocess, "run", return_value=ok) as mocked:
+                pin.cleanup_owned(Path(directory), "owned-cargo", "owned-database")
+            cargo_command, database_command = [call.args[0] for call in mocked.call_args_list]
+            self.assertEqual(cargo_command[-1], "owned-cargo")
+            self.assertNotIn("--volumes", cargo_command)
+            self.assertEqual(database_command[-1], "owned-database")
+            self.assertIn("--volumes", database_command)
 
 
 class NativeLockReceiptTests(unittest.TestCase):

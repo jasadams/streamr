@@ -196,6 +196,17 @@ class Selection(unittest.TestCase):
             self.assertIn('selected='+str(self.root / name / 'lib'), result.stdout)
             self.assertEqual(json.loads(result.stderr.split('streamr-rocksdb: ')[1])['selection'], name)
 
+    def test_upstream_implicit_lz4_dependency_feature_is_redundant(self):
+        for name, settings in self.pin['profiles'].items():
+            env = self.env | dict(CARGO_FEATURE_LZ4_SYS='1', OPT_LEVEL=settings['opt-level'], DEBUG=settings['debug'])
+            self.assertEqual(selector.select(self.root, env), (self.root / name / 'lib', name))
+        only_dependency = self.env | {'CARGO_FEATURE_LZ4_SYS':'1'}
+        del only_dependency['CARGO_FEATURE_LZ4']
+        with self.assertRaisesRegex(ValueError, 'native features'):
+            selector.select(self.root, only_dependency)
+        with self.assertRaisesRegex(ValueError, 'native features'):
+            selector.select(self.root, self.env | {'CARGO_FEATURE_LZ4_SYS':'1','CARGO_FEATURE_ZSTD_SYS':'1'})
+
     def test_compiler_logging_does_not_change_archive_selection(self):
         self.assertEqual(selector.select(self.root, self.env | {'CC_ENABLE_DEBUG_OUTPUT': '1'})[1], 'dev')
 
