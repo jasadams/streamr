@@ -7,6 +7,19 @@
 - Measurements: each repeat's 600-row native minimum restart revisited 179,700 deleted entries (page 1), versus stable pagination 0 and advancing logical bounds 599. Tight-pool admitted adapter checks passed. Shared production code remains unchanged: measured caller restart costs do not justify a new backend cache or snapshot contract. These are bounded diagnostics, not production/capacity qualification.
 - Next: independent final source/evidence review, publish, and verify current-head CI. No user decision pending. Evidence: `/home/jason/qa-evidence/str114-scans-20261014/`; report `docs/str-114-validation.md`.
 
+## STR-112 decoder increment — 2026-10-15
+
+- Branch `jason/str-112-export-20261014`, frozen benchmark base `6793409cb53eb7b13f5a591ce1717bcf1e846de8`; delivery integrated with main `196a9f72`. Current instructions/build/team guidance and ticket read. Production change removes discarded key serialization while preserving validation; native checkpoint regression covers concurrent writes and fresh-backend restore.
+- Isolated decoder CPU fell about 59%; whole-export diagnostics are inconclusive. Four native arms exited 0/0/0/2: first pair +1.46% durable and -3.74% steady source, final baseline exceeded unchanged 512 MiB at 513.215 MiB before CP90. All cleanup passed; second matched pair unavailable. No stable native improvement or ticket completion established.
+- [Exact evidence and remaining acceptance](str-112-validation.md). Independent review approves the narrow increment; STR-112 retains native performance/resource/full operator-value recovery gaps. Next: current-source affected gates, final integration review, PR/current-head CI. No cap increase, replacement interval or architecture change.
+
+## Active STR-111 calendar recovery — 2026-10-14
+
+- Recovered existing `jason/str-111-calendar-20261014` after original claimant's explicit `turn_aborted` and user confirmation; preserved reservation metadata and clean workspace, refreshed base `fa9c8133`. Current instructions/build/team/ticket/ledger/work-plan read. STR-112 active owner preserved.
+- Implements generic unchanged-reference/irrelevant-original-contribution reuse, native horizon upper bound, persisted retained-family pruning skip and equal-deadline reschedule reuse. No codec/exporter/SQL/time semantics changed. Independent source review approved initial diff; final changes require fresh review.
+- Isolated6793409 AB/BA operator diagnostic passed exact value/bucket oracles: scans512→128 per128events; pruning pages9→1/scans35→3. Delivery calendar14/store3, check/strictClippy/fmt, native SQL24 and shared ordinary-memory aggregate cancellation2 passed. Independent SQL audit repeated24oracles/84prefix snapshots; recovery is fresh local Engine/task owner, not OS process-loss. No production quiet-key scheduler coverage. User replaced legacy large cases with bounded production plus focused correctness/recovery. Optimized isolated8192-row/128key pair passed exact outputs, native descriptors, source/downstream8192 and Finished: observed12.258→6.767s, sampled RSS223481856→222928896B, zero checkpoints; single finite pair, no durable/stable-rate claim. Full integrated qualification remains STR-103/126. Final independent source/evidence publication review approved. Next: PR and green current-head CI.
+- [Scan audit, exact sources, commands and limitations](str-111-validation.md); receipts `/home/jason/qa-evidence/str111-calendar-20261014/`. No user decision pending.
+
 ## Active STR-113 SESSION drain repair — 2026-10-14
 
 - Worker `/root/str113`, branch `jason/str-113-session-drain-20261014`, fetched base `6793409cb53eb7b13f5a591ce1717bcf1e846de8`. Current instructions/build/team/ticket/ledger/work-plan read; claim guard CLEAR. STR-103 evidence remains unchanged and unqualified.

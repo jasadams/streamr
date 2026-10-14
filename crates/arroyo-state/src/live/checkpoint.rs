@@ -1084,6 +1084,197 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn native_export_restores_snapshot_during_concurrent_writes() {
+        use crate::live::{lifecycle::RocksStateConfig, rocks::RocksLiveState};
+        // Worker configuration is process-global. Establish it in a dedicated
+        // instance of this one test, before any configuration access, so the
+        // full restore entry point uses the same pool without parallel races.
+        const CHILD: &str = "STR112_NATIVE_RESTORE_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["live::checkpoint::tests::native_export_restores_snapshot_during_concurrent_writes", "--exact", "--nocapture"])
+                .env(CHILD, "1")
+                .spawn().unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            loop {
+                match child.try_wait() {
+                    Ok(Some(result)) => {
+                        assert!(
+                            result.success(),
+                            "configured native restore child failed: {result}"
+                        );
+                        return;
+                    }
+                    Ok(None) if std::time::Instant::now() < deadline => {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    result => {
+                        let killed = child.kill();
+                        let waited = child.wait();
+                        panic!(
+                            "configured native restore child did not complete: poll={result:?}, kill={killed:?}, wait={waited:?}"
+                        );
+                    }
+                }
+            }
+        }
+        let configuration = tempfile::tempdir().unwrap();
+        let config_path = configuration.path().join("worker.yaml");
+        std::fs::write(
+            &config_path,
+            r#"worker:
+  live-state-resources:
+    block-cache-bytes: 8388608
+    memtable-bytes: 4194304
+    queued-write-bytes: 33554432
+    decoded-value-bytes: 16777216
+    scan-page-bytes: 2097152
+    max-blocking-operations: 2
+    max-snapshots: 4
+    max-open-databases: 4
+    disk-reserve-bytes: 0
+"#,
+        )
+        .unwrap();
+        arroyo_rpc::config::initialize_config(Some(&config_path), None);
+        let resources = super::super::worker::configured_worker_resources()
+            .unwrap()
+            .unwrap();
+        assert_eq!(resources.config().scan_page_bytes, 2 * PAGE_BYTES);
+        assert_eq!(resources.config().max_blocking_operations, 2);
+        let directory = tempfile::tempdir().unwrap();
+        let storage = storage(&directory).await;
+        let live_config = |owner: &str| RocksStateConfig {
+            root: directory.path().join("live"),
+            job_id: "blocking-export".into(),
+            operator_id: owner.into(),
+            subtask: 0,
+            generation: 1,
+            attempt: 1,
+        };
+        let source = RocksLiveState::open_worker(live_config("source"))
+            .await
+            .unwrap();
+        for number in 0..64 {
+            source
+                .put(key(number), incompressible_payload(number), PAGE_BYTES)
+                .await
+                .unwrap();
+        }
+        let snapshot = source.snapshot().await.unwrap();
+        let namespace = namespace();
+        let config = config();
+        let export_observation = CheckpointObservation::new(None, CheckpointDirection::Export);
+        let export = export_snapshot_inner(
+            &snapshot,
+            &namespace,
+            &config.table_name,
+            config.table_name.as_bytes(),
+            &config.schema_identity,
+            1,
+            &storage,
+            "checkpoint/native-concurrent",
+            1,
+            0,
+            0,
+            MAX_FILES,
+            Some(resources.clone()),
+            &export_observation,
+        );
+        let writes = async {
+            source
+                .put(key(0), b"after-barrier".to_vec(), PAGE_BYTES)
+                .await
+                .unwrap();
+            source.delete(key(1), PAGE_BYTES).await.unwrap();
+            source
+                .put(key(64), b"new-key".to_vec(), PAGE_BYTES)
+                .await
+                .unwrap();
+        };
+        let (metadata, ()) = tokio::join!(export, writes);
+        let metadata = metadata.unwrap();
+        assert_eq!(
+            metadata
+                .files
+                .iter()
+                .map(|file| file.row_count)
+                .sum::<u64>(),
+            64
+        );
+        let destination = RocksLiveState::open_worker(live_config("fresh"))
+            .await
+            .unwrap();
+        let restore_observation = CheckpointObservation::new(None, CheckpointDirection::Restore);
+        restore_snapshot_inner(
+            &destination,
+            &namespace,
+            1,
+            &config.schema_identity,
+            &metadata,
+            &storage,
+            Some(resources.clone()),
+            &restore_observation,
+        )
+        .await
+        .unwrap();
+        for number in 0..64 {
+            assert_eq!(
+                destination
+                    .get(
+                        &key(number),
+                        ReadOptions {
+                            max_bytes: PAGE_BYTES
+                        }
+                    )
+                    .await
+                    .unwrap(),
+                Some(incompressible_payload(number)),
+                "restored key {number}"
+            );
+        }
+        assert_eq!(
+            destination
+                .get(
+                    &key(64),
+                    ReadOptions {
+                        max_bytes: PAGE_BYTES
+                    }
+                )
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            source
+                .get(
+                    &key(0),
+                    ReadOptions {
+                        max_bytes: PAGE_BYTES
+                    }
+                )
+                .await
+                .unwrap(),
+            Some(b"after-barrier".to_vec())
+        );
+        assert_eq!(
+            source
+                .get(
+                    &key(1),
+                    ReadOptions {
+                        max_bytes: PAGE_BYTES
+                    }
+                )
+                .await
+                .unwrap(),
+            None
+        );
+        drop(snapshot);
+        source.close_and_remove().await.unwrap();
+        destination.close_and_remove().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn restore_checksum_waits_for_scan_admission_and_cancellation_allows_fresh_retry() {
         let resources = WorkerStateResources::new(ResourceConfig {
             block_cache_bytes: PAGE_BYTES,
