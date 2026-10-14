@@ -1629,6 +1629,277 @@ mod tests {
         std::fs::remove_dir_all(config.root).unwrap();
     }
 
+    /// Finite traversal diagnostic. Native options deliberately retain deleted
+    /// versions; this is not SQL throughput or production resource qualification.
+    #[test]
+    #[ignore = "opt-in STR-114 bounded native traversal diagnostic"]
+    fn native_scan_churn_diagnostic() {
+        use rocksdb::perf::{PerfContext, PerfMetric, PerfStatsLevel, set_perf_stats};
+        const ROWS: usize = 600;
+        for repeat in 0usize..3 {
+            for (key_bytes, value_bytes, page_entries) in [(16, 32, 1), (96, 1024, 16)] {
+                let modes = if repeat.is_multiple_of(2) {
+                    ["minimum", "stable", "advancing"]
+                } else {
+                    ["advancing", "stable", "minimum"]
+                };
+                for mode in modes {
+                    let config = config();
+                    let mut options = Options::default();
+                    options.create_if_missing(true);
+                    options.set_disable_auto_compactions(true);
+                    let db = DB::open(&options, &config.root).unwrap();
+                    let namespace = encoding::encode_namespace(&key().namespace).unwrap();
+                    let logical = |family: u8, i: usize| {
+                        let mut k = key();
+                        k.key = vec![0; key_bytes];
+                        k.key[0] = family;
+                        k.key[1..9].copy_from_slice(&(i as u64).to_be_bytes());
+                        encode_key(&k).unwrap()
+                    };
+                    let keys: Vec<_> = (0..ROWS).map(|i| logical(b'B', i)).collect();
+                    let unrelated: Vec<_> = (0..ROWS).map(|i| logical(b'D', i)).collect();
+                    let value = vec![7; value_bytes];
+                    let mut initial = rocksdb::WriteBatch::default();
+                    for k in keys.iter().chain(&unrelated) {
+                        initial.put(k, &value);
+                    }
+                    db.write(initial).unwrap();
+                    db.flush().unwrap();
+                    // Keep pre-delete versions pinned in every arm. Stable
+                    // continuation reads this view; fresh views see tombstones.
+                    let pinned = db.snapshot();
+                    let mut removed = rocksdb::WriteBatch::default();
+                    for k in &unrelated {
+                        removed.delete(k);
+                    }
+                    db.write(removed).unwrap();
+                    db.flush().unwrap();
+                    let mut prefix = namespace.clone();
+                    prefix.push(b'B');
+                    set_perf_stats(PerfStatsLevel::EnableTimeAndCPUTimeExceptForMutex);
+                    let mut perf = PerfContext::default();
+                    let mut completed = 0;
+                    let mut issued_seeks = 0;
+                    let mut after: Option<Vec<u8>> = None;
+                    let mut started = std::time::Instant::now();
+                    perf.reset();
+                    while completed < ROWS {
+                        let fresh = db.snapshot();
+                        let mut read = rocksdb::ReadOptions::default();
+                        read.set_snapshot(if mode == "stable" { &pinned } else { &fresh });
+                        set_scan_upper_bound(&mut read, &namespace, Some(&prefix), None);
+                        let mut iterator = db.raw_iterator_opt(read);
+                        iterator.seek(after.as_deref().unwrap_or(&prefix));
+                        issued_seeks += 1;
+                        if after
+                            .as_ref()
+                            .is_some_and(|last| iterator.key() == Some(last.as_slice()))
+                        {
+                            iterator.next();
+                        }
+                        let mut page = rocksdb::WriteBatch::default();
+                        let mut count = 0;
+                        while iterator.valid()
+                            && count < page_entries.min(ROWS / 3 - completed % (ROWS / 3))
+                        {
+                            let k = iterator.key().unwrap();
+                            assert_eq!(k, keys[completed + count].as_slice());
+                            assert_eq!(iterator.value().unwrap(), value.as_slice());
+                            page.delete(k);
+                            if mode != "minimum" {
+                                after = Some(k.to_vec());
+                            }
+                            count += 1;
+                            iterator.next();
+                        }
+                        iterator.status().unwrap();
+                        assert!(count > 0);
+                        drop(iterator);
+                        drop(fresh);
+                        db.write(page).unwrap();
+                        completed += count;
+                        if completed.is_multiple_of(ROWS / 3) {
+                            println!(
+                                "STR114 repeat={repeat} mode={mode} keys={key_bytes} values={value_bytes} page={page_entries} completed={completed} elapsed_us={} seeks={issued_seeks} child_seeks={} memtable_seeks={} internal_skips={} deleted_skips={} recent_skips={} block_reads={} block_bytes={} seek_ns={} next_ns={}",
+                                started.elapsed().as_micros(),
+                                perf.metric(PerfMetric::SeekChildSeekCount),
+                                perf.metric(PerfMetric::SeekOnMemtableCount),
+                                perf.metric(PerfMetric::InternalKeySkippedCount),
+                                perf.metric(PerfMetric::InternalDeleteSkippedCount),
+                                perf.metric(PerfMetric::InternalRecentSkippedCount),
+                                perf.metric(PerfMetric::BlockReadCount),
+                                perf.metric(PerfMetric::BlockReadByte),
+                                perf.metric(PerfMetric::SeekInternalSeekTime),
+                                perf.metric(PerfMetric::FindNextUserEntryTime)
+                            );
+                            issued_seeks = 0;
+                            perf.reset();
+                            started = std::time::Instant::now();
+                        }
+                    }
+                    let final_view = db.snapshot();
+                    for k in &keys {
+                        assert!(final_view.get(k).unwrap().is_none());
+                        assert_eq!(pinned.get(k).unwrap().unwrap(), value);
+                    }
+                    set_perf_stats(PerfStatsLevel::Disable);
+                    drop(final_view);
+                    drop(pinned);
+                    drop(db);
+                    std::fs::remove_dir_all(config.root).unwrap();
+                }
+            }
+        }
+    }
+
+    /// Exercises the actual admitted/decode/page adapter with a stable read
+    /// view, including deletion history and native upper-bound exhaustion.
+    #[tokio::test]
+    #[ignore = "opt-in STR-114 bounded admitted scan diagnostic"]
+    async fn admitted_scan_churn_diagnostic() {
+        for repeat in 0usize..3 {
+            for (key_bytes, value_bytes, page_entries) in [(16, 32, 1), (96, 1024, 16)] {
+                let config = config();
+                let resources = WorkerStateResources::new(ResourceConfig {
+                    block_cache_bytes: 1024 * 1024,
+                    memtable_bytes: 1024 * 1024,
+                    queued_write_bytes: 128 * 1024,
+                    decoded_value_bytes: 64 * 1024,
+                    scan_page_bytes: 128 * 1024,
+                    max_blocking_operations: 1,
+                    max_snapshots: 2,
+                    max_open_databases: 1,
+                    disk_reserve_bytes: 0,
+                })
+                .unwrap();
+                let state =
+                    RocksLiveState::open_worker_with_resources(config.clone(), resources.clone())
+                        .await
+                        .unwrap();
+                let logical = |i: usize| {
+                    let mut k = key();
+                    k.key = vec![0; key_bytes];
+                    k.key[0] = b'B';
+                    k.key[1..9].copy_from_slice(&(i as u64).to_be_bytes());
+                    k
+                };
+                let value = vec![7; value_bytes];
+                for start in (0..600).step_by(8) {
+                    let mut batch = WriteBatch {
+                        operations: Vec::new(),
+                        max_bytes: 128 * 1024,
+                    };
+                    for i in start..(start + 8).min(600) {
+                        batch.operations.push(WriteOperation::Put {
+                            key: logical(i),
+                            value: value.clone(),
+                        });
+                    }
+                    state.write_batch(batch).await.unwrap();
+                }
+                let view = state.snapshot().await.unwrap();
+                let mut request = ScanRequest {
+                    range: ScanRange {
+                        namespace: key().namespace,
+                        prefix: Some(vec![b'B']),
+                        start: None,
+                        end: None,
+                    },
+                    max_entries: page_entries,
+                    max_bytes: page_entries * (2 * key_bytes + value_bytes + 128),
+                    cursor: None,
+                };
+                let mut completed = 0;
+                let mut pages = 0;
+                let mut scan_us = 0;
+                let mut write_us = 0;
+                let process_work = || {
+                    let stat = std::fs::read_to_string("/proc/self/stat").unwrap();
+                    let fields: Vec<_> = stat
+                        .rsplit_once(')')
+                        .unwrap()
+                        .1
+                        .split_whitespace()
+                        .collect();
+                    let io = std::fs::read_to_string("/proc/self/io").unwrap();
+                    let io_bytes = |name: &str| -> u64 {
+                        io.lines()
+                            .find_map(|line| line.strip_prefix(name))
+                            .unwrap()
+                            .trim()
+                            .parse()
+                            .unwrap()
+                    };
+                    (
+                        fields[11].parse::<u64>().unwrap(),
+                        fields[12].parse::<u64>().unwrap(),
+                        io_bytes("read_bytes:"),
+                        io_bytes("write_bytes:"),
+                    )
+                };
+                let mut prior_work = process_work();
+                let mut started = std::time::Instant::now();
+                loop {
+                    request.max_entries = page_entries.min(200 - completed % 200);
+                    let scan_started = std::time::Instant::now();
+                    let page = view.try_scan(request.clone()).await.unwrap();
+                    scan_us += scan_started.elapsed().as_micros();
+                    let mut batch = WriteBatch {
+                        operations: Vec::new(),
+                        max_bytes: 128 * 1024,
+                    };
+                    for (offset, entry) in page.entries.iter().enumerate() {
+                        assert_eq!(entry.key, logical(completed + offset));
+                        assert_eq!(entry.value, value);
+                        batch.operations.push(WriteOperation::Delete {
+                            key: entry.key.clone(),
+                        });
+                    }
+                    completed += page.entries.len();
+                    pages += 1;
+                    request.cursor = page.next_cursor.clone();
+                    drop(page); // release scan reservation before write
+                    let write_started = std::time::Instant::now();
+                    state.write_batch(batch).await.unwrap();
+                    write_us += write_started.elapsed().as_micros();
+                    if completed.is_multiple_of(200) {
+                        let status = std::fs::read_to_string("/proc/self/status").unwrap();
+                        let rss = status
+                            .lines()
+                            .find(|line| line.starts_with("VmRSS:"))
+                            .unwrap();
+                        let work = process_work();
+                        println!(
+                            "STR114_ADAPTER repeat={repeat} keys={key_bytes} values={value_bytes} page={page_entries} completed={completed} pages={pages} scan_us={scan_us} write_us={write_us} elapsed_us={} cpu_user_ticks={} cpu_system_ticks={} {rss} read_bytes={} write_bytes={}",
+                            started.elapsed().as_micros(),
+                            work.0 - prior_work.0,
+                            work.1 - prior_work.1,
+                            work.2 - prior_work.2,
+                            work.3 - prior_work.3
+                        );
+                        prior_work = work;
+                        pages = 0;
+                        scan_us = 0;
+                        write_us = 0;
+                        started = std::time::Instant::now();
+                    }
+                    if request.cursor.is_none() {
+                        break;
+                    }
+                }
+                assert_eq!(completed, 600);
+                drop(view);
+                let empty = state.snapshot().await.unwrap();
+                request.cursor = None;
+                assert!(empty.try_scan(request).await.unwrap().entries.is_empty());
+                drop(empty);
+                state.close_and_remove().await.unwrap();
+                std::fs::remove_dir_all(config.root).unwrap();
+            }
+        }
+    }
+
     #[tokio::test]
     async fn native_snapshot_preserves_point_multiget_and_paged_scan_sequence() {
         let config = config();
