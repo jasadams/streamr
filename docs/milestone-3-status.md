@@ -1,3 +1,10 @@
+## Active STR-113 SESSION drain repair — 2026-10-14
+
+- Worker `/root/str113`, branch `jason/str-113-session-drain-20261014`, fetched base `6793409cb53eb7b13f5a591ce1717bcf1e846de8`. Current instructions/build/team/ticket/ledger/work-plan read; claim guard CLEAR. STR-103 evidence remains unchanged and unqualified.
+- Measured repeated deadline-prefix seeks: 5,000 closures traversed 12,570,036 deleted entries. An optional admitted inclusive logical minimum, invalidated before inserts and cold after restore, reduces this to 8,662; same O0 diagnostic drain 37.858→17.844s (2.12×). No production-rate extrapolation or RocksDB defect claim.
+- Locked worker check, strict all-target Clippy, formatting and all 22 SESSION tests passed, including strengthened cancellation/checkpoint/fresh-backend recovery. Temporary probes absent from published source. Independent source/evidence review approved; final publication review is the next gate.
+- [Source-bound measurements, reproducible commands and limits](str-113-session-drain-validation.md). Evidence/pins: `/home/jason/qa-evidence/str113-session-drain-20261014/`. Next: publish reviewed PR, verify CI, hand off without auto-merge. No user decision pending; full STR-103 qualification remains separate.
+
 ## Active STR-109 scan bounds repair — 2026-10-14
 
 - Branch `jason/str-109-scan-investigation-20261014`, fetched base `453b33c73cd11c5cc277a08639bbda2c7fe08ae1`. Root continues its existing claim; merged PR #42 and the older unpublished worktree are preserved. Current instructions/build guidance/ticket read. User authorized this bounds-only repair and growth comparison.
