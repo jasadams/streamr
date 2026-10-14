@@ -5,10 +5,13 @@ The retained candidate removes a discarded full key encoding from `decode_key`:
 without allocating another namespace/key buffer. No encoded bytes, parser checks,
 public interface, admission, snapshot lifetime or checkpoint protocol change.
 The focused decoder CPU measurement improves in both alternating pairs; the
-whole-export diagnostic is inconclusive. **The strong native campaign is closed
+whole-export diagnostic is inconclusive. The native campaign is closed
 failed/inconclusive: only one matched pair qualified, and its results were mixed.
-STR-112 acceptance remains open; no stable native throughput improvement or ticket
-completion is established.**
+Two successful alternating native pairs are required to claim stable improvement,
+not to record an honest failed/inconclusive measurement outcome. No stable native
+throughput improvement is claimed. Four focused OS-worker recovery cases now
+passed exact value and cleanup checks, with resource interruptions disclosed
+below. The original failed intervals are preserved.
 
 ## Source and instructions
 
@@ -327,9 +330,10 @@ Exact source paths/endpoints and these scopes remain in the analysis artifact.
 The retained increment removes measured decoder allocation/encoding cost, with
 59–60% less isolated decoder CPU in both alternating pairs. Whole-export results
 remain inconclusive and this native campaign failed/inconclusive. Independent
-review approved publication of the narrow increment with these limits; STR-112
-acceptance remains open. Integration/current-source gates, publication/CI and
-remaining recovery/qualification evidence are coordinator-owned, not claimed here.
+review approved publication of the narrow increment with these limits. At that
+publication STR-112 acceptance remained open for focused worker recovery; the
+subsequent results below supply that evidence without changing the negative
+native performance outcome or claiming combined qualification.
 
 ## Delivery integration checks
 
@@ -344,3 +348,104 @@ start/end HEAD. Receipts: `integration-gates/commands.json`, SHA256
 These establish current-source focused gates, not integrated performance or full
 operator recovery qualification. Final documentation corrections only relabel
 the 64-row restore as fresh-backend and record these gates.
+
+## Remaining acceptance: real worker recovery
+
+Evidence root `R=/home/jason/qa-evidence/str112-complete-20261015`. Independent
+acceptance review corrected the earlier checklist: two successful alternating
+pairs are conditional on claiming stable native improvement. Preserved failed or
+inconclusive intervals are valid measurement outcomes, not a reason to retry
+until a favorable result appears. No further throughput campaign was run.
+
+The source-free normal CLI is built from `f09434d38a0f9b0a78dc8bc4fd019738283d2a1f`,
+SHA256 `695b7363377cfa92b501f91e2de936a6cc05842a0247222f91e4a10b7e35ff42`.
+Its 605-input manifest is
+`624b7e67eba8ecfdf4d1b07b8a6a53284f9327c25e05891f5214fd65f3a12785`.
+The completed release build exited 0 in 2033.513 s; source-before/after, normal
+runtime O3 versus host-only O0 artifacts, native archive and linkage were
+independently verified. Private build database removal exited 0 and absence was
+verified. This already completed pin was reused; no new build followed the
+discussion hold. Dev/release build improvements are separately STR-127.
+
+The previous 68-parent-test state suite, configured child, locked check, strict
+Clippy and formatting remain source-bound evidence: from their `9c675052` source
+to `f09434d3`, the affected state/worker production code is unchanged; only an
+ignored RocksDB test diagnostic was added. `native-recovery/focused-gate-reuse.json`
+and its source diff record this audit. Later STR-115 changes two worker files,
+including an optional flush reservation even with TTL disabled. These recovery
+results qualify the recorded `f09434d3` decoder/export/recovery paths, **not** the
+later TTL/resource interaction or full current-worker integration.
+
+The existing five-row synthetic four-owner fixture was reused, with native state
+tables, aggregate, calendar and SESSION execution. Each case verified checkpoint
+2's source prefix of two rows, native ownership/schema/checksums and all four
+committed sink prefixes before SIGKILL of the exact worker identity. A different
+PID/start identity restored that checkpoint and produced exact final typed/CDC,
+lookup, value and time oracles. All final outputs matched: table 5 records,
+aggregate 5, calendar 5 and SESSION 3. Source batch sizes are configured targets;
+barriers flush partial batches, so this is not proof of full eight-row batches.
+
+| Protocol | Batch target | Elapsed s | Sampled RSS MiB | Samples | Maximum gap s | Final run |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Controller | 1 | 75.241 | 221.477 | 368 | 0.354 | 2 |
+| Controller | 8 | 103.885 | 219.434 | 512 | 0.408 | 3 |
+| Worker leader | 1 | 92.522 | 218.941 | 443 | 0.283 | 2 |
+| Worker leader | 8 | 163.596 | 219.031 | 791 | 0.283 | 3 |
+
+All four native parents exited 0, cleanup completed with no errors, callers
+joined and each case stayed within its unchanged 180 s main plus shared 25 s
+cleanup bound. Pools remained 62 MiB and the sampled owned-session RSS gate
+512 MiB. RSS is main-loop sampled, with synchronous proof/API gaps; it is not a
+continuous peak or cleanup-RSS guarantee. Controller/batch-1 was retained from
+the earlier correct execution with 44 receipt/object/output hashes reverified;
+only the remaining three cases ran after the port repair. Their retained
+foreground session 89094 exited 0.
+
+`native-recovery/final-recovery-summary.json`, SHA256
+`55244044068fcd9147695bba4e8b3cc753fead4c648729ea04113ef167a68038`,
+binds every qualified case, checkpoint proof, output, log, fault identity and
+source/harness version. Post-run hashes of all 56 prepared files, 44 retained
+case-1 artifacts and pin/build receipts are unchanged. Container/process checks
+found no owned recovery runtime. Whole-process CPU was not collected for this
+focused matrix; it supplies no performance result.
+
+Both batch-8 cases had real scan-budget interruptions. Controller/batch-8 first
+automatically recovered generation 1 to 2 after `scan_page_bytes` exhaustion,
+then recovered the deliberate loss from 2 to 3. Worker-leader/batch-8 recovered
+the deliberate loss from 1 to 2, hit the same refusal after restore and restored
+checkpoint 2 again before finishing in run 3. Source review identifies fail-fast
+aggregate `try_scan` while holding other reservations and a shared 2 MiB scan
+pool also used by checkpoint export. Overlap is consistent with contention, but
+exact concurrent permit holders were not recorded. `ResourceExhausted` means insufficient
+currently available permits for a valid request, not an oversized allocation.
+The existing fail-fast/WithBackoff behavior preserved values and bounds. These
+are availability limitations, not error-free resource passes or established
+decoder regressions. No pool increase, admission redesign or production repair
+was introduced to make these cases pass.
+
+Earlier harness failures remain under `native-recovery/failed-watermark-date`
+and `failed-fixed-port`. The first could not plan retired `WATERMARK_DATE()` and
+created no job/worker. Replacing it with current `EVENT_DATE()` preserves this
+fixture's five calendar oracles because every relevant date is October 10 UTC;
+the clocks are not generally equivalent. A real TIME_WAIT/live-listener
+regression validated the `SO_REUSEADDR` probe correction. A second failure came
+from polling a fixed port instead of each case's configured port. Its archive
+retains the valid first case, failed second, interrupted startup of the third
+and host-controlled fourth interruption; outer exit 137 and container absence
+are recorded, without claiming inner cleanup/join for the fourth. The corrected
+remaining caller selects only the three unfinished cases and records ports
+18134/18135/18136. Inputs, oracles, limits and source pin were unchanged.
+
+The earlier B2 513.215 MiB failure remains failed. `rss-diagnosis.md` places it in
+steady processing about 115 s after checkpoint 89, before checkpoint 90 started.
+No duplicate process/thread/harness counting was found. The scalar peak lacks
+its timestamp and per-process allocation breakdown; compaction overlap does not
+prove causality. Backend cache/write-buffer targets are not whole-process RSS
+ceilings. This evidence does not establish an exporter leak or justify changing
+memory policy. No failed benchmark interval was replaced or reclassified.
+
+Full combined capacity, Kafka/controller-loss and later TTL integration remain
+the existing STR-103/126 scope. These focused cases complete the missing native
+worker-value/recovery verification for this increment. Independent final evidence
+review approved scoped STR-112 acceptance; publication checks remain. This does
+not establish stable native throughput or combined STR-103/126 qualification.
