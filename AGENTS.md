@@ -126,6 +126,26 @@ capability before proposing a replacement.
   recovery from a standalone SQL/state simulation. Preserve application output
   and time semantics or discuss explicit differences before changing them.
 
+## Default build path
+
+- Use the maintained repository build scripts by default: `scripts/cargo-dev`
+  for container Cargo commands, `scripts/preflight-clippy.sh` for the Clippy
+  gate, and `scripts/rust-build` for the shared queue. Follow
+  `.claude/build-test.md`; do not substitute direct Cargo/container commands or
+  external one-off builders merely because they already collect provenance.
+- Use the normal dev/test profile and matching precompiled RocksDB archive for
+  correctness, resource and recovery checks. Source hashes, executable pinning
+  or packaging alone are not reasons to select a release build.
+- Select release explicitly when optimized performance measurements or release
+  artifacts require it. Before an expensive build, record the purpose, actual
+  profile and whether RocksDB will use a matching precompiled archive or compile
+  from source. Preserve cache reuse, the shared target and queue in either mode.
+- If the maintained scripts lack a necessary capability, extend their supported
+  path within the authorized task rather than bypassing it for convenience.
+  Explicit native source builds remain available for deliberate comparisons or
+  unsupported settings; record the concrete reason. Dev/release pinning and
+  precompiled release RocksDB support are tracked in STR-127, not yet available.
+
 ## Work and verification
 
 - Before fixing a regression, trace the existing behavior and relevant upstream

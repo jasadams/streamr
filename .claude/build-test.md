@@ -7,6 +7,19 @@ their source/image versions, evidence and unresolved checks.
 
 ## Build Environment
 
+The maintained repository scripts are the default build interface. Use
+`scripts/cargo-dev`, `scripts/preflight-clippy.sh` and the shared
+`scripts/rust-build` queue; do not choose an external one-off builder simply to
+obtain source hashes, executable pins or packaging.
+
+Use normal dev/test builds for correctness, resource and recovery validation so
+the matching precompiled RocksDB archive is reused. Release is an explicit choice
+for optimized measurements or release artifacts. Record the purpose, selected
+profile and native archive/source mode before expensive work. If build or pinning
+support is missing, improve the maintained scripts within the authorized scope.
+[STR-127](https://trakkt.app/issues/STR-127) tracks shared dev/release pinning and
+precompiled release RocksDB; the current image only supplies the dev archive.
+
 Arroyo requires Debian Bookworm toolchain. Fedora 44's GCC 16 and OpenSSL 3.5 are incompatible
 with vendored C dependencies (sasl2-sys, rdkafka-sys, aws-lc-sys).
 
