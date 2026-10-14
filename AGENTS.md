@@ -149,6 +149,21 @@ disk space before large runs and remove unused build targets when safe. Audit
 worktree changes, PR dependencies and active process/container references before
 removing obsolete worktrees; preserve uncommitted work and validation evidence.
 
+## RocksDB scan reporting
+
+Every new or changed RocksDB scan must be reported and justified in its ticket
+validation report and independent review. Explain the operation requiring
+enumeration or order, why known-key point reads cannot suffice, actual native
+lower/upper bounds, call frequency, and pagination/progress across deletion,
+insertion and recovery. Record snapshot and memory/reservation lifetimes.
+Logical necessity alone does not establish acceptable performance: use finite
+source-bound workloads with retained state/churn and completed-work rates, and
+report actual seek/internal-key/deleted-key traversal plus CPU, I/O and RSS where
+relevant. Distinguish opt-in diagnostics from production measurements and
+returned rows from backend work. Preserve exact settings and failures; compare
+matched alternating runs before claiming an improvement. Do not introduce an
+unbounded cache/index or change semantics merely to avoid a scan.
+
 ## Delegation
 
 Proactively delegate suitable independent subtasks when doing so improves speed,

@@ -1,3 +1,12 @@
+## Active STR-114 shared RocksDB traversal — 2026-10-14
+
+- Coordinator `/root`, session `01a139e4-c732-7782-9282-8ae491296ff5`; branch `jason/str-114-scans-20261014`, fetched base `fa9c8133d3feefb4343e322c5405e843e25e1b61`. Current ticket, AGENTS.md, build/team guidance and ledger/work plan read; pickup guard CLEAR under owned reservation. No signing or automatic elapsed limit.
+- Own shared `live/rocks.rs`/`live/mod.rs` scan sections, minimal probes and scan-reporting guidance. STR-111/112 active claims remain separate; export/capture sections stay with STR-112. STR-110/113 are merged foundations.
+- Acceptance: complete caller inventory and justification, bounded comparable traversal/churn measurements, only demonstrated contract-preserving improvements, exact resource/cancellation/recovery checks, container gates, independent written review and green current-head CI.
+- Freshly compiled/pinned current-source tests passed: 65 live tests plus both opt-in bounded diagnostics. Strict Clippy/fmt passed. The earlier cross-worktree executable run remains invalid coverage with raw failure/withdrawn attribution preserved.
+- Measurements: each repeat's 600-row native minimum restart revisited 179,700 deleted entries (page 1), versus stable pagination 0 and advancing logical bounds 599. Tight-pool admitted adapter checks passed. Shared production code remains unchanged: measured caller restart costs do not justify a new backend cache or snapshot contract. These are bounded diagnostics, not production/capacity qualification.
+- Next: independent final source/evidence review, publish, and verify current-head CI. No user decision pending. Evidence: `/home/jason/qa-evidence/str114-scans-20261014/`; report `docs/str-114-validation.md`.
+
 ## STR-112 decoder increment — 2026-10-15
 
 - Branch `jason/str-112-export-20261014`, frozen benchmark base `6793409cb53eb7b13f5a591ce1717bcf1e846de8`; delivery integrated with main `196a9f72`. Current instructions/build/team guidance and ticket read. Production change removes discarded key serialization while preserving validation; native checkpoint regression covers concurrent writes and fresh-backend restore.
