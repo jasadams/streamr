@@ -71,6 +71,69 @@ struct BatchData {
     generation: u64,
 }
 
+/// Volatile, admitted progress for one serial cleanup drain. No snapshot or
+/// index survives a page, flush, cancellation, or checkpoint restore.
+#[derive(Default)]
+struct NativeCleanupProgress {
+    marker: Option<Vec<u8>>,
+    member_after: Option<Vec<u8>>,
+    phase: Option<u8>,
+    completed: bool,
+    _permit: Option<arroyo_state::live::resources::ResourcePermit>,
+}
+
+impl NativeCleanupProgress {
+    fn new(store: &AggregateStore) -> Self {
+        let limits = store.limits();
+        let charge = limits.key_bytes.saturating_mul(2);
+        let encoded_key = store.max_encoded_entry_bytes() - limits.value_bytes - 1;
+        // AggregateScope holds overlay + three maximum values. Rocks read_many
+        // separately admits one value, two encoded keys, and result containers.
+        // Optional progress must leave that existing mandatory peak available.
+        let required = limits
+            .overlay_bytes
+            .saturating_add(limits.value_bytes.saturating_mul(4))
+            .saturating_add(encoded_key.saturating_mul(2))
+            .saturating_add(mem::size_of::<Vec<u8>>())
+            .saturating_add(mem::size_of::<Option<Vec<u8>>>())
+            .saturating_add(charge);
+        let permit = (required <= store.resources().config().decoded_value_bytes)
+            .then(|| {
+                // Shared consumers may already hold part of a valid pool. Keep
+                // the mandatory peak reserved while testing optional headroom.
+                let mandatory = store
+                    .resources()
+                    .try_decoded_value(required - charge)
+                    .ok()?;
+                let cursor = store.resources().try_decoded_value(charge).ok();
+                drop(mandatory);
+                cursor
+            })
+            .flatten();
+        Self {
+            _permit: permit,
+            ..Self::default()
+        }
+    }
+
+    fn committed(
+        &mut self,
+        marker: Vec<u8>,
+        phase: u8,
+        member_after: Option<Vec<u8>>,
+        completed: bool,
+    ) {
+        if self._permit.is_some() {
+            // Decoded backend keys can have geometric Vec spare capacity.
+            // Retain only their exact lengths under the two-key reservation.
+            self.marker = Some(marker.into_boxed_slice().into_vec());
+            self.member_after = member_after.map(|key| key.into_boxed_slice().into_vec());
+            self.phase = Some(phase);
+            self.completed = completed;
+        }
+    }
+}
+
 /// One accepted contribution with its raw row clock and calendar inputs.
 struct NativeCalendarEvent<'a> {
     group_key: &'a [u8],
@@ -1638,13 +1701,66 @@ impl IncrementalAggregatingFunc {
         Ok(processed > 0)
     }
 
+    #[cfg(test)]
     async fn cleanup_native(&self) -> Result<bool> {
+        self.cleanup_native_with_progress(&mut NativeCleanupProgress::default())
+            .await
+    }
+
+    async fn cleanup_native_with_progress(
+        &self,
+        progress: &mut NativeCleanupProgress,
+    ) -> Result<bool> {
+        use arroyo_state::live::{LiveStateError, resources::ResourceError};
+        let result = self.cleanup_native_step(progress).await;
+        // Another owner can consume decoded headroom after cursor creation.
+        // The failed step has released its uncommitted scope before we discard
+        // optional keys and retry the established cold path. Other failures,
+        // including write admission, keep their original error and cursor.
+        if progress._permit.is_some()
+            && result.as_ref().is_err_and(|error| {
+                let resource = error.downcast_ref::<ResourceError>().or_else(|| match error
+                    .downcast_ref::<LiveStateError>(
+                ) {
+                    Some(LiveStateError::Resource(resource)) => Some(resource),
+                    _ => None,
+                });
+                matches!(
+                    resource,
+                    Some(ResourceError::ResourceExhausted {
+                        resource: "decoded_value_bytes",
+                        ..
+                    })
+                )
+            })
+        {
+            *progress = NativeCleanupProgress::default();
+            self.cleanup_native_step(progress).await
+        } else {
+            result
+        }
+    }
+
+    async fn cleanup_native_step(&self, progress: &mut NativeCleanupProgress) -> Result<bool> {
         let store = self
             .native_store
             .as_ref()
             .ok_or_else(|| anyhow!("native aggregate store missing"))?;
         let mut scope = store.begin().await?;
-        let Some((cleanup_key, phase)) = scope.first(b"C").await? else {
+        let pending = if progress._permit.is_some() {
+            match progress.marker.as_deref() {
+                Some(key) if !progress.completed => match scope.get(key).await? {
+                    Some(phase) => Some((key.to_vec(), phase)),
+                    // An atomic terminal deletion may have completed before its
+                    // future was cancelled. Its absent marker is safe to pass.
+                    None => scope.first_from(b"C", Some(key)).await?,
+                },
+                after => scope.first_from(b"C", after).await?,
+            }
+        } else {
+            scope.first(b"C").await?
+        };
+        let Some((cleanup_key, phase)) = pending else {
             return Ok(false);
         };
         ensure!(cleanup_key.len() >= 13, "invalid aggregate cleanup key");
@@ -1665,8 +1781,10 @@ impl IncrementalAggregatingFunc {
             if !self.native_has_group_keys() {
                 scope.delete(&cleanup_key)?;
                 scope.commit().await?;
+                progress.committed(cleanup_key, b'T', None, true);
                 return Ok(true);
             }
+            let mut marker_retired = true;
             let cleanup_prefix = native_group_key(b'C', group)?;
             if scope
                 .first_from(&cleanup_prefix, Some(&cleanup_key))
@@ -1697,6 +1815,7 @@ impl IncrementalAggregatingFunc {
                         // remaining action is to delete itself.
                         scope.delete(&group_key)?;
                         scope.delete(&rows_key)?;
+                        marker_retired = false;
                     } else {
                         scope.delete(&cleanup_key)?;
                     }
@@ -1705,34 +1824,48 @@ impl IncrementalAggregatingFunc {
                 }
             }
             scope.commit().await?;
+            progress.committed(cleanup_key, b'T', None, marker_retired);
             return Ok(true);
         }
         let prefix = native_generation_prefix(phase[0], group, generation)?;
-        let mut after = None;
+        let mut after = if progress._permit.is_some()
+            && progress.marker.as_ref() == Some(&cleanup_key)
+            && progress.phase == Some(phase[0])
+            && !progress.completed
+        {
+            progress.member_after.clone()
+        } else {
+            None
+        };
         let mut exhausted = false;
+        // U scans one pointer but may delete both that pointer and its owned
+        // deadline. Divide write/overlay capacities, never the scan-page cap.
+        let writes_per_member = if phase == b"U" { 2 } else { 1 };
         let max_entries = store
             .limits()
             .page_entries
-            .min(store.limits().write_operations.saturating_sub(1))
-            .min((store.limits().write_bytes / store.max_encoded_entry_bytes()).saturating_sub(1))
+            .min(store.limits().write_operations.saturating_sub(1) / writes_per_member)
+            .min(
+                (store.limits().write_bytes / store.max_encoded_entry_bytes()).saturating_sub(1)
+                    / writes_per_member,
+            )
             .min(
                 (store.limits().overlay_bytes
                     / (store.limits().key_bytes + store.limits().value_bytes))
-                    .saturating_sub(1),
+                    .saturating_sub(1)
+                    / writes_per_member,
             );
-        ensure!(
-            max_entries > 0,
-            "native aggregate cleanup requires two write operations"
-        );
-        let max_entries = if phase == b"U" {
-            max_entries / 2
+        if phase == b"U" {
+            ensure!(
+                max_entries > 0,
+                "calendar cleanup cannot admit a due pointer"
+            );
         } else {
-            max_entries
-        };
-        ensure!(
-            max_entries > 0,
-            "calendar cleanup cannot admit a due pointer"
-        );
+            ensure!(
+                max_entries > 0,
+                "native aggregate cleanup requires two write operations"
+            );
+        }
         for _ in 0..max_entries {
             let Some((key, _)) = scope.first_from(&prefix, after.as_deref()).await? else {
                 exhausted = true;
@@ -1772,6 +1905,12 @@ impl IncrementalAggregatingFunc {
             }
         }
         scope.commit().await?;
+        progress.committed(
+            cleanup_key,
+            phase[0],
+            if exhausted { None } else { after },
+            false,
+        );
         Ok(true)
     }
 
@@ -1805,7 +1944,12 @@ impl IncrementalAggregatingFunc {
         // Each invocation owns at most one admitted cleanup page. Drain the
         // finite backlog through EOF/barriers as well as timer flushes, so an
         // idle keyed group does not retain a tombstone indefinitely.
-        while self.cleanup_native().await? {
+        let mut cleanup = NativeCleanupProgress::new(
+            self.native_store
+                .as_ref()
+                .context("native aggregate store missing")?,
+        );
+        while self.cleanup_native_with_progress(&mut cleanup).await? {
             tokio::task::yield_now().await;
         }
         Ok(())
@@ -3533,6 +3677,12 @@ impl IncrementalAggregatingConstructor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    mod aggregate_cleanup_tests {
+        include!("aggregate_cleanup_tests.rs");
+    }
+    mod aggregate_cleanup_boundary_tests {
+        include!("aggregate_cleanup_boundary_tests.rs");
+    }
     use arrow::compute::SortOptions;
     use arrow_array::{Int64Array, StringArray, TimestampNanosecondArray};
     use arroyo_state::live::{
@@ -4038,6 +4188,209 @@ mod tests {
             .into_iter()
             .map(|index| state[index].evaluate().unwrap())
             .collect()
+    }
+
+    #[tokio::test]
+    async fn native_cleanup_single_pointer_page() {
+        let mut operator = native_calendar_operator();
+        operator.native_store = Some(native_test_store_with_limits(AggregateStoreLimits {
+            page_entries: 1,
+            ..native_test_store().limits()
+        }));
+        let store = operator.native_store.as_ref().unwrap();
+        let marker = native_cleanup_key(&GLOBAL_KEY, 0).unwrap();
+        let mut pointer = native_generation_prefix(b'U', &GLOBAL_KEY, 0).unwrap();
+        pointer.extend_from_slice(&0_u32.to_be_bytes());
+        let due = calendar_native::calendar_due_key(17, &GLOBAL_KEY).unwrap();
+        let mut scope = store.begin().await.unwrap();
+        scope.put(&marker, b"U").unwrap();
+        scope.put(&pointer, &17_i64.to_be_bytes()).unwrap();
+        scope.put(&due, &0_u64.to_be_bytes()).unwrap();
+        scope.commit().await.unwrap();
+        let mut progress = NativeCleanupProgress::new(store);
+        assert!(
+            operator
+                .cleanup_native_with_progress(&mut progress)
+                .await
+                .unwrap()
+        );
+        let scope = store.begin().await.unwrap();
+        assert_eq!(scope.get(&marker).await.unwrap(), Some(b"U".to_vec()));
+        assert!(scope.get(&pointer).await.unwrap().is_none());
+        assert!(scope.get(&due).await.unwrap().is_none());
+        drop(scope);
+        assert!(
+            operator
+                .cleanup_native_with_progress(&mut progress)
+                .await
+                .unwrap()
+        );
+        let scope = store.begin().await.unwrap();
+        assert_eq!(scope.get(&marker).await.unwrap(), Some(b"T".to_vec()));
+    }
+
+    /// Actual bounded cleanup calls with finite obsolete/current generations.
+    /// Native deleted-key attribution is measured separately in the state test.
+    #[tokio::test]
+    #[ignore = "opt-in STR-116 finite operator cleanup diagnostic"]
+    async fn native_cleanup_generation_pilot() {
+        use arroyo_state::live::{lifecycle::RocksStateConfig, rocks::RocksLiveState};
+        let repeats = std::env::var("STR116_PILOT_REPEAT")
+            .map(|value| vec![value.parse::<usize>().unwrap()])
+            .unwrap_or_else(|_| (0..3).collect());
+        for repeat in repeats {
+            let root = std::env::temp_dir().join(format!("cleanup-pilot-{}", uuid::Uuid::new_v4()));
+            let resources = native_test_store().resources().clone();
+            let backend = Arc::new(
+                RocksLiveState::open(
+                    RocksStateConfig {
+                        root: root.clone(),
+                        job_id: "cleanup-pilot".into(),
+                        operator_id: "aggregate".into(),
+                        subtask: 0,
+                        generation: 0,
+                        attempt: 0,
+                    },
+                    resources.clone(),
+                )
+                .await
+                .unwrap(),
+            );
+            let mut manager = LiveTableManager::new(
+                backend.clone(),
+                Ownership::PartitionLocal {
+                    subtask: 0,
+                    parallelism: 1,
+                },
+            )
+            .unwrap();
+            let table = manager.register(NATIVE_AGGREGATE_TABLE).unwrap();
+            let store = AggregateStore::new(
+                backend.clone(),
+                table,
+                resources,
+                native_test_store().limits(),
+            )
+            .unwrap();
+            let mut operator = native_calendar_operator();
+            operator.native_store = Some(store);
+            let store = operator.native_store.as_ref().unwrap();
+            for group_id in 0_u64..12 {
+                let group = group_id.to_be_bytes();
+                for generation in 0_u64..4 {
+                    if generation < 3 {
+                        let mut scope = store.begin().await.unwrap();
+                        scope
+                            .put(&native_cleanup_key(&group, generation).unwrap(), b"M")
+                            .unwrap();
+                        scope.commit().await.unwrap();
+                    }
+                    for family in b"MRBJQU" {
+                        for row in 0_u64..16 {
+                            let mut key =
+                                native_generation_prefix(*family, &group, generation).unwrap();
+                            key.extend_from_slice(&row.to_be_bytes());
+                            let mut scope = store.begin().await.unwrap();
+                            scope.put(&key, &row.to_be_bytes()).unwrap();
+                            if *family == b'U' {
+                                scope
+                                    .put(
+                                        &calendar_native::calendar_due_key(row as i64, &group)
+                                            .unwrap(),
+                                        &3_u64.to_be_bytes(),
+                                    )
+                                    .unwrap();
+                            }
+                            scope.commit().await.unwrap();
+                        }
+                    }
+                }
+            }
+            // Keep identical retained history in every run; production adapter
+            // pools/pages/native settings remain unchanged.
+            let pinned = backend.snapshot().await.unwrap();
+            let mut progress = NativeCleanupProgress::new(store);
+            assert!(progress._permit.is_some());
+            let mut completed = 0_u64;
+            let mut pages = 0;
+            let mut elapsed = std::time::Duration::ZERO;
+            loop {
+                let start = std::time::Instant::now();
+                let more = operator
+                    .cleanup_native_with_progress(&mut progress)
+                    .await
+                    .unwrap();
+                elapsed += start.elapsed();
+                if !more {
+                    break;
+                }
+                pages += 1;
+                assert!(pages < 600, "finite cleanup segment did not finish");
+                // Fixture-only point read counts completed generations outside
+                // the timed operation without introducing another C scan.
+                let scope = store.begin_point().await.unwrap();
+                let marker =
+                    native_cleanup_key(&(completed / 3).to_be_bytes(), completed % 3).unwrap();
+                let terminal = scope.get(&marker).await.unwrap().is_none();
+                drop(scope);
+                if terminal {
+                    completed += 1;
+                    if completed.is_multiple_of(12) {
+                        let status = std::fs::read_to_string("/proc/self/status").unwrap();
+                        let memory: Vec<_> = status
+                            .lines()
+                            .filter(|line| line.starts_with("VmRSS:") || line.starts_with("VmHWM:"))
+                            .collect();
+                        println!(
+                            "STR116_OPERATOR repeat={repeat} completed_generations={completed} completed_members={} completed_markers={completed} pages={pages} seconds={:.9} memory={memory:?}",
+                            completed * 6 * 16,
+                            elapsed.as_secs_f64()
+                        );
+                        pages = 0;
+                        elapsed = std::time::Duration::ZERO;
+                    }
+                }
+            }
+            assert_eq!(completed, 36);
+            let scope = store.begin().await.unwrap();
+            assert!(scope.first(b"C").await.unwrap().is_none());
+            for group_id in 0_u64..12 {
+                let group = group_id.to_be_bytes();
+                for generation in 0_u64..4 {
+                    for family in b"MRBJQU" {
+                        for row in 0_u64..16 {
+                            let mut key =
+                                native_generation_prefix(*family, &group, generation).unwrap();
+                            key.extend_from_slice(&row.to_be_bytes());
+                            assert_eq!(
+                                scope.get(&key).await.unwrap(),
+                                (generation == 3).then(|| row.to_be_bytes().to_vec())
+                            );
+                        }
+                    }
+                }
+                for row in 0_i64..16 {
+                    assert_eq!(
+                        scope
+                            .get(&calendar_native::calendar_due_key(row, &group).unwrap())
+                            .await
+                            .unwrap(),
+                        Some(3_u64.to_be_bytes().to_vec())
+                    );
+                }
+            }
+            drop(scope);
+            drop(progress);
+            drop(pinned);
+            drop(operator);
+            drop(manager);
+            Arc::try_unwrap(backend)
+                .unwrap_or_else(|_| panic!("retained cleanup backend"))
+                .close_and_remove()
+                .await
+                .unwrap();
+            std::fs::remove_dir_all(root).unwrap();
+        }
     }
 
     /// Finite operator diagnostic, not the four-owner production qualification.
