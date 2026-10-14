@@ -8,7 +8,8 @@ use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
 use arroyo_rpc::config::WindowStateConfig;
 use arroyo_state::live::{
-    LiveStateBackend, ReadOptions, ScanEntry, ScanRange, ScanRequest, StateSnapshot, encoding,
+    LastEntryRequest, LiveStateBackend, ReadOptions, ScanEntry, ScanRange, ScanRequest,
+    StateSnapshot, encoding,
     resources::{ResourcePermit, WorkerStateResources},
     table::LiveTable,
     write::AdmittedWriteBatch,
@@ -408,6 +409,13 @@ impl SessionStore {
         }
         let snapshot = self.snapshot().await?;
         let prefix = prefix(SESSION, group)?;
+        // A successor does not require another cardinality proof at the
+        // minimum. Unknown remains conservative after ambiguous writes.
+        if after.is_some() {
+            return self
+                .next_session_from_snapshot(&snapshot, group, after, prefix)
+                .await;
+        }
         // A full-prefix page proves empty or sole only if no continuation
         // exists. A page-byte cutoff can return one entry plus a cursor.
         let proof_page = snapshot
@@ -440,8 +448,12 @@ impl SessionStore {
             }
             GroupProof::Unknown => {}
         }
-        self.next_session_from_snapshot(&snapshot, group, after, prefix)
-            .await
+        // This cold minimum lookup already has its first row in the proof page.
+        proof_page
+            .entries
+            .first()
+            .map(|entry| Self::decode_session(entry, &prefix))
+            .transpose()
     }
 
     async fn next_session_from_snapshot(
@@ -619,44 +631,101 @@ impl SessionStore {
         )
         .await?;
 
-        // Session intervals are disjoint and ordered. Remove one overlapping
-        // interval at a time, then rescan: a newly bridged neighbor may become
-        // reachable after expanding the interval. No history is loaded.
         let mut merged = SessionMeta {
             start: time,
             end: time,
         };
-        loop {
-            let mut after = None;
-            let mut found = None;
-            while let Some(existing) = self.next_session(group, after).await? {
-                if existing.start
-                    > merged
-                        .end
-                        .checked_add(self.gap)
-                        .context("native SESSION interval overflow")?
-                {
-                    break;
+        match self.cached_proof(group)? {
+            Some(GroupProof::Empty) => return self.add_session(group, merged).await,
+            Some(GroupProof::Sole(existing)) => {
+                if self.overlaps(merged, existing)? {
+                    self.remove_session(group, existing).await?;
+                    merged.start = merged.start.min(existing.start);
+                    merged.end = merged.end.max(existing.end);
                 }
-                if merged.start
-                    <= existing
-                        .end
-                        .checked_add(self.gap)
-                        .context("native SESSION interval overflow")?
-                {
-                    found = Some(existing);
-                    break;
-                }
-                after = Some(existing.start);
+                return self.add_session(group, merged).await;
             }
-            let Some(existing) = found else {
+            Some(GroupProof::Unknown) | None => {}
+        }
+        self.remember_group(group, GroupProof::Unknown)?;
+        let snapshot = self.snapshot().await?;
+        let prefix = prefix(SESSION, group)?;
+        // Appended zero is the immediate strict successor of this logical
+        // key, including the exact event start without timestamp overflow.
+        let mut end = session_key(group, time)?;
+        end.push(0);
+        let predecessor = {
+            let page = snapshot
+                .try_last_in_range(LastEntryRequest {
+                    range: ScanRange {
+                        namespace: self.table.namespace().clone(),
+                        prefix: Some(prefix.clone()),
+                        start: None,
+                        end: Some(end),
+                    },
+                    max_bytes: self.limits.page_bytes,
+                })
+                .await?;
+            page.entries
+                .first()
+                .map(|entry| Self::decode_session(entry, &prefix))
+                .transpose()?
+        }; // Drop the admitted page before any awaited write/read.
+        let mut current = predecessor;
+        let mut after = Some(time);
+        let mut examined = false;
+        loop {
+            let existing = match current.take() {
+                Some(existing) => Some(existing),
+                None => {
+                    self.next_session_from_snapshot(&snapshot, group, after, prefix.clone())
+                        .await?
+                }
+            };
+            let Some(existing) = existing else {
                 break;
             };
-            self.remove_session(group, existing).await?;
-            merged.start = merged.start.min(existing.start);
-            merged.end = merged.end.max(existing.end);
+            examined = true;
+            if existing.start
+                > merged
+                    .end
+                    .checked_add(self.gap)
+                    .context("native SESSION interval overflow")?
+            {
+                break;
+            }
+            if self.overlaps(merged, existing)? {
+                self.remove_session(group, existing).await?;
+                // Only local insertion progress survives a successful deletion;
+                // cancelled attempts restart from a fresh snapshot and proofs.
+                merged.start = merged.start.min(existing.start);
+                merged.end = merged.end.max(existing.end);
+            }
+            // The predecessor is the greatest start at or before the event.
+            // No later live key can be <= time; start there to avoid scanning
+            // obsolete earlier starts. Later neighbors keep their own start.
+            after = Some(existing.start.max(time));
+        }
+        drop(snapshot);
+        // No predecessor or successor means this snapshot proved the whole
+        // group empty. Otherwise earlier intervals may remain unexamined.
+        if !examined {
+            self.remember_group(group, GroupProof::Empty)?;
         }
         self.add_session(group, merged).await
+    }
+
+    fn overlaps(&self, left: SessionMeta, right: SessionMeta) -> Result<bool> {
+        Ok(right.start
+            <= left
+                .end
+                .checked_add(self.gap)
+                .context("native SESSION interval overflow")?
+            && left.start
+                <= right
+                    .end
+                    .checked_add(self.gap)
+                    .context("native SESSION interval overflow")?)
     }
 
     fn update_deadline(&self, update: impl FnOnce(DeadlineProof) -> DeadlineProof) -> Result<()> {
@@ -1146,6 +1215,445 @@ pub(super) mod tests {
 
     fn snapshots(backend: &ObservedBackend) -> usize {
         backend.snapshots.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Finite diagnostic, excluded from normal test execution. Uses the same
+    /// insertion/history contracts and limits as the store regressions.
+    async fn metadata_rows(
+        store: &SessionStore,
+        group: &[u8],
+        session: SessionMeta,
+    ) -> Vec<(i64, i64)> {
+        let snapshot = store.snapshot().await.unwrap();
+        let mut after = None;
+        let mut rows = Vec::new();
+        while let Some(next) = store
+            .next_row(&snapshot, group, session, after.as_deref())
+            .await
+            .unwrap()
+        {
+            let offset = prefix(ROW, group).unwrap().len();
+            let time = decode_time(&next.key[offset..offset + 8]).unwrap();
+            let value = next
+                .batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0);
+            rows.push((time, value));
+            after = Some(next.key);
+        }
+        rows
+    }
+
+    #[tokio::test]
+    async fn metadata_progress_preserves_skipped_intervals_duplicate_rows_and_tight_fallback() {
+        for rocks in [false, true] {
+            for budget in [9 * 1024, 1024 * 1024] {
+                let mut store = store_with_decoded(budget);
+                let root = std::env::temp_dir()
+                    .join(format!("str117-values-{}-{budget}", std::process::id()));
+                if rocks {
+                    let resources = store.resources.clone();
+                    let schema = store.schema.clone();
+                    let limits = store.limits;
+                    let gap = store.gap;
+                    drop(store);
+                    let backend = arroyo_state::live::worker::construct_backend(
+                        arroyo_state::live::worker::BackendConstruction::Rocksdb(
+                            arroyo_state::live::lifecycle::RocksStateConfig {
+                                root: root.clone(),
+                                job_id: "str117-values".into(),
+                                operator_id: "session".into(),
+                                subtask: 0,
+                                generation: 0,
+                                attempt: 0,
+                            },
+                        ),
+                        resources.clone(),
+                    )
+                    .await
+                    .unwrap();
+                    let mut tables = LiveTableManager::new(
+                        backend.clone(),
+                        Ownership::PartitionLocal {
+                            subtask: 0,
+                            parallelism: 1,
+                        },
+                    )
+                    .unwrap();
+                    let table = tables.register("session").unwrap();
+                    store =
+                        SessionStore::new(backend, table, resources, schema, limits, gap).unwrap();
+                }
+                store.limits.page_entries = 1;
+                // Out-of-order, equality bridges and duplicate arrivals. Alternating
+                // opaque groups evict the one-group proof without sharing intervals.
+                for (ordinal, time) in [100, -100, 20, 0, 10, 10, 30, -10, 31]
+                    .into_iter()
+                    .enumerate()
+                {
+                    for group in [b"a".as_slice(), b"b".as_slice()] {
+                        store
+                            .insert(group, time, &row(store.schema.clone(), ordinal as i64))
+                            .await
+                            .unwrap();
+                    }
+                }
+                if budget == 9 * 1024 {
+                    assert!(store.cached_proof(b"a").unwrap().is_none());
+                    assert!(store.cached_proof(b"b").unwrap().is_none());
+                }
+                for group in [b"a".as_slice(), b"b".as_slice()] {
+                    let expected = [
+                        (
+                            SessionMeta {
+                                start: -100,
+                                end: -100,
+                            },
+                            vec![(-100, 1)],
+                        ),
+                        (
+                            SessionMeta {
+                                start: -10,
+                                end: 31,
+                            },
+                            vec![
+                                (-10, 7),
+                                (0, 3),
+                                (10, 4),
+                                (10, 5),
+                                (20, 2),
+                                (30, 6),
+                                (31, 8),
+                            ],
+                        ),
+                        (
+                            SessionMeta {
+                                start: 100,
+                                end: 100,
+                            },
+                            vec![(100, 0)],
+                        ),
+                    ];
+                    let mut after = None;
+                    for (meta, expected_rows) in expected {
+                        assert_eq!(store.next_session(group, after).await.unwrap(), Some(meta));
+                        after = Some(meta.start);
+                        let snapshot = store.snapshot().await.unwrap();
+                        let mut row_after = None;
+                        let mut actual = Vec::new();
+                        while let Some(next) = store
+                            .next_row(&snapshot, group, meta, row_after.as_deref())
+                            .await
+                            .unwrap()
+                        {
+                            let time_offset = prefix(ROW, group).unwrap().len();
+                            let timestamp =
+                                decode_time(&next.key[time_offset..time_offset + 8]).unwrap();
+                            let value = next
+                                .batch
+                                .column(0)
+                                .as_any()
+                                .downcast_ref::<Int64Array>()
+                                .unwrap()
+                                .value(0);
+                            actual.push((timestamp, value));
+                            row_after = Some(next.key);
+                        }
+                        assert_eq!(actual, expected_rows);
+                    }
+                    assert_eq!(store.next_session(group, after).await.unwrap(), None);
+                }
+                // A long interval starts far before the event; seeking only at
+                // event-gap would miss it. Evict Sole before the late duplicate.
+                for time in (0..=100).step_by(10) {
+                    store
+                        .insert(b"long", time, &row(store.schema.clone(), time))
+                        .await
+                        .unwrap();
+                }
+                store.next_session(b"a", None).await.unwrap();
+                store
+                    .insert(b"long", 90, &row(store.schema.clone(), 999))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    store.next_session(b"long", None).await.unwrap(),
+                    Some(SessionMeta { start: 0, end: 100 })
+                );
+                assert_eq!(store.next_session(b"long", Some(0)).await.unwrap(), None);
+                let mut expected_long: Vec<_> =
+                    (0..=100).step_by(10).map(|time| (time, time)).collect();
+                expected_long.push((90, 999));
+                expected_long.sort_by_key(|(time, _)| *time);
+                assert_eq!(
+                    metadata_rows(&store, b"long", SessionMeta { start: 0, end: 100 }).await,
+                    expected_long
+                );
+                // Valid extrema avoid deadline overflow; no time+1 is needed for
+                // the inclusive predecessor bound at the greatest admitted start.
+                for (time, value) in [
+                    (i64::MIN, 1),
+                    (i64::MIN + 10, 2),
+                    (i64::MAX - 10, 3),
+                    (i64::MAX - 10, 4),
+                ] {
+                    store
+                        .insert(b"edge", time, &row(store.schema.clone(), value))
+                        .await
+                        .unwrap();
+                }
+                assert_eq!(
+                    store.next_session(b"edge", None).await.unwrap(),
+                    Some(SessionMeta {
+                        start: i64::MIN,
+                        end: i64::MIN + 10
+                    })
+                );
+                assert_eq!(
+                    store.next_session(b"edge", Some(i64::MIN)).await.unwrap(),
+                    Some(SessionMeta {
+                        start: i64::MAX - 10,
+                        end: i64::MAX - 10
+                    })
+                );
+                assert_eq!(
+                    metadata_rows(
+                        &store,
+                        b"edge",
+                        SessionMeta {
+                            start: i64::MIN,
+                            end: i64::MIN + 10
+                        }
+                    )
+                    .await,
+                    vec![(i64::MIN, 1), (i64::MIN + 10, 2)]
+                );
+                assert_eq!(
+                    metadata_rows(
+                        &store,
+                        b"edge",
+                        SessionMeta {
+                            start: i64::MAX - 10,
+                            end: i64::MAX - 10
+                        }
+                    )
+                    .await,
+                    vec![(i64::MAX - 10, 3), (i64::MAX - 10, 4)]
+                );
+                let backend = store.backend.clone();
+                drop(store);
+                if rocks {
+                    backend.close().await.unwrap();
+                    std::fs::remove_dir_all(root).unwrap();
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "finite STR-117 metadata comparison"]
+    async fn str117_metadata_comparison() {
+        use arroyo_state::live::{
+            lifecycle::RocksStateConfig,
+            worker::{BackendConstruction, construct_backend},
+        };
+        for scenario in ["disjoint", "bridges", "alternating", "tight"] {
+            let template = if scenario == "tight" {
+                store_with_decoded(9 * 1024)
+            } else {
+                store()
+            };
+            let resources = template.resources.clone();
+            let schema = template.schema.clone();
+            let limits = template.limits;
+            let gap = template.gap;
+            drop(template);
+            let root =
+                std::env::temp_dir().join(format!("str117-{}-{scenario}", std::process::id()));
+            let backend = construct_backend(
+                BackendConstruction::Rocksdb(RocksStateConfig {
+                    root: root.clone(),
+                    job_id: "str117".into(),
+                    operator_id: "session".into(),
+                    subtask: 0,
+                    generation: 0,
+                    attempt: 0,
+                }),
+                resources.clone(),
+            )
+            .await
+            .unwrap();
+            let mut tables = LiveTableManager::new(
+                backend.clone(),
+                Ownership::PartitionLocal {
+                    subtask: 0,
+                    parallelism: 1,
+                },
+            )
+            .unwrap();
+            let table = tables.register("session").unwrap();
+            let mut store =
+                SessionStore::new(backend, table, resources, schema, limits, gap).unwrap();
+            let observed = observe(&mut store);
+            // Retain 180 disjoint intervals before measuring updates/merges.
+            for index in 0..180_i64 {
+                for group in [b"a".as_slice(), b"b".as_slice()] {
+                    store
+                        .insert(group, index * 20, &row(store.schema.clone(), index))
+                        .await
+                        .unwrap();
+                }
+            }
+            for third in 0..3_i64 {
+                eprintln!("STR117_PHASE scenario={scenario} third={third} start");
+                let before = snapshots(&observed);
+                for file in ["stat", "io"] {
+                    eprintln!(
+                        "STR117_PROCESS scenario={scenario} third={third} initial_{file}={}",
+                        std::fs::read_to_string(format!("/proc/self/{file}"))
+                            .unwrap()
+                            .replace('\n', ";")
+                    );
+                }
+                let started = std::time::Instant::now();
+                for offset in 0..60_i64 {
+                    let index = third * 60 + offset;
+                    let group = if scenario == "alternating" && index % 2 == 1 {
+                        b"b"
+                    } else {
+                        b"a"
+                    };
+                    let time = if scenario == "disjoint" {
+                        (180 + index) * 20
+                    } else if scenario == "bridges" {
+                        index * 20 + 10
+                    } else {
+                        index * 20
+                    };
+                    store
+                        .insert(group, time, &row(store.schema.clone(), 1000 + index))
+                        .await
+                        .unwrap();
+                }
+                eprintln!(
+                    "STR117 scenario={scenario} third={third} completed=60 elapsed_ns={} snapshots={}",
+                    started.elapsed().as_nanos(),
+                    snapshots(&observed) - before
+                );
+                for file in ["status", "stat", "io"] {
+                    let contents = std::fs::read_to_string(format!("/proc/self/{file}")).unwrap();
+                    if file == "status" {
+                        eprintln!(
+                            "STR117_PROCESS scenario={scenario} third={third} {}",
+                            contents
+                                .lines()
+                                .filter(
+                                    |line| line.starts_with("VmRSS:") || line.starts_with("VmHWM:")
+                                )
+                                .collect::<Vec<_>>()
+                                .join(" ")
+                        );
+                    } else {
+                        eprintln!(
+                            "STR117_PROCESS scenario={scenario} third={third} {file}={}",
+                            contents.replace('\n', ";")
+                        );
+                    }
+                }
+            }
+            let snapshot = store.snapshot().await.unwrap();
+            for group in [b"a".as_slice(), b"b".as_slice()] {
+                let mut after = None;
+                let mut sessions = Vec::new();
+                while let Some(session) = store
+                    .next_session_from_snapshot(
+                        &snapshot,
+                        group,
+                        after,
+                        prefix(SESSION, group).unwrap(),
+                    )
+                    .await
+                    .unwrap()
+                {
+                    after = Some(session.start);
+                    sessions.push(session);
+                }
+                let expected_sessions = if scenario == "bridges" && group == b"a" {
+                    vec![SessionMeta {
+                        start: 0,
+                        end: 3590,
+                    }]
+                } else {
+                    let count = if scenario == "disjoint" && group == b"a" {
+                        360
+                    } else {
+                        180
+                    };
+                    (0..count)
+                        .map(|i| SessionMeta {
+                            start: i * 20,
+                            end: i * 20,
+                        })
+                        .collect()
+                };
+                assert_eq!(sessions, expected_sessions);
+                let mut actual_rows = Vec::new();
+                for session in &sessions {
+                    let mut after = None;
+                    while let Some(next) = store
+                        .next_row(&snapshot, group, *session, after.as_deref())
+                        .await
+                        .unwrap()
+                    {
+                        let offset = prefix(ROW, group).unwrap().len();
+                        let time = decode_time(&next.key[offset..offset + 8]).unwrap();
+                        let value = next
+                            .batch
+                            .column(0)
+                            .as_any()
+                            .downcast_ref::<Int64Array>()
+                            .unwrap()
+                            .value(0);
+                        actual_rows.push((time, value));
+                        after = Some(next.key);
+                    }
+                }
+                let mut expected_rows: Vec<_> = (0..180_i64).map(|i| (i * 20, i)).collect();
+                for i in 0..180_i64 {
+                    let updated_group = if scenario == "alternating" && i % 2 == 1 {
+                        b"b"
+                    } else {
+                        b"a"
+                    };
+                    if group != updated_group {
+                        continue;
+                    }
+                    let time = if scenario == "disjoint" {
+                        (180 + i) * 20
+                    } else if scenario == "bridges" {
+                        i * 20 + 10
+                    } else {
+                        i * 20
+                    };
+                    expected_rows.push((time, 1000 + i));
+                }
+                expected_rows.sort_by_key(|(time, _)| *time);
+                assert_eq!(actual_rows, expected_rows);
+                eprintln!(
+                    "STR117 scenario={scenario} group={} retained={} rows={}",
+                    String::from_utf8_lossy(group),
+                    sessions.len(),
+                    actual_rows.len()
+                );
+            }
+            let native_backend = observed.inner.clone();
+            drop((snapshot, store, observed, tables));
+            native_backend.close().await.unwrap();
+            std::fs::remove_dir_all(root).unwrap();
+        }
     }
 
     #[tokio::test]
