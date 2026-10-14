@@ -1331,10 +1331,30 @@ impl IncrementalAggregatingFunc {
                     calendar_families.insert(storage_index, (selected.clone(), contribution_day));
                 }
                 let reference = calendar_inputs[position].reference_day(row)?;
-                self.calendar_set_reference(scope, group_key, generation, calendar, reference)?;
-                *state = self
-                    .calendar_recalculate(scope, group_key, generation, calendar, reference)
-                    .await?;
+                // G already holds this horizon's accumulator. Reuse it only
+                // when Q proves an unchanged reference and this original CDC
+                // contribution cannot affect membership. Relevant changes still
+                // rebuild in bucket order, including floating-point SUM.
+                let affects_horizon = selected.is_some()
+                    && contribution_day.is_some_and(|day| {
+                        day <= reference && day >= reference - (calendar.horizon_days() - 1)
+                    });
+                // A relevant change rebuilds anyway, so do not add a Q read
+                // to that path merely to avoid its existing reference write.
+                let reuse = !affects_horizon
+                    && !expired
+                    && previous.is_some()
+                    && self
+                        .calendar_reference_matches(
+                            scope, group_key, generation, calendar, reference,
+                        )
+                        .await?;
+                if !reuse {
+                    self.calendar_set_reference(scope, group_key, generation, calendar, reference)?;
+                    *state = self
+                        .calendar_recalculate(scope, group_key, generation, calendar, reference)
+                        .await?;
+                }
                 continue;
             }
             let Some(values) = selected else {
@@ -3997,6 +4017,228 @@ mod tests {
             .collect()
     }
 
+    /// Finite operator diagnostic, not the four-owner production qualification.
+    #[tokio::test]
+    #[ignore = "explicit isolated calendar operation-count pilot"]
+    async fn calendar_operation_count_pilot() {
+        use arroyo_state::live::{lifecycle::RocksStateConfig, rocks::RocksLiveState};
+        let root = std::env::temp_dir().join(format!("calendar-pilot-{}", uuid::Uuid::new_v4()));
+        let resources = WorkerStateResources::new(ResourceConfig {
+            disk_reserve_bytes: 0,
+            ..native_test_store().resources().config().clone()
+        })
+        .unwrap();
+        let registry = prometheus::Registry::new();
+        resources.register_metrics(&registry).unwrap();
+        let backend = Arc::new(
+            RocksLiveState::open(
+                RocksStateConfig {
+                    root: root.clone(),
+                    job_id: "calendar-pilot".into(),
+                    operator_id: "aggregate".into(),
+                    subtask: 0,
+                    generation: 0,
+                    attempt: 0,
+                },
+                resources.clone(),
+            )
+            .await
+            .unwrap(),
+        );
+        let mut manager = LiveTableManager::new(
+            backend.clone(),
+            Ownership::PartitionLocal {
+                subtask: 0,
+                parallelism: 1,
+            },
+        )
+        .unwrap();
+        let table = manager.register(NATIVE_AGGREGATE_TABLE).unwrap();
+        let mut operator = native_calendar_operator();
+        operator.native_store = Some(
+            AggregateStore::new(
+                backend.clone(),
+                table,
+                resources,
+                native_test_store().limits(),
+            )
+            .unwrap(),
+        );
+        calendar_test_event(&mut operator, 200, 200, Some(true), false, &[255; 16]).await;
+        let counts = || {
+            registry
+                .gather()
+                .into_iter()
+                .find(|family| family.name() == "arroyo_live_state_operation_latency_seconds")
+                .unwrap()
+                .get_metric()
+                .iter()
+                .map(|metric| {
+                    let operation = metric
+                        .get_label()
+                        .iter()
+                        .find(|label| label.name() == "operation")
+                        .unwrap()
+                        .value()
+                        .to_string();
+                    (operation, metric.get_histogram().get_sample_count())
+                })
+                .collect::<std::collections::BTreeMap<_, _>>()
+        };
+        let before = counts();
+        let start = std::time::Instant::now();
+        // Fixed prefix: absent static contribution, old/future contributions,
+        // and relevant rows. No synthetic source clock or changed SQL rules.
+        for id in 0..128u8 {
+            let (day, include) = match id % 4 {
+                0 => (200, Some(false)),
+                1 => (193, Some(true)),
+                2 => (201 + i32::from(id), Some(true)),
+                _ => (200, Some(true)),
+            };
+            calendar_test_event(&mut operator, day, 200, include, false, &[id; 16]).await;
+        }
+        let seconds = start.elapsed().as_secs_f64();
+        let after = counts();
+        let deltas: std::collections::BTreeMap<_, _> = after
+            .into_iter()
+            .map(|(key, count)| {
+                let prior = before.get(&key).copied().unwrap_or(0);
+                (key, count - prior)
+            })
+            .collect();
+        assert_eq!(
+            calendar_test_values(&operator).await,
+            vec![
+                ScalarValue::Int64(Some(129)),
+                ScalarValue::Int64(Some(33)),
+                ScalarValue::Int64(Some(33))
+            ]
+        );
+        println!("CALENDAR_PILOT events=128 seconds={seconds:.9} operations={deltas:?}");
+        let pruning_before = counts();
+        let pruning_start = std::time::Instant::now();
+        operator
+            .calendar_watermark(arroyo_types::Watermark::EventTime(
+                arroyo_types::event_time::from_signed_nanos(200 * 86_400_000_000_000).unwrap(),
+            ))
+            .await
+            .unwrap();
+        let mut pages = 1;
+        loop {
+            let scope = operator
+                .native_store
+                .as_ref()
+                .unwrap()
+                .begin()
+                .await
+                .unwrap();
+            let cleanup = crate::arrow::aggregate_codec::CalendarCleanup::decode(
+                &scope.get(b"V").await.unwrap().unwrap(),
+            )
+            .unwrap();
+            drop(scope);
+            if cleanup.complete {
+                break;
+            }
+            assert!(pages < 64, "finite diagnostic pruning bound");
+            operator.prune_calendar_buckets().await.unwrap();
+            pages += 1;
+        }
+        let pruning_seconds = pruning_start.elapsed().as_secs_f64();
+        let pruning_deltas: std::collections::BTreeMap<_, _> = counts()
+            .into_iter()
+            .map(|(key, count)| {
+                let prior = pruning_before.get(&key).copied().unwrap_or(0);
+                (key, count - prior)
+            })
+            .collect();
+        println!(
+            "CALENDAR_PRUNING pages={pages} seconds={pruning_seconds:.9} operations={pruning_deltas:?}"
+        );
+        // Full bucket oracle after timing/counter capture: G alone would not
+        // detect an incorrect fast cleanup deleting retained/future history.
+        let scope = operator
+            .native_store
+            .as_ref()
+            .unwrap()
+            .begin()
+            .await
+            .unwrap();
+        let mut after = None;
+        let mut retained_days = Vec::new();
+        while let Some((key, _)) = scope.first_from(b"B", after.as_deref()).await.unwrap() {
+            retained_days.push(
+                (u32::from_be_bytes(key[key.len() - 4..].try_into().unwrap()) ^ (1 << 31)) as i32,
+            );
+            after = Some(key);
+        }
+        let expected_days: Vec<_> = std::iter::once(200)
+            .chain((0..128).filter(|id| id % 4 == 2).map(|id| 201 + id))
+            .collect();
+        assert_eq!(retained_days, expected_days);
+        drop(scope);
+        drop(operator);
+        drop(manager);
+        backend.close().await.unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn calendar_reuse_matches_full_recalculation_for_original_corrections() {
+        let mut operator = native_calendar_operator();
+        // Irrelevant and relevant contributions, both horizon edges, reference
+        // changes in both directions, and misleading correction envelopes.
+        for (id, day, reference, include, retract) in [
+            (1, 194, 200, Some(true), false),
+            (2, 193, 200, Some(true), false),
+            (3, 201, 200, Some(true), false),
+            (4, 200, 200, Some(false), false),
+            (5, 200, 200, None, false),
+            (6, 200, 200, Some(true), false),
+            (2, 200, 200, Some(false), true),
+            (1, 300, 200, Some(false), true),
+            (7, 202, 201, Some(false), false),
+            (8, 202, 200, Some(false), false),
+            (3, 193, 200, Some(false), true),
+            (6, 193, 200, Some(false), true),
+        ] {
+            calendar_test_event(&mut operator, day, reference, include, retract, &[id; 16]).await;
+            let store = operator.native_store.as_ref().unwrap();
+            let scope = store.begin().await.unwrap();
+            let bytes = scope
+                .get(&native_group_key(b'G', &GLOBAL_KEY).unwrap())
+                .await
+                .unwrap()
+                .unwrap();
+            let group = decode_group(
+                &bytes,
+                &operator.native_state_types(),
+                &operator.native_output_types(),
+                scope.limits().value_bytes,
+            )
+            .unwrap();
+            let mut actual = operator.native_accumulators(Some(&group)).unwrap();
+            for calendar in &operator.calendars {
+                let mut expected = operator
+                    .calendar_recalculate(
+                        &scope,
+                        &GLOBAL_KEY,
+                        group.generation,
+                        calendar,
+                        reference,
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    actual[calendar.aggregate_index].evaluate().unwrap(),
+                    expected.evaluate().unwrap(),
+                    "id={id} retract={retract}"
+                );
+            }
+        }
+    }
+
     #[tokio::test]
     async fn calendar_shared_day_buckets_use_raw_reference_and_keep_lifetime() {
         let mut operator = native_calendar_operator();
@@ -4234,6 +4476,53 @@ mod tests {
             .try_decoded_value(store.resources().config().decoded_value_bytes)
             .unwrap();
         drop(permit);
+    }
+
+    #[tokio::test]
+    async fn calendar_pruning_skips_retained_family_and_restores_the_skip_frontier() {
+        use crate::arrow::aggregate_codec::CalendarCleanup;
+        let mut operator = native_calendar_operator();
+        operator.native_store = Some(native_test_store_with_limits(AggregateStoreLimits {
+            page_entries: 1,
+            ..native_test_store().limits()
+        }));
+        for (id, day) in [194, 195, 199, 200, 201].into_iter().enumerate() {
+            calendar_test_event(&mut operator, day, 200, Some(true), false, &[id as u8; 16]).await;
+        }
+        operator
+            .calendar_watermark(arroyo_types::Watermark::EventTime(
+                arroyo_types::event_time::from_signed_nanos(200 * 86_400_000_000_000).unwrap(),
+            ))
+            .await
+            .unwrap();
+        let scope = operator
+            .native_store
+            .as_ref()
+            .unwrap()
+            .begin()
+            .await
+            .unwrap();
+        let frontier = CalendarCleanup::decode(&scope.get(b"V").await.unwrap().unwrap()).unwrap();
+        let cursor = frontier.after.unwrap();
+        assert_eq!(&cursor[cursor.len() - 4..], &u32::MAX.to_be_bytes());
+        drop(scope);
+        // A cold owner uses V, without an in-memory family cache.
+        let mut fresh = native_calendar_operator();
+        std::mem::swap(&mut fresh.native_store, &mut operator.native_store);
+        fresh.prune_calendar_buckets().await.unwrap();
+        let scope = fresh.native_store.as_ref().unwrap().begin().await.unwrap();
+        assert!(
+            CalendarCleanup::decode(&scope.get(b"V").await.unwrap().unwrap())
+                .unwrap()
+                .complete
+        );
+        let mut after = None;
+        let mut count = 0;
+        while let Some((key, _)) = scope.first_from(b"B", after.as_deref()).await.unwrap() {
+            count += 1;
+            after = Some(key);
+        }
+        assert_eq!(count, 5);
     }
 
     #[tokio::test]

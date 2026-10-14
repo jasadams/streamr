@@ -1,3 +1,10 @@
+## Active STR-111 calendar recovery — 2026-10-14
+
+- Recovered existing `jason/str-111-calendar-20261014` after original claimant's explicit `turn_aborted` and user confirmation; preserved reservation metadata and clean workspace, refreshed base `fa9c8133`. Current instructions/build/team/ticket/ledger/work-plan read. STR-112 active owner preserved.
+- Implements generic unchanged-reference/irrelevant-original-contribution reuse, native horizon upper bound, persisted retained-family pruning skip and equal-deadline reschedule reuse. No codec/exporter/SQL/time semantics changed. Independent source review approved initial diff; final changes require fresh review.
+- Isolated6793409 AB/BA operator diagnostic passed exact value/bucket oracles: scans512→128 per128events; pruning pages9→1/scans35→3. Delivery calendar14/store3, check/strictClippy/fmt, native SQL24 and shared ordinary-memory aggregate cancellation2 passed. Independent SQL audit repeated24oracles/84prefix snapshots; recovery is fresh local Engine/task owner, not OS process-loss. No production quiet-key scheduler coverage. User replaced legacy large cases with bounded production plus focused correctness/recovery. Optimized isolated8192-row/128key pair passed exact outputs, native descriptors, source/downstream8192 and Finished: observed12.258→6.767s, sampled RSS223481856→222928896B, zero checkpoints; single finite pair, no durable/stable-rate claim. Full integrated qualification remains STR-103/126. Final independent source/evidence publication review approved. Next: PR and green current-head CI.
+- [Scan audit, exact sources, commands and limitations](str-111-validation.md); receipts `/home/jason/qa-evidence/str111-calendar-20261014/`. No user decision pending.
+
 ## Active STR-113 SESSION drain repair — 2026-10-14
 
 - Worker `/root/str113`, branch `jason/str-113-session-drain-20261014`, fetched base `6793409cb53eb7b13f5a591ce1717bcf1e846de8`. Current instructions/build/team/ticket/ledger/work-plan read; claim guard CLEAR. STR-103 evidence remains unchanged and unqualified.
