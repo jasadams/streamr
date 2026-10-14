@@ -172,6 +172,73 @@ impl ScanRequest {
     }
 }
 
+/// Return the greatest full encoded entry in a stable logical range.
+/// An oversized greatest entry errors rather than selecting an earlier entry.
+#[derive(Debug, Clone)]
+pub struct LastEntryRequest {
+    pub range: ScanRange,
+    /// Combined encoded key and value bytes, as in `ScanRequest`.
+    pub max_bytes: usize,
+}
+impl LastEntryRequest {
+    pub(crate) fn validate(&self) -> Result<()> {
+        if self.max_bytes == 0 {
+            return Err(LiveStateError::InvalidLimit);
+        }
+        if self
+            .range
+            .start
+            .as_ref()
+            .zip(self.range.end.as_ref())
+            .is_some_and(|(start, end)| start > end)
+        {
+            return Err(LiveStateError::InvalidCursor);
+        }
+        Ok(())
+    }
+}
+
+// Escaped unterminated logical bounds include all hash variants at an inclusive
+// start and exclude all variants at an exclusive end. Install this intersection
+// before native reverse positioning, including for an absent logical prefix.
+fn last_entry_bounds(range: &ScanRange) -> Result<(Vec<u8>, Vec<u8>)> {
+    let namespace = encoding::encode_namespace(&range.namespace)?;
+    let bound = |logical: &[u8]| -> Result<Vec<u8>> {
+        let capacity = logical
+            .len()
+            .checked_mul(2)
+            .and_then(|size| size.checked_add(namespace.len()))
+            .ok_or(LiveStateError::InvalidLimit)?;
+        let mut encoded = Vec::with_capacity(capacity);
+        encoded.extend_from_slice(&namespace);
+        for byte in logical {
+            if *byte == 0 {
+                encoded.extend_from_slice(&[0, 255]);
+            } else {
+                encoded.push(*byte);
+            }
+        }
+        Ok(encoded)
+    };
+    let prefix = bound(range.prefix.as_deref().unwrap_or_default())?;
+    let mut lower = bound(range.start.as_deref().unwrap_or_default())?;
+    if prefix > lower {
+        lower = prefix.clone();
+    }
+    // Encoded namespaces start with the fixed format version, so their
+    // successor always exists; a longer encoded prefix has one as well.
+    let last = prefix
+        .iter()
+        .rposition(|byte| *byte != u8::MAX)
+        .expect("encoded namespace has a successor");
+    let mut upper = prefix[..=last].to_vec();
+    upper[last] += 1;
+    if let Some(end) = &range.end {
+        upper = upper.min(bound(end)?);
+    }
+    Ok((lower, upper))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScanEntry {
     pub key: StateKey,
@@ -208,12 +275,26 @@ pub trait SnapshotReader: Send + Sync {
         options: ReadOptions,
     ) -> Result<Vec<Option<Vec<u8>>>>;
     async fn scan(&self, request: ScanRequest) -> Result<ScanPage>;
+    /// Zero or one entry; `next_cursor` is always None, not a cardinality proof.
+    async fn last_in_range(&self, request: LastEntryRequest) -> Result<ScanPage>;
+    /// Only page admission is fail-fast; native blocking admission still awaits.
+    async fn try_last_in_range(&self, _request: LastEntryRequest) -> Result<ScanPage> {
+        Err(LiveStateError::Backend(
+            "snapshot does not support fail-fast last-entry admission".into(),
+        ))
+    }
 }
 
 /// Cloning retains a stable snapshot. Dropping the final clone releases it.
 #[derive(Clone)]
 pub struct StateSnapshot(pub Arc<dyn SnapshotReader>);
 impl StateSnapshot {
+    pub async fn last_in_range(&self, request: LastEntryRequest) -> Result<ScanPage> {
+        self.0.last_in_range(request).await
+    }
+    pub async fn try_last_in_range(&self, request: LastEntryRequest) -> Result<ScanPage> {
+        self.0.try_last_in_range(request).await
+    }
     pub async fn get(&self, key: &StateKey, options: ReadOptions) -> Result<Option<Vec<u8>>> {
         self.0.get(key, options).await
     }

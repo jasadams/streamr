@@ -565,6 +565,12 @@ struct RocksSnapshot {
 
 #[async_trait]
 impl SnapshotReader for RocksSnapshot {
+    async fn last_in_range(&self, request: LastEntryRequest) -> Result<ScanPage> {
+        self.last_entry_admission(request, false).await
+    }
+    async fn try_last_in_range(&self, request: LastEntryRequest) -> Result<ScanPage> {
+        self.last_entry_admission(request, true).await
+    }
     async fn get(&self, key: &StateKey, read: ReadOptions) -> Result<Option<Vec<u8>>> {
         Ok(self
             .multi_get(std::slice::from_ref(key), read)
@@ -637,6 +643,101 @@ fn set_scan_upper_bound(
 }
 
 impl RocksSnapshot {
+    async fn last_entry_admission(
+        &self,
+        request: LastEntryRequest,
+        fail_fast: bool,
+    ) -> Result<ScanPage> {
+        request.validate()?;
+        let namespace_bytes = encoding::encoded_namespace_size(&request.range.namespace)?;
+        let logical_bytes = request
+            .range
+            .prefix
+            .as_ref()
+            .map_or(0, Vec::len)
+            .saturating_add(request.range.start.as_ref().map_or(0, Vec::len))
+            .saturating_add(request.range.end.as_ref().map_or(0, Vec::len));
+        // Covers owned request, escaped temporary bounds, both owned native
+        // bounds, iterator and decoded key/value/container. Unlike a forward
+        // seek, reverse positioning retains an owned lower bound as well.
+        let bytes = request
+            .max_bytes
+            .saturating_mul(4)
+            .saturating_add(namespace_bytes.saturating_mul(8))
+            .saturating_add(logical_bytes.saturating_mul(8))
+            .saturating_add(std::mem::size_of::<LastEntryRequest>())
+            .saturating_add(std::mem::size_of::<ScanEntry>().saturating_mul(2));
+        let permit = if fail_fast {
+            self.resources.try_scan_page(bytes)
+        } else {
+            self.resources.scan_page(bytes).await
+        }?;
+        let db = DbHandle::Snapshot(self.view.clone());
+        let resources = self.resources.clone();
+        self.resources
+            .run_blocking(move || {
+                let _latency = resources.operation_timer("last_in_range");
+                let (lower, upper) = last_entry_bounds(&request.range)?;
+                let mut entries = Vec::with_capacity(1);
+                if lower < upper {
+                    let mut read = rocksdb::ReadOptions::default();
+                    let DbHandle::Snapshot(view) = &db else {
+                        unreachable!("stable last-entry lookup requires a snapshot view")
+                    };
+                    read.set_snapshot(view.snapshot.borrow_dependent());
+                    read.set_iterate_lower_bound(lower);
+                    read.set_iterate_upper_bound(upper);
+                    let mut iterator = db.raw_iterator_opt(read);
+                    iterator.seek_to_last();
+                    iterator.status().map_err(backend)?;
+                    if iterator.valid() {
+                        let encoded = iterator.key().expect("valid iterator key");
+                        let value = iterator.value().expect("valid iterator value");
+                        let required = encoded.len().saturating_add(value.len());
+                        if required > request.max_bytes {
+                            return Err(LiveStateError::ReadLimitExceeded {
+                                required,
+                                limit: request.max_bytes,
+                            });
+                        }
+                        let key = decode_key(encoded)?;
+                        if key.namespace != request.range.namespace
+                            || request
+                                .range
+                                .prefix
+                                .as_ref()
+                                .is_some_and(|prefix| !key.key.starts_with(prefix))
+                            || request
+                                .range
+                                .start
+                                .as_ref()
+                                .is_some_and(|start| key.key < *start)
+                            || request
+                                .range
+                                .end
+                                .as_ref()
+                                .is_some_and(|end| key.key >= *end)
+                        {
+                            return Err(LiveStateError::Backend(
+                                "native last-entry escaped its bounds".into(),
+                            ));
+                        }
+                        entries.push(ScanEntry {
+                            key,
+                            value: decode_value(value)?,
+                        });
+                    }
+                }
+                Ok(ScanPage {
+                    entries,
+                    next_cursor: None,
+                    _reservation: Some(permit),
+                })
+            })
+            .await
+            .map_err(LiveStateError::from)?
+    }
+
     async fn scan_admission(&self, request: ScanRequest, fail_fast: bool) -> Result<ScanPage> {
         request.validate(self.id)?;
         let id = self.id;
@@ -1058,6 +1159,340 @@ mod tests {
             routing_hash: None,
         }
     }
+    #[tokio::test]
+    async fn last_entry_backend_parity_ranges_routes_limits_and_snapshot() {
+        for routed in [false, true] {
+            let config = config();
+            let rocks = RocksLiveState::open(config.clone(), resources())
+                .await
+                .unwrap();
+            let memory = memory::MemoryLiveState::new();
+            let mut namespace = key().namespace;
+            namespace.table = b"last\0range".to_vec();
+            if routed {
+                namespace.ownership = Ownership::Routed {
+                    range_start: 1,
+                    range_end: 3,
+                };
+            }
+            let make_key = |logical: &[u8], hash| StateKey {
+                namespace: namespace.clone(),
+                key: logical.to_vec(),
+                routing_hash: if routed { Some(hash) } else { None },
+            };
+            let logical_keys = [
+                b"".as_slice(),
+                b"a",
+                b"a\0",
+                b"a\0\0",
+                b"a\0b",
+                b"a\xff",
+                b"b",
+                b"\xff",
+                b"\xff\xff",
+            ];
+            for logical in logical_keys {
+                for hash in if routed { 1..=3 } else { 1..=1 } {
+                    for backend in [&memory as &dyn LiveStateBackend, &rocks] {
+                        backend
+                            .put(make_key(logical, hash), logical.to_vec(), 1024)
+                            .await
+                            .unwrap();
+                    }
+                }
+            }
+            let snapshots = [
+                memory.snapshot().await.unwrap(),
+                rocks.snapshot().await.unwrap(),
+            ];
+            for backend in [&memory as &dyn LiveStateBackend, &rocks] {
+                backend.delete(make_key(b"a\0b", 3), 1024).await.unwrap();
+            }
+            // Old snapshots still return the deleted greatest full key below.
+            // A fresh view must choose the remaining hash variant, or the
+            // preceding logical key when the deleted key was partition-local.
+            for backend in [&memory as &dyn LiveStateBackend, &rocks] {
+                let fresh = backend.snapshot().await.unwrap();
+                let page = fresh
+                    .try_last_in_range(LastEntryRequest {
+                        range: ScanRange {
+                            namespace: namespace.clone(),
+                            prefix: Some(b"a\0".to_vec()),
+                            start: None,
+                            end: None,
+                        },
+                        max_bytes: 1024,
+                    })
+                    .await
+                    .unwrap();
+                let expected = if routed {
+                    make_key(b"a\0b", 2)
+                } else {
+                    make_key(b"a\0\0", 1)
+                };
+                assert_eq!(page.entries.len(), 1);
+                assert_eq!(page.entries[0].key, expected);
+                assert_eq!(page.entries[0].value, expected.key);
+                assert!(page.next_cursor.is_none());
+            }
+            for (prefix, start, end, expected) in [
+                (None, None, None, Some(b"\xff\xff".as_slice())),
+                (
+                    Some(b"".as_slice()),
+                    None,
+                    None,
+                    Some(b"\xff\xff".as_slice()),
+                ),
+                (
+                    Some(b"a\0".as_slice()),
+                    None,
+                    None,
+                    Some(b"a\0b".as_slice()),
+                ),
+                (
+                    None,
+                    Some(b"a\0".as_slice()),
+                    Some(b"a\0b".as_slice()),
+                    Some(b"a\0\0".as_slice()),
+                ),
+                (
+                    Some(b"\xff".as_slice()),
+                    None,
+                    None,
+                    Some(b"\xff\xff".as_slice()),
+                ),
+                (Some(b"absent".as_slice()), None, None, None),
+                (Some(b"a".as_slice()), Some(b"b".as_slice()), None, None),
+                (Some(b"a".as_slice()), None, Some(b"a".as_slice()), None),
+                (None, Some(b"a".as_slice()), Some(b"a".as_slice()), None),
+                (None, None, Some(b"".as_slice()), None),
+            ] {
+                let request = LastEntryRequest {
+                    range: ScanRange {
+                        namespace: namespace.clone(),
+                        prefix: prefix.map(<[u8]>::to_vec),
+                        start: start.map(<[u8]>::to_vec),
+                        end: end.map(<[u8]>::to_vec),
+                    },
+                    max_bytes: 1024,
+                };
+                for snapshot in &snapshots {
+                    for page in [
+                        snapshot.last_in_range(request.clone()).await.unwrap(),
+                        snapshot.try_last_in_range(request.clone()).await.unwrap(),
+                    ] {
+                        assert!(page.next_cursor.is_none());
+                        assert_eq!(page.entries.len(), usize::from(expected.is_some()));
+                        if let Some(expected) = expected {
+                            assert_eq!(page.entries[0].key, make_key(expected, 3));
+                            assert_eq!(page.entries[0].value, expected);
+                        }
+                    }
+                }
+            }
+            let request = LastEntryRequest {
+                range: ScanRange {
+                    namespace: namespace.clone(),
+                    prefix: Some(b"a\0".to_vec()),
+                    start: None,
+                    end: None,
+                },
+                max_bytes: 1,
+            };
+            for snapshot in &snapshots {
+                assert!(matches!(
+                    snapshot.try_last_in_range(request.clone()).await,
+                    Err(LiveStateError::ReadLimitExceeded { .. })
+                ));
+                assert!(matches!(
+                    snapshot
+                        .try_last_in_range(LastEntryRequest {
+                            max_bytes: 0,
+                            ..request.clone()
+                        })
+                        .await,
+                    Err(LiveStateError::InvalidLimit)
+                ));
+                let mut reversed = request.clone();
+                reversed.range.start = Some(b"b".to_vec());
+                reversed.range.end = Some(b"a".to_vec());
+                assert!(matches!(
+                    snapshot.try_last_in_range(reversed).await,
+                    Err(LiveStateError::InvalidCursor)
+                ));
+            }
+            // Inclusive lookup of a complete extrema key uses its immediate
+            // logical successor and never adds one to an integer timestamp.
+            for timestamp in [i64::MIN, i64::MAX] {
+                let mut logical = b"T".to_vec();
+                logical.extend_from_slice(&((timestamp as u64) ^ (1 << 63)).to_be_bytes());
+                for backend in [&memory as &dyn LiveStateBackend, &rocks] {
+                    backend
+                        .put(
+                            make_key(&logical, 3),
+                            timestamp.to_be_bytes().to_vec(),
+                            1024,
+                        )
+                        .await
+                        .unwrap();
+                }
+                let mut end = logical.clone();
+                end.push(0);
+                for backend in [&memory as &dyn LiveStateBackend, &rocks] {
+                    let page = backend
+                        .snapshot()
+                        .await
+                        .unwrap()
+                        .try_last_in_range(LastEntryRequest {
+                            range: ScanRange {
+                                namespace: namespace.clone(),
+                                prefix: Some(b"T".to_vec()),
+                                start: Some(logical.clone()),
+                                end: Some(end.clone()),
+                            },
+                            max_bytes: 1024,
+                        })
+                        .await
+                        .unwrap();
+                    assert_eq!(page.entries[0].value, timestamp.to_be_bytes());
+                }
+            }
+            // A smaller preceding entry fits, but an oversized greatest entry
+            // must fail instead of falling back to that preceding entry.
+            for backend in [&memory as &dyn LiveStateBackend, &rocks] {
+                backend
+                    .put(make_key(b"O/a", 3), vec![1], 1024)
+                    .await
+                    .unwrap();
+                backend
+                    .put(make_key(b"O/z", 3), vec![2; 256], 1024)
+                    .await
+                    .unwrap();
+                let page = backend
+                    .snapshot()
+                    .await
+                    .unwrap()
+                    .try_last_in_range(LastEntryRequest {
+                        range: ScanRange {
+                            namespace: namespace.clone(),
+                            prefix: Some(b"O/".to_vec()),
+                            start: None,
+                            end: None,
+                        },
+                        max_bytes: 128,
+                    })
+                    .await;
+                assert!(matches!(
+                    page,
+                    Err(LiveStateError::ReadLimitExceeded { .. })
+                ));
+            }
+            drop(snapshots);
+            rocks.close_and_remove().await.unwrap();
+            std::fs::remove_dir_all(config.root).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn last_entry_retains_admission_through_waiter_cancellation_and_drop() {
+        let config = config();
+        let resources = resources();
+        let registry = prometheus::Registry::new();
+        resources.register_metrics(&registry).unwrap();
+        let usage = |measurement: &str| {
+            registry
+                .gather()
+                .into_iter()
+                .find(|family| family.name() == "arroyo_live_state_resources")
+                .unwrap()
+                .get_metric()
+                .iter()
+                .find(|metric| {
+                    metric.get_label().iter().any(|label| {
+                        label.name() == "resource" && label.value() == "scan_page_bytes"
+                    }) && metric
+                        .get_label()
+                        .iter()
+                        .any(|label| label.name() == "measurement" && label.value() == measurement)
+                })
+                .unwrap()
+                .get_gauge()
+                .as_ref()
+                .unwrap()
+                .value() as usize
+        };
+        let state = RocksLiveState::open(config.clone(), resources.clone())
+            .await
+            .unwrap();
+        state
+            .put(key(), b"decoded-page".to_vec(), 1024)
+            .await
+            .unwrap();
+        let snapshot = state.snapshot().await.unwrap();
+        let request = LastEntryRequest {
+            range: ScanRange {
+                namespace: key().namespace,
+                prefix: None,
+                start: None,
+                end: None,
+            },
+            max_bytes: 1024,
+        };
+        let page = snapshot.last_in_range(request.clone()).await.unwrap();
+        assert_eq!(page.entries[0].value, b"decoded-page");
+        let retained = usage("used");
+        assert!(retained >= 4 * request.max_bytes);
+        let remainder = resources
+            .try_scan_page(resources.config().scan_page_bytes - retained)
+            .unwrap();
+        assert!(matches!(
+            snapshot.try_last_in_range(request.clone()).await,
+            Err(LiveStateError::Resource(
+                super::super::resources::ResourceError::ResourceExhausted {
+                    resource: "scan_page_bytes",
+                    ..
+                }
+            ))
+        ));
+        {
+            let mut waiting = Box::pin(snapshot.last_in_range(request.clone()));
+            assert!(futures::poll!(&mut waiting).is_pending());
+            assert_eq!(usage("waiting"), 1);
+            assert_eq!(usage("used"), resources.config().scan_page_bytes);
+        }
+        assert_eq!(usage("waiting"), 0);
+        assert_eq!(usage("used"), resources.config().scan_page_bytes);
+        drop(remainder);
+        assert_eq!(usage("used"), retained);
+        // The returned data outlives its snapshot while retaining its admission.
+        drop(snapshot);
+        assert_eq!(page.entries[0].value, b"decoded-page");
+        assert_eq!(usage("used"), retained);
+        drop(page);
+        assert_eq!(usage("used"), 0);
+        let snapshot = state.snapshot().await.unwrap();
+        let mut oversized = request.clone();
+        oversized.max_bytes = resources.config().scan_page_bytes;
+        assert!(matches!(
+            snapshot.last_in_range(oversized).await,
+            Err(LiveStateError::Resource(
+                super::super::resources::ResourceError::RequestTooLarge {
+                    resource: "scan_page_bytes",
+                    ..
+                }
+            ))
+        ));
+        assert_eq!(usage("used"), 0);
+        let retried = snapshot.last_in_range(request).await.unwrap();
+        assert_eq!(usage("used"), retained);
+        drop(retried);
+        assert_eq!(usage("used"), 0);
+        drop(snapshot);
+        state.close_and_remove().await.unwrap();
+        drain_cleanup(&resources).await;
+        std::fs::remove_dir_all(config.root).unwrap();
+    }
+
     #[tokio::test]
     async fn decoded_scan_page_retains_admission_through_waiter_cancellation_and_drop() {
         let config = config();
@@ -1558,6 +1993,75 @@ mod tests {
         drop(other_page);
         drop(snapshot);
         state.close_and_remove().await.unwrap();
+        std::fs::remove_dir_all(config.root).unwrap();
+    }
+
+    #[test]
+    fn native_last_entry_lower_bound_avoids_preceding_unrelated_tombstones() {
+        use rocksdb::perf::{PerfContext, PerfMetric, PerfStatsLevel, set_perf_stats};
+        let config = config();
+        let mut options = Options::default();
+        options.create_if_missing(true);
+        options.set_disable_auto_compactions(true);
+        let db = DB::open(&options, &config.root).unwrap();
+        let logical = |bytes: &[u8]| {
+            let mut k = key();
+            k.key = bytes.to_vec();
+            k
+        };
+        let namespace = encoding::encode_namespace(&key().namespace).unwrap();
+        let deleted: Vec<_> = (0..1000)
+            .map(|i| encode_key(&logical(format!("D/{i:06}").as_bytes())).unwrap())
+            .collect();
+        let live = encode_key(&logical(b"A/live")).unwrap();
+        let mut initial = rocksdb::WriteBatch::default();
+        for k in &deleted {
+            initial.put(k, b"v");
+        }
+        initial.put(&live, b"g");
+        db.write(initial).unwrap();
+        db.flush().unwrap();
+        let before = db.snapshot();
+        let mut removed = rocksdb::WriteBatch::default();
+        for k in &deleted {
+            removed.delete(k);
+        }
+        db.write(removed).unwrap();
+        db.flush().unwrap();
+        let after = db.snapshot();
+        assert!(before.get(&deleted[0]).unwrap().is_some());
+        assert!(after.get(&deleted[0]).unwrap().is_none());
+        let mut prefix = namespace.clone();
+        prefix.extend_from_slice(b"F/");
+        set_perf_stats(PerfStatsLevel::EnableCount);
+        let mut perf = PerfContext::default();
+        for bounded in [false, true] {
+            let mut read = rocksdb::ReadOptions::default();
+            read.set_snapshot(&after);
+            if bounded {
+                read.set_iterate_lower_bound(prefix.clone());
+                set_scan_upper_bound(&mut read, &namespace, Some(&prefix), None);
+            }
+            let mut iterator = db.raw_iterator_opt(read);
+            perf.reset();
+            iterator.seek_to_last();
+            iterator.status().unwrap();
+            let skipped = perf.metric(PerfMetric::InternalDeleteSkippedCount);
+            if bounded {
+                assert_eq!(
+                    skipped, 0,
+                    "empty prefix must not traverse unrelated D deletions"
+                );
+                assert!(!iterator.valid());
+            } else {
+                assert_eq!(skipped, deleted.len() as u64);
+                assert_eq!(iterator.key(), Some(live.as_slice()));
+            }
+        }
+        set_perf_stats(PerfStatsLevel::Disable);
+        drop(after);
+        drop(before);
+        drop(db);
         std::fs::remove_dir_all(config.root).unwrap();
     }
 

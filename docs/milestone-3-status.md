@@ -1,3 +1,10 @@
+## STR-117 metadata discovery ready for publication — 2026-10-15
+
+- Branch `jason/str-117-metadata-20261015`; frozen comparison base `aaab7727200defe3c5b00e13975ef61a379084e1`. Current ticket/guidance read; STR-112/116 owners preserved. Delivery base `cd9520ee` preserves the incoming STR-112 ledger and build guidance; all five validated source hashes are unchanged.
+- User-approved generic bounded snapshot last-entry API and SESSION timestamp predecessor/monotonic successor discovery implemented. No SQL/cache-cap/state-format/resource-limit change. Independent final source/evidence review approved.
+- Final no-probe locked state+worker check/strict Clippy/fmt and serial state71/SESSION23 tests passed. Matched diagnostic and probe-disabled finite AB/BA arms all0, exact both-group intervals/rows and awaited cleanup. [Complete receipts, native counters, modest/residual bridge cost and limits](str-117-validation.md); queued130/fixture-cleanup139 preserved separately.
+- Next: reviewed commit/PR and green current-head CI. Documentation-only integration passed static checks and guidance was reread. No further user contract decision; no optimized production throughput or broad qualification claim. Evidence `/home/jason/qa-evidence/str117-metadata-20261015/`.
+
 ## Active STR-112 remaining acceptance — 2026-10-15
 
 - Resumed after user challenged premature stop at merged PR #50. Branch `jason/str-112-complete-20261015`, fresh base `f09434d38a0f9b0a78dc8bc4fd019738283d2a1f`; fetched instructions/build/team guidance, ledger/work plan and current ticket read. Invoking dirty checkout preserved; owned reservation renewed after verified merged-branch exclusion.

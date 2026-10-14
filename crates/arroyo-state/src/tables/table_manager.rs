@@ -1354,7 +1354,9 @@ impl TableManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::live::{ReadOptions, ScanPage, ScanRequest, SnapshotReader, StateKey};
+    use crate::live::{
+        LastEntryRequest, ReadOptions, ScanPage, ScanRequest, SnapshotReader, StateKey,
+    };
     use std::sync::atomic::{AtomicBool, Ordering};
     use tokio::sync::Notify;
 
@@ -1369,6 +1371,10 @@ mod tests {
     }
     #[async_trait::async_trait]
     impl SnapshotReader for BlockingSnapshot {
+        async fn last_in_range(&self, _: LastEntryRequest) -> crate::live::Result<ScanPage> {
+            unreachable!("checkpoint export uses forward scanning")
+        }
+
         async fn get(&self, _: &StateKey, _: ReadOptions) -> crate::live::Result<Option<Vec<u8>>> {
             unreachable!()
         }

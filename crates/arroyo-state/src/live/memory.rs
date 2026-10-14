@@ -231,6 +231,34 @@ struct MemorySnapshot {
 }
 #[async_trait]
 impl SnapshotReader for MemorySnapshot {
+    async fn try_last_in_range(&self, request: LastEntryRequest) -> Result<ScanPage> {
+        self.last_in_range(request).await
+    }
+    async fn last_in_range(&self, request: LastEntryRequest) -> Result<ScanPage> {
+        request.validate()?;
+        let (lower, upper) = last_entry_bounds(&request.range)?;
+        let mut entries = Vec::with_capacity(1);
+        if lower < upper
+            && let Some((encoded, value)) = self.data.range(lower..upper).next_back()
+        {
+            let required = encoded.len().saturating_add(value.len());
+            if required > request.max_bytes {
+                return Err(LiveStateError::ReadLimitExceeded {
+                    required,
+                    limit: request.max_bytes,
+                });
+            }
+            entries.push(ScanEntry {
+                key: encoding::decode_key(encoded)?,
+                value: encoding::decode_value(value)?,
+            });
+        }
+        Ok(ScanPage {
+            entries,
+            next_cursor: None,
+            _reservation: None,
+        })
+    }
     async fn try_get(&self, key: &StateKey, options: ReadOptions) -> Result<Option<Vec<u8>>> {
         self.get(key, options).await
     }
