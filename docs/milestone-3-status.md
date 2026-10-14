@@ -1,3 +1,9 @@
+## Active STR-112 remaining acceptance — 2026-10-15
+
+- Resumed after user challenged premature stop at merged PR #50. Branch `jason/str-112-complete-20261015`, fresh base `f09434d38a0f9b0a78dc8bc4fd019738283d2a1f`; fetched instructions/build/team guidance, ledger/work plan and current ticket read. Invoking dirty checkout preserved; owned reservation renewed after verified merged-branch exclusion.
+- Retain the completed failed/inconclusive native campaign and isolated decoder evidence; do not replace failed intervals or require unsupported stable-gain claims. Diagnose exact B2 RSS failure and run the smallest current native operator value/fresh-worker recovery checks needed by STR-112. No raised caps, new admission or checkpoint redesign.
+- RSS diagnosis completed without establishing an engine defect. Independent review corrected the benchmark bar: two successful pairs are conditional on a stable-gain claim; the preserved failed/inconclusive measurement is valid. Focused source-equivalent state gates remain passed. One CLI build at `f09434d3` finished before the discussion hold; reuse it without another build. Next: review completed pin/source bindings, then execute the four prepared real-worker recovery cases and finalize scoped acceptance. STR-127 separately tracks build improvements; no user decision currently pending.
+
 ## Active STR-114 shared RocksDB traversal — 2026-10-14
 
 - Coordinator `/root`, session `01a139e4-c732-7782-9282-8ae491296ff5`; branch `jason/str-114-scans-20261014`, fetched base `fa9c8133d3feefb4343e322c5405e843e25e1b61`. Current ticket, AGENTS.md, build/team guidance and ledger/work plan read; pickup guard CLEAR under owned reservation. No signing or automatic elapsed limit.
