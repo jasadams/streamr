@@ -219,7 +219,8 @@ pub fn decode_key(bytes: &[u8]) -> Result<StateKey> {
         key,
         routing_hash,
     };
-    encode_key(&result)?;
+    // Validation does not need to materialize a second encoded key.
+    encoded_key_size(&result)?;
     Ok(result)
 }
 pub fn encode_value(value: &[u8]) -> Vec<u8> {
@@ -233,4 +234,165 @@ pub fn decode_value(value: &[u8]) -> Result<Vec<u8>> {
         return Err(invalid());
     }
     Ok(value[1..].to_vec())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key(ownership: Ownership, routing_hash: Option<u64>, bytes: Vec<u8>) -> StateKey {
+        StateKey {
+            namespace: StateNamespace {
+                ownership,
+                table: vec![0, b't', 255],
+            },
+            key: bytes,
+            routing_hash,
+        }
+    }
+
+    #[test]
+    fn decoded_keys_preserve_all_ownerships_empty_keys_escapes_and_routing_endpoints() {
+        let owners = [
+            (
+                Ownership::PartitionLocal {
+                    subtask: 0,
+                    parallelism: 1,
+                },
+                None,
+            ),
+            (
+                Ownership::PartitionLocal {
+                    subtask: 2,
+                    parallelism: 3,
+                },
+                None,
+            ),
+            (
+                Ownership::Routed {
+                    range_start: 0,
+                    range_end: u64::MAX,
+                },
+                Some(0),
+            ),
+            (
+                Ownership::Routed {
+                    range_start: 0,
+                    range_end: u64::MAX,
+                },
+                Some(u64::MAX),
+            ),
+            (
+                Ownership::Routed {
+                    range_start: 9,
+                    range_end: 9,
+                },
+                Some(9),
+            ),
+            (Ownership::Replicated { id: vec![] }, None),
+            (Ownership::Replicated { id: vec![0, 255] }, None),
+            (
+                Ownership::Connector {
+                    connector: vec![],
+                    partition: vec![],
+                },
+                None,
+            ),
+            (
+                Ownership::Connector {
+                    connector: vec![0],
+                    partition: vec![0, 255],
+                },
+                None,
+            ),
+        ];
+        for (ownership, hash) in owners {
+            for bytes in [vec![], vec![0], vec![0, 255, 1, 0]] {
+                let key = key(ownership.clone(), hash, bytes);
+                let encoded = encode_key(&key).unwrap();
+                assert_eq!(encoded_key_size(&key).unwrap(), encoded.len());
+                let decoded = decode_key(&encoded).unwrap();
+                assert_eq!(decoded, key);
+                assert_eq!(encode_key(&decoded).unwrap(), encoded);
+                for end in 0..encoded.len() {
+                    assert!(
+                        decode_key(&encoded[..end]).is_err(),
+                        "truncation at {end}: {key:?}"
+                    );
+                }
+                let mut trailing = encoded.clone();
+                trailing.push(0);
+                assert!(decode_key(&trailing).is_err());
+                let mut version = encoded.clone();
+                version[0] = VERSION + 1;
+                assert!(decode_key(&version).is_err());
+                let mut tag = encoded;
+                tag[1] = 4;
+                assert!(decode_key(&tag).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn decoded_keys_reject_partition_route_and_escape_invariants() {
+        let partition = key(
+            Ownership::PartitionLocal {
+                subtask: 0,
+                parallelism: 1,
+            },
+            None,
+            vec![],
+        );
+        let encoded = encode_key(&partition).unwrap();
+        let mut zero_parallelism = encoded.clone();
+        zero_parallelism[6..10].copy_from_slice(&0u32.to_be_bytes());
+        assert!(decode_key(&zero_parallelism).is_err());
+        let mut invalid_subtask = encoded.clone();
+        invalid_subtask[2..6].copy_from_slice(&1u32.to_be_bytes());
+        assert!(decode_key(&invalid_subtask).is_err());
+        let mut invalid_escape = encoded;
+        *invalid_escape.last_mut().unwrap() = 1;
+        assert!(decode_key(&invalid_escape).is_err());
+
+        let routed = key(
+            Ownership::Routed {
+                range_start: 10,
+                range_end: 20,
+            },
+            Some(10),
+            vec![0],
+        );
+        let encoded = encode_key(&routed).unwrap();
+        let mut reversed_range = encoded.clone();
+        reversed_range[10..18].copy_from_slice(&9u64.to_be_bytes());
+        assert!(decode_key(&reversed_range).is_err());
+        for hash in [9u64, 21] {
+            let mut outside_range = encoded.clone();
+            let offset = outside_range.len() - 8;
+            outside_range[offset..].copy_from_slice(&hash.to_be_bytes());
+            assert!(decode_key(&outside_range).is_err());
+        }
+        assert!(
+            encoded_key_size(&key(
+                Ownership::Routed {
+                    range_start: 10,
+                    range_end: 20
+                },
+                None,
+                vec![]
+            ))
+            .is_err()
+        );
+        assert!(
+            encoded_key_size(&key(
+                Ownership::PartitionLocal {
+                    subtask: 0,
+                    parallelism: 1
+                },
+                Some(0),
+                vec![]
+            ))
+            .is_err()
+        );
+    }
 }
