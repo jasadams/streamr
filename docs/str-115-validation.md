@@ -191,3 +191,54 @@ remain the executable validation evidence. This publication-record update change
 no tested executable source. The coordinator verifies final current-head CI before
 the Trakkt green handoff; merge-sweeper owns merge. No deferrals; broader STR-103
 qualification and server/browser batch QA remain separate.
+
+## Integration after STR-111 merge
+
+The isolated measurements and original executable results above remain tied to
+frozen base `fa9c8133d3feefb4343e322c5405e843e25e1b61` and the pre-STR-111
+implementation. They are not relabeled as measurements of the integrated source.
+
+After STR-111/PR #49 merged, the coordinator rebased onto main
+`196a9f7209c26b24f68c0f83106c325212635fe6`. The integrated executable source is
+local head `1bac3f5385ca1909fe76b3137e69a4b14c08ff23`. The independent fresh-source
+review found the TTL progress type/helper, expiry/flush logic and TTL fixtures
+unchanged from `a9039a16`. The shared store now delegates `first_from` to
+`first_from_bounded` with `end=None`, and its maximum scan-request allowance counts
+three logical keys rather than two. This warrants executable integration checks;
+it does not require repeating the frozen TTL-only diagnostic or attributing
+STR-111's changes to TTL performance.
+
+One foreground shared-target reservation ran all commands with the same immutable
+image `e67afacf02e9b93cd67e603af190b6a68f67d9efab9c857441162c1359c14382`.
+Current receipts, full logs and the pinned executable are under
+`/home/jason/qa-evidence/str115-ttl-20261014/integration-1bac3f53/`.
+
+| Command | Integrated result |
+| --- | --- |
+| `scripts/cargo-dev check --locked -p arroyo-worker` | Exit 0 |
+| `scripts/preflight-clippy.sh -p arroyo-worker` | Exit 0; locked, no-deps, all-features, all-targets, `-D warnings` |
+| `scripts/cargo-dev fmt --all -- --check` | Exit 0 |
+| `scripts/cargo-dev test --locked -p arroyo-worker --lib --no-fail-fast arrow::incremental_aggregator::tests -- --nocapture --test-threads=1` | Exit 0; 50 passed, 0 failed, 1 ignored; 1.60 s |
+| `scripts/cargo-dev test --locked -p arroyo-worker --lib --no-fail-fast arrow::aggregate_store::tests -- --nocapture --test-threads=1` | Exit 0; 3 passed, 0 failed, 0 ignored; 0.02 s |
+
+The ignored case is `calendar_operation_count_pilot`, the explicit isolated
+STR-111 operation-count diagnostic; it was not executed or claimed passed.
+Both new TTL tests and the existing bounded expiry test passed. The unchanged
+exact changelog test still covers six declared combinations and 138 collected
+CDC rows; the omitted tight+checkpoint cross-product remains unclaimed.
+There was no integration failure or source repair. The selected test scopes remain
+serial; no new default-parallel or process-loss claim is made. These are local
+executable integration results, separate from current-head PR CI.
+
+`source-before.json` and `source-receipt.json` record unchanged source hashes across
+the reservation, including the worker, shared store, calendar module, lockfile and
+applicable instruction files. The integrated worker test pin SHA-256 is
+`e6f9be97283337df4b7212ffa65083bbf568a0bc46dd801f9a62a1afd0612190`.
+The two changed/shared worker files are:
+
+- `incremental_aggregator.rs`: `d55de32cbc2f6bc788178aec25d560f17f24927b048ddc25308006509424bafc`
+- `aggregate_store.rs`: `7bd68019a90753aebde89bdeb50ce7d8ec71863050c315f82e63cd05ea0b70b9`
+
+This report update changes no validated executable source. Final integrated
+source/evidence review and publication/current-head CI remain coordinator-owned;
+no new benchmark, capacity qualification or STR-103 completion is claimed.
