@@ -335,6 +335,7 @@ def native_image_receipt(image, evidence):
     script = '''import hashlib,json,pathlib,subprocess
 root=pathlib.Path('/opt/streamr-rocksdb')
 manifest=json.loads((root/'manifest.json').read_text())
+build_lock=(root/'build-Cargo.lock').read_bytes()
 profiles={}
 for name in manifest['profiles']:
     directory=root/name
@@ -342,11 +343,16 @@ for name in manifest['profiles']:
     with (directory/'lib/librocksdb.a').open('rb') as f:
         for chunk in iter(lambda:f.read(1048576),b''): digest.update(chunk)
     profiles[name]={'receipt':json.loads((directory/'receipt.json').read_text()),'archive_sha256':digest.hexdigest()}
-print(json.dumps({'manifest':manifest,'profiles':profiles,'rustc':subprocess.check_output(['rustc','-Vv'],text=True),'cxx':subprocess.check_output(['c++','--version'],text=True)}))
+print(json.dumps({'manifest':manifest,'profiles':profiles,'build_lock':build_lock.decode('utf-8'),'build_lock_sha256':hashlib.sha256(build_lock).hexdigest(),'rustc':subprocess.check_output(['rustc','-Vv'],text=True),'cxx':subprocess.check_output(['c++','--version'],text=True)}))
 '''
     command = ["podman", "run", "--rm", "--network", "none", image, "python3", "-c", script]
     result = owned_image_run(command, evidence, "native-image", timeout=180)
-    return {**json.loads(result.stdout), "command": command, "exit_code": result.returncode}
+    receipt = json.loads(result.stdout)
+    digest = hashlib.sha256(receipt["build_lock"].encode("utf-8")).hexdigest()
+    require(digest == receipt["build_lock_sha256"], "Preserved native build lock hash differs")
+    for name, profile in receipt["profiles"].items():
+        require(profile["receipt"]["build_lock_sha256"] == digest, "Native profile build lock differs: " + name)
+    return {**receipt, "command": command, "exit_code": result.returncode}
 
 
 def write_launcher(package):
@@ -456,7 +462,8 @@ def main():
     if args.profile == "release":
         cargo_args.append("--release")
     native_mode = subprocess.check_output(["python3", str(source / "docker/rocksdb-build-mode.py"), str(source),
-        subprocess.check_output(["podman", "image", "inspect", "--format", '{{ index .Labels "io.streamr.rocksdb.pin" }}', build_image], text=True).strip(), *cargo_args], env=env, text=True).strip()
+        subprocess.check_output(["podman", "image", "inspect", "--format", '{{ index .Labels "io.streamr.rocksdb.pin" }}', build_image], text=True).strip(),
+        build_image, *cargo_args], env=env, text=True).strip()
     require(native_mode in {"0", "1"}, "Unexpected native mode result")
     require(native_mode == "0" or args.native_source_reason, "Native source selected; declare --native-source-reason before building")
     selection = {"profile": args.profile, "purpose": args.purpose, "image_id": build_image,

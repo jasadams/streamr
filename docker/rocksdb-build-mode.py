@@ -5,7 +5,9 @@ import json
 import os
 from pathlib import Path
 import sys
+import subprocess
 import tomllib
+from rocksdb_native_lock import image_lock_metadata, verify_native_lock
 
 
 def profiles_match_archive(workspace, selected, pin):
@@ -76,7 +78,7 @@ def profiles_match_archive(workspace, selected, pin):
     return True
 
 
-def build_mode(root, image_pin, args, env):
+def build_mode(root, image_pin, args, env, image_metadata=None):
     pin = json.loads((root / "docker/rocksdb-prebuilt.json").read_text())
     packages = tomllib.loads((root / "Cargo.lock").read_text())["package"]
     for name, version, checksum in [
@@ -135,12 +137,19 @@ def build_mode(root, image_pin, args, env):
             return "1"
         if name in {"RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "CARGO_BUILD_TARGET", "CC", "CXX", "CFLAGS", "CXXFLAGS", "ROCKSDB_CXX_STD"}:
             return "1"
+    if image_metadata is not None:
+        verify_native_lock((root / "Cargo.lock").read_text(), image_metadata["build_lock"], image_metadata["build_lock_sha256"])
     return "0"
 
 
 if __name__ == "__main__":
     try:
-        print(build_mode(Path(sys.argv[1]), sys.argv[2], sys.argv[3:], os.environ))
-    except (ValueError, KeyError, OSError) as error:
+        root = Path(sys.argv[1])
+        mode = build_mode(root, sys.argv[2], sys.argv[4:], os.environ)
+        if mode == "0":
+            metadata = image_lock_metadata(sys.argv[3])
+            mode = build_mode(root, sys.argv[2], sys.argv[4:], os.environ, metadata)
+        print(mode)
+    except (ValueError, KeyError, OSError, subprocess.TimeoutExpired) as error:
         print(f"Build configuration error: {error}", file=sys.stderr)
         sys.exit(2)

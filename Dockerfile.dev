@@ -35,6 +35,7 @@ RUN bash /usr/local/bin/build-rocksdb-prebuilt
 FROM dev-toolchain
 COPY docker/rocksdb-rustc-wrapper /usr/local/bin/streamr-rocksdb-rustc-wrapper
 COPY docker/rocksdb-select /usr/local/bin/streamr-rocksdb-select
+COPY docker/rocksdb_native_lock.py /usr/local/bin/rocksdb_native_lock.py
 COPY docker/rocksdb-cache-guard /usr/local/bin/streamr-rocksdb-cache-guard
 COPY --from=rocksdb-prebuild /opt/streamr-rocksdb /opt/streamr-rocksdb
 LABEL io.streamr.rocksdb.pin="0.17.3+10.4.2:cef2a00ee60fe526157c9023edab23943fae1ce2ab6f4abb2a807c1746835de9:1.11.1+lz4-1.10.0:6bd8c0d6c6ed0cd30b3652886bb8711dc4bb01d637a68105a3d5158039b418e6:8aed3793265b646373941d8d36fa378a62afb7c39e04a013224124b1ea01d795"

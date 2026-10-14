@@ -6,6 +6,9 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+from rocksdb_native_lock import verify_native_lock
+
+WORKSPACE_LOCK = Path('/app/Cargo.lock')
 
 TRACKED = ('STREAMR_ROCKSDB_SOURCE_REASON', 'ROCKSDB_COMPILE', 'ROCKSDB_LIB_DIR', 'ROCKSDB_STATIC', 'CC', 'CXX', 'CFLAGS', 'CXXFLAGS', 'ROCKSDB_CXX_STD', 'CARGO_ENCODED_RUSTFLAGS')
 
@@ -37,6 +40,7 @@ def select(root, env):
         raise ValueError(f'unsupported actual native settings {settings}; select source mode with a reason')
     name = matches[0]
     receipt = json.loads((root / name / 'receipt.json').read_text())
+    verify_native_lock(WORKSPACE_LOCK.read_text(), (root / 'build-Cargo.lock').read_bytes().decode(), [receipt['build_lock_sha256']])
     archive = root / name / 'lib/librocksdb.a'
     with archive.open('rb') as archive_file:
         digest = hashlib.file_digest(archive_file, 'sha256').hexdigest()
@@ -60,6 +64,9 @@ if __name__ == '__main__':
         directory, reason = select(Path('/opt/streamr-rocksdb'), env)
         print('cargo:rerun-if-changed=/usr/local/bin/streamr-rocksdb-select', flush=True)
         print('cargo:rerun-if-changed=/opt/streamr-rocksdb/manifest.json', flush=True)
+        print('cargo:rerun-if-changed=/opt/streamr-rocksdb/build-Cargo.lock', flush=True)
+        print('cargo:rerun-if-changed=/app/Cargo.lock', flush=True)
+        print('cargo:rerun-if-changed=/usr/local/bin/rocksdb_native_lock.py', flush=True)
         for key in set(TRACKED) | {key for key in env if key.startswith(('CC_', 'CXX_', 'CFLAGS_', 'CXXFLAGS_', 'HOST_', 'TARGET_'))}:
             print(f'cargo:rerun-if-env-changed={key}', flush=True)
         print('streamr-rocksdb: ' + json.dumps({'mode': 'prebuilt' if directory else 'source', 'selection': reason, 'target': env.get('TARGET'), 'opt_level': env.get('OPT_LEVEL'), 'debug': env.get('DEBUG')}), file=sys.stderr)

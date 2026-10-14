@@ -184,6 +184,25 @@ class CleanupTests(unittest.TestCase):
             self.assertEqual(json.loads((root / "build-db-cleanup.json").read_text())["exit_code"], 0)
 
 
+class NativeLockReceiptTests(unittest.TestCase):
+    def test_preserves_raw_lock_and_checks_all_profiles(self):
+        import hashlib
+        lock = '# Exact native build graph\nversion = 4\n'
+        digest = hashlib.sha256(lock.encode()).hexdigest()
+        receipt = {"build_lock": lock, "build_lock_sha256": digest, "profiles": {
+            name: {"receipt": {"build_lock_sha256": digest}} for name in ("dev", "release", "release-host")}}
+        result = subprocess.CompletedProcess([], 0, stdout=json.dumps(receipt), stderr="")
+        with patch.object(pin, "owned_image_run", return_value=result):
+            preserved = pin.native_image_receipt("immutable-image-id", Path("unused"))
+        self.assertEqual(preserved["build_lock"], lock)
+        self.assertEqual(preserved["build_lock_sha256"], digest)
+        receipt["profiles"]["release-host"]["receipt"]["build_lock_sha256"] = "different"
+        result.stdout = json.dumps(receipt)
+        with patch.object(pin, "owned_image_run", return_value=result):
+            with self.assertRaisesRegex(ValueError, "build lock differs: release-host"):
+                pin.native_image_receipt("immutable-image-id", Path("unused"))
+
+
 class CargoTimingTests(unittest.TestCase):
     def test_preserves_exact_logged_report_through_cache_eviction(self):
         with tempfile.TemporaryDirectory() as directory:
