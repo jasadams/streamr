@@ -1,0 +1,30 @@
+#!/usr/bin/env python3
+"""Invalidate only stale unwrapped RocksDB build scripts, while queue is held.
+
+Cargo does not fingerprint RUSTC_WRAPPER identity. An older image may have left
+an upstream ELF executable marked fresh in this shared target. Preserve native
+outputs and other crates, but force that build script to compile through the
+selector wrapper before Cargo can reuse it.
+"""
+import os
+from pathlib import Path
+import shutil
+
+root = Path(os.environ['CARGO_TARGET_DIR'])
+executables = list(root.glob('*/build/librocksdb-sys-*/build-script-build'))
+executables += list(root.glob('*/*/build/librocksdb-sys-*/build-script-build'))
+for executable in executables:
+    with executable.open('rb') as source:
+        header = source.read(128)
+    if b'streamr-rocksdb-select' in header:
+        continue
+    build_dir = executable.parent
+    fingerprint = build_dir.parent.parent / '.fingerprint' / build_dir.name
+    if fingerprint.exists():
+        shutil.rmtree(fingerprint)
+    # Only compiler-produced executables in this directory; native outputs live
+    # in separate hash directories and remain available to explicit source mode.
+    for artifact in build_dir.glob('build*'):
+        if artifact.is_file():
+            artifact.unlink()
+    print(f'streamr-rocksdb: invalidated unwrapped build script {build_dir}')

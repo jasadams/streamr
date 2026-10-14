@@ -1,9 +1,18 @@
+## Active STR-127 build pinning — 2026-10-15
+
+- Coordinator `/root`; branch `jason/str-127-build-pinning`, fetched base `cd9520ee89f6ba1e4e9c7362b4b306fc257c78e1`, worktree `/home/jason/repos/streamr-str-127`. Read current ticket, `AGENTS.md`, `.claude/build-test.md`, `.claude/team.md`, this ledger and feature plan. Invoking dirty checkout preserved. Pickup guard CLEAR with verified merged instruction-only branch excluded.
+- Scope: maintained dev/release CLI pin/package entrypoint, exact provenance and owned DB cleanup; dual native image archives selected by actual host/runtime compilation settings. No engine behavior changes.
+- Acceptance: source-free dev real-worker recovery and release native correctness; isolated cold/warm/source-edit reuse; mismatch/source-mode checks; exact timing/compiler/hash/cleanup evidence; independent review and affected tooling/container gates.
+- Implemented native selector/wrapper and narrow old-cache guard; maintained build/pin freezes inputs, owns DB/helper cleanup, packages ELF/libraries and opts into embedded UI. Native source review approved; package review repairs in progress. Cheap checks passed (20 wrapper, seven native, ten package tests).
+- Next: queued pinned native image build, then actual Cargo/cache, dev/release package and source-free recovery acceptance. Image build is waiting behind existing work; no acceptance execution passed yet. Evidence `/home/jason/qa-evidence/str127-build-pinning-20261015/`. No user decision pending.
+
 ## STR-117 metadata discovery ready for publication — 2026-10-15
 
 - Branch `jason/str-117-metadata-20261015`; frozen comparison base `aaab7727200defe3c5b00e13975ef61a379084e1`. Current ticket/guidance read; STR-112/116 owners preserved. Delivery base `cd9520ee` preserves the incoming STR-112 ledger and build guidance; all five validated source hashes are unchanged.
 - User-approved generic bounded snapshot last-entry API and SESSION timestamp predecessor/monotonic successor discovery implemented. No SQL/cache-cap/state-format/resource-limit change. Independent final source/evidence review approved.
 - Final no-probe locked state+worker check/strict Clippy/fmt and serial state71/SESSION23 tests passed. Matched diagnostic and probe-disabled finite AB/BA arms all0, exact both-group intervals/rows and awaited cleanup. [Complete receipts, native counters, modest/residual bridge cost and limits](str-117-validation.md); queued130/fixture-cleanup139 preserved separately.
 - Next: reviewed commit/PR and green current-head CI. Documentation-only integration passed static checks and guidance was reread. No further user contract decision; no optimized production throughput or broad qualification claim. Evidence `/home/jason/qa-evidence/str117-metadata-20261015/`.
+
 
 ## Active STR-112 remaining acceptance — 2026-10-15
 

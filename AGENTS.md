@@ -130,7 +130,8 @@ capability before proposing a replacement.
 
 - Use the maintained repository build scripts by default: `scripts/cargo-dev`
   for container Cargo commands, `scripts/preflight-clippy.sh` for the Clippy
-  gate, and `scripts/rust-build` for the shared queue. Follow
+  gate, and `scripts/rust-build` for the shared queue. Use `scripts/build-pin` for a
+  preserved source-free CLI/package and source/native/linkage receipts. Follow
   `.claude/build-test.md`; do not substitute direct Cargo/container commands or
   external one-off builders merely because they already collect provenance.
 - Use the normal dev/test profile and matching precompiled RocksDB archive for
@@ -143,8 +144,8 @@ capability before proposing a replacement.
 - If the maintained scripts lack a necessary capability, extend their supported
   path within the authorized task rather than bypassing it for convenience.
   Explicit native source builds remain available for deliberate comparisons or
-  unsupported settings; record the concrete reason. Dev/release pinning and
-  precompiled release RocksDB support are tracked in STR-127, not yet available.
+  unsupported settings; record the concrete reason. See `.claude/build-test.md`
+  for build/pin and actual host/runtime native archive selection.
 
 ## Work and verification
 

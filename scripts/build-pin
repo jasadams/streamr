@@ -1,0 +1,533 @@
+#!/usr/bin/env python3
+"""Build and preserve a source-free CLI through cargo-dev and the shared queue.
+
+Dev is the default. Select --profile release only for optimized measurements or
+release artifacts. Evidence, frozen inputs and packaged libraries live outside
+Cargo caches. No recovery or performance qualification is implied by a pin.
+"""
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import time
+import uuid
+
+
+def require(condition, message):
+    if not condition:
+        raise ValueError(message)
+
+
+def sha(path):
+    result = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            result.update(chunk)
+    return result.hexdigest()
+
+
+def write(path, value):
+    with Path(path).open("x") as handle:
+        json.dump(value, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+
+
+def compiled(name):
+    return name.startswith(("crates/", ".cargo/")) or name in {
+        "Cargo.toml", "Cargo.lock", "rust-toolchain", "rust-toolchain.toml", "build.rs"
+    }
+
+
+def inventory(root):
+    result = {}
+    for path in sorted(root.rglob("*")):
+        if path.is_symlink():
+            require(path.resolve().is_relative_to(root.resolve()), f"External symlink input: {path}")
+        if path.is_file():
+            result[str(path.relative_to(root))] = sha(path)
+    return result
+
+
+def git(repo, *args):
+    return subprocess.check_output(["git", *args], cwd=repo)
+
+
+def freeze(repo, destination, ui_assets):
+    """Copy declared inputs; reject source edits racing the snapshot operation."""
+    names = set(git(repo, "ls-files", "-z").decode().split("\0"))
+    names.update(git(repo, "ls-files", "--others", "--exclude-standard", "-z").decode().split("\0"))
+    names.discard("")
+    destination.mkdir()
+    originals = {}
+    for name in sorted(names):
+        source = repo / name
+        require(source.is_file(), f"Source input missing or unsupported: {name}")
+        if source.is_symlink():
+            require(source.resolve().is_relative_to(repo), f"External symlink input: {name}")
+        originals[name] = sha(source)
+        target = destination / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        # Dereference internal links: their content is the declared input.
+        shutil.copy2(source, target)
+        require(sha(target) == originals[name], f"Source changed while copying: {name}")
+    require(all(sha(repo / n) == h for n, h in originals.items()), "Source changed during snapshot")
+    assets = destination / "webui/dist"
+    if ui_assets is not None:
+        require(not assets.exists(), "Snapshot already includes webui/dist; do not override declared input")
+        before = inventory(ui_assets)
+        require(bool(before), "Declared UI asset directory is empty")
+        shutil.copytree(ui_assets, assets, symlinks=False)
+        require(before == inventory(assets) == inventory(ui_assets), "UI assets changed during snapshot")
+    require((assets / "index.html").is_file(), "Declare actual built UI assets with --ui-assets (index.html required)")
+    return inventory(destination)
+
+
+def host_path(path, target):
+    relative = Path(path).relative_to("/app/target")
+    require(".." not in relative.parts, "Cargo artifact escapes target")
+    return target / relative
+
+
+def cargo_events(log):
+    events = []
+    for line in log.read_text().splitlines():
+        try:
+            value = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict) and "reason" in value:
+            events.append(value)
+    return events
+
+
+def native_proof(events, target, artifact, evidence, image_native):
+    """Bind native output/rlib to the final CLI's Cargo fingerprint graph."""
+    libraries = [e for e in events if e.get("reason") == "compiler-artifact"
+                 and e.get("target", {}).get("name") == "librocksdb_sys"
+                 and "lib" in e.get("target", {}).get("kind", [])]
+    scripts = [e for e in events if e.get("reason") == "build-script-executed"
+               and "librocksdb-sys" in e.get("package_id", "")]
+    require(bool(libraries), "Cargo JSON lacks RocksDB native artifacts")
+    executable = host_path(artifact["executable"], target)
+    profile_dir = executable.parent
+    fingerprint_root = profile_dir / ".fingerprint"
+    saved = evidence / "native-proof"
+    saved.mkdir()
+    preserved = {}
+
+    def preserve(path):
+        path = Path(path)
+        name = str(path.relative_to(target))
+        copied = saved / name
+        copied.parent.mkdir(parents=True, exist_ok=True)
+        if not copied.exists():
+            shutil.copy2(path, copied)
+        require(sha(path) == sha(copied), "Native proof changed while copying")
+        preserved[name] = sha(copied)
+        return name
+
+    mappings = []
+    for library in libraries:
+        rlibs = [p for p in library["filenames"] if p.endswith(".rlib")]
+        require(len(rlibs) == 1, "Unique native rlib required")
+        rlib = host_path(rlibs[0], target)
+        suffix = rlib.stem.removeprefix("liblibrocksdb_sys-")
+        dep = rlib.parent / ("librocksdb_sys-" + suffix + ".d")
+        outdirs = set(re.findall(r"# env-dep:OUT_DIR=(.+)", dep.read_text()))
+        require(len(outdirs) == 1, "Native dependency OUT_DIR missing or ambiguous")
+        outdir = outdirs.pop()
+        matches = [s for s in scripts if s["out_dir"] == outdir]
+        require(len(matches) == 1, "Native script/rlib pairing missing or ambiguous")
+        script = matches[0]
+        output = host_path(outdir, target).parent / "output"
+        # Preserve original Cargo output rather than infer profile from its directory.
+        preserve(output)
+        preserve(dep)
+        stderr = output.with_name("stderr")
+        selection = None
+        if stderr.is_file():
+            preserve(stderr)
+            for line in stderr.read_text().splitlines():
+                if line.startswith("streamr-rocksdb: "):
+                    selection = json.loads(line.removeprefix("streamr-rocksdb: "))
+        require(selection is not None, "Actual native selector receipt missing")
+        if selection["mode"] == "prebuilt":
+            chosen = image_native["profiles"][selection["selection"]]
+            require(str(chosen["receipt"]["profile"]["opt-level"]) == library["profile"]["opt_level"],
+                    "Selected native archive differs from Rust artifact optimization")
+            require(chosen["archive_sha256"] == chosen["receipt"]["archive_sha256"], "Image native archive hash differs")
+            settings = chosen["receipt"]["profile"]
+            require(str(settings["opt-level"]) == selection["opt_level"] and settings["debug"] == selection["debug"],
+                    "Actual native settings differ from selected archive")
+            expected_search = "/opt/streamr-rocksdb/" + selection["selection"] + "/lib"
+            require("native=" + expected_search in script.get("linked_paths", []), "Selected native archive is not linked")
+            archive_hash = chosen["archive_sha256"]
+        else:
+            archive = host_path(outdir, target) / "librocksdb.a"
+            require(archive.is_file(), "Source-native archive missing")
+            archive_hash = sha(archive)
+        fp = fingerprint_root / ("librocksdb-sys-" + suffix) / "lib-librocksdb_sys.json"
+        require(fp.is_file(), "Native fingerprint missing")
+        mappings.append({"compiler_artifact": library, "build_script": script,
+                         "rlib_sha256": sha(rlib), "dependency_file": str(dep.relative_to(target)),
+                         "build_output": str(output.relative_to(target)),
+                         "fingerprint": str(fp.relative_to(target)),
+                         "native_selection": selection, "archive_sha256": archive_hash,
+                         "opt_level": library["profile"]["opt_level"]})
+
+    nodes = {}
+    for fp in fingerprint_root.glob("*/*.json"):
+        raw = fp.with_suffix("")
+        if raw.is_file() and re.fullmatch(r"[0-9a-f]{16}", raw.read_text()):
+            value = int.from_bytes(bytes.fromhex(raw.read_text()), "little")
+            nodes.setdefault(value, []).append(fp)
+
+    def closure(start, normal_only):
+        seen, pending = set(), [start]
+        while pending:
+            fp = pending.pop()
+            if fp in seen:
+                continue
+            seen.add(fp)
+            preserve(fp)
+            preserve(fp.with_suffix(""))
+            data = json.loads(fp.read_text())
+            for dependency in data["deps"]:
+                if normal_only and dependency[1] == "build_script_build":
+                    continue
+                if not (dependency[1].startswith("arroyo_") or dependency[1] in {"rocksdb", "librocksdb_sys"}):
+                    continue
+                matches = nodes.get(dependency[3], [])
+                require(bool(matches), "Dependency fingerprint missing: " + str(dependency))
+                require(len({json.dumps(json.loads(p.read_text()), sort_keys=True) for p in matches}) == 1,
+                        "Dependency fingerprint ambiguous: " + str(dependency))
+                pending.append(matches[0])
+        return {str(p.relative_to(target)) for p in seen}
+
+    # Cargo's unhashed executable is hard-linked/copied from the actual hashed
+    # executable. Match bytes as fallback on filesystems that do not hard-link.
+    candidates = []
+    for fp in fingerprint_root.glob("arroyo-*/bin-arroyo.json"):
+        suffix = fp.parent.name.removeprefix("arroyo-")
+        binary = profile_dir / "deps" / ("arroyo-" + suffix)
+        if binary.is_file() and (binary.samefile(executable) or sha(binary) == sha(executable)):
+            candidates.append(fp)
+    require(len(candidates) == 1, "Unique executable fingerprint required")
+    runtime = closure(candidates[0], True)
+    runtime_mappings = [m for m in mappings if m["fingerprint"] in runtime]
+    require(len(runtime_mappings) == 1, "Unique runtime RocksDB dependency required")
+    expected_opt = artifact["profile"]["opt_level"]
+    require(runtime_mappings[0]["opt_level"] == expected_opt, "CLI/native runtime optimization differs")
+    host_closures = []
+    host_candidates = set()
+    for event in events:
+        if event.get("reason") != "compiler-artifact" or "arroyo-openapi" not in event.get("package_id", ""):
+            continue
+        if "custom-build" not in event.get("target", {}).get("kind", []):
+            continue
+        for filename in event.get("filenames", []):
+            directory = Path(filename).parent.name
+            if directory.startswith("arroyo-openapi-"):
+                host_candidates.add(fingerprint_root / directory / "build-script-build-script-build.json")
+    require(len(host_candidates) == 1, "Unique current OpenAPI build-script artifact required")
+    for fp in host_candidates:
+        graph = closure(fp, False)
+        if any(m["fingerprint"] in graph for m in mappings):
+            host_closures.append(sorted(graph))
+    require(bool(host_closures), "OpenAPI host RocksDB dependency proof missing")
+    return {"mappings": mappings, "runtime_closure": sorted(runtime),
+            "openapi_host_closures": host_closures, "preserved_files": preserved,
+            "traversal_scope": "First-party Arroyo and rocksdb/librocksdb_sys dependency paths"}
+
+
+def run(command, **kwargs):
+    return subprocess.run(command, check=True, **kwargs)
+
+
+def interrupt(signum, frame):
+    # Raising lets the build subprocess and finally blocks finish owned cleanup.
+    raise KeyboardInterrupt(f"Interrupted by signal {signum}")
+
+
+def cleanup_owned(root, cargo_name, database):
+    """Attempt both removals even if one fails or times out; retain every exit."""
+    failures = []
+    for name, receipt_name in ((cargo_name, "build-container-cleanup.json"), (database, "build-db-cleanup.json")):
+        try:
+            result = subprocess.run(["podman", "rm", "--force", "--ignore", name],
+                                    capture_output=True, text=True, timeout=30)
+            receipt = {"container": name, "exit_code": result.returncode, "stdout": result.stdout, "stderr": result.stderr}
+            if result.returncode:
+                failures.append(name)
+        except (OSError, subprocess.SubprocessError) as error:
+            receipt = {"container": name, "exit_code": None, "error": str(error)}
+            failures.append(name)
+        write(root / receipt_name, receipt)
+    require(not failures, "Owned container cleanup failed: " + ", ".join(failures))
+
+
+def image_id(image):
+    return subprocess.check_output(["podman", "image", "inspect", "--format", "{{.Id}}", image], text=True).strip()
+
+
+def owned_image_run(command, evidence, label, timeout=120):
+    """Bound helper lifetime even when its Podman client is interrupted."""
+    name = "streamr-build-pin-helper-" + uuid.uuid4().hex
+    command = command[:3] + ["--name", name] + command[3:]
+    receipt = {"command": command, "container": name}
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, timeout=timeout)
+        receipt.update(exit_code=result.returncode, stdout=result.stdout, stderr=result.stderr)
+        result.check_returncode()
+        return result
+    except BaseException as error:
+        receipt["error"] = type(error).__name__ + ": " + str(error)
+        raise
+    finally:
+        previous = {sig: signal.signal(sig, signal.SIG_IGN) for sig in (signal.SIGINT, signal.SIGTERM)}
+        try:
+            try:
+                removed = subprocess.run(["podman", "rm", "--force", "--ignore", name], capture_output=True, text=True, timeout=30)
+                receipt["cleanup"] = {"exit_code": removed.returncode, "stdout": removed.stdout, "stderr": removed.stderr}
+                require(removed.returncode == 0, "Owned image helper cleanup failed")
+            except (OSError, subprocess.SubprocessError) as error:
+                receipt["cleanup"] = {"exit_code": None, "error": str(error)}
+                raise
+        finally:
+            write(evidence / (label + "-container.json"), receipt)
+            for sig, handler in previous.items():
+                signal.signal(sig, handler)
+
+
+def native_image_receipt(image, evidence):
+    script = '''import hashlib,json,pathlib,subprocess
+root=pathlib.Path('/opt/streamr-rocksdb')
+manifest=json.loads((root/'manifest.json').read_text())
+profiles={}
+for name in manifest['profiles']:
+    directory=root/name
+    digest=hashlib.sha256()
+    with (directory/'lib/librocksdb.a').open('rb') as f:
+        for chunk in iter(lambda:f.read(1048576),b''): digest.update(chunk)
+    profiles[name]={'receipt':json.loads((directory/'receipt.json').read_text()),'archive_sha256':digest.hexdigest()}
+print(json.dumps({'manifest':manifest,'profiles':profiles,'rustc':subprocess.check_output(['rustc','-Vv'],text=True),'cxx':subprocess.check_output(['c++','--version'],text=True)}))
+'''
+    command = ["podman", "run", "--rm", "--network", "none", image, "python3", "-c", script]
+    result = owned_image_run(command, evidence, "native-image", timeout=180)
+    return {**json.loads(result.stdout), "command": command, "exit_code": result.returncode}
+
+
+def write_launcher(package):
+    launcher = package / "bin/run-arroyo"
+    launcher.write_text('#!/bin/sh\nset -eu\nartifact_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)\n'
+                        'export LD_LIBRARY_PATH="$artifact_dir/lib"\n'
+                        'exec "$artifact_dir/bin/arroyo" "$@"\n')
+    launcher.chmod(0o755)
+
+
+def package_runtime(package, image, evidence):
+    # Resolve and copy every dynamic dependency, including the ELF loader, from
+    # the exact image used for the build. No source checkout is mounted.
+    script = r'''set -euo pipefail
+ldd /artifact/bin/arroyo > /artifact/ldd.txt
+if grep -q 'not found' /artifact/ldd.txt; then cat /artifact/ldd.txt; exit 1; fi
+mkdir /artifact/lib
+awk '{for (i=1;i<=NF;i++) if ($i ~ /^\//) print $i}' /artifact/ldd.txt | sort -u > /artifact/libraries.txt
+while IFS= read -r library; do cp -L "$library" /artifact/lib/; done < /artifact/libraries.txt
+readelf -l /artifact/bin/arroyo > /artifact/elf-program-headers.txt
+'''
+    command = ["podman", "run", "--rm", "--network", "none", "-w", "/", "-v", f"{package}:/artifact:rw,z",
+               image, "bash", "-c", script]
+    result = owned_image_run(command, evidence, "runtime-linkage")
+    write(evidence / "runtime-linkage.json", {"command": command, "exit_code": result.returncode,
+          "stdout": result.stdout, "stderr": result.stderr, "ldd": (package / "ldd.txt").read_text()})
+    headers = (package / "elf-program-headers.txt").read_text()
+    match = re.search(r"Requesting program interpreter: ([^\]]+)\]", headers)
+    require(match is not None, "ELF interpreter missing")
+    loader = Path(match.group(1)).name
+    require((package / "lib" / loader).is_file(), "ELF loader was not packaged")
+    # Process schedulers use current_exe() to spawn workers. Invoking ld-linux
+    # directly makes current_exe() resolve to the loader and breaks that path.
+    # Use the pinned compatible Linux runtime's ELF interpreter while supplying
+    # packaged shared libraries; preserve the loader as dependency evidence.
+    write_launcher(package)
+    command = ["podman", "run", "--rm", "--network", "none", "-w", "/", "-v", f"{package}:/artifact:ro,z",
+               image, "/artifact/bin/run-arroyo", "--help"]
+    result = owned_image_run(command, evidence, "source-free-smoke")
+    write(evidence / "source-free-smoke.json", {"command": command, "exit_code": result.returncode,
+          "stdout": result.stdout, "stderr": result.stderr,
+          "runtime_contract": "Compatible Bookworm Linux ELF interpreter; packaged libraries via LD_LIBRARY_PATH",
+          "scope": "CLI startup/help only; recovery not implied"})
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--root", type=Path, required=True, help="New evidence directory outside Cargo targets")
+    parser.add_argument("--repo", type=Path, default=Path(__file__).resolve().parent.parent)
+    parser.add_argument("--profile", choices=["dev", "release"], default="dev")
+    parser.add_argument("--purpose", required=True, help="Correctness/recovery purpose or explicit release rationale")
+    parser.add_argument("--ui-assets", type=Path, help="Caller-declared actual webui/dist build (never placeholders)")
+    parser.add_argument("--image", default=os.environ.get("STREAMR_DEV_IMAGE", "arroyo-dev"))
+    parser.add_argument("--database-image", default="docker.io/library/postgres:16")
+    parser.add_argument("--native-source-reason", help="Explicitly compile native source, with recorded reason")
+    parser.add_argument("--expected-source", help="Require this HEAD; dirty input hashes are still preserved")
+    parser.add_argument("--minimum-free-gib", type=int, default=30)
+    args = parser.parse_args()
+    require(args.minimum_free_gib > 0, "Positive disk reserve required")
+    repo = args.repo.resolve(strict=True)
+    common = Path(git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir").decode().strip())
+    target = Path(os.environ.get("STREAMR_SHARED_TARGET_DIR", str(common.parent / "target"))).resolve()
+    root = args.root.resolve()
+    require(not root.exists(), "Evidence directory already exists; preserve prior pins")
+    require(not root.is_relative_to(repo) and not root.is_relative_to(target), "Evidence must be outside checkout and Cargo caches")
+    require(root.parent.is_dir(), "Evidence parent must exist")
+    queue = repo / "scripts/rust-build"
+    lock = Path(os.environ.get("XDG_CACHE_HOME", str(Path.home() / ".cache"))) / "rust-build/build.lock"
+    if os.environ.get("RUST_BUILD_QUEUE_HELD") != str(lock):
+        os.execv(str(queue), [str(queue), sys.executable, str(Path(__file__).resolve()), *sys.argv[1:]])
+    signal.signal(signal.SIGTERM, interrupt)
+    signal.signal(signal.SIGINT, interrupt)
+    head = git(repo, "rev-parse", "HEAD").decode().strip()
+    if args.expected_source:
+        require(head == args.expected_source, "Repository HEAD differs from --expected-source")
+    disk = {}
+    for path in (root.parent, target if target.exists() else target.parent):
+        usage = shutil.disk_usage(path)
+        disk[str(path)] = usage._asdict()
+        require(usage.free >= args.minimum_free_gib * 1024**3, f"Insufficient free space: {path}")
+    build_image = image_id(args.image)
+    database_image = image_id(args.database_image)
+    root.mkdir()
+    write(root / "disk-prerequisite.json", {"minimum_free_gib": args.minimum_free_gib, "filesystems": disk})
+    started = time.monotonic()
+    source = root / "source"
+    files = freeze(repo, source, args.ui_assets.resolve(strict=True) if args.ui_assets else None)
+    compiled_files = {n: h for n, h in files.items() if compiled(n)}
+    diff = git(repo, "diff", "--binary", "HEAD", "--", "crates", ".cargo", "Cargo.toml", "Cargo.lock", "rust-toolchain", "rust-toolchain.toml", "build.rs")
+    (root / "compiled-source.diff").write_bytes(diff)
+    write(root / "source-before.json", {"source_commit": head, "files": files, "compiled_sources": compiled_files,
+          "compiled_diff_sha256": hashlib.sha256(diff).hexdigest()})
+    db_name = "streamr-build-pin-db-" + uuid.uuid4().hex
+    cargo_name = "streamr-build-pin-cargo-" + uuid.uuid4().hex
+    db_id = None
+    build_log = root / "build.jsonl"
+    env = os.environ.copy()
+    env.update(STREAMR_DEV_IMAGE=build_image, STREAMR_SHARED_TARGET_DIR=str(target), STREAMR_BUILD_MIGRATE="1",
+               STREAMR_BUILD_CONTAINER_NAME=cargo_name)
+    if args.native_source_reason:
+        env["ROCKSDB_COMPILE"] = "1"
+        env["STREAMR_ROCKSDB_SOURCE_REASON"] = args.native_source_reason
+    # rust-embed normally reads dev assets from the checkout. Packaging opts in
+    # to embedding the declared actual UI without changing ordinary dev builds.
+    cargo_args = ["build", "--locked", "-p", "arroyo", "--bin", "arroyo", "--features", "arroyo-api/embedded-ui",
+                  "--message-format=json", "--timings"]
+    if args.profile == "release":
+        cargo_args.append("--release")
+    native_mode = subprocess.check_output(["python3", str(source / "docker/rocksdb-build-mode.py"), str(source),
+        subprocess.check_output(["podman", "image", "inspect", "--format", '{{ index .Labels "io.streamr.rocksdb.pin" }}', build_image], text=True).strip(), *cargo_args], env=env, text=True).strip()
+    require(native_mode in {"0", "1"}, "Unexpected native mode result")
+    require(native_mode == "0" or args.native_source_reason, "Native source selected; declare --native-source-reason before building")
+    selection = {"profile": args.profile, "purpose": args.purpose, "image_id": build_image,
+                 "database_image_id": database_image, "native_mode": "source" if native_mode == "1" else "prebuilt",
+                 "native_source_reason": args.native_source_reason, "shared_target": str(target),
+                 "cargo_features": ["arroyo-api/embedded-ui"],
+                 "environment_overrides": {k: v for k, v in env.items() if k.startswith("CARGO_PROFILE_") or k in {
+                     "CARGO_INCREMENTAL", "RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "CARGO_BUILD_TARGET", "CC", "CXX", "CFLAGS", "CXXFLAGS", "ROCKSDB_CXX_STD", "CARGO_BUILD_JOBS"}}}
+    write(root / "build-selection.json", selection)
+    print(json.dumps(selection, sort_keys=True), flush=True)
+    native_image = native_image_receipt(build_image, root)
+    write(root / "image-native-receipt.json", native_image)
+    signal.signal(signal.SIGTERM, interrupt)
+    signal.signal(signal.SIGINT, interrupt)
+    try:
+        command = ["podman", "run", "-d", "--name", db_name, "--label", "io.streamr.build-pin=" + str(root),
+                   "-e", "POSTGRES_USER=arroyo", "-e", "POSTGRES_PASSWORD=arroyo", "-e", "POSTGRES_DB=arroyo", database_image]
+        db_id = run(command, capture_output=True, text=True, timeout=120).stdout.strip()
+        require(re.fullmatch("[0-9a-f]{64}", db_id), "Invalid owned database container ID")
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline:
+            ready = subprocess.run(["podman", "exec", db_id, "pg_isready", "-U", "arroyo", "-d", "arroyo"],
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
+            if ready.returncode == 0:
+                break
+            time.sleep(1)
+        else:
+            raise RuntimeError("Owned PostgreSQL build database did not become ready")
+        env["STREAMR_BUILD_DATABASE_CONTAINER"] = db_id
+        env["DATABASE_URL"] = "postgres://arroyo:arroyo@localhost:5432/arroyo"
+        command = [str(source / "scripts/cargo-dev"), *cargo_args]
+        write(root / "build-environment.json", {**selection, "command": command, "database_container": db_id,
+              "supervisor_sha256": sha(Path(__file__)), "snapshot_supervisor_sha256": sha(source / "scripts/build-pin")})
+        build_started = time.monotonic()
+        with build_log.open("x") as log:
+            result = subprocess.run(command, cwd=source, env=env, stdout=log, stderr=log)
+        write(root / "build-result.json", {"exit_code": result.returncode, "build_seconds": time.monotonic() - build_started,
+              "total_seconds": time.monotonic() - started, "log_sha256": sha(build_log)})
+        require(result.returncode == 0, f"Cargo build failed (exit {result.returncode}); see {build_log}")
+    except BaseException as error:
+        write(root / "build-failure.json", {"error": type(error).__name__ + ": " + str(error), "database_container": db_id,
+              "elapsed_seconds": time.monotonic() - started})
+        raise
+    finally:
+        # Ignore a second signal while bounded cleanup removes owned containers.
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        owned = db_id or db_name
+        try:
+            with (root / "build-db.log").open("x") as log:
+                subprocess.run(["podman", "logs", owned], stdout=log, stderr=log, timeout=30)
+        finally:
+            cleanup_owned(root, cargo_name, owned)
+        signal.signal(signal.SIGTERM, interrupt)
+        signal.signal(signal.SIGINT, interrupt)
+    require(inventory(source) == files, "Frozen source inputs changed during build")
+    write(root / "source-after.json", {"source_commit": head, "files": files, "compiled_sources": compiled_files})
+    events = cargo_events(build_log)
+    artifacts = [e for e in events if e.get("reason") == "compiler-artifact" and e.get("target", {}).get("name") == "arroyo" and e.get("executable")]
+    require(len(artifacts) == 1, "Unique CLI artifact required")
+    artifact = artifacts[0]
+    require(artifact["profile"]["opt_level"] == ("3" if args.profile == "release" else "0"), "Actual CLI profile differs")
+    require(any(e.get("reason") == "build-finished" and e.get("success") is True for e in events), "Cargo success event missing")
+    proof = native_proof(events, target, artifact, root, native_image)
+    write(root / "native-linkage-proof.json", proof)
+    actual = host_path(artifact["executable"], target)
+    with actual.open("rb") as handle:
+        require(handle.read(4) == b"\x7fELF", "CLI is not an ELF executable")
+    package = root / "package"
+    (package / "bin").mkdir(parents=True)
+    pinned = package / "bin/arroyo"
+    shutil.copy2(actual, pinned)
+    require(sha(actual) == sha(pinned), "Executable changed while pinning")
+    package_runtime(package, build_image, root)
+    receipt = {"source_commit": head, "repository_head": head, "validated_implementation": head,
+               "compiled_sources": compiled_files, "compiled_diff_sha256": hashlib.sha256(diff).hexdigest(),
+               "source_files": files, "binary": str(pinned), "binary_sha256": sha(pinned), "package_files": inventory(package),
+               "compiled_ui_assets": {n.removeprefix("webui/dist/"): h for n, h in files.items() if n.startswith("webui/dist/")},
+               "image_id": build_image, "runtime_image": build_image, "build_profile": args.profile,
+               "native_mode": selection["native_mode"], "build_exit_code": 0, "compiler_artifact": artifact,
+               "build_log_sha256": sha(build_log), "native_linkage_proof_sha256": sha(root / "native-linkage-proof.json"),
+               "source_before_sha256": sha(root / "source-before.json"), "source_after_sha256": sha(root / "source-after.json"),
+               "build_selection_sha256": sha(root / "build-selection.json"),
+               "image_native_receipt_sha256": sha(root / "image-native-receipt.json"),
+               "runtime_linkage_receipt_sha256": sha(root / "runtime-linkage.json"),
+               "source_free_smoke_receipt_sha256": sha(root / "source-free-smoke.json"),
+               "scope": "Build, package and source-free CLI help only; correctness/recovery/performance require separate evidence"}
+    write(root / "source-manifest.json", receipt)
+    print("PINNED", pinned, receipt["binary_sha256"], flush=True)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (ValueError, OSError, subprocess.SubprocessError) as error:
+        print(f"Build/pin failed: {error}", file=sys.stderr)
+        sys.exit(1)
+    except KeyboardInterrupt as error:
+        print(f"Build/pin interrupted: {error}", file=sys.stderr)
+        sys.exit(130)

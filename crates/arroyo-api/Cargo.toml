@@ -6,6 +6,8 @@ license = "MIT OR Apache-2.0"
 
 [features]
 default = []
+# Source-free build/pin packages embed actual UI assets in both profiles.
+embedded-ui = ["rust-embed/debug-embed"]
 
 [dependencies]
 arroyo-types = { path = "../arroyo-types" }

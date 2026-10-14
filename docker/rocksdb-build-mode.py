@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Validate the image's native pin and choose prebuilt versus source compilation."""
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -17,7 +18,7 @@ def build_mode(root, image_pin, args, env):
         matches = [p for p in packages if p["name"] == name]
         if len(matches) != 1 or (matches[0]["version"], matches[0].get("checksum")) != (version, checksum):
             raise ValueError(f"{name} differs from the prebuilt pin; update the pin and rebuild the dev image")
-    expected = ":".join(pin[k] for k in ("version", "checksum", "lz4_version", "lz4_checksum"))
+    expected = ":".join(pin[k] for k in ("version", "checksum", "lz4_version", "lz4_checksum")) + ":" + hashlib.sha256((root / "docker/rocksdb-prebuilt.json").read_bytes()).hexdigest()
     if image_pin != expected:
         raise ValueError("dev image lacks the matching prebuilt RocksDB; run scripts/cargo-dev --build")
     state = tomllib.loads((root / "crates/arroyo-state/Cargo.toml").read_text())
@@ -47,20 +48,16 @@ def build_mode(root, image_pin, args, env):
             return "1"
     if args and args[0] == "bench":
         profile = "bench"
-    if profile not in {"dev", "test"} or target != pin["target"]:
+    if profile not in {"dev", "test", "release", "bench"} or target != pin["target"]:
         return "1"
     if any((root / ".cargo" / name).exists() for name in ("config", "config.toml")):
         return "1"
-    workspace = tomllib.loads((root / "Cargo.toml").read_text())
-    profiles = workspace.get("profile", {})
-    for settings in (profiles.get("dev", {}), profiles.get(profile, {})):
-        native_settings = [settings, settings.get("build-override", {})]
-        native_settings.extend(settings.get("package", {}).get(key, {}) for key in ("*", "librocksdb-sys"))
-        for native in native_settings:
-            if native.get("opt-level", 0) != 0 or native.get("debug", "line-tables-only") != "line-tables-only":
-                return "1"
+    # Actual OPT_LEVEL/DEBUG are available only when Cargo executes build.rs.
+    # The runtime selector validates them, including release host dependencies.
     for name in env:
         if name.startswith("CARGO_PROFILE_") and not name.endswith("_INCREMENTAL"):
+            return "1"
+        if (name != "CC_ENABLE_DEBUG_OUTPUT" and name.startswith(("CC_", "CXX_", "CFLAGS_", "CXXFLAGS_"))) or name in {"HOST_CC", "HOST_CXX", "TARGET_CC", "TARGET_CXX", "HOST_CFLAGS", "HOST_CXXFLAGS", "TARGET_CFLAGS", "TARGET_CXXFLAGS", "CRATE_CC_NO_DEFAULTS"}:
             return "1"
         if name in {"RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "CARGO_BUILD_TARGET", "CC", "CXX", "CFLAGS", "CXXFLAGS", "ROCKSDB_CXX_STD"}:
             return "1"

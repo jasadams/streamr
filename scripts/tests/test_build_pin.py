@@ -1,0 +1,180 @@
+"""Input freeze and actual Cargo native dependency proof regression checks."""
+import importlib.machinery
+import importlib.util
+import json
+import os
+import shutil
+from pathlib import Path
+import subprocess
+import tempfile
+import unittest
+from unittest.mock import patch
+
+
+loader = importlib.machinery.SourceFileLoader("build_pin", str(Path(__file__).parents[1] / "build-pin"))
+spec = importlib.util.spec_from_loader(loader.name, loader)
+pin = importlib.util.module_from_spec(spec)
+loader.exec_module(pin)
+
+
+class FreezeTests(unittest.TestCase):
+    def test_freezes_dirty_and_untracked_inputs_and_explicit_ui(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = root / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            (repo / "Cargo.toml").write_text("original")
+            subprocess.run(["git", "-C", str(repo), "add", "Cargo.toml"], check=True)
+            (repo / "Cargo.toml").write_text("dirty")
+            (repo / "new.rs").write_text("untracked")
+            assets = root / "assets"
+            assets.mkdir()
+            (assets / "index.html").write_text("actual built UI")
+            source = root / "snapshot"
+            files = pin.freeze(repo, source, assets)
+            self.assertEqual(files, pin.inventory(source))
+            self.assertEqual((source / "Cargo.toml").read_text(), "dirty")
+            self.assertEqual((source / "new.rs").read_text(), "untracked")
+            self.assertFalse((source / ".git").exists())
+            (repo / "Cargo.toml").write_text("later edit")
+            self.assertEqual((source / "Cargo.toml").read_text(), "dirty")
+
+    def test_rejects_external_symlink(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = root / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            (root / "external").write_text("outside input")
+            (repo / "linked").symlink_to(root / "external")
+            with self.assertRaisesRegex(ValueError, "External symlink"):
+                pin.freeze(repo, root / "snapshot", None)
+
+    def test_compiled_inventory_excludes_receipt_only_script_edits(self):
+        self.assertTrue(pin.compiled("crates/arroyo-state/src/lib.rs"))
+        self.assertTrue(pin.compiled("Cargo.lock"))
+        self.assertFalse(pin.compiled("scripts/build-pin"))
+        self.assertFalse(pin.compiled("docs/milestone-3-status.md"))
+
+
+class NativeProofTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.target = self.root / "target"
+        self.profile = self.target / "milestone2-runtime/release"
+        self.fps = self.profile / ".fingerprint"
+        (self.profile / "deps").mkdir(parents=True)
+        self.binary = self.profile / "arroyo"
+        self.binary.write_bytes(b"ELF fixture")
+        os.link(self.binary, self.profile / "deps/arroyo-cli")
+        self.artifact = {"executable": "/app/target/milestone2-runtime/release/arroyo", "profile": {"opt_level": "3"}}
+        self.events = [{"reason": "compiler-artifact", "package_id": "arroyo-openapi", "target": {"kind": ["custom-build"]},
+            "filenames": ["/app/target/milestone2-runtime/release/build/arroyo-openapi-api/build-script-build"]}]
+        self.image_native = {"profiles": {}}
+        self.fp("arroyo-cli/bin-arroyo", 1, [[0, "arroyo_state", False, 2], [0, "build_script_build", False, 6]])
+        self.fp("arroyo-state-state/lib-arroyo_state", 2, [[0, "rocksdb", False, 3]])
+        self.fp("rocksdb-rock/lib-rocksdb", 3, [[0, "librocksdb_sys", False, 4]])
+        self.fp("arroyo-openapi-api/build-script-build-script-build", 6, [[0, "librocksdb_sys", False, 5]])
+        self.native("runtime", "release", "3", 4)
+        self.native("host", "release-host", "0", 5)
+
+    def fp(self, name, value, deps):
+        path = self.fps / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(value.to_bytes(8, "little").hex())
+        path.with_suffix(".json").write_text(json.dumps({"deps": deps}))
+
+    def native(self, suffix, selection, opt, value):
+        self.fp(f"librocksdb-sys-{suffix}/lib-librocksdb_sys", value, [])
+        out = self.profile / f"build/librocksdb-sys-{suffix}/out"
+        out.mkdir(parents=True)
+        container_out = "/app/target/" + str(out.relative_to(self.target))
+        (out.parent / "output").write_text("cargo:rustc-link-search=native=/opt/streamr-rocksdb/" + selection + "/lib")
+        (out.parent / "stderr").write_text("streamr-rocksdb: " + json.dumps({"mode": "prebuilt", "selection": selection,
+            "opt_level": opt, "debug": "false"}) + "\n")
+        rlib = self.profile / f"deps/liblibrocksdb_sys-{suffix}.rlib"
+        rlib.write_bytes(b"rlib fixture")
+        (self.profile / f"deps/librocksdb_sys-{suffix}.d").write_text("# env-dep:OUT_DIR=" + container_out + "\n")
+        self.events.extend([
+            {"reason": "compiler-artifact", "target": {"name": "librocksdb_sys", "kind": ["lib"]},
+             "filenames": ["/app/target/" + str(rlib.relative_to(self.target))], "profile": {"opt_level": opt}},
+            {"reason": "build-script-executed", "package_id": "librocksdb-sys", "out_dir": container_out,
+             "linked_paths": ["native=/opt/streamr-rocksdb/" + selection + "/lib"]},
+        ])
+        self.image_native["profiles"][selection] = {"archive_sha256": suffix, "receipt": {"archive_sha256": suffix,
+            "profile": {"opt-level": opt, "debug": "false"}}}
+
+    def proof(self):
+        return pin.native_proof(self.events, self.target, self.artifact, self.root, self.image_native)
+
+    def test_runtime_o3_and_host_o0_are_separately_proven_and_preserved(self):
+        proof = self.proof()
+        runtime = next(m for m in proof["mappings"] if m["opt_level"] == "3")
+        host = next(m for m in proof["mappings"] if m["opt_level"] == "0")
+        self.assertIn(runtime["fingerprint"], proof["runtime_closure"])
+        self.assertNotIn(host["fingerprint"], proof["runtime_closure"])
+        self.assertIn(host["fingerprint"], proof["openapi_host_closures"][0])
+        for name, digest in proof["preserved_files"].items():
+            self.assertEqual(pin.sha(self.root / "native-proof" / name), digest)
+
+    def test_wrong_archive_optimization_is_rejected(self):
+        self.image_native["profiles"]["release"]["receipt"]["profile"]["opt-level"] = "0"
+        with self.assertRaisesRegex(ValueError, "archive differs"):
+            self.proof()
+
+    def test_wrong_runtime_dependency_is_rejected(self):
+        self.fp("rocksdb-rock/lib-rocksdb", 3, [[0, "librocksdb_sys", False, 5]])
+        with self.assertRaisesRegex(ValueError, "runtime optimization differs"):
+            self.proof()
+
+    def test_native_archive_hash_mismatch_is_rejected(self):
+        self.image_native["profiles"]["release"]["archive_sha256"] = "modified"
+        with self.assertRaisesRegex(ValueError, "archive hash differs"):
+            self.proof()
+
+
+class CleanupTests(unittest.TestCase):
+    def test_helper_removed_after_interruption(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            ok = subprocess.CompletedProcess([], 0, stdout="", stderr="")
+            with patch.object(pin.subprocess, "run", side_effect=[KeyboardInterrupt(), ok]) as mocked:
+                with self.assertRaises(KeyboardInterrupt):
+                    pin.owned_image_run(["podman", "run", "--rm", "image", "true"], root, "helper")
+            receipt = json.loads((root / "helper-container.json").read_text())
+            self.assertEqual(receipt["cleanup"]["exit_code"], 0)
+            self.assertIn("--name", mocked.call_args_list[0].args[0])
+            self.assertEqual(mocked.call_args_list[1].args[0][-1], receipt["container"])
+
+    def test_database_removed_when_cargo_removal_times_out(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            ok = subprocess.CompletedProcess([], 0, stdout="", stderr="")
+            with patch.object(pin.subprocess, "run", side_effect=[subprocess.TimeoutExpired("podman", 30), ok]) as mocked:
+                with self.assertRaisesRegex(ValueError, "cleanup failed"):
+                    pin.cleanup_owned(root, "cargo-owned", "database-owned")
+            self.assertEqual(mocked.call_count, 2)
+            self.assertIsNone(json.loads((root / "build-container-cleanup.json").read_text())["exit_code"])
+            self.assertEqual(json.loads((root / "build-db-cleanup.json").read_text())["exit_code"], 0)
+
+
+class LauncherTests(unittest.TestCase):
+    def test_launcher_preserves_current_executable_identity(self):
+        # readlink observes its own /proc/self/exe, matching Rust current_exe().
+        # Invoking it through ld-linux directly fails this check.
+        with tempfile.TemporaryDirectory() as directory:
+            package = Path(directory)
+            (package / "bin").mkdir()
+            (package / "lib").mkdir()
+            executable = package / "bin/arroyo"
+            shutil.copy2(shutil.which("readlink"), executable)
+            pin.write_launcher(package)
+            result = subprocess.check_output([str(package / "bin/run-arroyo"), "/proc/self/exe"], text=True).strip()
+            self.assertEqual(result, str(executable))
+
+
+if __name__ == "__main__":
+    unittest.main()

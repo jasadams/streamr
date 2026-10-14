@@ -1,0 +1,76 @@
+#!/usr/bin/env python3
+"""Select a verified archive from actual build-script settings, never CLI guesses."""
+import hashlib
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+TRACKED = ('STREAMR_ROCKSDB_SOURCE_REASON', 'ROCKSDB_COMPILE', 'ROCKSDB_LIB_DIR', 'ROCKSDB_STATIC', 'CC', 'CXX', 'CFLAGS', 'CXXFLAGS', 'ROCKSDB_CXX_STD', 'CARGO_ENCODED_RUSTFLAGS')
+
+def select(root, env):
+    pin = json.loads((root / 'manifest.json').read_text())
+    if env.get('ROCKSDB_COMPILE', '').lower() in ('1', 'true'):
+        reason = env.get('STREAMR_ROCKSDB_SOURCE_REASON')
+        if not reason:
+            raise ValueError('source build requires STREAMR_ROCKSDB_SOURCE_REASON')
+        return None, reason
+    if env.get('CARGO_PKG_VERSION') != pin['version']:
+        raise ValueError('native crate version differs from pinned source')
+    features = sorted(k.removeprefix('CARGO_FEATURE_').lower().replace('_', '-') for k in env if k.startswith('CARGO_FEATURE_'))
+    if features != sorted(pin['features']):
+        raise ValueError(f'native features {features} differ from pinned {pin["features"]}; select source mode with a reason')
+    if env.get('TARGET') != pin['target']:
+        raise ValueError('native target differs from image; select source mode with a reason')
+    overrides = [key for key in env if key in ('CC', 'CXX', 'CFLAGS', 'CXXFLAGS', 'ROCKSDB_CXX_STD', 'HOST_CC', 'HOST_CXX', 'TARGET_CC', 'TARGET_CXX', 'HOST_CFLAGS', 'HOST_CXXFLAGS', 'TARGET_CFLAGS', 'TARGET_CXXFLAGS', 'CRATE_CC_NO_DEFAULTS') or (key != 'CC_ENABLE_DEBUG_OUTPUT' and key.startswith(('CC_', 'CXX_', 'CFLAGS_', 'CXXFLAGS_')))]
+    if overrides:
+        raise ValueError(f'native compiler overrides {overrides}; select source mode with a reason')
+    flags = env.get('CARGO_ENCODED_RUSTFLAGS', '').split('\x1f')
+    if flags != pin['rustflags']:
+        raise ValueError('native Rust flags differ from image recipe; select source mode with a reason')
+    if sorted(env.get('CARGO_CFG_TARGET_FEATURE', '').split(',')) != pin['target_features']:
+        raise ValueError('native target features differ from image recipe; select source mode with a reason')
+    settings = {'opt-level': env.get('OPT_LEVEL'), 'debug': env.get('DEBUG')}
+    matches = [name for name, profile in pin['profiles'].items() if profile == settings]
+    if len(matches) != 1:
+        raise ValueError(f'unsupported actual native settings {settings}; select source mode with a reason')
+    name = matches[0]
+    receipt = json.loads((root / name / 'receipt.json').read_text())
+    archive = root / name / 'lib/librocksdb.a'
+    with archive.open('rb') as archive_file:
+        digest = hashlib.file_digest(archive_file, 'sha256').hexdigest()
+    if digest != receipt['archive_sha256']:
+        raise ValueError('native archive checksum mismatch; rebuild image')
+    if receipt.get('source_checksum') != pin['checksum'] or receipt.get('lz4_checksum') != pin['lz4_checksum']:
+        raise ValueError('native source or compression checksum differs from image pin')
+    for key in ('rustc', 'rustc_commit', 'cxx', 'target', 'features', 'profile', 'rustflags', 'target_features'):
+        expected = pin['profiles'][name] if key == 'profile' else pin[key]
+        if receipt[key] != expected:
+            raise ValueError(f'native receipt {key} differs from image pin')
+    rustc = subprocess.check_output(['rustc', '-Vv'], text=True)
+    cxx = subprocess.check_output(['c++', '--version'], text=True).splitlines()[0]
+    if f"release: {pin['rustc']}\n" not in rustc or f"commit-hash: {pin['rustc_commit']}\n" not in rustc or f"host: {pin['target']}\n" not in rustc or cxx != pin['cxx']:
+        raise ValueError('native toolchain differs from image recipe')
+    return archive.parent, name
+
+if __name__ == '__main__':
+    try:
+        env = dict(os.environ)
+        directory, reason = select(Path('/opt/streamr-rocksdb'), env)
+        print('cargo:rerun-if-changed=/usr/local/bin/streamr-rocksdb-select', flush=True)
+        print('cargo:rerun-if-changed=/opt/streamr-rocksdb/manifest.json', flush=True)
+        for key in set(TRACKED) | {key for key in env if key.startswith(('CC_', 'CXX_', 'CFLAGS_', 'CXXFLAGS_', 'HOST_', 'TARGET_'))}:
+            print(f'cargo:rerun-if-env-changed={key}', flush=True)
+        print('streamr-rocksdb: ' + json.dumps({'mode': 'prebuilt' if directory else 'source', 'selection': reason, 'target': env.get('TARGET'), 'opt_level': env.get('OPT_LEVEL'), 'debug': env.get('DEBUG')}), file=sys.stderr)
+        if directory:
+            print(f'cargo:rerun-if-changed={directory.parent / "receipt.json"}', flush=True)
+            print(f'cargo:rerun-if-changed={directory / "librocksdb.a"}', flush=True)
+            env.update(ROCKSDB_LIB_DIR=str(directory), ROCKSDB_STATIC='1')
+            print('cargo:rustc-link-lib=dylib=stdc++', flush=True)
+        else:
+            env.pop('ROCKSDB_LIB_DIR', None)
+            env.pop('ROCKSDB_STATIC', None)
+        os.execve(sys.argv[1], sys.argv[1:], env)
+    except (ValueError, KeyError, OSError) as error:
+        sys.exit(f'Native selection error: {error}')
