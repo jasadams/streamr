@@ -182,4 +182,12 @@ Arc ownership error in cleanup; no baseline measurement resulted. The correction
 uses the existing `Arc::try_unwrap` cleanup pattern. Its full compiler log and failed
 source patch are preserved. The initial separately queued no-run command was cancelled
 before starting (143), then replaced by a combined build/pin/run reservation.
-Publication, independent final review and current-head CI remain coordinator-owned.
+Final independent source/evidence review approved publication. The reviewed
+implementation is `a9039a16eaacc0d504526f381d7ef7db5de66ecb` in
+[PR #48](https://github.com/jasadams/streamr/pull/48). All six reported CI checks
+passed on that head: Rust formatting, Web UI lint and tooling for push/PR runs.
+These active workflows do not execute Rust tests; the serial local results above
+remain the executable validation evidence. This publication-record update changes
+no tested executable source. The coordinator verifies final current-head CI before
+the Trakkt green handoff; merge-sweeper owns merge. No deferrals; broader STR-103
+qualification and server/browser batch QA remain separate.

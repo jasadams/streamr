@@ -5,7 +5,7 @@
 - Acceptance: measured growing/churn TTL backlog across deletion batches, bounded logical progress with safe invalidation, exact output/generation/cancellation/resource/fresh-worker recovery, affected-container gates, independent review and green open PR.
 - Candidate retains one optionally admitted logical key during a serial flush. Repeated alternating dev-profile diagnostics reduce deleted-key skips from 4,512 to 47 for 192 entries and about 44,000 to 191 for 768; seek counts are unchanged. Timing includes variation and a late-interval regression; no uniform latency or production speedup claim.
 - Instrumentation-free locked worker check, strict Clippy and fmt pass; 48 aggregate/TTL and three store tests pass serially, including six exact backend/budget/recovery combinations and cancellation/refusal/retry. Initial fixture admission failure and subsequent abort are preserved separately; no failed attempt relabeled passed.
-- Next: final independent source/evidence review, publish and verify current-head CI. Evidence: `/home/jason/qa-evidence/str115-ttl-20261014/`; [report](str-115-validation.md). No user decision pending; STR-103 remains separate and unqualified.
+- Final independent source/evidence review approved. Published [PR #48](https://github.com/jasadams/streamr/pull/48); six formatting/tooling CI checks passed on implementation head `a9039a16`. Awaiting merge-sweeper after final current-head CI verification; this publication-record edit changes no tested executable source. Evidence: `/home/jason/qa-evidence/str115-ttl-20261014/`; [report](str-115-validation.md). No deferrals or user decision pending; STR-103 remains separate and unqualified.
 
 ## Active STR-111 calendar recovery — 2026-10-14
 
