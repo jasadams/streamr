@@ -63,6 +63,12 @@ def freeze(repo, destination, ui_assets):
     names = set(git(repo, "ls-files", "-z").decode().split("\0"))
     names.update(git(repo, "ls-files", "--others", "--exclude-standard", "-z").decode().split("\0"))
     names.discard("")
+    # Cargo consumes these files even when a checkout ignores local overrides.
+    # Preserve them so snapshot preflight cannot silently select an archive
+    # using different settings from the invoking checkout.
+    for name in (".cargo/config", ".cargo/config.toml"):
+        if (repo / name).exists() or (repo / name).is_symlink():
+            names.add(name)
     destination.mkdir()
     originals = {}
     for name in sorted(names):

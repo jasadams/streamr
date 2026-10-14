@@ -8,6 +8,74 @@ import sys
 import tomllib
 
 
+def profiles_match_archive(workspace, selected, pin):
+    """Conservatively catch unsupported native settings before launching Cargo.
+
+    Cargo's execution-time selector remains authoritative: this check models
+    only profile inheritance and native package/build overrides, never guesses
+    whether a particular dependency will be used on the host or target.
+    """
+    profiles = workspace.get("profile", {})
+    active = set()
+
+    def resolve(name):
+        if name in active:
+            return None
+        active.add(name)
+        table = profiles.get(name, {})
+        parent = table.get("inherits", {"test": "dev", "bench": "release"}.get(name))
+        if parent:
+            inherited = resolve(parent)
+            if inherited is None:
+                return None
+            result = dict(inherited)
+            # Nested package/build overrides inherit independently.
+            for nested in ("package", "build-override"):
+                result[nested] = dict(inherited.get(nested, {})) | table.get(nested, {})
+                if nested == "package":
+                    for package, override in table.get(nested, {}).items():
+                        result[nested][package] = inherited.get(nested, {}).get(package, {}) | override
+        elif name in ("dev", "release"):
+            result = {"opt-level": 0 if name == "dev" else 3,
+                      "debug": "line-tables-only" if name == "dev" else False}
+        else:
+            return None
+        result.update({key: value for key, value in table.items() if key not in ("package", "build-override")})
+        if not parent:
+            result.update({key: table[key] for key in ("package", "build-override") if key in table})
+        active.remove(name)
+        return result
+
+    settings = resolve(selected)
+    if settings is None:
+        return False
+    supported = {(profile["opt-level"], profile["debug"]) for profile in pin["profiles"].values()}
+
+    def matches(table):
+        debug = table["debug"]
+        if debug in (False, 0, "none", "0", "false"):
+            native_debug = "false"
+        elif debug in (True, 1, 2, "1", "2", "true", "limited", "full", "line-tables-only", "line-directives-only"):
+            native_debug = "true"
+        else:
+            return False
+        return (str(table["opt-level"]), native_debug) in supported
+
+    runtime = {key: settings[key] for key in ("opt-level", "debug")}
+    host = {"opt-level": 0, "debug": False} | settings.get("build-override", {})
+    if not matches(runtime) or not matches(host):
+        return False
+    package_overrides = settings.get("package", {})
+    wildcard = package_overrides.get("*", {})
+    for name in ("librocksdb-sys", "lz4-sys"):
+        relevant = [value for key, value in package_overrides.items()
+                    if key == name or key.startswith((name + ":", name + "@"))]
+        for override in relevant or [{}]:
+            if not matches(runtime | wildcard | override) or not matches(host | wildcard | override):
+                return False
+    return True
+
+
 def build_mode(root, image_pin, args, env):
     pin = json.loads((root / "docker/rocksdb-prebuilt.json").read_text())
     packages = tomllib.loads((root / "Cargo.lock").read_text())["package"]
@@ -27,9 +95,9 @@ def build_mode(root, image_pin, args, env):
         raise ValueError("RocksDB features differ from the prebuilt image; update its native build contract")
     if env.get("ROCKSDB_COMPILE", "").lower() in {"1", "true"}:
         return "1"
-    # Preserve release/custom-profile native optimization by using the original
-    # source build. The prebuilt archive has the development O0 configuration.
-    profile = "dev"
+    # Parse the requested profile for conservative preflight; the executable
+    # selector later validates the actual host/runtime native settings.
+    profile = {"test": "test", "bench": "bench"}.get(args[0] if args else "", "dev")
     target = pin["target"]
     for i, arg in enumerate(args):
         if arg == "--":
@@ -46,14 +114,20 @@ def build_mode(root, image_pin, args, env):
             target = arg.split("=", 1)[1]
         elif arg == "--config" or arg.startswith("--config="):
             return "1"
-    if args and args[0] == "bench":
-        profile = "bench"
-    if profile not in {"dev", "test", "release", "bench"} or target != pin["target"]:
+    if target != pin["target"]:
         return "1"
     if any((root / ".cargo" / name).exists() for name in ("config", "config.toml")):
         return "1"
-    # Actual OPT_LEVEL/DEBUG are available only when Cargo executes build.rs.
-    # The runtime selector validates them, including release host dependencies.
+    workspace = tomllib.loads((root / "Cargo.toml").read_text())
+    if not profiles_match_archive(workspace, profile, pin):
+        return "1"
+    replacements = list(workspace.get("replace", {}))
+    for registry in workspace.get("patch", {}).values():
+        for name, replacement in registry.items():
+            if name in {"librocksdb-sys", "lz4-sys"} or replacement.get("package") in {"librocksdb-sys", "lz4-sys"}:
+                return "1"
+    if any(key.split(":", 1)[0] in {"librocksdb-sys", "lz4-sys"} for key in replacements):
+        return "1"
     for name in env:
         if name.startswith("CARGO_PROFILE_") and not name.endswith("_INCREMENTAL"):
             return "1"

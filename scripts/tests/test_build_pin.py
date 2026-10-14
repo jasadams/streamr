@@ -51,6 +51,29 @@ class FreezeTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "External symlink"):
                 pin.freeze(repo, root / "snapshot", None)
 
+    def test_ignored_cargo_overrides_are_frozen(self):
+        for filename in ("config", "config.toml"):
+            with self.subTest(filename=filename), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                repo = root / "repo"
+                (repo / ".cargo").mkdir(parents=True)
+                (repo / ".gitignore").write_text(".cargo/\n")
+                override = repo / ".cargo" / filename
+                override.write_text('[build]\nrustflags = ["-C", "target-cpu=native"]\n')
+                subprocess.run(["git", "init", "-q", str(repo)], check=True)
+                # Verify this is the ignored-input case, not the ordinary
+                # nonignored untracked input path exercised above.
+                subprocess.run(["git", "-C", str(repo), "check-ignore", "-q", str(override)], check=True)
+                assets = root / "assets"
+                assets.mkdir()
+                (assets / "index.html").write_text("actual built UI")
+                source = root / "snapshot"
+                files = pin.freeze(repo, source, assets)
+                name = ".cargo/" + filename
+                self.assertEqual(files[name], pin.sha(override))
+                self.assertEqual((source / name).read_text(), override.read_text())
+                self.assertTrue(pin.compiled(name))
+
     def test_compiled_inventory_excludes_receipt_only_script_edits(self):
         self.assertTrue(pin.compiled("crates/arroyo-state/src/lib.rs"))
         self.assertTrue(pin.compiled("Cargo.lock"))

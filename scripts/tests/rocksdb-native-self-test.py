@@ -3,6 +3,7 @@
 import hashlib
 import importlib.machinery
 import json
+import tomllib
 from pathlib import Path
 import tempfile
 import os
@@ -14,6 +15,44 @@ from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
 selector = importlib.machinery.SourceFileLoader('rocksdb_select', str(ROOT / 'docker/rocksdb-select')).load_module()
+
+preflight = importlib.machinery.SourceFileLoader('rocksdb_mode', str(ROOT / 'docker/rocksdb-build-mode.py')).load_module()
+
+class ProfilePreflight(unittest.TestCase):
+    def setUp(self):
+        self.pin = json.loads((ROOT / 'docker/rocksdb-prebuilt.json').read_text())
+
+    def test_baselines_and_matching_custom_profiles(self):
+        workspace = tomllib.loads((ROOT / 'Cargo.toml').read_text())
+        for profile in ('dev', 'test', 'release', 'bench'):
+            self.assertTrue(preflight.profiles_match_archive(workspace, profile, self.pin), profile)
+        workspace.setdefault('profile', {})['fast-check'] = {'inherits':'dev','opt-level':3}
+        self.assertTrue(preflight.profiles_match_archive(workspace, 'fast-check', self.pin))
+        workspace['profile']['lean'] = {'inherits':'release', 'opt-level':0, 'debug':False}
+        self.assertTrue(preflight.profiles_match_archive(workspace, 'lean', self.pin))
+
+    def test_unsupported_native_overrides(self):
+        overrides = [
+            {'opt-level':2}, {'debug':'unknown'},
+            {'build-override':{'opt-level':2}},
+            {'package':{'*':{'opt-level':1}}},
+            {'package':{'librocksdb-sys':{'opt-level':2}}},
+            {'package':{'librocksdb-sys:0.17.3+10.4.2':{'opt-level':'s'}}},
+            {'package':{'lz4-sys':{'opt-level':2}}},
+        ]
+        for override in overrides:
+            with self.subTest(override=override):
+                self.assertFalse(preflight.profiles_match_archive({'profile':{'dev':override}}, 'test', self.pin))
+        self.assertFalse(preflight.profiles_match_archive({'profile':{'a':{'inherits':'b'}, 'b':{'inherits':'a'}}}, 'a', self.pin))
+
+    def test_inherited_native_package_fields_are_checked(self):
+        workspace = {'profile':{'dev':{'package':{'librocksdb-sys':{'opt-level':2}}},
+                    'child':{'inherits':'dev', 'package':{'librocksdb-sys':{'debug':True}}}}}
+        self.assertFalse(preflight.profiles_match_archive(workspace, 'child', self.pin))
+
+    def test_non_native_overrides_do_not_force_source(self):
+        workspace = {'profile':{'release':{'debug':1,'package':{'unrelated-crate':{'opt-level':2}}}}}
+        self.assertTrue(preflight.profiles_match_archive(workspace, 'release', self.pin))
 
 class Selection(unittest.TestCase):
     def setUp(self):

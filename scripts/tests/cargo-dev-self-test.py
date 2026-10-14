@@ -261,8 +261,11 @@ sys.exit(37)
         manifest = self.root / 'Cargo.toml'
         manifest.write_text(manifest.read_text().replace('[profile.dev]', '[profile.dev]\nopt-level = 2'))
         result = self.run_wrapper('build')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(any(r['args'][0] == 'run' for r in self.records()))
+        result = self.run_wrapper('build', STREAMR_ROCKSDB_SOURCE_REASON='unsupported manifest profile')
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn('ROCKSDB_COMPILE=0', self.records()[-1]['args'])
+        self.assertIn('ROCKSDB_COMPILE=1', self.records()[-1]['args'])
 
     def test_mismatched_lock_or_features_fails_before_build(self):
         lock = self.root / 'Cargo.lock'
