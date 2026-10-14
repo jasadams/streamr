@@ -19,6 +19,9 @@ import time
 import uuid
 
 
+PACKAGING_FEATURES = ["arroyo-api/embedded-ui", "arroyo-openapi/embedded-ui"]
+
+
 def require(condition, message):
     if not condition:
         raise ValueError(message)
@@ -475,7 +478,7 @@ def main():
         env["STREAMR_ROCKSDB_SOURCE_REASON"] = args.native_source_reason
     # rust-embed normally reads dev assets from the checkout. Packaging opts in
     # to embedding the declared actual UI without changing ordinary dev builds.
-    cargo_args = ["build", "--locked", "-p", "arroyo", "--bin", "arroyo", "--features", "arroyo-api/embedded-ui",
+    cargo_args = ["build", "--locked", "-p", "arroyo", "--bin", "arroyo", "--features", ",".join(PACKAGING_FEATURES),
                   "--message-format=json", "--timings"]
     if args.profile == "release":
         cargo_args.append("--release")
@@ -488,7 +491,7 @@ def main():
                  "database_image_id": database_image, "native_mode": "source" if native_mode == "1" else "prebuilt",
                  "native_source_reason": args.native_source_reason, "shared_target": str(target),
                  "cache_namespace": cache_namespace(env),
-                 "cargo_features": ["arroyo-api/embedded-ui"],
+                 "cargo_features": PACKAGING_FEATURES,
                  "environment_overrides": environment_overrides(env)}
     write(root / "build-selection.json", selection)
     print(json.dumps(selection, sort_keys=True), flush=True)
