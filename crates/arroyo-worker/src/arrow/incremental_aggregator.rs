@@ -2,7 +2,7 @@
 mod calendar_native;
 use calendar_native::{CalendarAggregate, CalendarContributionChange, CalendarInput};
 
-use crate::arrow::aggregate_codec::{EncodedGroup, decode_group, encode_group};
+use crate::arrow::aggregate_codec::{EncodedGroup, GroupCodec, decode_group, encode_group};
 use crate::arrow::aggregate_store::{AggregateScope, AggregateStore, AggregateStoreLimits};
 use crate::arrow::decode_aggregate;
 use crate::arrow::updating_cache::{Key, UpdatingCache};
@@ -383,6 +383,7 @@ pub struct IncrementalAggregatingFunc {
     new_generation: u64,
     native_config: Option<AggregateStateConfig>,
     native_store: Option<AggregateStore>,
+    native_codec: Option<GroupCodec>,
     retain_indefinitely: bool,
     native_schema_identity: Vec<u8>,
     native_append_only: bool,
@@ -688,6 +689,12 @@ fn native_collection_decode_bound(types: &[DataType], encoded_bytes: usize) -> R
 }
 
 impl IncrementalAggregatingFunc {
+    fn native_group_codec(&self) -> Result<&GroupCodec> {
+        self.native_codec
+            .as_ref()
+            .context("native aggregate codec is missing")
+    }
+
     fn native_collection_budget(
         &self,
         scope: &AggregateScope<'_>,
@@ -1180,12 +1187,8 @@ impl IncrementalAggregatingFunc {
             .get(&storage_key)
             .await?
             .map(|bytes| {
-                decode_group(
-                    &bytes,
-                    &self.native_state_types(),
-                    &self.native_output_types(),
-                    scope.limits().value_bytes,
-                )
+                self.native_group_codec()?
+                    .decode(&bytes, scope.limits().value_bytes)
             })
             .transpose()?;
         let live_rows_key = self
@@ -1403,7 +1406,9 @@ impl IncrementalAggregatingFunc {
             accumulator_state: self.native_state_values(&mut accumulators)?,
             last_emitted: previous.and_then(|group| group.last_emitted),
         };
-        let encoded = encode_group(&next, scope.limits().value_bytes)?;
+        let encoded = self
+            .native_group_codec()?
+            .encode(&next, scope.limits().value_bytes)?;
         scope.put(&storage_key, &encoded)?;
         scope.put(&native_group_key(b'D', group_key)?, &[1])?;
         if !self.retain_indefinitely {
@@ -1563,12 +1568,9 @@ impl IncrementalAggregatingFunc {
             let group_key = &key[13..];
             let storage_key = native_group_key(b'G', group_key)?;
             if let Some(bytes) = scope.get(&storage_key).await? {
-                let mut group = decode_group(
-                    &bytes,
-                    &self.native_state_types(),
-                    &self.native_output_types(),
-                    scope.limits().value_bytes,
-                )?;
+                let mut group = self
+                    .native_group_codec()?
+                    .decode(&bytes, scope.limits().value_bytes)?;
                 if group.last_update_nanos.saturating_add(ttl_nanos) == deadline {
                     let old_generation = group.generation;
                     group.generation = group
@@ -1581,7 +1583,9 @@ impl IncrementalAggregatingFunc {
                     group.last_update_nanos = now;
                     scope.put(
                         &storage_key,
-                        &encode_group(&group, scope.limits().value_bytes)?,
+                        &self
+                            .native_group_codec()?
+                            .encode(&group, scope.limits().value_bytes)?,
                     )?;
                     scope.put(&native_group_key(b'D', group_key)?, &[1])?;
                     if self.native_has_group_keys() {
@@ -1824,12 +1828,9 @@ impl IncrementalAggregatingFunc {
                 let group_key = dirty_key[5..].to_vec();
                 let group_storage = native_group_key(b'G', &group_key)?;
                 if let Some(bytes) = scope.get(&group_storage).await? {
-                    let mut group = decode_group(
-                        &bytes,
-                        &self.native_state_types(),
-                        &self.native_output_types(),
-                        scope.limits().value_bytes,
-                    )?;
+                    let mut group = self
+                        .native_group_codec()?
+                        .decode(&bytes, scope.limits().value_bytes)?;
                     let mut accumulators = self.native_accumulators(Some(&group))?;
                     let mut next = Vec::with_capacity(self.aggregates.len());
                     for (index, state) in accumulators.iter_mut().enumerate() {
@@ -1921,7 +1922,9 @@ impl IncrementalAggregatingFunc {
                     }
                     scope.put(
                         &group_storage,
-                        &encode_group(&group, scope.limits().value_bytes)?,
+                        &self
+                            .native_group_codec()?
+                            .encode(&group, scope.limits().value_bytes)?,
                     )?;
                 }
                 scope.delete(&dirty_key)?;
@@ -3456,7 +3459,7 @@ impl IncrementalAggregatingConstructor {
             Some(key_fields),
         ));
 
-        Ok(IncrementalAggregatingFunc {
+        let mut operator = IncrementalAggregatingFunc {
             flush_interval: Duration::from_micros(config.flush_interval_micros),
             metadata_expr,
             ttl,
@@ -3470,11 +3473,17 @@ impl IncrementalAggregatingConstructor {
             new_generation: 0,
             native_config,
             native_store: None,
+            native_codec: None,
             retain_indefinitely: config.retain_indefinitely == Some(true),
             native_schema_identity,
             native_append_only,
             calendars,
-        })
+        };
+        operator.native_codec = Some(GroupCodec::new(
+            &operator.native_state_types(),
+            &operator.native_output_types(),
+        )?);
+        Ok(operator)
     }
 }
 

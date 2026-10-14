@@ -9,7 +9,7 @@ source revisions, not qualification of the current checkpoint format.
 `checkpoint_inventory.py` reads **one explicitly selected** local checkpoint. It parses the
 controller checkpoint metadata or leader manifest, each native aggregate owner's
 `native-aggregate-v1` table descriptor, the `STRDS001` full logical snapshot
-pages, escaped version-1 state keys, and `STRAGG02` group headers. It validates
+pages, escaped version-1 state keys, and `STRAGG03` group headers. It validates
 namespace/owner/epoch/generation, table schema identity, safe page paths,
 SHA-256 and byte/row counts, sorted unique keys, and recognized key layouts.
 It reports exact `G/D/M/R/E/C` counts and stored value-length min/max/sum per

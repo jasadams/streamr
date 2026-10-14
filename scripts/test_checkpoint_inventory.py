@@ -42,7 +42,7 @@ def make_case(root, mode, *, state_version=1, padding=0):
     namespace = b"\x01\x00" + struct.pack(">III", 0, 1, len(table_bytes)) + table_bytes
     logical_key = b"G" + struct.pack(">I", 1) + b"x"
     key = namespace + logical_key.replace(b"\x00", b"\x00\xff") + b"\x00\x00"
-    value = b"STRAGG02" + struct.pack(">qqqII", 11, 0, 1, 1, 1) + b"ipc"
+    value = b"STRAGG03" + struct.pack(">qqqII", 11, 0, 1, 1, 1) + b"ipc"
     page = b"STRDS001" + struct.pack(">II", len(key), len(value)) + key + value + b"x" * padding
     page_ref = f"{base}/operator-{operator}/table-{table}-000/disk-fixture-000000.bin"
     filemeta = (bfield(1, page_ref.encode()) + nfield(2, len(page))
