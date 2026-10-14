@@ -3,7 +3,9 @@ mod calendar_native;
 use calendar_native::{CalendarAggregate, CalendarContributionChange, CalendarInput};
 
 use crate::arrow::aggregate_codec::{EncodedGroup, GroupCodec, decode_group, encode_group};
-use crate::arrow::aggregate_store::{AggregateScope, AggregateStore, AggregateStoreLimits};
+use crate::arrow::aggregate_store::{
+    AggregateExpiryProgress, AggregateScope, AggregateStore, AggregateStoreLimits,
+};
 use crate::arrow::decode_aggregate;
 use crate::arrow::updating_cache::{Key, UpdatingCache};
 use anyhow::{Context, Result, anyhow, bail, ensure};
@@ -1545,7 +1547,7 @@ impl IncrementalAggregatingFunc {
     /// One admitted page of due expirations. The caller drains these pages in
     /// the same flush, yielding and emitting bounded changelog batches between
     /// pages so finite TTL does not acquire a new delayed-expiry policy.
-    async fn expire_native(&self) -> Result<bool> {
+    async fn expire_native(&self, progress: Option<&mut AggregateExpiryProgress>) -> Result<bool> {
         if self.retain_indefinitely {
             return Ok(false);
         }
@@ -1573,7 +1575,9 @@ impl IncrementalAggregatingFunc {
             rows_per_chunk > 0,
             "native aggregate budget cannot process one expiry"
         );
-        let mut after = None;
+        let mut after = progress
+            .as_ref()
+            .and_then(|progress| progress.after.clone());
         let mut scope = store.begin().await?;
         let mut processed = 0usize;
         while processed < rows_per_chunk {
@@ -1625,6 +1629,11 @@ impl IncrementalAggregatingFunc {
         }
         if processed > 0 {
             scope.commit().await?;
+            // Commit before publishing an exclusive logical lower bound. A
+            // cancelled/failed flush drops it and the next flush starts at E.
+            if let Some(progress) = progress {
+                progress.after = after.map(|key| key.into_boxed_slice().into_vec());
+            }
         }
         Ok(processed > 0)
     }
@@ -1775,10 +1784,24 @@ impl IncrementalAggregatingFunc {
         // Existing dirty groups are emitted before expiration, matching the
         // legacy flush order (updates first, then TTL retractions).
         self.drain_native_dirty(ctx, collector).await?;
-        while self.expire_native().await? {
+        // Input cannot interleave with this serial flush. Dirty emission only
+        // deletes expiry entries, so no earlier E insertion can be skipped.
+        // Keep only an admitted logical key across fresh per-chunk snapshots;
+        // cancellation, errors, the next flush and recovery all start cold.
+        let store = self
+            .native_store
+            .as_ref()
+            .context("native aggregate store missing")?;
+        let output_bytes = self
+            .native_config
+            .context("native aggregate limits missing")?
+            .max_pending_output_bytes;
+        let mut expiry_progress = store.try_expiry_progress(output_bytes);
+        while self.expire_native(expiry_progress.as_mut()).await? {
             self.drain_native_dirty(ctx, collector).await?;
             tokio::task::yield_now().await;
         }
+        drop(expiry_progress);
         // Each invocation owns at most one admitted cleanup page. Drain the
         // finite backlog through EOF/barriers as well as timer flushes, so an
         // idle keyed group does not retain a tombstone indefinitely.
@@ -7360,6 +7383,660 @@ mod tests {
         );
     }
 
+    fn ttl_keyed_operator() -> IncrementalAggregatingFunc {
+        let mut operator = native_operator();
+        operator.retain_indefinitely = false;
+        operator.ttl = Duration::from_secs(3600);
+        let mut fields = operator.schema_without_metadata.fields().to_vec();
+        fields.insert(0, Arc::new(Field::new("group_key", DataType::Utf8, false)));
+        operator.schema_without_metadata = Arc::new(Schema::new(fields));
+        operator.key_converter = RowConverter::new(vec![SortField::new(DataType::Utf8)]).unwrap();
+        let metadata = StructArray::new(
+            updating_meta_fields(),
+            vec![
+                Arc::new(BooleanArray::from(vec![false])),
+                ScalarValue::FixedSizeBinary(16, None).to_array().unwrap(),
+            ],
+            None,
+        );
+        operator.metadata_expr = Arc::new(Literal::new(ScalarValue::Struct(Arc::new(metadata))));
+        operator
+    }
+
+    async fn ttl_age_group(operator: &IncrementalAggregatingFunc, key: &[u8], deadline: i64) {
+        let store = operator.native_store.as_ref().unwrap();
+        let mut scope = store.begin_point().await.unwrap();
+        let storage_key = native_group_key(b'G', key).unwrap();
+        let mut group = operator
+            .native_group_codec()
+            .unwrap()
+            .decode(
+                &scope.get(&storage_key).await.unwrap().unwrap(),
+                scope.limits().value_bytes,
+            )
+            .unwrap();
+        let ttl = i64::try_from(operator.ttl.as_nanos()).unwrap();
+        scope
+            .delete(&native_expiry_key(group.last_update_nanos.saturating_add(ttl), key).unwrap())
+            .unwrap();
+        group.last_update_nanos = deadline - ttl;
+        scope
+            .put(
+                &storage_key,
+                &operator
+                    .native_group_codec()
+                    .unwrap()
+                    .encode(&group, scope.limits().value_bytes)
+                    .unwrap(),
+            )
+            .unwrap();
+        scope
+            .put(&native_expiry_key(deadline, key).unwrap(), &[1])
+            .unwrap();
+        scope.commit().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn finite_ttl_exact_changelog_and_fresh_worker_recovery() {
+        use arroyo_state::live::{checkpoint, lifecycle::RocksStateConfig, rocks::RocksLiveState};
+        for rocks in [false, true] {
+            for recover in [false, true] {
+                // Existing unit checkpoint fixtures use default global restore
+                // admission. Test tight aggregate admission independently;
+                // recovery uses the ordinary checkpoint fixture pools.
+                for &tight in if recover {
+                    &[false][..]
+                } else {
+                    &[false, true][..]
+                } {
+                    let root = std::env::temp_dir()
+                        .join(format!("str115-recovery-{}", uuid::Uuid::new_v4()));
+                    let remote = root.join("checkpoint");
+                    std::fs::create_dir_all(&remote).unwrap();
+                    // Existing checkpoint regression pools, plus a tighter case.
+                    // Its smaller scan pages keep the existing writer inside the
+                    // tight decoded budget; these fixture values fit both pages.
+                    let original_store = native_test_store();
+                    let original_limits = original_store.limits();
+                    let mandatory_decoded = original_limits.overlay_bytes
+                        + original_limits.value_bytes * 3
+                        + native_test_config().max_pending_output_bytes * 3
+                        + original_store.max_encoded_entry_bytes() * 2
+                        + 128;
+                    let resources = WorkerStateResources::new(ResourceConfig {
+                        max_open_databases: 2,
+                        scan_page_bytes: if tight && rocks {
+                            1024 * 1024
+                        } else {
+                            16 * 1024 * 1024
+                        },
+                        queued_write_bytes: 16 * 1024 * 1024,
+                        decoded_value_bytes: if tight {
+                            mandatory_decoded
+                        } else {
+                            32 * 1024 * 1024
+                        },
+                        ..native_test_store().resources().config().clone()
+                    })
+                    .unwrap();
+                    let mut native = Vec::new();
+                    let mut backends: Vec<Arc<dyn LiveStateBackend>> = Vec::new();
+                    for generation in [0, 1] {
+                        if rocks {
+                            let backend = Arc::new(
+                                RocksLiveState::open(
+                                    RocksStateConfig {
+                                        root: root.join("live"),
+                                        job_id: "ttl-recovery".into(),
+                                        operator_id: "aggregate".into(),
+                                        subtask: 0,
+                                        generation,
+                                        attempt: 0,
+                                    },
+                                    resources.clone(),
+                                )
+                                .await
+                                .unwrap(),
+                            );
+                            backends.push(backend.clone());
+                            native.push(backend);
+                        } else {
+                            backends.push(Arc::new(
+                                MemoryLiveState::bounded(resources.clone(), 8 * 1024 * 1024)
+                                    .unwrap(),
+                            ));
+                        }
+                    }
+                    let ownership = Ownership::PartitionLocal {
+                        subtask: 0,
+                        parallelism: 1,
+                    };
+                    let mut manager =
+                        LiveTableManager::new(backends[0].clone(), ownership.clone()).unwrap();
+                    let table = manager.register(NATIVE_AGGREGATE_TABLE).unwrap();
+                    let namespace = table.namespace().clone();
+                    let limits = AggregateStoreLimits {
+                        page_entries: 2,
+                        ..native_test_store().limits()
+                    };
+                    let mut operator = ttl_keyed_operator();
+                    operator.native_store = Some(
+                        AggregateStore::new(backends[0].clone(), table, resources.clone(), limits)
+                            .unwrap(),
+                    );
+                    let columns: Vec<ArrayRef> = vec![Arc::new(StringArray::from_iter_values(
+                        (0..7).map(|i| format!("k{i}")),
+                    ))];
+                    let rows = operator.key_converter.convert_columns(&columns).unwrap();
+                    let keys: Vec<_> = rows.iter().map(|r| r.as_ref().to_vec()).collect();
+                    let old = batch(&[Some("a")], &[1], &[Some(true)]);
+                    let update = batch(&[Some("z")], &[2], &[Some(true)]);
+                    for key in &keys {
+                        let store = operator.native_store.as_ref().unwrap();
+                        let mut scope = store.begin_point().await.unwrap();
+                        operator
+                            .native_process_event(
+                                &mut scope,
+                                key,
+                                &operator.compute_inputs(&old).unwrap(),
+                                0,
+                                false,
+                                Some(&test_row_id(&old, 0)),
+                            )
+                            .await
+                            .unwrap();
+                        scope.commit().await.unwrap();
+                    }
+                    let mut ctx = native_input_context(old.schema()).await;
+                    let mut output =
+                        SchemaBuilder::from(operator.schema_without_metadata.as_ref().clone());
+                    output.push(Field::new(
+                        UPDATING_META_FIELD,
+                        DataType::Struct(updating_meta_fields()),
+                        false,
+                    ));
+                    ctx.out_schema = Some(Arc::new(
+                        ArroyoSchema::from_schema_unkeyed(Arc::new(output.finish())).unwrap(),
+                    ));
+                    let mut collector = AggregateCollector::default();
+                    operator
+                        .drain_native_dirty(&mut ctx, &mut collector)
+                        .await
+                        .unwrap();
+                    // Real interleaved updates delete old E deadlines and install
+                    // later deadlines, using the established native event path.
+                    for key in &keys[..5] {
+                        let mut scope = operator
+                            .native_store
+                            .as_ref()
+                            .unwrap()
+                            .begin_point()
+                            .await
+                            .unwrap();
+                        operator
+                            .native_process_event(
+                                &mut scope,
+                                key,
+                                &operator.compute_inputs(&update).unwrap(),
+                                0,
+                                false,
+                                Some(&test_row_id(&update, 0)),
+                            )
+                            .await
+                            .unwrap();
+                        scope.commit().await.unwrap();
+                    }
+                    // The sixth key is quiet: expiry must not require new input.
+                    for key in &keys[..6] {
+                        ttl_age_group(&operator, key, 1_000_000_000).await;
+                    }
+                    let mut scope = operator
+                        .native_store
+                        .as_ref()
+                        .unwrap()
+                        .begin()
+                        .await
+                        .unwrap();
+                    // Obsolete due entry for a non-due key must not reset its state.
+                    scope
+                        .put(&native_expiry_key(0, &keys[6]).unwrap(), &[1])
+                        .unwrap();
+                    scope.commit().await.unwrap();
+                    if recover {
+                        operator
+                            .drain_native_dirty(&mut ctx, &mut collector)
+                            .await
+                            .unwrap();
+                        let store = operator.native_store.as_ref().unwrap();
+                        let mut progress = store
+                            .try_expiry_progress(native_test_config().max_pending_output_bytes);
+                        assert_eq!(progress.is_none(), tight);
+                        // First chunk removes stale k6 and expires k0 only.
+                        assert!(operator.expire_native(progress.as_mut()).await.unwrap());
+                        let scope = store.begin().await.unwrap();
+                        let bytes = scope
+                            .get(&native_group_key(b'G', &keys[0]).unwrap())
+                            .await
+                            .unwrap()
+                            .unwrap();
+                        assert_eq!(
+                            operator
+                                .native_group_codec()
+                                .unwrap()
+                                .decode(&bytes, scope.limits().value_bytes)
+                                .unwrap()
+                                .generation,
+                            1
+                        );
+                        drop(scope);
+                        operator
+                            .drain_native_dirty(&mut ctx, &mut collector)
+                            .await
+                            .unwrap();
+                        let scope = store.begin().await.unwrap();
+                        let bytes = scope
+                            .get(&native_group_key(b'G', &keys[0]).unwrap())
+                            .await
+                            .unwrap()
+                            .unwrap();
+                        assert_eq!(
+                            operator
+                                .native_group_codec()
+                                .unwrap()
+                                .decode(&bytes, scope.limits().value_bytes)
+                                .unwrap()
+                                .generation,
+                            2
+                        );
+                        drop(scope);
+                        drop(progress);
+                        let snapshot = backends[0].snapshot().await.unwrap();
+                        let storage = arroyo_state::get_storage_provider(
+                            &arroyo_state::StorageProviderFor::Controller {
+                                storage_url: Some(format!("file://{}", remote.display())),
+                            },
+                        )
+                        .await
+                        .unwrap();
+                        let config = DiskKeyedTableConfig {
+                            table_name: NATIVE_AGGREGATE_TABLE.into(),
+                            encoding_version: 1,
+                            schema_identity: operator.native_schema_identity.clone(),
+                        };
+                        let receipt = checkpoint::export(
+                            &snapshot,
+                            &namespace,
+                            &config,
+                            &storage,
+                            "checkpoint-1/aggregate",
+                            1,
+                            0,
+                            0,
+                        )
+                        .await
+                        .unwrap();
+                        checkpoint::restore(
+                            backends[1].as_ref(),
+                            &namespace,
+                            &config,
+                            &receipt,
+                            &storage,
+                        )
+                        .await
+                        .unwrap();
+                        let mut restored_manager =
+                            LiveTableManager::new(backends[1].clone(), ownership).unwrap();
+                        let restored_table =
+                            restored_manager.register(NATIVE_AGGREGATE_TABLE).unwrap();
+                        let mut fresh = ttl_keyed_operator();
+                        fresh.native_store = Some(
+                            AggregateStore::new(
+                                backends[1].clone(),
+                                restored_table,
+                                resources.clone(),
+                                limits,
+                            )
+                            .unwrap(),
+                        );
+                        operator = fresh;
+                        // A recovered worker has no retained minimum. A newly
+                        // earlier stale entry must be discovered and removed.
+                        let mut scope = operator
+                            .native_store
+                            .as_ref()
+                            .unwrap()
+                            .begin()
+                            .await
+                            .unwrap();
+                        scope
+                            .put(&native_expiry_key(0, &keys[6]).unwrap(), &[1])
+                            .unwrap();
+                        scope.commit().await.unwrap();
+                        drop(snapshot);
+                    }
+                    operator
+                        .flush_native(&mut ctx, &mut collector)
+                        .await
+                        .unwrap();
+                    let mut changes = Vec::new();
+                    for output in &collector.batches {
+                        let retracts = IncrementalAggregatingFunc::get_retracts(output).unwrap();
+                        for row in 0..output.num_rows() {
+                            changes.push((
+                                output.column(0).as_string::<i32>().value(row).to_string(),
+                                retracts.value(row),
+                                ScalarValue::try_from_array(output.column(6), row).unwrap(),
+                                ScalarValue::try_from_array(output.column(1), row).unwrap(),
+                                ScalarValue::try_from_array(output.column(2), row).unwrap(),
+                                ScalarValue::try_from_array(output.column(9), row).unwrap(),
+                            ));
+                        }
+                    }
+                    assert_eq!(changes.len(), 23);
+                    for i in 0..7 {
+                        let name = format!("k{i}");
+                        let actual: Vec<_> = changes
+                            .iter()
+                            .filter(|r| r.0 == name)
+                            .map(|r| (r.1, r.2.clone(), r.3.clone(), r.4.clone(), r.5.clone()))
+                            .collect();
+                        let initial = (
+                            false,
+                            ScalarValue::Int64(Some(1)),
+                            ScalarValue::Utf8(Some("a".into())),
+                            ScalarValue::Utf8(Some("a".into())),
+                            ScalarValue::TimestampNanosecond(Some(1), None),
+                        );
+                        let mut expected = vec![initial.clone()];
+                        if i < 5 {
+                            expected.push((
+                                true,
+                                initial.1.clone(),
+                                initial.2.clone(),
+                                initial.3.clone(),
+                                initial.4.clone(),
+                            ));
+                            let updated = (
+                                false,
+                                ScalarValue::Int64(Some(2)),
+                                ScalarValue::Utf8(Some("a".into())),
+                                ScalarValue::Utf8(Some("z".into())),
+                                ScalarValue::TimestampNanosecond(Some(2), None),
+                            );
+                            expected.push(updated.clone());
+                            expected.push((true, updated.1, updated.2, updated.3, updated.4));
+                        } else if i == 5 {
+                            expected.push((true, initial.1, initial.2, initial.3, initial.4));
+                        }
+                        assert_eq!(
+                            actual, expected,
+                            "backend rocks={rocks} recovery={recover} key={name}"
+                        );
+                    }
+                    // All five pending updates precede any TTL retraction.
+                    assert!(changes[7..17].iter().all(|r| r.0 != "k5"));
+                    assert!(changes[17..].iter().all(|r| r.1));
+                    let emitted = collector
+                        .batches
+                        .iter()
+                        .map(RecordBatch::num_rows)
+                        .sum::<usize>();
+                    operator
+                        .flush_native(&mut ctx, &mut collector)
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        collector
+                            .batches
+                            .iter()
+                            .map(RecordBatch::num_rows)
+                            .sum::<usize>(),
+                        emitted
+                    );
+                    let scope = operator
+                        .native_store
+                        .as_ref()
+                        .unwrap()
+                        .begin()
+                        .await
+                        .unwrap();
+                    assert!(
+                        scope
+                            .get(&native_expiry_key(0, &keys[6]).unwrap())
+                            .await
+                            .unwrap()
+                            .is_none()
+                    );
+                    for key in &keys[..6] {
+                        assert!(
+                            scope
+                                .get(&native_group_key(b'G', key).unwrap())
+                                .await
+                                .unwrap()
+                                .is_none()
+                        );
+                    }
+                    let bytes = scope
+                        .get(&native_group_key(b'G', &keys[6]).unwrap())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(
+                        operator
+                            .native_group_codec()
+                            .unwrap()
+                            .decode(&bytes, scope.limits().value_bytes)
+                            .unwrap()
+                            .generation,
+                        0
+                    );
+                    drop(scope);
+                    drop(operator);
+                    drop(manager);
+                    drop(backends);
+                    for backend in native {
+                        Arc::try_unwrap(backend)
+                            .unwrap_or_else(|_| panic!("retained Rocks backend"))
+                            .close_and_remove()
+                            .await
+                            .unwrap();
+                    }
+                    std::fs::remove_dir_all(root).unwrap();
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn finite_ttl_cancelled_progress_retry_and_optional_admission() {
+        let resources = native_test_store().resources().clone();
+        let backend =
+            Arc::new(MemoryLiveState::bounded(resources.clone(), 8 * 1024 * 1024).unwrap());
+        let mut manager = LiveTableManager::new(
+            backend.clone(),
+            Ownership::PartitionLocal {
+                subtask: 0,
+                parallelism: 1,
+            },
+        )
+        .unwrap();
+        let table = manager.register(NATIVE_AGGREGATE_TABLE).unwrap();
+        let mut operator = native_operator();
+        operator.retain_indefinitely = false;
+        operator.ttl = Duration::from_secs(1);
+        operator.native_store = Some(
+            AggregateStore::new(
+                backend.clone(),
+                table,
+                resources.clone(),
+                native_test_store().limits(),
+            )
+            .unwrap(),
+        );
+        let store = operator.native_store.as_ref().unwrap();
+        let state = operator
+            .native_state_values(&mut operator.native_accumulators(None).unwrap())
+            .unwrap();
+        for number in 0..9 {
+            let key = format!("k{number}");
+            let mut scope = store.begin().await.unwrap();
+            let group = EncodedGroup {
+                last_update_nanos: 0,
+                generation: 0,
+                next_ordinal: 0,
+                accumulator_state: state.clone(),
+                last_emitted: None,
+            };
+            scope
+                .put(
+                    &native_group_key(b'G', key.as_bytes()).unwrap(),
+                    &encode_group(&group, scope.limits().value_bytes).unwrap(),
+                )
+                .unwrap();
+            scope
+                .put(
+                    &native_expiry_key(1_000_000_000, key.as_bytes()).unwrap(),
+                    &[1],
+                )
+                .unwrap();
+            scope.commit().await.unwrap();
+        }
+        let mut progress = store
+            .try_expiry_progress(native_test_config().max_pending_output_bytes)
+            .unwrap();
+        assert!(operator.expire_native(Some(&mut progress)).await.unwrap());
+        let committed = progress.after.clone();
+        let snapshots = [
+            backend.snapshot().await.unwrap(),
+            backend.snapshot().await.unwrap(),
+        ];
+        let mut expiring = Box::pin(operator.expire_native(Some(&mut progress)));
+        assert!(futures::poll!(&mut expiring).is_pending());
+        drop(expiring);
+        assert_eq!(progress.after, committed);
+        drop(snapshots);
+        // A write reservation failure must not publish attempted progress.
+        let occupied = resources
+            .try_queued_write(resources.config().queued_write_bytes)
+            .unwrap();
+        assert!(operator.expire_native(Some(&mut progress)).await.is_err());
+        assert_eq!(progress.after, committed);
+        drop(occupied);
+        // Cancellation of the owning flush discards key and permit together.
+        drop(progress);
+        assert!(
+            resources
+                .try_decoded_value(resources.config().decoded_value_bytes)
+                .is_ok()
+        );
+        // Earlier insertion after that interrupted flush cannot be skipped.
+        let mut scope = store.begin().await.unwrap();
+        let group = EncodedGroup {
+            last_update_nanos: -1_000_000_000,
+            generation: 0,
+            next_ordinal: 0,
+            accumulator_state: state,
+            last_emitted: None,
+        };
+        scope
+            .put(
+                &native_group_key(b'G', b"earlier").unwrap(),
+                &encode_group(&group, scope.limits().value_bytes).unwrap(),
+            )
+            .unwrap();
+        scope
+            .put(&native_expiry_key(0, b"earlier").unwrap(), &[1])
+            .unwrap();
+        scope.commit().await.unwrap();
+        let mut retry = store
+            .try_expiry_progress(native_test_config().max_pending_output_bytes)
+            .unwrap();
+        while operator.expire_native(Some(&mut retry)).await.unwrap() {}
+        drop(retry);
+        let scope = store.begin().await.unwrap();
+        for key in std::iter::once("earlier".to_string()).chain((0..9).map(|i| format!("k{i}"))) {
+            let bytes = scope
+                .get(&native_group_key(b'G', key.as_bytes()).unwrap())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                operator
+                    .native_group_codec()
+                    .unwrap()
+                    .decode(&bytes, scope.limits().value_bytes)
+                    .unwrap()
+                    .generation,
+                1
+            );
+        }
+        assert!(scope.first(b"E").await.unwrap().is_none());
+        drop(scope);
+        // Refusal under live pressure is optional and retains no key/permit.
+        let held = resources
+            .try_decoded_value(resources.config().decoded_value_bytes)
+            .unwrap();
+        assert!(
+            store
+                .try_expiry_progress(native_test_config().max_pending_output_bytes)
+                .is_none()
+        );
+        drop(held);
+        assert!(
+            resources
+                .try_decoded_value(resources.config().decoded_value_bytes)
+                .is_ok()
+        );
+        // A formerly valid minimum budget still uses the original fresh seeks.
+        assert!(
+            store
+                .try_expiry_progress(resources.config().decoded_value_bytes / 3)
+                .is_none()
+        );
+        let mut scope = store.begin().await.unwrap();
+        let bytes = scope
+            .get(&native_group_key(b'G', b"earlier").unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut group = operator
+            .native_group_codec()
+            .unwrap()
+            .decode(&bytes, scope.limits().value_bytes)
+            .unwrap();
+        group.last_update_nanos = 0;
+        scope
+            .put(
+                &native_group_key(b'G', b"fallback").unwrap(),
+                &encode_group(&group, scope.limits().value_bytes).unwrap(),
+            )
+            .unwrap();
+        scope
+            .put(
+                &native_expiry_key(1_000_000_000, b"fallback").unwrap(),
+                &[1],
+            )
+            .unwrap();
+        scope.commit().await.unwrap();
+        assert!(operator.expire_native(None).await.unwrap());
+        assert!(!operator.expire_native(None).await.unwrap());
+        let scope = store.begin().await.unwrap();
+        let bytes = scope
+            .get(&native_group_key(b'G', b"fallback").unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            operator
+                .native_group_codec()
+                .unwrap()
+                .decode(&bytes, scope.limits().value_bytes)
+                .unwrap()
+                .generation,
+            2
+        );
+    }
+
     #[tokio::test]
     async fn finite_ttl_expires_all_due_groups_in_bounded_pages() {
         let mut operator = native_operator();
@@ -7395,9 +8072,9 @@ mod tests {
                 .unwrap();
         }
         scope.commit().await.unwrap();
-        assert!(operator.expire_native().await.unwrap());
-        assert!(operator.expire_native().await.unwrap());
-        assert!(!operator.expire_native().await.unwrap());
+        assert!(operator.expire_native(None).await.unwrap());
+        assert!(operator.expire_native(None).await.unwrap());
+        assert!(!operator.expire_native(None).await.unwrap());
         let scope = store.begin().await.unwrap();
         for number in 0..5 {
             let group = format!("k{number}");

@@ -54,6 +54,13 @@ pub(crate) struct AggregateStore {
     max_encoded_entry_bytes: usize,
 }
 
+/// A logical expiry lower bound for one serial flush, never a backend cursor.
+/// The optional permit covers keys, their clones/replacement and headers.
+pub(crate) struct AggregateExpiryProgress {
+    pub after: Option<Vec<u8>>,
+    _permit: ResourcePermit,
+}
+
 pub(crate) struct AggregateScope<'a> {
     store: &'a AggregateStore,
     // Scan scopes retain the original stable view. Point-only scopes belong to
@@ -165,6 +172,32 @@ impl AggregateStore {
             overlay: BTreeMap::new(),
             overlay_bytes: 0,
             _decoded_permit: decoded,
+        })
+    }
+
+    pub fn try_expiry_progress(&self, output_bytes: usize) -> Option<AggregateExpiryProgress> {
+        // Native decoding can grow a Vec to up to twice its logical size;
+        // cover replacement and shrinking as well as the retained/request key.
+        let charge = self
+            .limits
+            .key_bytes
+            .checked_mul(4)?
+            .checked_add(std::mem::size_of::<AggregateExpiryProgress>() + 128)?;
+        // Headroom is optional. Preserve configurations that can only admit
+        // the original scope and dirty-output reservations without this key.
+        let mandatory = self
+            .limits
+            .overlay_bytes
+            .checked_add(self.limits.value_bytes.checked_mul(3)?)?
+            .checked_add(output_bytes.checked_mul(3)?)?
+            .checked_add(self.max_encoded_entry_bytes.checked_mul(2)?)?
+            .checked_add(128)?;
+        if mandatory.checked_add(charge)? > self.resources.config().decoded_value_bytes {
+            return None;
+        }
+        Some(AggregateExpiryProgress {
+            after: None,
+            _permit: self.resources.try_decoded_value(charge).ok()?,
         })
     }
 
