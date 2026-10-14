@@ -1,3 +1,9 @@
+## STR-112 decoder increment — 2026-10-15
+
+- Branch `jason/str-112-export-20261014`, frozen benchmark base `6793409cb53eb7b13f5a591ce1717bcf1e846de8`; delivery integrated with main `196a9f72`. Current instructions/build/team guidance and ticket read. Production change removes discarded key serialization while preserving validation; native checkpoint regression covers concurrent writes and fresh-backend restore.
+- Isolated decoder CPU fell about 59%; whole-export diagnostics are inconclusive. Four native arms exited 0/0/0/2: first pair +1.46% durable and -3.74% steady source, final baseline exceeded unchanged 512 MiB at 513.215 MiB before CP90. All cleanup passed; second matched pair unavailable. No stable native improvement or ticket completion established.
+- [Exact evidence and remaining acceptance](str-112-validation.md). Independent review approves the narrow increment; STR-112 retains native performance/resource/full operator-value recovery gaps. Next: current-source affected gates, final integration review, PR/current-head CI. No cap increase, replacement interval or architecture change.
+
 ## Active STR-111 calendar recovery — 2026-10-14
 
 - Recovered existing `jason/str-111-calendar-20261014` after original claimant's explicit `turn_aborted` and user confirmation; preserved reservation metadata and clean workspace, refreshed base `fa9c8133`. Current instructions/build/team/ticket/ledger/work-plan read. STR-112 active owner preserved.
@@ -488,9 +494,3 @@ Read-view lifetime and stopped-input event-time semantics are unchanged.
   remain source-bound historical evidence.
 - Next action: independent review, publish the repair and verify current-head CI.
   Full SQL/capacity/slow-consumer/process-loss qualification remains STR-32.
-## STR-112 decoder increment — 2026-10-15
-
-- Branch `jason/str-112-export-20261014`, frozen benchmark base `6793409cb53eb7b13f5a591ce1717bcf1e846de8`; delivery integrated with main `196a9f72`. Current instructions/build/team guidance and ticket read. Production change removes discarded key serialization while preserving validation; native checkpoint regression covers concurrent writes and fresh-backend restore.
-- Isolated decoder CPU fell about 59%; whole-export diagnostics are inconclusive. Four native arms exited 0/0/0/2: first pair +1.46% durable and -3.74% steady source, final baseline exceeded unchanged 512 MiB at 513.215 MiB before CP90. All cleanup passed; second matched pair unavailable. No stable native improvement or ticket completion established.
-- [Exact evidence and remaining acceptance](str-112-validation.md). Independent review approves the narrow increment; STR-112 retains native performance/resource/full operator-value recovery gaps. Next: current-source affected gates, final integration review, PR/current-head CI. No cap increase, replacement interval or architecture change.
-

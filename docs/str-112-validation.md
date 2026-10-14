@@ -301,7 +301,7 @@ checkpoint protocol/namespace/schema/marker/path/checksum closure, source cursor
 and clock, sink offsets, and complete Parquet record/count enumeration. This is
 not fresh-worker full-value/operator-recovery qualification, a full application
 oracle or combined STR-103/126 qualification. The separate configured native
-snapshot regression above establishes its exact 64-row fresh-worker values only.
+snapshot regression above establishes its exact 64-row fresh-backend values only.
 B2's failed-arm protocol did not run heavy offline audits.
 
 Evidence root: `/home/jason/qa-evidence/str112-export-20261014/production-comparison`.
@@ -330,3 +330,17 @@ remain inconclusive and this native campaign failed/inconclusive. Independent
 review approved publication of the narrow increment with these limits; STR-112
 acceptance remains open. Integration/current-source gates, publication/CI and
 remaining recovery/qualification evidence are coordinator-owned, not claimed here.
+
+## Delivery integration checks
+
+The narrow increment rebased cleanly onto main `196a9f72`; benchmark source and
+pins remain frozen at their recorded B/C commits. At delivery source `9c675052`,
+one foreground queue reservation completed exit 0: full `live::` state tests
+(68 parent tests plus the configured child, no failures), locked state check,
+strict all-features/all-targets Clippy and container formatting. Test/check state
+compiler artifacts report `fresh=false`, with exact source hashes and unchanged
+start/end HEAD. Receipts: `integration-gates/commands.json`, SHA256
+`ba3d7e15376d5ee06e2a808e64320477a88ac97daf8d8b879a8d63301853b386`.
+These establish current-source focused gates, not integrated performance or full
+operator recovery qualification. Final documentation corrections only relabel
+the 64-row restore as fresh-backend and record these gates.
