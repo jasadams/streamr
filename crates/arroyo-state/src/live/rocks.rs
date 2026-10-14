@@ -605,6 +605,37 @@ impl SnapshotReader for RocksSnapshot {
         self.scan_admission(request, false).await
     }
 }
+// Exclusive ceiling of an encoded prefix, including prefixes ending in 0xff.
+fn encoded_prefix_end(prefix: &[u8]) -> Option<Vec<u8>> {
+    let last = prefix.iter().rposition(|byte| *byte != u8::MAX)?;
+    let mut end = prefix[..=last].to_vec();
+    end[last] += 1;
+    Some(end)
+}
+
+fn set_scan_upper_bound(
+    read: &mut rocksdb::ReadOptions,
+    namespace: &[u8],
+    prefix: Option<&[u8]>,
+    end: Option<&[u8]>,
+) {
+    // An encoded prefix includes its namespace, so its successor is already
+    // no greater than the namespace successor. Allocate only that candidate.
+    let prefix = prefix.unwrap_or(namespace);
+    debug_assert!(prefix.starts_with(namespace));
+    let mut upper = encoded_prefix_end(prefix);
+    if let Some(end) = end
+        && upper
+            .as_ref()
+            .is_none_or(|current| end < current.as_slice())
+    {
+        upper = Some(end.to_vec());
+    }
+    if let Some(upper) = upper {
+        read.set_iterate_upper_bound(upper);
+    }
+}
+
 impl RocksSnapshot {
     async fn scan_admission(&self, request: ScanRequest, fail_fast: bool) -> Result<ScanPage> {
         request.validate(self.id)?;
@@ -659,24 +690,39 @@ impl RocksSnapshot {
                 };
                 let prefix = request.range.prefix.as_ref().map(|prefix| bound(prefix));
                 let end = request.range.end.as_ref().map(|end| bound(end));
-                let mut lower = bound(request.range.start.as_deref().unwrap_or_default());
+                let start = bound(request.range.start.as_deref().unwrap_or_default());
+                // Borrow the greatest lower bound rather than cloning an
+                // escaped prefix/cursor. That spare copy covers the owned
+                // native upper bound within the existing request admission:
+                // start/prefix/end expand at most 2x, plus at most one extra
+                // prefix and end while choosing the upper bound (4x total).
+                let mut lower = start.as_slice();
                 if let Some(prefix) = &prefix
-                    && *prefix > lower
+                    && prefix.as_slice() > lower
                 {
-                    lower = prefix.clone();
+                    lower = prefix;
                 }
                 if let Some(cursor) = &request.cursor
-                    && cursor.last_key > lower
+                    && cursor.last_key.as_slice() > lower
                 {
-                    lower = cursor.last_key.clone();
+                    lower = &cursor.last_key;
                 }
                 let mut native_read = rocksdb::ReadOptions::default();
                 let DbHandle::Snapshot(view) = &db else {
                     unreachable!("stable scan requires a snapshot view")
                 };
                 native_read.set_snapshot(view.snapshot.borrow_dependent());
+                // Rust checks below define the same range, but run only after
+                // native Seek/Next. Bound those operations too, so an empty
+                // prefix cannot walk unrelated deleted keys to find a live row.
+                set_scan_upper_bound(
+                    &mut native_read,
+                    &namespace,
+                    prefix.as_deref(),
+                    end.as_deref(),
+                );
                 let mut iterator = db.raw_iterator_opt(native_read);
-                iterator.seek(&lower);
+                iterator.seek(lower);
                 let mut first = true;
                 let mut entries = Vec::new();
                 let mut used = 0usize;
@@ -1350,6 +1396,239 @@ mod tests {
         );
         std::fs::remove_dir_all(config.root).unwrap();
     }
+    #[tokio::test]
+    async fn native_scan_bounds_preserve_encoded_ranges_and_pages() {
+        let config = config();
+        let state = RocksLiveState::open_worker_with_resources(config.clone(), resources())
+            .await
+            .unwrap();
+        let logical = |bytes: &[u8]| {
+            let mut k = key();
+            k.key = bytes.to_vec();
+            k
+        };
+        let keys: Vec<Vec<u8>> = [
+            b"".as_slice(),
+            b"\0",
+            b"\0\0",
+            b"\0\xff",
+            b"a",
+            b"a\0",
+            b"a\xff",
+            b"b",
+            b"\xff",
+            b"\xff\0",
+            b"\xff\xff",
+        ]
+        .into_iter()
+        .map(<[u8]>::to_vec)
+        .collect();
+        for k in &keys {
+            state.put(logical(k), b"old".to_vec(), 1024).await.unwrap();
+        }
+        let mut other = logical(b"a");
+        other.namespace.table = b"other".to_vec();
+        state
+            .put(other.clone(), b"outside".to_vec(), 1024)
+            .await
+            .unwrap();
+        let snapshot = state.snapshot().await.unwrap();
+        state.delete(logical(b"a"), 1024).await.unwrap();
+        state
+            .put(logical(b"a!"), b"new".to_vec(), 1024)
+            .await
+            .unwrap();
+        let ranges = [
+            (None, None, None),
+            (Some(b"".to_vec()), None, None),
+            (Some(b"a".to_vec()), None, None),
+            (
+                Some(b"a".to_vec()),
+                Some(b"a\0".to_vec()),
+                Some(b"a\xff".to_vec()),
+            ),
+            (Some(b"a".to_vec()), None, Some(b"a\0".to_vec())),
+            (Some(b"a".to_vec()), Some(b"b".to_vec()), None),
+            (Some(b"a".to_vec()), None, Some(b"\0".to_vec())),
+            (Some(b"\0".to_vec()), None, Some(b"\0\xff".to_vec())),
+            (Some(b"\xff".to_vec()), None, None),
+            (Some(b"\xff\xff".to_vec()), None, None),
+            (None, Some(b"a".to_vec()), Some(b"a".to_vec())),
+        ];
+        for (prefix, start, end) in ranges {
+            let expected: Vec<_> = keys
+                .iter()
+                .filter(|k| {
+                    prefix.as_ref().is_none_or(|p| k.starts_with(p))
+                        && start.as_ref().is_none_or(|s| *k >= s)
+                        && end.as_ref().is_none_or(|e| *k < e)
+                })
+                .cloned()
+                .collect();
+            let request = ScanRequest {
+                range: ScanRange {
+                    namespace: key().namespace,
+                    prefix,
+                    start,
+                    end,
+                },
+                max_entries: 2,
+                max_bytes: 1024,
+                cursor: None,
+            };
+            let one_entry_bytes = keys
+                .iter()
+                .map(|k| encoding::encoded_key_size(&logical(k)).unwrap() + 4)
+                .max()
+                .unwrap();
+            for (max_entries, max_bytes) in [(2, 1024), (64, one_entry_bytes)] {
+                for fail_fast in [false, true] {
+                    let mut cursor = None;
+                    let mut actual = Vec::new();
+                    loop {
+                        let next = ScanRequest {
+                            cursor,
+                            max_entries,
+                            max_bytes,
+                            ..request.clone()
+                        };
+                        let page = if fail_fast {
+                            snapshot.try_scan(next).await
+                        } else {
+                            snapshot.scan(next).await
+                        }
+                        .unwrap();
+                        for entry in &page.entries {
+                            assert_eq!(entry.value, b"old");
+                            actual.push(entry.key.key.clone());
+                        }
+                        cursor = page.next_cursor.clone();
+                        if cursor.is_none() {
+                            break;
+                        }
+                    }
+                    assert_eq!(actual, expected);
+                }
+            }
+        }
+        let request = ScanRequest {
+            range: ScanRange {
+                namespace: key().namespace,
+                prefix: None,
+                start: Some(b"b".to_vec()),
+                end: Some(b"a".to_vec()),
+            },
+            max_entries: 1,
+            max_bytes: 1024,
+            cursor: None,
+        };
+        assert!(matches!(
+            snapshot.try_scan(request.clone()).await,
+            Err(LiveStateError::InvalidCursor)
+        ));
+        let small = ScanRequest {
+            range: ScanRange {
+                start: None,
+                end: None,
+                ..request.range
+            },
+            max_bytes: 1,
+            ..request
+        };
+        assert!(matches!(
+            snapshot.try_scan(small).await,
+            Err(LiveStateError::ReadLimitExceeded { .. })
+        ));
+        let other_page = snapshot
+            .try_scan(ScanRequest {
+                range: ScanRange {
+                    namespace: other.namespace,
+                    prefix: None,
+                    start: None,
+                    end: None,
+                },
+                max_entries: 8,
+                max_bytes: 1024,
+                cursor: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(other_page.entries.len(), 1);
+        assert_eq!(other_page.entries[0].value, b"outside");
+        drop(other_page);
+        drop(snapshot);
+        state.close_and_remove().await.unwrap();
+        std::fs::remove_dir_all(config.root).unwrap();
+    }
+
+    #[test]
+    fn native_scan_upper_bound_skips_no_unrelated_tombstones() {
+        use rocksdb::perf::{PerfContext, PerfMetric, PerfStatsLevel, set_perf_stats};
+        let config = config();
+        let mut options = Options::default();
+        options.create_if_missing(true);
+        options.set_disable_auto_compactions(true);
+        let db = DB::open(&options, &config.root).unwrap();
+        let logical = |bytes: &[u8]| {
+            let mut k = key();
+            k.key = bytes.to_vec();
+            k
+        };
+        let namespace = encoding::encode_namespace(&key().namespace).unwrap();
+        let deleted: Vec<_> = (0..1000)
+            .map(|i| encode_key(&logical(format!("D/{i:06}").as_bytes())).unwrap())
+            .collect();
+        let live = encode_key(&logical(b"G/live")).unwrap();
+        let mut initial = rocksdb::WriteBatch::default();
+        for k in &deleted {
+            initial.put(k, b"v");
+        }
+        initial.put(&live, b"g");
+        db.write(initial).unwrap();
+        db.flush().unwrap();
+        let before = db.snapshot();
+        let mut removed = rocksdb::WriteBatch::default();
+        for k in &deleted {
+            removed.delete(k);
+        }
+        db.write(removed).unwrap();
+        db.flush().unwrap();
+        let after = db.snapshot();
+        assert!(before.get(&deleted[0]).unwrap().is_some());
+        assert!(after.get(&deleted[0]).unwrap().is_none());
+        let mut prefix = namespace.clone();
+        prefix.extend_from_slice(b"B/");
+        set_perf_stats(PerfStatsLevel::EnableCount);
+        let mut perf = PerfContext::default();
+        for bounded in [false, true] {
+            let mut read = rocksdb::ReadOptions::default();
+            read.set_snapshot(&after);
+            if bounded {
+                set_scan_upper_bound(&mut read, &namespace, Some(&prefix), None);
+            }
+            let mut iterator = db.raw_iterator_opt(read);
+            perf.reset();
+            iterator.seek(&prefix);
+            iterator.status().unwrap();
+            let skipped = perf.metric(PerfMetric::InternalDeleteSkippedCount);
+            if bounded {
+                assert_eq!(
+                    skipped, 0,
+                    "empty prefix must not traverse unrelated D deletions"
+                );
+                assert!(!iterator.valid());
+            } else {
+                assert_eq!(skipped, deleted.len() as u64);
+                assert_eq!(iterator.key(), Some(live.as_slice()));
+            }
+        }
+        set_perf_stats(PerfStatsLevel::Disable);
+        drop(after);
+        drop(before);
+        drop(db);
+        std::fs::remove_dir_all(config.root).unwrap();
+    }
+
     #[tokio::test]
     async fn native_snapshot_preserves_point_multiget_and_paged_scan_sequence() {
         let config = config();
