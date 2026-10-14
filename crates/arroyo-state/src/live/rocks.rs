@@ -2257,6 +2257,298 @@ mod tests {
         }
     }
 
+    /// Native mechanism comparison only: no admitted operator, SQL, checkpoint,
+    /// calendar due-pointer, or recovery measurements are implied by this test.
+    #[test]
+    #[ignore = "opt-in STR-116 finite cleanup traversal diagnostic"]
+    fn cleanup_generation_churn_diagnostic() {
+        use rocksdb::perf::{PerfContext, PerfMetric, PerfStatsLevel, set_perf_stats};
+        const GROUPS: usize = 24;
+        const GENERATIONS: usize = 3;
+        const MEMBERS: usize = 24;
+        const PAGE: usize = 4;
+        const FAMILIES: &[u8] = b"MRBJQU";
+        let metrics = [
+            PerfMetric::SeekChildSeekCount,
+            PerfMetric::SeekOnMemtableCount,
+            PerfMetric::InternalKeySkippedCount,
+            PerfMetric::InternalDeleteSkippedCount,
+            PerfMetric::InternalRecentSkippedCount,
+            PerfMetric::BlockReadCount,
+            PerfMetric::BlockReadByte,
+            PerfMetric::SeekInternalSeekTime,
+            PerfMetric::FindNextUserEntryTime,
+        ];
+        // Linux process CPU ticks include writes as well as iteration. Native
+        // seek/next timings below isolate traversal; neither is an RSS measure.
+        let cpu_ticks = || {
+            let stat = std::fs::read_to_string("/proc/self/stat").unwrap();
+            let fields: Vec<_> = stat
+                .rsplit_once(") ")
+                .unwrap()
+                .1
+                .split_whitespace()
+                .collect();
+            fields[11].parse::<u64>().unwrap() + fields[12].parse::<u64>().unwrap()
+        };
+        for repeat in 0usize..3 {
+            let modes = if repeat.is_multiple_of(2) {
+                ["reset", "progress"]
+            } else {
+                ["progress", "reset"]
+            };
+            for mode in modes {
+                let config = config();
+                let mut options = Options::default();
+                options.create_if_missing(true);
+                options.set_disable_auto_compactions(true);
+                // Freeze cache and native write-buffer options in both arms.
+                let cache = rocksdb::Cache::new_lru_cache(1024 * 1024);
+                let mut table = rocksdb::BlockBasedOptions::default();
+                table.set_block_cache(&cache);
+                options.set_block_based_table_factory(&table);
+                options.set_write_buffer_size(1024 * 1024);
+                let db = DB::open(&options, &config.root).unwrap();
+                let namespace = encoding::encode_namespace(&key().namespace).unwrap();
+                let logical =
+                    |family: u8, group: usize, generation: usize, member: Option<usize>| {
+                        let mut k = key();
+                        // Match native_group_key/native_generation_prefix framing.
+                        k.key = vec![family];
+                        k.key.extend_from_slice(&8u32.to_be_bytes());
+                        k.key.extend_from_slice(&(group as u64).to_be_bytes());
+                        k.key.extend_from_slice(&(generation as u64).to_be_bytes());
+                        if let Some(member) = member {
+                            k.key.extend_from_slice(&0u32.to_be_bytes());
+                            k.key.extend_from_slice(&(member as u64).to_be_bytes());
+                        }
+                        encode_key(&k).unwrap()
+                    };
+                let mut initial = rocksdb::WriteBatch::default();
+                let mut obsolete = Vec::new();
+                let mut retained = Vec::new();
+                for group in 0..GROUPS {
+                    for generation in 0..=GENERATIONS {
+                        if generation < GENERATIONS {
+                            let marker = logical(b'C', group, generation, None);
+                            initial.put(&marker, b"M");
+                            obsolete.push(marker);
+                        }
+                        for &family in FAMILIES {
+                            for member in 0..MEMBERS {
+                                let k = logical(family, group, generation, Some(member));
+                                initial.put(&k, b"member-value");
+                                if generation < GENERATIONS {
+                                    obsolete.push(k);
+                                } else {
+                                    retained.push((k, b"member-value".to_vec()));
+                                }
+                            }
+                        }
+                    }
+                    let unrelated = logical(b'Z', group, 0, None);
+                    initial.put(&unrelated, b"unrelated-value");
+                    retained.push((unrelated, b"unrelated-value".to_vec()));
+                }
+                db.write(initial).unwrap();
+                db.flush().unwrap();
+                // This diagnostic intentionally retains all obsolete history.
+                let pinned = db.snapshot();
+                set_perf_stats(PerfStatsLevel::EnableTimeAndCPUTimeExceptForMutex);
+                let mut perf = PerfContext::default();
+                let mut marker_after: Option<Vec<u8>> = None;
+                let mut stage_counts = [[0u64; 9]; 2];
+                let mut seeks = [0usize; 2];
+                let mut stage_cpu = [0u64; 2];
+                let mut stage_ns = [0u128; 2];
+                let mut completed = 0usize;
+                let mut reclaimed = 0usize;
+                let mut segment_start = std::time::Instant::now();
+                let mut segment_cpu = cpu_ticks();
+                for group in 0..GROUPS {
+                    for generation in 0..GENERATIONS {
+                        let expected_marker = logical(b'C', group, generation, None);
+                        for phase in b"MRBJQUT" {
+                            let mut member_after: Option<Vec<u8>> = None;
+                            let page_count = if *phase == b'T' {
+                                1
+                            } else {
+                                MEMBERS / PAGE + 1
+                            };
+                            for page in 0..page_count {
+                                // C selection occurs once per cleanup invocation.
+                                let fresh = db.snapshot();
+                                let mut read = rocksdb::ReadOptions::default();
+                                read.set_snapshot(&fresh);
+                                let mut prefix = namespace.clone();
+                                prefix.push(b'C');
+                                read.set_iterate_lower_bound(prefix.clone());
+                                set_scan_upper_bound(&mut read, &namespace, Some(&prefix), None);
+                                perf.reset();
+                                let scan_cpu = cpu_ticks();
+                                let scan_start = std::time::Instant::now();
+                                let mut iterator = db.raw_iterator_opt(read);
+                                iterator.seek(marker_after.as_deref().unwrap_or(&prefix));
+                                if marker_after
+                                    .as_ref()
+                                    .is_some_and(|k| iterator.key() == Some(k.as_slice()))
+                                {
+                                    iterator.next();
+                                }
+                                assert_eq!(iterator.key(), Some(expected_marker.as_slice()));
+                                iterator.status().unwrap();
+                                for (i, metric) in metrics.iter().enumerate() {
+                                    stage_counts[0][i] += perf.metric(*metric);
+                                }
+                                stage_cpu[0] += cpu_ticks() - scan_cpu;
+                                stage_ns[0] += scan_start.elapsed().as_nanos();
+                                seeks[0] += 1;
+                                drop(iterator);
+                                let mut deleted = rocksdb::WriteBatch::default();
+                                if *phase != b'T' {
+                                    let mut prefix = logical(*phase, group, generation, None);
+                                    // encode_key ends a point key with [0,0].
+                                    // Production scan bounds escape the logical
+                                    // prefix without that terminal delimiter.
+                                    assert!(prefix.ends_with(&[0, 0]));
+                                    prefix.truncate(prefix.len() - 2);
+                                    let mut read = rocksdb::ReadOptions::default();
+                                    read.set_snapshot(&fresh);
+                                    read.set_iterate_lower_bound(prefix.clone());
+                                    set_scan_upper_bound(
+                                        &mut read,
+                                        &namespace,
+                                        Some(&prefix),
+                                        None,
+                                    );
+                                    perf.reset();
+                                    let scan_cpu = cpu_ticks();
+                                    let scan_start = std::time::Instant::now();
+                                    let mut iterator = db.raw_iterator_opt(read);
+                                    iterator.seek(member_after.as_deref().unwrap_or(&prefix));
+                                    if member_after
+                                        .as_ref()
+                                        .is_some_and(|k| iterator.key() == Some(k.as_slice()))
+                                    {
+                                        iterator.next();
+                                    }
+                                    let mut count = 0;
+                                    while iterator.valid() && count < PAGE {
+                                        assert_eq!(
+                                            iterator.key(),
+                                            Some(
+                                                logical(
+                                                    *phase,
+                                                    group,
+                                                    generation,
+                                                    Some(page * PAGE + count)
+                                                )
+                                                .as_slice()
+                                            )
+                                        );
+                                        assert_eq!(
+                                            iterator.value(),
+                                            Some(b"member-value".as_slice())
+                                        );
+                                        let k = iterator.key().unwrap();
+                                        deleted.delete(k);
+                                        if mode == "progress" {
+                                            member_after = Some(k.to_vec());
+                                        }
+                                        count += 1;
+                                        iterator.next();
+                                    }
+                                    iterator.status().unwrap();
+                                    assert_eq!(
+                                        count,
+                                        if page == MEMBERS / PAGE { 0 } else { PAGE }
+                                    );
+                                    for (i, metric) in metrics.iter().enumerate() {
+                                        stage_counts[1][i] += perf.metric(*metric);
+                                    }
+                                    stage_cpu[1] += cpu_ticks() - scan_cpu;
+                                    stage_ns[1] += scan_start.elapsed().as_nanos();
+                                    seeks[1] += 1;
+                                    reclaimed += count;
+                                }
+                                if *phase == b'T' {
+                                    deleted.delete(&expected_marker);
+                                    reclaimed += 1;
+                                    if mode == "progress" {
+                                        marker_after = Some(expected_marker.clone());
+                                    }
+                                } else if page == MEMBERS / PAGE {
+                                    // Production updates a marker only after
+                                    // exhausting the family, not per member page.
+                                    let next = match *phase {
+                                        b'M' => b'R',
+                                        b'R' => b'B',
+                                        b'B' => b'J',
+                                        b'J' => b'Q',
+                                        b'Q' => b'U',
+                                        b'U' => b'T',
+                                        _ => unreachable!(),
+                                    };
+                                    deleted.put(&expected_marker, [next]);
+                                }
+                                drop(fresh);
+                                db.write(deleted).unwrap();
+                            }
+                        }
+                        completed += 1;
+                        if completed.is_multiple_of(GROUPS * GENERATIONS / 3) {
+                            for stage in 0..2 {
+                                println!(
+                                    "STR116 repeat={repeat} mode={mode} stage={} completed_generations={completed} reclaimed={reclaimed} elapsed_us={} process_cpu_ticks={} stage_cpu_ticks={} stage_elapsed_ns={} seeks={} child_seeks={} memtable_seeks={} internal_skips={} deleted_skips={} recent_skips={} block_reads={} block_bytes={} seek_ns={} next_ns={} page={PAGE} groups={GROUPS} obsolete_generations={GENERATIONS} members={MEMBERS} cache_bytes=1048576 write_buffer_bytes=1048576 auto_compaction=false pinned_history=true",
+                                    ["C", "members"][stage],
+                                    segment_start.elapsed().as_micros(),
+                                    cpu_ticks() - segment_cpu,
+                                    stage_cpu[stage],
+                                    stage_ns[stage],
+                                    seeks[stage],
+                                    stage_counts[stage][0],
+                                    stage_counts[stage][1],
+                                    stage_counts[stage][2],
+                                    stage_counts[stage][3],
+                                    stage_counts[stage][4],
+                                    stage_counts[stage][5],
+                                    stage_counts[stage][6],
+                                    stage_counts[stage][7],
+                                    stage_counts[stage][8]
+                                );
+                            }
+                            stage_counts = [[0; 9]; 2];
+                            seeks = [0; 2];
+                            stage_cpu = [0; 2];
+                            stage_ns = [0; 2];
+                            segment_start = std::time::Instant::now();
+                            segment_cpu = cpu_ticks();
+                        }
+                    }
+                }
+                assert_eq!(reclaimed, obsolete.len());
+                assert_eq!(
+                    reclaimed,
+                    GROUPS * GENERATIONS * (FAMILIES.len() * MEMBERS + 1)
+                );
+                let final_view = db.snapshot();
+                for k in &obsolete {
+                    assert!(final_view.get(k).unwrap().is_none());
+                    assert!(pinned.get(k).unwrap().is_some());
+                }
+                for (k, value) in &retained {
+                    assert_eq!(final_view.get(k).unwrap().as_ref(), Some(value));
+                }
+                assert_eq!(retained.len(), GROUPS * (FAMILIES.len() * MEMBERS + 1));
+                set_perf_stats(PerfStatsLevel::Disable);
+                drop(final_view);
+                drop(pinned);
+                drop(db);
+                std::fs::remove_dir_all(config.root).unwrap();
+            }
+        }
+    }
+
     /// Exercises the actual admitted/decode/page adapter with a stable read
     /// view, including deletion history and native upper-bound exhaustion.
     #[tokio::test]
