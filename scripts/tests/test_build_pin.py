@@ -184,6 +184,41 @@ class CleanupTests(unittest.TestCase):
             self.assertEqual(json.loads((root / "build-db-cleanup.json").read_text())["exit_code"], 0)
 
 
+class CargoTimingTests(unittest.TestCase):
+    def test_preserves_exact_logged_report_through_cache_eviction(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "target"
+            reports = target / "milestone2-runtime/cargo-timings"
+            reports.mkdir(parents=True)
+            current = reports / "cargo-timing-exact-current.html"
+            current.write_text("current build Rust/codegen/link timings")
+            stale = reports / "cargo-timing-newer-stale.html"
+            stale.write_text("unrelated newer report")
+            log = root / "build.jsonl"
+            log.write_text("      Timing report saved to /app/target/milestone2-runtime/cargo-timings/" + current.name + "\n")
+            evidence = root / "evidence"
+            evidence.mkdir()
+            digest = pin.sha(current)
+            receipt = pin.preserve_cargo_timing(log, target, evidence)
+            shutil.rmtree(target)
+            preserved = evidence / receipt["preserved_report"]
+            self.assertEqual(preserved.read_text(), "current build Rust/codegen/link timings")
+            self.assertEqual(pin.sha(preserved), digest)
+            self.assertEqual(receipt["report_sha256"], digest)
+            self.assertEqual(receipt["build_log_sha256"], pin.sha(log))
+            self.assertEqual(json.loads((evidence / "cargo-timing-receipt.json").read_text()), receipt)
+
+    def test_refuses_missing_or_ambiguous_current_report(self):
+        for lines in ("no report", "Timing report saved to /app/target/one.html\nTiming report saved to /app/target/two.html\n"):
+            with self.subTest(lines=lines), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                log = root / "build.jsonl"
+                log.write_text(lines)
+                with self.assertRaisesRegex(ValueError, "Unique current"):
+                    pin.preserve_cargo_timing(log, root / "target", root)
+
+
 class LauncherTests(unittest.TestCase):
     def test_launcher_preserves_current_executable_identity(self):
         # readlink observes its own /proc/self/exe, matching Rust current_exe().

@@ -112,6 +112,26 @@ def cargo_events(log):
     return events
 
 
+def preserve_cargo_timing(log, target, evidence):
+    """Preserve only the report explicitly identified by this completed build."""
+    plain = re.sub(r"\x1b\[[0-9;]*m", "", log.read_text())
+    reports = re.findall(r"^\s*Timing report saved to (\S+\.html)\s*$", plain, re.MULTILINE)
+    require(len(reports) == 1, "Unique current Cargo timing report path required in build log")
+    original = host_path(reports[0], target)
+    require(original.parent == target / "milestone2-runtime/cargo-timings", "Unexpected Cargo timing report directory")
+    require(original.is_file(), "Current Cargo timing report missing")
+    destination = evidence / "cargo-timings" / original.name
+    destination.parent.mkdir()
+    digest = sha(original)
+    shutil.copy2(original, destination)
+    require(sha(original) == digest == sha(destination), "Cargo timing report changed while preserving")
+    receipt = {"container_report": reports[0], "target_report": str(original),
+               "preserved_report": str(destination.relative_to(evidence)), "report_sha256": digest,
+               "build_log_sha256": sha(log), "scope": "Cargo Rust/codegen/build-script/link timing; no runtime speedup claim"}
+    write(evidence / "cargo-timing-receipt.json", receipt)
+    return receipt
+
+
 def native_proof(events, target, artifact, evidence, image_native):
     """Bind native output/rlib to the final CLI's Cargo fingerprint graph."""
     libraries = [e for e in events if e.get("reason") == "compiler-artifact"
@@ -500,6 +520,7 @@ def main():
     artifact = artifacts[0]
     require(artifact["profile"]["opt_level"] == ("3" if args.profile == "release" else "0"), "Actual CLI profile differs")
     require(any(e.get("reason") == "build-finished" and e.get("success") is True for e in events), "Cargo success event missing")
+    timing = preserve_cargo_timing(build_log, target, root)
     proof = native_proof(events, target, artifact, root, native_image)
     write(root / "native-linkage-proof.json", proof)
     actual = host_path(artifact["executable"], target)
@@ -520,6 +541,8 @@ def main():
                "build_log_sha256": sha(build_log), "native_linkage_proof_sha256": sha(root / "native-linkage-proof.json"),
                "source_before_sha256": sha(root / "source-before.json"), "source_after_sha256": sha(root / "source-after.json"),
                "build_selection_sha256": sha(root / "build-selection.json"),
+               "cargo_timing_receipt_sha256": sha(root / "cargo-timing-receipt.json"),
+               "cargo_timing_report": timing["preserved_report"], "cargo_timing_report_sha256": timing["report_sha256"],
                "image_native_receipt_sha256": sha(root / "image-native-receipt.json"),
                "runtime_linkage_receipt_sha256": sha(root / "runtime-linkage.json"),
                "source_free_smoke_receipt_sha256": sha(root / "source-free-smoke.json"),
