@@ -81,6 +81,25 @@ class NativeLockGraph(unittest.TestCase):
         archived = self.lock.replace(registry, header)
         native_lock.verify_native_lock(self.lock, archived, [hashlib.sha256(archived.encode()).hexdigest()])
 
+class PreflightFrozenSource(unittest.TestCase):
+    def test_isolated_subprocess_import_preserves_frozen_inventory(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            docker = root / 'docker'
+            docker.mkdir()
+            for name in ('rocksdb-build-mode.py', 'rocksdb_native_lock.py'):
+                (docker / name).write_bytes((ROOT / 'docker' / name).read_bytes())
+            before = sorted(str(path.relative_to(root)) for path in root.rglob('*'))
+            env = dict(os.environ)
+            # Exercise ordinary Python invocation, without relying on a caller
+            # setting PYTHONDONTWRITEBYTECODE to protect the frozen checkout.
+            env.pop('PYTHONDONTWRITEBYTECODE', None)
+            result = subprocess.run([sys.executable, str(docker / 'rocksdb-build-mode.py'), str(root), 'old-pin', 'a'*64, 'build'], env=env, text=True, capture_output=True)
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertIn('Build configuration error', result.stderr)
+            self.assertEqual(before, sorted(str(path.relative_to(root)) for path in root.rglob('*')))
+            self.assertFalse((docker / '__pycache__').exists())
+
 class NativeImageProbe(unittest.TestCase):
     def test_bounded_helper_cleanup_on_success(self):
         metadata = {'build_lock':'test-lock','build_lock_sha256':['digest']}

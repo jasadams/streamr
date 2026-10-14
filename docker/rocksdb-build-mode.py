@@ -7,6 +7,10 @@ from pathlib import Path
 import sys
 import subprocess
 import tomllib
+
+# Preflight also runs inside frozen build-pin source snapshots. Importing its
+# shared verifier must not add files to those compiled inputs.
+sys.dont_write_bytecode = True
 from rocksdb_native_lock import image_lock_metadata, verify_native_lock
 
 
