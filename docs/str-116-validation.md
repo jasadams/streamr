@@ -234,3 +234,37 @@ milestone qualification are deferred to their separate acceptance batch. The
 exact recovery tests here instantiate fresh backend/operator owners using the
 existing worker harness and persisted M/U/T phase state; they do not claim that
 broader process qualification.
+
+## Integrated main verification
+
+The coordinator integrated latest main `cd9520ee` into reviewed ticket commit
+`07040ac4`, producing `f95e585e7415599537d508cfcef60d6019e9d17a`.
+Re-read `AGENTS.md`, `.claude/build-test.md`, `.claude/team.md`, current
+`docs/milestone-3-status.md`/`docs/milestone-3-work-plan.md` and the unchanged
+full ticket. Updated guidance explicitly defaults to maintained repository
+scripts and normal dev/test with matching precompiled RocksDB for correctness.
+Disk check showed 151 GiB free before this run. Integration source review
+approved zero findings (`integration-source-review.md`).
+
+The integrated flush retains TTL progress, drops its permit, then constructs
+cleanup progress; both bounded drains remain serial. Narrow integration gates
+used the task worktree's `scripts/cargo-dev`, `scripts/preflight-clippy.sh` and
+one `scripts/rust-build` reservation. On this exact integrated source all exited
+zero: locked worker check (287.08s), strict all-target worker Clippy (75.42s),
+fmt (3.12s), fresh worker test build (185.33s), three aggregate-store tests and
+62 incremental-aggregate tests (two ignored). The full serial targets include
+TTL, cleanup, calendar, cancellation/resource and fresh-backend recovery checks.
+No production or fixture repair was necessary after integration.
+
+`integration/receipt.json` binds source inventory, commands, exits, image and
+fresh compiled artifact. The executable is pinned outside Cargo cache at
+`integration/arroyo-worker-tests`, SHA256
+`1af280e8994fd8e32ab7f5a3c7220b9204fea48f30f693579b3cc19367a889cc`.
+`integration/source-reconciliation.json` confirms exact current source/pin
+matches and unchanged state sources. Only `aggregate_store.rs` and
+`incremental_aggregator.rs` differ from the frozen worker source inventory,
+through integrated TTL code. State tests/native diagnostics and isolated pairs
+were therefore not repeated; their frozen evidence remains separately bound.
+The coordinator retains final evidence review, documentation commit,
+publication and current-head CI. Expected CI covers six formatting/tooling
+checks; these local source-bound Rust gates provide compilation/test evidence.
