@@ -98,7 +98,7 @@ impl AggregateStore {
         let namespace_bytes = encoding::encoded_namespace_size(table.namespace())?;
         let request_bytes = namespace_bytes
             .saturating_mul(5)
-            .saturating_add(limits.key_bytes.saturating_mul(2))
+            .saturating_add(limits.key_bytes.saturating_mul(3))
             .saturating_add(encoded_key_bytes);
         let entry_containers = limits
             .page_entries
@@ -261,6 +261,16 @@ impl AggregateScope<'_> {
         prefix: &[u8],
         after: Option<&[u8]>,
     ) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+        self.first_from_bounded(prefix, after, None).await
+    }
+
+    /// First logical entry with an optional exclusive native upper bound.
+    pub async fn first_from_bounded(
+        &self,
+        prefix: &[u8],
+        after: Option<&[u8]>,
+        end: Option<&[u8]>,
+    ) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
         let snapshot = self
             .snapshot
             .as_ref()
@@ -273,6 +283,13 @@ impl AggregateScope<'_> {
                 "aggregate scan start is outside prefix"
             );
         }
+        if let Some(end) = end {
+            self.check_key(end)?;
+            ensure!(
+                end.starts_with(prefix),
+                "aggregate scan end is outside prefix"
+            );
+        }
         let mut cursor = None;
         let mut backend_first = None;
         loop {
@@ -282,7 +299,7 @@ impl AggregateScope<'_> {
                         namespace: self.store.table.namespace().clone(),
                         prefix: Some(prefix.to_vec()),
                         start: after.map(<[u8]>::to_vec),
-                        end: None,
+                        end: end.map(<[u8]>::to_vec),
                     },
                     max_entries: self.store.limits.page_entries,
                     max_bytes: self.store.limits.page_bytes,
@@ -309,7 +326,9 @@ impl AggregateScope<'_> {
         let overlay_first = self
             .overlay
             .range(after.unwrap_or(prefix).to_vec()..)
-            .take_while(|(key, _)| key.starts_with(prefix))
+            .take_while(|(key, _)| {
+                key.starts_with(prefix) && end.is_none_or(|end| key.as_slice() < end)
+            })
             .filter(|(key, _)| after.is_none_or(|after| key.as_slice() > after))
             .find_map(|(key, value)| value.as_ref().map(|v| (key.clone(), v.clone())));
         Ok(match (backend_first, overlay_first) {
@@ -360,7 +379,7 @@ mod tests {
         })
         .unwrap();
         let required = limits.page_bytes * 4
-            + (namespace_bytes * 5 + limits.key_bytes * 2 + cursor_bytes) * 4
+            + (namespace_bytes * 5 + limits.key_bytes * 3 + cursor_bytes) * 4
             + limits
                 .page_entries
                 .min(limits.page_bytes / (namespace_bytes + 3))
@@ -412,6 +431,38 @@ mod tests {
         assert_eq!(
             scope.first(b"a").await.unwrap(),
             Some((b"a".to_vec(), b"one".to_vec()))
+        );
+        assert!(
+            scope
+                .first_from_bounded(b"a", None, Some(b"a"))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        drop(scope);
+        let mut scope = store.begin().await.unwrap();
+        scope.put(b"aa", b"pending").unwrap();
+        // Both committed and overlay entries respect the exclusive endpoint.
+        assert_eq!(
+            scope
+                .first_from_bounded(b"a", None, Some(b"aa"))
+                .await
+                .unwrap(),
+            Some((b"a".to_vec(), b"one".to_vec()))
+        );
+        assert!(
+            scope
+                .first_from_bounded(b"a", Some(b"a"), Some(b"aa"))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            scope
+                .first_from_bounded(b"a", Some(b"a"), Some(b"ab"))
+                .await
+                .unwrap(),
+            Some((b"aa".to_vec(), b"pending".to_vec()))
         );
         drop(scope);
         drop(store);

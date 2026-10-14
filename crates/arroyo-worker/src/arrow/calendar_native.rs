@@ -48,6 +48,10 @@ impl CalendarInput {
 }
 
 impl CalendarAggregate {
+    pub(super) fn horizon_days(&self) -> i32 {
+        self.horizon
+    }
+
     #[cfg(test)]
     pub(super) fn test_dates(&mut self, contribution: i32, reference: i32) {
         self.contribution = Arc::new(datafusion::physical_expr::expressions::Literal::new(
@@ -374,8 +378,17 @@ impl IncrementalAggregatingFunc {
             let (family, contribution) = Self::calendar_bucket_identity(&key)?;
             if contribution < self.calendar_family_floor(progress, family)? {
                 scope.delete(&key)?;
+                cleanup.after = Some(key);
+            } else {
+                // B orders group/generation/family before signed day. Once
+                // retained history is reached, later days in this exact family
+                // cannot expire at this watermark. Persist the family end so
+                // later pages and fresh workers skip it too.
+                let mut family_end = key;
+                let day_start = family_end.len() - 4;
+                family_end[day_start..].copy_from_slice(&u32::MAX.to_be_bytes());
+                cleanup.after = Some(family_end);
             }
-            cleanup.after = Some(key);
         }
         scope.put(b"V", &cleanup.encode(limits.value_bytes)?)?;
         scope.commit().await
@@ -589,6 +602,29 @@ impl IncrementalAggregatingFunc {
         Ok(())
     }
 
+    pub(super) async fn calendar_reference_matches(
+        &self,
+        scope: &AggregateScope<'_>,
+        group: &[u8],
+        generation: u64,
+        calendar: &CalendarAggregate,
+        reference: i32,
+    ) -> Result<bool> {
+        let Some(bytes) = scope
+            .get(&family_prefix(
+                b'Q',
+                group,
+                generation,
+                calendar.aggregate_index,
+            )?)
+            .await?
+        else {
+            return Ok(false);
+        };
+        ensure!(bytes.len() == 4, "invalid calendar reference date");
+        Ok(i32::from_be_bytes(bytes.as_slice().try_into()?) == reference)
+    }
+
     pub(super) fn calendar_set_reference(
         &self,
         scope: &mut AggregateScope<'_>,
@@ -631,7 +667,14 @@ impl IncrementalAggregatingFunc {
             )?)
         };
         let last = bucket_key(group, generation, calendar.storage_index, reference)?;
-        while let Some((key, bytes)) = scope.first_from(&prefix, after.as_deref()).await? {
+        let end = reference
+            .checked_add(1)
+            .map(|day| bucket_key(group, generation, calendar.storage_index, day))
+            .transpose()?;
+        while let Some((key, bytes)) = scope
+            .first_from_bounded(&prefix, after.as_deref(), end.as_deref())
+            .await?
+        {
             if key > last {
                 break;
             }
@@ -667,12 +710,15 @@ impl IncrementalAggregatingFunc {
         reference: i32,
     ) -> Result<()> {
         let pointer = native_generation_prefix(b'U', group, generation)?;
+        let deadline = Self::calendar_next_boundary(reference)?;
         if let Some(bytes) = scope.get(&pointer).await? {
             ensure!(bytes.len() == 8, "invalid calendar due boundary");
             let previous = i64::from_be_bytes(bytes.as_slice().try_into()?);
+            if previous == deadline {
+                return Ok(());
+            }
             scope.delete(&calendar_due_key(previous, group)?)?;
         }
-        let deadline = Self::calendar_next_boundary(reference)?;
         scope.put(
             &calendar_due_key(deadline, group)?,
             &generation.to_be_bytes(),
