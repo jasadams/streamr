@@ -17,8 +17,9 @@ the matching precompiled RocksDB archive is reused. Release is an explicit choic
 for optimized measurements or release artifacts. Record the purpose, selected
 profile and native archive/source mode before expensive work. If build or pinning
 support is missing, improve the maintained scripts within the authorized scope.
-[STR-127](https://trakkt.app/issues/STR-127) tracks shared dev/release pinning and
-precompiled release RocksDB; the current image only supplies the dev archive.
+`scripts/build-pin` supplies the same packaging and provenance path for both
+profiles. The image supplies matching dev, release runtime and release build-
+dependency native archives.
 
 Arroyo requires Debian Bookworm toolchain. Fedora 44's GCC 16 and OpenSSL 3.5 are incompatible
 with vendored C dependencies (sasl2-sys, rdkafka-sys, aws-lc-sys).
@@ -60,25 +61,69 @@ preserving Cargo's exit status.
 are per container and reset on each run. Use Cargo's `--timings` to measure
 build performance. The machine-wide build queue and four-job default remain.
 
-The development image also contains the exact pinned RocksDB 10.4.2 static
-library, built once through `librocksdb-sys`'s original build script with LZ4,
-O0 and line-table debug information. Normal dev/test commands generate bindings
-and link this archive without recompiling RocksDB C++. LZ4 and Kafka continue to
-use their existing dependencies. The image retains a source checksum, build lock
-and archive hash under `/opt/streamr-rocksdb`.
+The development image contains pinned RocksDB 10.4.2 static archives built once
+through the original `librocksdb-sys` build script with LZ4. The selector uses
+Cargo's actual native optimization, debug, target and feature settings for each
+invocation: dev O0/debug, release runtime O3/debug, and release build dependencies
+O0/no debug. It validates source, dependent-native, toolchain, compiler flags and
+archive receipts under `/opt/streamr-rocksdb`. These image archives survive Cargo
+cache eviction and ordinary Rust/source edits.
 
-Rebuild with `scripts/cargo-dev --build` to obtain this image. The wrapper checks
-the image pin against the checkout's lockfile and RocksDB features before
-building, so old or mismatched images fail with rebuild instructions. The state
-crate supplies the external archive's Linux C++ runtime linkage without changing
-workspace-wide compiler flags. Use the wrapper for validated image defaults.
+Rebuild with `scripts/cargo-dev --build` when the native pin changes. Old or
+mismatched images fail before a build starts. Queued startup invalidates only
+stale unwrapped RocksDB build scripts from older images; it preserves native
+outputs and other crate artifacts. The wrapper executes the original upstream
+build script after selecting its archive and supplies Linux C++ linkage.
 
-Release/custom profiles, custom targets, compiler/profile overrides, local
-`.cargo/config` files and Cargo `--config` options select the original native
-source build. `ROCKSDB_COMPILE=1 scripts/cargo-dev build --locked -p arroyo-worker
---lib --timings` explicitly selects it for a native rebuild comparison. Keep
-this setting stable during ordinary iterations: switching native build modes
-invalidates the RocksDB dependency and its dependents.
+Custom profiles/targets, compiler overrides, local `.cargo/config` and Cargo
+`--config` require an explicit native source reason. For deliberate comparison:
+
+```bash
+ROCKSDB_COMPILE=1 STREAMR_ROCKSDB_SOURCE_REASON='native source comparison' \
+  scripts/cargo-dev build --locked -p arroyo-worker --lib --timings
+```
+
+Unsupported actual native settings fail explicitly instead of substituting a
+wrong archive. Keep native mode stable during ordinary iterations: switching
+modes invalidates RocksDB and its dependents.
+
+## Build and preserve a CLI package
+
+Use a new evidence directory outside checkouts and Cargo caches, and supply
+actual built UI assets (`webui/dist`) rather than placeholders:
+
+```bash
+scripts/build-pin --root /absolute/evidence/dev-pin \
+  --purpose 'focused correctness and recovery' --ui-assets /absolute/webui/dist
+scripts/build-pin --root /absolute/evidence/release-pin --profile release \
+  --purpose 'optimized measurement executable' --ui-assets /absolute/webui/dist
+```
+
+The entrypoint reserves the shared queue, freezes declared tracked/untracked
+inputs, starts and migrates an owned disposable build database, and invokes
+`scripts/cargo-dev`. It enables `arroyo-api/embedded-ui` so dev packages also
+embed the supplied UI. It records actual Cargo profile and host/runtime native
+linkage, source/image/archive/executable hashes, build timing/exits, and cleanup.
+It preserves the executable, dynamic libraries and receipts outside Cargo's
+regenerable caches. `source-manifest.json` is build evidence; successful packaging
+and CLI startup do not establish worker recovery or performance qualification.
+
+Use `package/bin/run-arroyo` in the recorded compatible Debian Bookworm runtime
+image. The launcher preserves the executable identity required by process-worker
+scheduling. The package includes its native libraries and loader receipt; it is
+not a cross-platform executable.
+
+`--native-source-reason 'concrete reason'` selects deliberate source compilation
+through the same entrypoint. `--expected-source COMMIT` checks the invoking HEAD;
+exact dirty and copied inputs remain separately hashed. `--database-image` and
+`--image` are resolved to immutable local image IDs before execution.
+
+Normal builds retain the canonical shared target and cache volumes. For isolated
+cold-cache acceptance only, `STREAMR_SHARED_TARGET_DIR=/absolute/isolated-target`
+and a unique `STREAMR_CACHE_NAMESPACE=streamr-cold-validation` isolate target,
+registry/git and compiler caches without deleting active shared caches. Serialize
+these checks through the same queue; reuse the single isolated target sequentially
+and preserve receipts before removing owned validation caches.
 
 Linked Git worktrees automatically mount the original checkout's `target/` at
 `/app/target`, using `target/milestone2-runtime` for every queued build. Do not

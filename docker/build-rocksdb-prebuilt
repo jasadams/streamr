@@ -10,9 +10,14 @@ import json, pathlib, tomllib
 root = pathlib.Path('/tmp/streamr-rocksdb-input')
 pin = json.loads((root / 'rocksdb-prebuilt.json').read_text())
 if (sorted(pin['features']) != ['bindgen-runtime', 'lz4', 'static']
-        or pin['profile'] != {'opt-level': 0, 'debug': 'line-tables-only'}
+        or pin['profiles'] != {'dev': {'opt-level': '0', 'debug': 'true'}, 'release': {'opt-level': '3', 'debug': 'true'}, 'release-host': {'opt-level': '0', 'debug': 'false'}}
         or pin['target'] != 'x86_64-unknown-linux-gnu'):
     raise SystemExit('Unsupported prebuilt native recipe; update the build harness with its pin')
+import subprocess
+actual_rustc = subprocess.check_output(['rustc', '-Vv'], text=True)
+actual_cxx = subprocess.check_output(['c++', '--version'], text=True).splitlines()[0]
+if (f"release: {pin['rustc']}\n" not in actual_rustc or f"commit-hash: {pin['rustc_commit']}\n" not in actual_rustc or f"host: {pin['target']}\n" not in actual_rustc or actual_cxx != pin['cxx']):
+    raise SystemExit('Native recipe toolchain/host differs from pin before compilation')
 packages = tomllib.loads((root / 'Cargo.lock').read_text())['package']
 for name, version, checksum in [
     (pin['crate'], pin['version'], pin['checksum']),
@@ -33,6 +38,17 @@ librocksdb-sys = { path = "librocksdb-sys", default-features = false, features =
 [profile.dev]
 opt-level = 0
 debug = "line-tables-only"
+incremental = false
+
+[profile.release]
+opt-level = 3
+debug = "line-tables-only"
+incremental = false
+
+[profile.release-host]
+inherits = "dev"
+opt-level = 0
+debug = false
 incremental = false
 ''')
 (build / 'src/lib.rs').write_text('// Native archive build harness.\n')
@@ -72,14 +88,38 @@ for p in resolved['package']:
     if p.get('source') and (p['name'], p['version'], p.get('checksum')) not in allowed:
         raise SystemExit(f'Build dependency not pinned by repository lock: {p["name"]} {p["version"]}')
 PY
-# Do not inherit the final image's prebuilt overrides or a native compiler cache.
-env -u ROCKSDB_LIB_DIR -u ROCKSDB_STATIC -u ROCKSDB_INCLUDE_DIR RUSTC_WRAPPER= \
-    cargo build --locked --manifest-path Cargo.toml --jobs "${STREAMR_ROCKSDB_BUILD_JOBS:-4}"
-archives=(target/debug/build/librocksdb-sys-*/out/librocksdb.a)
-test "${#archives[@]}" -eq 1
-install -m 644 "${archives[0]}" "$install_dir/lib/librocksdb.a"
+# All three settings occur in Cargo: dev runtime/host, release runtime,
+# and release build dependencies (O0 without debug). Build each through the
+# exact original native build script, never a CMake substitute.
+for profile in dev release release-host; do
+    env -u ROCKSDB_LIB_DIR -u ROCKSDB_STATIC -u ROCKSDB_INCLUDE_DIR RUSTC_WRAPPER= \
+        cargo build --locked --manifest-path Cargo.toml --profile "$profile" --jobs "${STREAMR_ROCKSDB_BUILD_JOBS:-4}"
+    target_profile="$profile"
+    [[ "$profile" != dev ]] || target_profile=debug
+    archives=(target/"$target_profile"/build/librocksdb-sys-*/out/librocksdb.a)
+    test "${#archives[@]}" -eq 1
+    mkdir -p "$install_dir/$profile/lib"
+    install -m 644 "${archives[0]}" "$install_dir/$profile/lib/librocksdb.a"
+    python3 - "$profile" <<'RECEIPT'
+import hashlib, json, pathlib, subprocess, sys
+root = pathlib.Path('/opt/streamr-rocksdb')
+pin = json.loads(pathlib.Path('/tmp/streamr-rocksdb-input/rocksdb-prebuilt.json').read_text())
+name = sys.argv[1]
+receipt = {key: pin[key] for key in ('target', 'features', 'rustc', 'rustc_commit', 'cxx', 'rustflags', 'target_features')}
+actual_rustc = subprocess.check_output(['rustc', '--version'], text=True).split()[1]
+actual_cxx = subprocess.check_output(['c++', '--version'], text=True).splitlines()[0]
+if actual_rustc != pin['rustc'] or actual_cxx != pin['cxx']:
+    raise SystemExit(f'Native recipe toolchain mismatch: rustc={actual_rustc}, cxx={actual_cxx}')
+receipt['profile'] = pin['profiles'][name]
+with (root / name / 'lib/librocksdb.a').open('rb') as archive_file:
+    receipt['archive_sha256'] = hashlib.file_digest(archive_file, 'sha256').hexdigest()
+receipt['build_lock_sha256'] = hashlib.sha256(pathlib.Path('Cargo.lock').read_bytes()).hexdigest()
+receipt['source_checksum'] = pin['checksum']
+receipt['lz4_checksum'] = pin['lz4_checksum']
+(root / name / 'receipt.json').write_text(json.dumps(receipt, indent=2) + '\n')
+RECEIPT
+done
 cp /tmp/streamr-rocksdb-input/rocksdb-prebuilt.json "$install_dir/manifest.json"
 cp Cargo.lock "$install_dir/build-Cargo.lock"
-sha256sum "$install_dir/lib/librocksdb.a" > "$install_dir/archive.sha256"
 sha256sum /tmp/streamr-rocksdb-input/Cargo.lock > "$install_dir/source-lock.sha256"
 rm -rf "$build_dir"

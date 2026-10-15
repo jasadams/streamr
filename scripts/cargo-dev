@@ -21,6 +21,10 @@ if [[ "$1" == --build ]]; then
     cp "$repo_dir/docker/rustc-cache" "$build_context/docker/"
     cp "$repo_dir/docker/build-rocksdb-prebuilt" "$build_context/docker/"
     cp "$repo_dir/docker/rocksdb-prebuilt.json" "$build_context/docker/"
+    cp "$repo_dir/docker/rocksdb-rustc-wrapper" "$build_context/docker/"
+    cp "$repo_dir/docker/rocksdb-select" "$build_context/docker/"
+    cp "$repo_dir/docker/rocksdb-cache-guard" "$build_context/docker/"
+    cp "$repo_dir/docker/rocksdb_native_lock.py" "$build_context/docker/"
     cp "$repo_dir/Cargo.lock" "$build_context/"
     cp "$repo_dir/Dockerfile.dev" "$build_context/Dockerfile.dev"
     "$repo_dir/scripts/rust-build" podman build \
@@ -28,6 +32,27 @@ if [[ "$1" == --build ]]; then
     exit
 fi
 container_command=(cargo "$@")
+if [[ "$1" == --exec ]]; then
+    shift
+    (( $# )) || { echo 'Usage: scripts/cargo-dev --exec <finite command> [args...]' >&2; exit 2; }
+    container_command=("$@")
+fi
+container_shell='/usr/local/bin/streamr-rocksdb-cache-guard && "$@"; result=$?; sccache --stop-server >/dev/null 2>&1; exit "$result"'
+network_options=()
+container_options=()
+if [[ -n "${STREAMR_BUILD_CONTAINER_NAME:-}" ]]; then
+    [[ "$STREAMR_BUILD_CONTAINER_NAME" =~ ^streamr-build-pin-[a-z0-9-]+$ ]] || { echo "Invalid owned build container name" >&2; exit 2; }
+    container_options=(--name "$STREAMR_BUILD_CONTAINER_NAME")
+fi
+if [[ -n "${STREAMR_BUILD_DATABASE_CONTAINER:-}" ]]; then
+    [[ "$STREAMR_BUILD_DATABASE_CONTAINER" =~ ^[a-f0-9]{64}$ ]] || { echo "Build database must be an owned container ID" >&2; exit 2; }
+    : "${DATABASE_URL:?Set DATABASE_URL for the build database}"
+    network_options=(--network "container:$STREAMR_BUILD_DATABASE_CONTAINER" -e "DATABASE_URL=$DATABASE_URL")
+fi
+if [[ "${STREAMR_BUILD_MIGRATE:-0}" == 1 ]]; then
+    (( ${#network_options[@]} )) || { echo "Migration requires an owned build database" >&2; exit 2; }
+    container_shell='/usr/local/bin/streamr-rocksdb-cache-guard && bash scripts/migrate-build-db.sh && "$@"; result=$?; sccache --stop-server >/dev/null 2>&1; exit "$result"'
+fi
 if [[ "$1" == --stats ]]; then
     if (( $# != 1 )); then
         echo 'Usage: scripts/cargo-dev --stats' >&2
@@ -43,7 +68,15 @@ else
     exit "$image_status"
 fi
 image_pin="$(podman image inspect --format '{{ index .Labels "io.streamr.rocksdb.pin" }}' "$image")"
-native_compile="$(python3 "$repo_dir/docker/rocksdb-build-mode.py" "$repo_dir" "$image_pin" "$@")"
+image_id="$(podman image inspect --format '{{.Id}}' "$image")"
+[[ "$image_id" =~ ^(sha256:)?[a-f0-9]{64}$ ]] || { echo 'Dev image inspection did not return an immutable ID' >&2; exit 2; }
+native_compile="$(python3 "$repo_dir/docker/rocksdb-build-mode.py" "$repo_dir" "$image_pin" "$image_id" "$@")"
+if [[ "$native_compile" == 1 ]]; then
+    : "${STREAMR_ROCKSDB_SOURCE_REASON:?Source native compilation requires an explicit reason}"
+    echo "RocksDB native mode: source ($STREAMR_ROCKSDB_SOURCE_REASON)" >&2
+else
+    echo 'RocksDB native mode: prebuilt; actual Cargo host/runtime settings select the archive.' >&2
+fi
 incremental_override=()
 if [[ -n "${CARGO_INCREMENTAL+x}" ]]; then
     incremental_override=(-e "CARGO_INCREMENTAL=$CARGO_INCREMENTAL")
@@ -51,28 +84,38 @@ fi
 native_overrides=()
 while IFS= read -r variable; do
     case "$variable" in
-        CARGO_PROFILE_*|RUSTFLAGS|CARGO_ENCODED_RUSTFLAGS|CARGO_BUILD_TARGET|CC|CXX|CFLAGS|CXXFLAGS|ROCKSDB_CXX_STD)
+        CARGO_PROFILE_*|RUSTFLAGS|CARGO_ENCODED_RUSTFLAGS|CARGO_BUILD_TARGET|CC|CXX|CFLAGS|CXXFLAGS|CC_*|CXX_*|CFLAGS_*|CXXFLAGS_*|HOST_CC|HOST_CXX|HOST_CFLAGS|HOST_CXXFLAGS|TARGET_CC|TARGET_CXX|TARGET_CFLAGS|TARGET_CXXFLAGS|CRATE_CC_NO_DEFAULTS|ROCKSDB_CXX_STD)
             native_overrides+=(-e "$variable=${!variable}")
             ;;
     esac
 done < <(compgen -e)
+cache_namespace="${STREAMR_CACHE_NAMESPACE:-streamr}"
+[[ "$cache_namespace" =~ ^[a-z][a-z0-9-]*$ ]] || { echo 'Invalid Cargo cache namespace' >&2; exit 2; }
 shared_target="$repo_dir/target"
 if common_git_dir="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"; then
     shared_target="$(dirname -- "$common_git_dir")/target"
 fi
+if [[ -n "${STREAMR_SHARED_TARGET_DIR:-}" ]]; then
+    [[ "$STREAMR_SHARED_TARGET_DIR" == /* ]] || { echo 'Shared target override must be absolute' >&2; exit 2; }
+    shared_target="$STREAMR_SHARED_TARGET_DIR"
+fi
 exec "$repo_dir/scripts/rust-build" podman run --rm \
+    "${network_options[@]}" \
+    "${container_options[@]}" \
     -w /app \
     -e CARGO_TARGET_DIR=/app/target/milestone2-runtime \
     -e "CARGO_PROFILE_DEV_INCREMENTAL=${CARGO_PROFILE_DEV_INCREMENTAL:-true}" \
     -e "CARGO_PROFILE_TEST_INCREMENTAL=${CARGO_PROFILE_TEST_INCREMENTAL:-true}" \
     -e "ROCKSDB_COMPILE=$native_compile" \
+    -e "STREAMR_ROCKSDB_SOURCE_REASON=${STREAMR_ROCKSDB_SOURCE_REASON:-}" \
+    -e RUSTC_WRAPPER=/usr/local/bin/streamr-rocksdb-rustc-wrapper \
     "${incremental_override[@]}" \
     "${native_overrides[@]}" \
     -e "CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-4}" \
     -v "$repo_dir:/app:z" \
     -v "$shared_target:/app/target:z" \
-    -v streamr-cargo-registry:/usr/local/cargo/registry \
-    -v streamr-cargo-git:/usr/local/cargo/git \
-    -v streamr-sccache:/var/cache/sccache \
-    "$image" sh -c '"$@"; result=$?; sccache --stop-server >/dev/null 2>&1; exit "$result"' sh \
+    -v "$cache_namespace-cargo-registry":/usr/local/cargo/registry \
+    -v "$cache_namespace-cargo-git":/usr/local/cargo/git \
+    -v "$cache_namespace-sccache":/var/cache/sccache \
+    "$image_id" sh -c "$container_shell" sh \
     "${container_command[@]}"
