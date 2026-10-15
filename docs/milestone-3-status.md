@@ -1,3 +1,10 @@
+## STR-122 updating join fanout — ready for final review 2026-10-15
+
+- Branch `jason/str-122-join-fanout-20261015`, measurement base `5f326ae5`, integrated `2368459d`; current ticket/guidance read. Private per-change lazy LEFT proof reuse; SQL/state/API/resource limits unchanged, no state diff.
+- Ten finite runs/120 stages passed exact CDC/probe/cancellation/backend checks. Right proof seeks1152/2304/3456→24/24/24; required opposite scans/output unchanged. External CPU confounds wall timing; no stable throughput or full qualification claim. Failures/refusals retained.
+- Final no-probe locked worker check/strict Clippy/fmt all0; inventory7passed/0failed/1ignored, explicit pilot1passed; four direct INNER/LEFT memory/Rocks controller/batch1 fresh Engine recoveries passed exact existing oracle. Source unchanged through final combined reservation `b7d7e3a07e79`; measured/final join hash identical.
+- [Report](str-122-validation.md), evidence `/home/jason/qa-evidence/str122-join-fanout-20261015/`. Next: independent final supplement, coordinator commit/publication/current-head CI. No user decision pending. STR-103/126 retain integrated capacity/recovery qualification.
+
 ## STR-119 duplicate occurrence lookup — ready for publication 2026-10-15
 
 - Branch `jason/str-119-duplicates-20261015`, fetched base `277adcb8a2ff8d2821530de4ba4fc2abd613db66`; instructions `AGENTS.md`, `.claude/team.md`, `.claude/build-test.md`, this ledger/work plan and current STR-119. SESSION remains with its owner.
