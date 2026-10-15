@@ -172,7 +172,7 @@ async fn cleanup_generations_restore_mid_page_on_both_backends() {
                         )
                         .unwrap();
                         decoded.generation = 3;
-                        let encoded_group = encode_group(&decoded, limits.value_bytes).unwrap();
+                        let encoded_group = operator.native_group_codec().unwrap().encode(&decoded, limits.value_bytes).unwrap();
                         let group_key = native_group_key(b'G', &group).unwrap();
                         let rows_key = native_live_rows_key(&group).unwrap();
                         scope.put(&group_key, &encoded_group).unwrap();
