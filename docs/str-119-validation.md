@@ -277,3 +277,11 @@ were not repeated for this documentation-only integration; the exact
 probe-free executable evidence above remains source-bound to the unchanged code.
 Static whitespace/conflict/scope checks and independent integration review
 are delivery gates; current-head CI remains required before handoff.
+
+Before publication completed, main advanced to `5862fc2c` with the independent
+SESSION history delivery. The PR now merges that commit, preserving its two
+SESSION files/report exactly and resolving only the ledger prepend. All four
+duplicate-path worker files remain identical to the final passing receipt.
+SESSION changes are incoming main content, not part of this ticket diff.
+No new local build was run for this ledger integration; final independent review
+and current-head CI remain required.
