@@ -1,3 +1,11 @@
+## Active STR-124 TUMBLE/HOP scans — 2026-10-15
+
+- Coordinator `/root`, implementer `/root/implement`; branch `jason/str-124-windows-20261015`, fetched base `2368459dacd53f9e3aa5024fb5a4f31ba96f8dab`. Current ticket and AGENTS/build/team/ledger/work plan read; adjacent ownership preserved.
+- Measured predecessor/extra-value work repaired with strict full-leaf successors and1-result lookups; expiry/group/pane/retirement bounds, snapshot/commit progression and caps preserved. Group enumeration, known-key catalogue reads and historical tombstone skips remain necessary/unchanged.
+- All8 matched optimized native/probe-free timing arms passed0; each3,328 exact partial assertions plus32 actual watermark phases/40 exact outputs. Per-path/early-middle-late rates and negative noisy arms retained in [report](str-124-validation.md); finite gains do not establish combined production capacity. Temporary backend probes removed exactly.
+- Final locked worker check/strict Clippy/fmt/builds all0;11native+7store tests passed, each ignored diagnostic explicitly passed. Eight actual fresh Engine worker SQL checkpoint cases pass exact scalar/collection TUMBLE/HOP on memory/Rocks; no OS-process-loss claim. Final source manifests unchanged; worker89927702…/SQL528d885a… pins outside cache. Raw refusals/exits preserved under `/home/jason/qa-evidence/str124-windows-20261015/`.
+- Known append-partial CDC-window limitation remains STR-68; no semantic repair or passing retraction claim. Independent final source/evidence review approved. Next: coordinator integration/publication/current-head CI. Full qualification remains STR-103/126; no new user decision pending.
+
 ## STR-122 updating join fanout — ready for final review 2026-10-15
 
 - Branch `jason/str-122-join-fanout-20261015`, measurement base `5f326ae5`, integrated `2368459d`; current ticket/guidance read. Private per-change lazy LEFT proof reuse; SQL/state/API/resource limits unchanged, no state diff.

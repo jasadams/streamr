@@ -87,7 +87,10 @@ impl Write for CappedWriter {
 }
 
 // Exclusive upper bound for all keys with this nonempty index/time prefix.
-// The index byte guarantees a successor even at i64::MAX.
+// The index byte guarantees a successor even at i64::MAX. Complete window
+// index keys are self-delimiting leaves (group length and fixed sequence), so
+// this is also a strict lower bound after one consumed key, without extending
+// the admitted maximum key length.
 fn prefix_end(mut prefix: Vec<u8>) -> Vec<u8> {
     while prefix.last() == Some(&0xff) {
         prefix.pop();
@@ -578,7 +581,7 @@ impl WindowStore {
         let range = ScanRange {
             namespace: self.table.namespace().clone(),
             prefix: Some(vec![EXPIRY]),
-            start: after.clone(),
+            start: after.as_ref().map(|key| prefix_end(key.clone())),
             end: Some(end),
         };
         let mut cursor = None;
@@ -686,13 +689,13 @@ impl WindowStore {
 
 impl WindowSnapshot {
     /// First expiry remaining after the last successfully retired key in this
-    /// stable view. A one-entry page can contain only the inclusive start;
-    /// follow its cursor until the next key or EOF.
+    /// stable view. Seek past the complete retired leaf so even one-entry
+    /// pages do not reread it before finding the next populated bin.
     pub async fn next_expiry_time(&self, after: Option<&[u8]>) -> Result<Option<i64>> {
         let range = ScanRange {
             namespace: self.table.namespace().clone(),
             prefix: Some(vec![EXPIRY]),
-            start: after.map(<[u8]>::to_vec),
+            start: after.map(|key| prefix_end(key.to_vec())),
             end: None,
         };
         let mut cursor = None;
@@ -701,7 +704,7 @@ impl WindowSnapshot {
                 .snapshot
                 .try_scan(ScanRequest {
                     range: range.clone(),
-                    max_entries: self.limits.page_entries.min(2),
+                    max_entries: 1,
                     max_bytes: self.limits.page_bytes,
                     cursor,
                 })
@@ -727,7 +730,7 @@ impl WindowSnapshot {
         let range = ScanRange {
             namespace: self.table.namespace().clone(),
             prefix: Some(vec![GROUP]),
-            start: key.clone(),
+            start: key.as_ref().map(|key| prefix_end(key.clone())),
             end: None,
         };
         let mut cursor = None;
@@ -736,7 +739,7 @@ impl WindowSnapshot {
                 .snapshot
                 .try_scan(ScanRequest {
                     range: range.clone(),
-                    max_entries: self.limits.page_entries.min(2),
+                    max_entries: 1,
                     max_bytes: self.limits.page_bytes,
                     cursor,
                 })
@@ -798,11 +801,13 @@ impl WindowSnapshot {
             );
             upper = prefix_end(upper);
         }
-        let scan_start = after.map(<[u8]>::to_vec).unwrap_or(lower);
         ensure!(
-            scan_start.starts_with(&prefix),
+            after.is_none_or(|key| key.starts_with(&prefix)),
             "native window cursor is outside group"
         );
+        // Check the supplied leaf before advancing: an all-ff sequence at
+        // the final timestamp can have its successor outside the prefix.
+        let scan_start = after.map(|key| prefix_end(key.to_vec())).unwrap_or(lower);
         let range = ScanRange {
             namespace: self.table.namespace().clone(),
             prefix: Some(prefix),
@@ -815,7 +820,7 @@ impl WindowSnapshot {
                 .snapshot
                 .try_scan(ScanRequest {
                     range: range.clone(),
-                    max_entries: self.limits.page_entries.min(2),
+                    max_entries: 1,
                     max_bytes: self.limits.page_bytes,
                     cursor,
                 })
@@ -1411,5 +1416,302 @@ mod tests {
             None
         );
         assert_eq!(store.earliest_time().await.unwrap(), None);
+    }
+    // Finite diagnostic; uses the established backend/partial fixture directly.
+    #[tokio::test]
+    #[ignore = "STR-124 finite scan-stage diagnostic"]
+    async fn str124_scan_stages() {
+        use std::time::Instant;
+        for (name, groups, panes, overlap, page_entries) in [
+            ("many", 128usize, 8i64, 1i64, 64),
+            ("hot-hop", 4, 128, 4, 64),
+            ("one-entry", 16, 8, 2, 1),
+        ] {
+            let template = store_with_page_entries(page_entries);
+            let resources = template.resources.clone();
+            let limits = template.limits;
+            let schema = template.schema.clone();
+            let old = template.backend.clone();
+            drop(template);
+            old.close().await.unwrap();
+            let root = std::env::temp_dir().join(format!("str124-{}-{name}", std::process::id()));
+            std::fs::create_dir_all(&root).unwrap();
+            let backend =
+                exact_test_backend(true, &root, 0, resources.clone(), limits.max_resident_bytes)
+                    .await;
+            let mut tables = LiveTableManager::new(
+                backend.clone(),
+                Ownership::PartitionLocal {
+                    subtask: 0,
+                    parallelism: 1,
+                },
+            )
+            .unwrap();
+            let store = WindowStore::new(
+                backend.clone(),
+                tables.register("window").unwrap(),
+                resources,
+                schema,
+                limits,
+            )
+            .unwrap();
+            drop(tables);
+            // Reverse arrival preserves the latest catalogue time and creates churn.
+            for time in (0..panes).rev() {
+                for key in 0..groups {
+                    store
+                        .append(
+                            &(key as u64).to_be_bytes(),
+                            time,
+                            &partial(time + key as i64),
+                        )
+                        .await
+                        .unwrap();
+                }
+            }
+            for time in -8..0 {
+                for key in 0..groups {
+                    store
+                        .append(
+                            &(key as u64).to_be_bytes(),
+                            time,
+                            &partial(time + key as i64),
+                        )
+                        .await
+                        .unwrap();
+                }
+            }
+            assert_eq!(store.expire_before(0).await.unwrap(), groups * 8);
+            eprintln!(
+                "STR124 workload scenario={name} groups={groups} panes={panes} overlap={overlap} page_entries={page_entries} retained={} retired_history={}",
+                groups * panes as usize,
+                groups * 8
+            );
+            let snapshot = store.snapshot().await.unwrap();
+            let mut retired = None;
+            for tick in 1..panes + overlap {
+                let proc_start_stat = std::fs::read_to_string("/proc/self/stat").unwrap();
+                let proc_start_io = std::fs::read_to_string("/proc/self/io").unwrap();
+                let begin = Instant::now();
+                eprintln!("STR124 phase scenario={name} tick={tick} stage=expiry");
+                let earliest = snapshot.next_expiry_time(retired.as_deref()).await.unwrap();
+                assert_eq!(earliest, Some((tick - overlap).max(0)));
+                let expiry_ns = begin.elapsed().as_nanos();
+                eprintln!("STR124 phase scenario={name} tick={tick} stage=groups-panes");
+                let mut after_group = None;
+                let mut group_ns = 0u128;
+                let mut partial_ns = 0u128;
+                let mut rows = 0;
+                loop {
+                    let t = Instant::now();
+                    let group = snapshot.next_group(after_group.as_deref()).await.unwrap();
+                    group_ns += t.elapsed().as_nanos();
+                    let Some((key, latest)) = group else { break };
+                    assert_eq!(latest, panes - 1);
+                    let identity = u64::from_be_bytes(key.as_slice().try_into().unwrap()) as i64;
+                    let mut after = None;
+                    let mut values = Vec::new();
+                    let t = Instant::now();
+                    while let Some(row) = snapshot
+                        .next_partial(
+                            &key,
+                            (tick - overlap).max(0),
+                            tick.min(panes),
+                            after.as_deref(),
+                        )
+                        .await
+                        .unwrap()
+                    {
+                        let value = row
+                            .batch
+                            .column(0)
+                            .as_any()
+                            .downcast_ref::<Int64Array>()
+                            .unwrap()
+                            .value(0);
+                        values.push(value - identity);
+                        rows += 1;
+                        after = Some(row.key.clone());
+                    }
+                    assert_eq!(
+                        values,
+                        ((tick - overlap).max(0)..tick.min(panes)).collect::<Vec<_>>()
+                    );
+                    partial_ns += t.elapsed().as_nanos();
+                    after_group = Some(key);
+                }
+                let expected = groups * ((tick.min(panes) - (tick - overlap).max(0)) as usize);
+                assert_eq!(rows, expected);
+                eprintln!("STR124 phase scenario={name} tick={tick} stage=retire");
+                let t = Instant::now();
+                let cutoff = (tick - overlap + 1).max(0);
+                let deleted = store
+                    .expire_before_snapshot(&snapshot, cutoff, &mut retired)
+                    .await
+                    .unwrap();
+                assert_eq!(deleted, if tick >= overlap { groups } else { 0 });
+                let retire_ns = t.elapsed().as_nanos();
+                eprintln!(
+                    "STR124 result scenario={name} tick={tick} rows={rows} deleted={deleted} expiry_ns={expiry_ns} group_ns={group_ns} partial_ns={partial_ns} retire_ns={retire_ns} proc_stat={:?} proc_io={:?} proc_status={:?} proc_start_stat={:?} proc_start_io={:?}",
+                    std::fs::read_to_string("/proc/self/stat").unwrap(),
+                    std::fs::read_to_string("/proc/self/io").unwrap(),
+                    std::fs::read_to_string("/proc/self/status").unwrap(),
+                    proc_start_stat,
+                    proc_start_io
+                );
+            }
+            assert!(
+                snapshot
+                    .next_expiry_time(retired.as_deref())
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            drop(snapshot);
+            assert!(
+                store
+                    .snapshot()
+                    .await
+                    .unwrap()
+                    .next_group(None)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            drop(store);
+            backend.close().await.unwrap();
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn binary_group_and_extreme_time_cursors_keep_exact_neighbors() {
+        for rocks in [false, true] {
+            for page_entries in [1, 64] {
+                let template = store_with_page_entries(page_entries);
+                let resources = template.resources.clone();
+                let limits = template.limits;
+                let schema = template.schema.clone();
+                let old = template.backend.clone();
+                drop(template);
+                old.close().await.unwrap();
+                let root = std::env::temp_dir().join(format!(
+                    "str124-boundary-{}-{rocks}-{page_entries}",
+                    std::process::id()
+                ));
+                std::fs::create_dir_all(&root).unwrap();
+                let backend = exact_test_backend(
+                    rocks,
+                    &root,
+                    0,
+                    resources.clone(),
+                    limits.max_resident_bytes,
+                )
+                .await;
+                let mut tables = LiveTableManager::new(
+                    backend.clone(),
+                    Ownership::PartitionLocal {
+                        subtask: 0,
+                        parallelism: 1,
+                    },
+                )
+                .unwrap();
+                let store = WindowStore::new(
+                    backend.clone(),
+                    tables.register("window").unwrap(),
+                    resources,
+                    schema,
+                    limits,
+                )
+                .unwrap();
+                drop(tables);
+                for group in [b"".as_slice(), b"\xff", b"\xff\0"] {
+                    for time in [i64::MIN, 0, i64::MAX] {
+                        store.append(group, time, &partial(time)).await.unwrap();
+                    }
+                }
+                let snapshot = store.snapshot().await.unwrap();
+                let mut after_group = None;
+                for expected in [b"".as_slice(), b"\xff", b"\xff\0"] {
+                    let (group, latest) = snapshot
+                        .next_group(after_group.as_deref())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(group, expected);
+                    assert_eq!(latest, i64::MAX);
+                    for time in [i64::MIN, 0, i64::MAX] {
+                        let row = snapshot
+                            .next_partial_range(&group, time, time, true, None)
+                            .await
+                            .unwrap()
+                            .unwrap();
+                        assert_eq!(
+                            row.batch
+                                .column(0)
+                                .as_any()
+                                .downcast_ref::<Int64Array>()
+                                .unwrap()
+                                .value(0),
+                            time
+                        );
+                        assert!(
+                            snapshot
+                                .next_partial_range(&group, time, time, true, Some(&row.key))
+                                .await
+                                .unwrap()
+                                .is_none()
+                        );
+                        // A complete sequence ending in ff has no legal descendants.
+                        // Its strict successor may leave the timestamp/group prefix.
+                        let last = partial_key(&group, time, [0xff; 16]).unwrap();
+                        assert!(
+                            snapshot
+                                .next_partial_range(&group, time, time, true, Some(&last))
+                                .await
+                                .unwrap()
+                                .is_none()
+                        );
+                    }
+                    after_group = Some(group);
+                }
+                assert!(
+                    snapshot
+                        .next_group(after_group.as_deref())
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
+                let mut retired = None;
+                assert_eq!(
+                    store
+                        .expire_range_snapshot(&snapshot, i64::MAX, true, &mut retired)
+                        .await
+                        .unwrap(),
+                    9
+                );
+                assert!(
+                    snapshot
+                        .next_expiry_time(retired.as_deref())
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
+                drop(snapshot);
+                assert!(
+                    store
+                        .snapshot()
+                        .await
+                        .unwrap()
+                        .next_group(None)
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
+                drop(store);
+                backend.close().await.unwrap();
+                std::fs::remove_dir_all(root).unwrap();
+            }
+        }
     }
 }
