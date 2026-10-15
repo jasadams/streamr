@@ -875,3 +875,502 @@ fn ipc_preflight_rejects_aliased_schema_and_field_metadata_before_expansion() {
         assert!(preflight_ipc(&malformed, &descriptor, limits()).is_err());
     }
 }
+
+fn numbered_row(index: usize, payload: &str, generation: i64) -> RecordBatch {
+    row(
+        &format!("{index:010}"),
+        payload,
+        (!index.is_multiple_of(3)).then_some(index as i64 + generation),
+    )
+}
+
+async fn write_numbered(table: &TypedTable, count: usize, payload: &str, churn: bool) {
+    for start in (0..count).step_by(8) {
+        let mut scope = table.begin().await.unwrap();
+        for index in start..(start + 8).min(count) {
+            if churn && index.is_multiple_of(2) {
+                scope
+                    .delete(&key(&format!("{index:010}"), payload))
+                    .unwrap();
+            } else {
+                scope
+                    .put(&numbered_row(index, payload, if churn { 100 } else { 0 }))
+                    .unwrap();
+            }
+        }
+        scope.commit().await.unwrap();
+    }
+}
+
+fn process_work() -> [u64; 5] {
+    let stat = std::fs::read_to_string("/proc/self/stat").unwrap();
+    let fields: Vec<_> = stat
+        .rsplit_once(')')
+        .unwrap()
+        .1
+        .split_whitespace()
+        .collect();
+    let io = std::fs::read_to_string("/proc/self/io").unwrap();
+    let bytes = |name: &str| {
+        io.lines()
+            .find_map(|line| line.strip_prefix(name))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap()
+    };
+    let status = std::fs::read_to_string("/proc/self/status").unwrap();
+    let rss = status
+        .lines()
+        .find_map(|line| line.strip_prefix("VmRSS:"))
+        .unwrap()
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .parse::<u64>()
+        .unwrap()
+        * 1024;
+    [
+        fields[11].parse().unwrap(),
+        fields[12].parse().unwrap(),
+        bytes("read_bytes:"),
+        bytes("write_bytes:"),
+        rss,
+    ]
+}
+
+/// Actual public API, with finite retained growth and pinned pre-churn history.
+/// Timings are dev-profile diagnostics, not engine throughput qualification.
+#[tokio::test]
+#[ignore = "opt-in STR-125 finite typed-table pagination diagnostic"]
+async fn typed_scan_growth_churn_diagnostic() {
+    for (payload_bytes, page_entries, page_bytes) in
+        [(16, 1, 32768), (16, 16, 32768), (256, 16, 1900)]
+    {
+        for retained in [192usize, 768, 3072] {
+            let root = tempfile::tempdir().unwrap();
+            let resources = test_resources();
+            let backend = Arc::new(
+                RocksLiveState::open_worker_with_resources(
+                    RocksStateConfig {
+                        root: root.path().to_path_buf(),
+                        job_id: "str125".into(),
+                        operator_id: "enumeration".into(),
+                        subtask: 0,
+                        generation: 0,
+                        attempt: 0,
+                    },
+                    resources.clone(),
+                )
+                .await
+                .unwrap(),
+            );
+            backend.remove_on_drop();
+            let table_limits = TableLimits {
+                page_entries,
+                page_bytes,
+                ..limits()
+            };
+            let table = TypedTable::new(
+                backend.clone(),
+                namespace(),
+                descriptor(),
+                table_limits,
+                resources.clone(),
+            )
+            .unwrap();
+            let payload = "p".repeat(payload_bytes);
+            write_numbered(&table, retained * 2, &payload, false).await;
+            let history = table.snapshot().await.unwrap();
+            for _ in 0..3 {
+                write_numbered(&table, retained * 2, &payload, true).await;
+            }
+            let snapshot = table.snapshot().await.unwrap();
+            let mut completed = 0;
+            let mut next_report = retained / 3;
+            let mut cursor = None;
+            let mut pages = 0;
+            let mut scan_us = 0;
+            let mut started = std::time::Instant::now();
+            let mut work = process_work();
+            loop {
+                let scan_started = std::time::Instant::now();
+                let page = snapshot.scan(cursor).await.unwrap();
+                scan_us += scan_started.elapsed().as_micros();
+                assert!(!page.rows.is_empty());
+                for actual in &page.rows {
+                    let index = (completed * 2) + 1;
+                    assert_eq!(actual.batch(), &numbered_row(index, &payload, 100));
+                    completed += 1;
+                }
+                pages += 1;
+                cursor = page.next_cursor.clone();
+                drop(page);
+                if completed >= next_report || cursor.is_none() {
+                    next_report += retained / 3;
+                    let next = process_work();
+                    println!(
+                        "STR125_API retained={retained} history_keys={} churn_rounds=3 payload={payload_bytes} page_entries={page_entries} page_bytes={page_bytes} completed={completed} pages={pages} scan_us={scan_us} elapsed_us={} cpu_user_ticks={} cpu_system_ticks={} read_bytes={} write_bytes={} rss_bytes={}",
+                        retained * 2,
+                        started.elapsed().as_micros(),
+                        next[0] - work[0],
+                        next[1] - work[1],
+                        next[2] - work[2],
+                        next[3] - work[3],
+                        next[4]
+                    );
+                    started = std::time::Instant::now();
+                    work = next;
+                    pages = 0;
+                    scan_us = 0;
+                }
+                if cursor.is_none() {
+                    break;
+                }
+            }
+            assert_eq!(completed, retained);
+            drop(snapshot);
+            drop(history);
+            drop(table);
+            Arc::try_unwrap(backend)
+                .ok()
+                .unwrap()
+                .close()
+                .await
+                .unwrap();
+            assert!(
+                resources
+                    .try_scan_page(resources.config().scan_page_bytes)
+                    .is_ok()
+            );
+            assert!(
+                resources
+                    .try_decoded_value(resources.config().decoded_value_bytes)
+                    .is_ok()
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn typed_scan_cursor_values_isolation_and_resource_lifetimes() {
+    for rocks in [false, true] {
+        for (page_entries, page_bytes) in [(1, 32768), (16, 32768), (16, 1900)] {
+            let root = tempfile::tempdir().unwrap();
+            let resources = test_resources();
+            let backend: Arc<dyn LiveStateBackend> = crate::live::worker::construct_backend(
+                if rocks {
+                    crate::live::worker::BackendConstruction::Rocksdb(RocksStateConfig {
+                        root: root.path().to_path_buf(),
+                        job_id: "str125".into(),
+                        operator_id: "exact".into(),
+                        subtask: 0,
+                        generation: 0,
+                        attempt: 0,
+                    })
+                } else {
+                    crate::live::worker::BackendConstruction::Memory {
+                        max_resident_bytes: 1024 * 1024,
+                    }
+                },
+                resources.clone(),
+            )
+            .await
+            .unwrap();
+            let table = TypedTable::new(
+                backend.clone(),
+                namespace(),
+                descriptor(),
+                TableLimits {
+                    page_entries,
+                    page_bytes,
+                    ..limits()
+                },
+                resources.clone(),
+            )
+            .unwrap();
+            let empty = table.snapshot().await.unwrap();
+            let page = empty.scan(None).await.unwrap();
+            assert!(page.rows.is_empty() && page.next_cursor.is_none());
+            drop(page);
+            drop(empty);
+            write_numbered(&table, 48, "payload", false).await;
+            let history = table.snapshot().await.unwrap();
+            write_numbered(&table, 48, "payload", true).await;
+            let snapshot = table.snapshot().await.unwrap();
+            let mut other_descriptor = descriptor();
+            other_descriptor.table_identity.push(b'2');
+            let other = TypedTable::new(
+                backend.clone(),
+                StateNamespace {
+                    table: other_descriptor.table_identity.clone(),
+                    ..namespace()
+                },
+                other_descriptor,
+                limits(),
+                resources.clone(),
+            )
+            .unwrap();
+            let mut scope = other.begin().await.unwrap();
+            scope.put(&row("foreign", "payload", Some(999))).unwrap();
+            scope.commit().await.unwrap();
+            let other_view = other.snapshot().await.unwrap();
+            let first = snapshot.scan(None).await.unwrap();
+            let cursor = first.next_cursor.clone().unwrap();
+            assert!(matches!(
+                history.scan(Some(cursor.clone())).await,
+                Err(LiveStateError::InvalidCursor)
+            ));
+            assert!(matches!(
+                other_view.scan(Some(cursor.clone())).await,
+                Err(LiveStateError::InvalidCursor)
+            ));
+            // Mutations before and after the continuation position cannot leak
+            // into this stable view, even when already returned keys are deleted.
+            let mut scope = table.begin().await.unwrap();
+            scope.delete(&key("0000000001", "payload")).unwrap();
+            scope.put(&row("0000000000", "payload", Some(999))).unwrap();
+            scope.put(&row("zzzz", "payload", None)).unwrap();
+            scope.commit().await.unwrap();
+            let mut completed = 0;
+            let mut page = first;
+            loop {
+                for actual in &page.rows {
+                    assert_eq!(
+                        actual.batch(),
+                        &numbered_row(completed * 2 + 1, "payload", 100)
+                    );
+                    completed += 1;
+                }
+                let cursor = page.next_cursor.clone();
+                drop(page);
+                let Some(cursor) = cursor else {
+                    break;
+                };
+                page = snapshot.scan(Some(cursor)).await.unwrap();
+            }
+            assert_eq!(completed, 24);
+            // Retaining a row keeps the shared decoded-page charge after the
+            // page drops. Encoded-page capacity is released independently.
+            let mut page = snapshot.scan(None).await.unwrap();
+            let held = page.rows.pop().unwrap();
+            drop(page);
+            assert!(
+                resources
+                    .try_scan_page(resources.config().scan_page_bytes)
+                    .is_ok()
+            );
+            assert!(
+                resources
+                    .try_decoded_value(resources.config().decoded_value_bytes)
+                    .is_err()
+            );
+            drop(held);
+            assert!(
+                resources
+                    .try_decoded_value(resources.config().decoded_value_bytes)
+                    .is_ok()
+            );
+            // Cancel after polling into a blocked native-operation admission.
+            // The other operations own the slots; the abandoned scan must
+            // release its page reservations without waiting for their completion.
+            if rocks {
+                let mut blockers = Vec::new();
+                for _ in 0..resources.config().max_blocking_operations {
+                    let worker = resources.clone();
+                    let (started, ready) = tokio::sync::oneshot::channel();
+                    let (release, released) = std::sync::mpsc::channel();
+                    let task = tokio::spawn(async move {
+                        worker
+                            .run_blocking(move || {
+                                let _ = started.send(());
+                                let _ = released.recv();
+                            })
+                            .await
+                            .unwrap();
+                    });
+                    ready.await.unwrap();
+                    blockers.push((release, task));
+                }
+                {
+                    let pending = snapshot.scan(Some(cursor));
+                    tokio::pin!(pending);
+                    assert!(futures::poll!(&mut pending).is_pending());
+                }
+                assert!(
+                    resources
+                        .try_scan_page(resources.config().scan_page_bytes)
+                        .is_ok()
+                );
+                for (release, task) in blockers {
+                    release.send(()).unwrap();
+                    task.await.unwrap();
+                }
+            }
+            let tiny = TypedTable::new(
+                backend.clone(),
+                namespace(),
+                descriptor(),
+                TableLimits {
+                    page_bytes: 1,
+                    ..limits()
+                },
+                resources.clone(),
+            )
+            .unwrap();
+            let tiny_view = tiny.snapshot().await.unwrap();
+            assert!(matches!(
+                tiny_view.scan(None).await,
+                Err(LiveStateError::ReadLimitExceeded { .. })
+            ));
+            drop(tiny_view);
+            drop(tiny);
+            drop(other_view);
+            drop(other);
+            drop(snapshot);
+            drop(history);
+            drop(table);
+            backend.close().await.unwrap();
+            assert!(
+                resources
+                    .try_scan_page(resources.config().scan_page_bytes)
+                    .is_ok()
+            );
+            assert!(
+                resources
+                    .try_decoded_value(resources.config().decoded_value_bytes)
+                    .is_ok()
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn typed_scan_after_checkpoint_restore_restarts_with_new_cursor() {
+    use crate::live::checkpoint::{export_typed, restore_typed};
+    use arroyo_rpc::grpc::rpc::TypedStateTableConfig;
+    for target_rocks in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let resources = test_resources();
+        let source: Arc<dyn LiveStateBackend> =
+            Arc::new(MemoryLiveState::bounded(resources.clone(), 1024 * 1024).unwrap());
+        let table = TypedTable::new(
+            source.clone(),
+            namespace(),
+            descriptor(),
+            limits(),
+            resources,
+        )
+        .unwrap();
+        write_numbered(&table, 48, "restore", false).await;
+        let history = source.snapshot().await.unwrap();
+        write_numbered(&table, 48, "restore", true).await;
+        let typed_snapshot = table.snapshot().await.unwrap();
+        let page = typed_snapshot.scan(None).await.unwrap();
+        let old_cursor = page.next_cursor.clone().unwrap();
+        drop(page);
+        let raw = source.snapshot().await.unwrap();
+        let transport = arroyo_state_protocol::typed_checkpoint::transport_table_name(
+            &descriptor().table_identity,
+        )
+        .unwrap();
+        let config = TypedStateTableConfig {
+            transport_name: transport.clone(),
+            table_identity: descriptor().table_identity,
+            schema_identity: descriptor().schema_identity,
+            schema_json: b"{}".to_vec(),
+            primary_key: vec![0, 1],
+            partition_key: vec![0, 1],
+            encoding_version: ENCODING_VERSION,
+        };
+        let storage = Arc::new(
+            arroyo_storage::StorageProvider::for_url(&format!(
+                "file://{}/checkpoint",
+                root.path().display()
+            ))
+            .await
+            .unwrap(),
+        );
+        let metadata = export_typed(
+            &raw,
+            &namespace(),
+            &config,
+            &storage,
+            &format!(
+                "P/J/generations/1/checkpoints/checkpoint-0000001/operator-o/table-{transport}-000"
+            ),
+            1,
+            1,
+            0,
+            65536,
+        )
+        .await
+        .unwrap();
+        let mut config_resources = test_resources().config().clone();
+        // The existing restore adapter reserves a full backend page. These
+        // fixture budgets are identical for the two restored backends.
+        config_resources.scan_page_bytes = 8 * 1024 * 1024;
+        config_resources.queued_write_bytes = 8 * 1024 * 1024;
+        let resources = WorkerStateResources::new(config_resources).unwrap();
+        let target = crate::live::worker::construct_backend(
+            if target_rocks {
+                crate::live::worker::BackendConstruction::Rocksdb(RocksStateConfig {
+                    root: root.path().join("target"),
+                    job_id: "str125".into(),
+                    operator_id: "restore".into(),
+                    subtask: 0,
+                    generation: 1,
+                    attempt: 1,
+                })
+            } else {
+                crate::live::worker::BackendConstruction::Memory {
+                    max_resident_bytes: 1024 * 1024,
+                }
+            },
+            resources.clone(),
+        )
+        .await
+        .unwrap();
+        restore_typed(target.as_ref(), &namespace(), &config, &metadata, &storage)
+            .await
+            .unwrap();
+        let restored = TypedTable::new(
+            target.clone(),
+            namespace(),
+            descriptor(),
+            limits(),
+            resources,
+        )
+        .unwrap();
+        let view = restored.snapshot().await.unwrap();
+        assert!(matches!(
+            view.scan(Some(old_cursor)).await,
+            Err(LiveStateError::InvalidCursor)
+        ));
+        let mut cursor = None;
+        let mut completed = 0;
+        loop {
+            let page = view.scan(cursor).await.unwrap();
+            for actual in &page.rows {
+                assert_eq!(
+                    actual.batch(),
+                    &numbered_row(completed * 2 + 1, "restore", 100)
+                );
+                completed += 1;
+            }
+            cursor = page.next_cursor.clone();
+            if cursor.is_none() {
+                break;
+            }
+        }
+        assert_eq!(completed, 24);
+        drop(view);
+        drop(restored);
+        target.close().await.unwrap();
+        drop(raw);
+        drop(typed_snapshot);
+        drop(history);
+        drop(table);
+        source.close().await.unwrap();
+    }
+}

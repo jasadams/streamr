@@ -1,3 +1,12 @@
+## Active STR-125 typed-table pagination — 2026-10-15
+
+- Coordinator `/root`, implementer `/root/implement`; branch `jason/str-125-pagination-20261015`, fetched base `11a18a4281335690431fc52afd60e5dfadfd19fb`. Current ticket, AGENTS/build/team guidance and ledger/work plan read. Invoking dirty checkout preserved; pickup guard CLEAR under owned reservation.
+- Own public `TableSnapshot::scan`, directly necessary tests/adapter and `docs/str-125-validation.md`; preserve active STR-123/124 owners. No invented runtime caller, API redesign, resource-cap change or integrated qualification claim.
+- Acceptance: finite public API growth/churn/page baseline, measured contract-preserving improvement or reviewed efficient conclusion; exact typed/order/cursor/isolation/snapshot/resource/cancellation checks, affected state container gates, independent review and green open PR.
+- Six finite actual API arms passed: two native counter repeats plus four uninstrumented same-pin ABBA repeats, each 9 settings/12,096 exact rows. Retained192/768/3072 with pinned history/churn; seeks page1=192/768/3072, page16=12/48/192. No prefix-restart defect or speedup claimed; retain execution and document cursor/resource lifetimes. Probe removed.
+- Final current-source locked state check, strict Clippy and fmt all0; full state library82passed/0failed/4ignored, STR125 diagnostic explicitly passed6times. Exact cursor/order/values/isolation, polled cancellation/resource release and checkpoint→fresh memory/Rocks enumeration passed. Initial image refusal and analysis syntax error preserved.
+- Independent final source/evidence review approved with zero findings. Integrated STR-123/124 from fetched main `704b30c2`, preserving their ledger blocks; state/build/dependency inputs unchanged. Next: independent integration review, publication/current-head CI. No user decision pending. [Report](str-125-validation.md), evidence `/home/jason/qa-evidence/str125-pagination-20261015/`; STR-103/126 retain integrated qualification.
+
 ## Active STR-123 dirty flush traversal — 2026-10-15
 
 - Branch `jason/str-123-dirty-20261015`, fresh fetched base `2368459dacd53f9e3aa5024fb5a4f31ba96f8dab`. Read current STR-123, AGENTS/build/team guidance, ledger/work plan and build QA notes; STR-120 extrema/member and STR-122 join ownership preserved.
