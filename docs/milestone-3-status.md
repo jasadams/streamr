@@ -5,7 +5,7 @@
 - Acceptance: finite public API growth/churn/page baseline, measured contract-preserving improvement or reviewed efficient conclusion; exact typed/order/cursor/isolation/snapshot/resource/cancellation checks, affected state container gates, independent review and green open PR.
 - Six finite actual API arms passed: two native counter repeats plus four uninstrumented same-pin ABBA repeats, each 9 settings/12,096 exact rows. Retained192/768/3072 with pinned history/churn; seeks page1=192/768/3072, page16=12/48/192. No prefix-restart defect or speedup claimed; retain execution and document cursor/resource lifetimes. Probe removed.
 - Final current-source locked state check, strict Clippy and fmt all0; full state library82passed/0failed/4ignored, STR125 diagnostic explicitly passed6times. Exact cursor/order/values/isolation, polled cancellation/resource release and checkpoint→fresh memory/Rocks enumeration passed. Initial image refusal and analysis syntax error preserved.
-- Next: independent final source/evidence review, coordinator publication/current-head CI. No user decision pending. [Report](str-125-validation.md), evidence `/home/jason/qa-evidence/str125-pagination-20261015/`; STR-103/126 retain integrated qualification.
+- Independent final source/evidence review approved with zero findings. Integrated STR-123/124 from fetched main `704b30c2`, preserving their ledger blocks; state/build/dependency inputs unchanged. Next: independent integration review, publication/current-head CI. No user decision pending. [Report](str-125-validation.md), evidence `/home/jason/qa-evidence/str125-pagination-20261015/`; STR-103/126 retain integrated qualification.
 
 ## Active STR-123 dirty flush traversal — 2026-10-15
 

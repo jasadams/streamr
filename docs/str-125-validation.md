@@ -227,3 +227,13 @@ current-head PR CI remain delivery steps. No user semantics/architecture decisio
 is pending. Full engine throughput/RSS, arbitrary-history/large-state and actual
 worker/OS-process fault qualification remain outside this focused ticket and with
 STR-103/126; they are not claimed by these fixtures.
+
+## Delivery integration
+
+Independent final source/evidence review approved with zero findings. Delivery
+rebased onto fetched main `704b30c2cf7d617527ad495c3636369cd80f07a9`
+(merged STR-123/124). Only the ledger conflicted; all three ticket blocks were
+preserved. State sources, Cargo inputs and AGENTS/build/team guidance are identical
+to the validated source. Static diff/whitespace checks pass; no executable check
+was repeated for this documentation-only integration. Independent integration
+review and current-head PR CI remain delivery gates.
