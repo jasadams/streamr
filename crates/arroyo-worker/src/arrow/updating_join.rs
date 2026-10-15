@@ -386,9 +386,14 @@ impl UpdatingJoin {
             retract,
             own_key: &own_key,
         };
+        // Both passes use the same immutable snapshot and mutation overlay.
+        // Cache only the scalar LEFT unmatched decision, lazily after a match.
+        let mut unmatched_transition = None;
         let mut discard = Discard;
-        self.fanout(&change, &scope, &mut discard).await?;
-        self.fanout(&change, &scope, collector).await?;
+        self.fanout(&change, &scope, &mut unmatched_transition, &mut discard)
+            .await?;
+        self.fanout(&change, &scope, &mut unmatched_transition, collector)
+            .await?;
         scope.commit().await?;
         Ok(())
     }
@@ -396,6 +401,7 @@ impl UpdatingJoin {
         &self,
         change: &FanoutChange<'_>,
         scope: &AggregateScope<'_>,
+        unmatched_transition: &mut Option<bool>,
         collector: &mut dyn Collector,
     ) -> DataflowResult<()> {
         let FanoutChange {
@@ -430,17 +436,23 @@ impl UpdatingJoin {
                     self.emit(row.clone(), Some(opposite), retract, collector)
                         .await?;
                 } else if self.left_outer {
-                    let right_prefix = row_prefix(1, join_key)?;
-                    let first = scope.first(&right_prefix).await?;
-                    let only_current = if let Some((key, _)) = first {
-                        key == own_key
-                            && scope.first_from(&right_prefix, Some(&key)).await?.is_none()
+                    let transition = if let Some(transition) = *unmatched_transition {
+                        transition
                     } else {
-                        false
+                        let right_prefix = row_prefix(1, join_key)?;
+                        let first = scope.first(&right_prefix).await?;
+                        let transition = if retract {
+                            first.is_none()
+                        } else if let Some((key, _)) = first {
+                            key == own_key
+                                && scope.first_from(&right_prefix, Some(&key)).await?.is_none()
+                        } else {
+                            false
+                        };
+                        *unmatched_transition = Some(transition);
+                        transition
                     };
-                    if (!retract && only_current)
-                        || (retract && scope.first(&right_prefix).await?.is_none())
-                    {
+                    if transition {
                         if !retract {
                             self.emit(opposite.clone(), None, true, collector).await?;
                         }
@@ -829,6 +841,243 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    /// Finite operator CDC/traversal diagnostic; intentionally excluded from routine runs.
+    #[tokio::test]
+    #[ignore = "opt-in STR122 finite fanout growth/churn diagnostic"]
+    async fn native_join_fanout_growth_churn() {
+        use arroyo_state::live::{lifecycle::RocksStateConfig, rocks::RocksLiveState};
+        for left_outer in [false, true] {
+            let planned = planned_config(left_outer).await;
+            for rocks in [false, true] {
+                let root = std::env::temp_dir().join(format!("str122-{}", uuid::Uuid::new_v4()));
+                let mut op = operator_from_config(planned.clone());
+                // Finite fixture settings, identical for baseline/candidate; production limits are unchanged.
+                op.limits.max_probe_rows = 48;
+                let limits = op.store.as_ref().unwrap().limits();
+                let resources = op.store.as_ref().unwrap().resources().clone();
+                op.store.take();
+                let native = if rocks {
+                    Some(Arc::new(
+                        RocksLiveState::open(
+                            RocksStateConfig {
+                                root: root.clone(),
+                                job_id: "fanout-pilot".into(),
+                                operator_id: "join".into(),
+                                subtask: 0,
+                                generation: 0,
+                                attempt: 0,
+                            },
+                            resources.clone(),
+                        )
+                        .await
+                        .unwrap(),
+                    ))
+                } else {
+                    None
+                };
+                let backend: Arc<dyn LiveStateBackend> = native
+                    .as_ref()
+                    .map(|b| b.clone() as Arc<dyn LiveStateBackend>)
+                    .unwrap_or_else(|| {
+                        Arc::new(
+                            MemoryLiveState::bounded(
+                                resources.clone(),
+                                op.limits.max_resident_bytes,
+                            )
+                            .unwrap(),
+                        )
+                    });
+                let mut manager = LiveTableManager::new(
+                    backend.clone(),
+                    Ownership::PartitionLocal {
+                        subtask: 0,
+                        parallelism: 1,
+                    },
+                )
+                .unwrap();
+                let table = manager.register(TABLE).unwrap();
+                op.store = Some(
+                    AggregateStore::new(backend.clone(), table, resources.clone(), limits).unwrap(),
+                );
+                eprintln!(
+                    "STR122 settings outer={left_outer} rocks={rocks} limits={:?} resources={:?}",
+                    op.limits,
+                    resources.config()
+                );
+                // Retain historical versions while deleting right-side identities lower than the live IDs.
+                for id in 64..96 {
+                    op.change(1, row(&op, 1, id, Some(7), 20, false), &mut Discard)
+                        .await
+                        .unwrap();
+                }
+                let history = backend.snapshot().await.unwrap();
+                for id in 64..96 {
+                    op.change(1, row(&op, 1, id, Some(7), 20, true), &mut Discard)
+                        .await
+                        .unwrap();
+                }
+                let mut completed = 0usize;
+                let mut outputs = 0usize;
+                for (stage, end) in [16_u8, 32, 48].into_iter().enumerate() {
+                    for id in (end - 15)..=end {
+                        op.change(
+                            0,
+                            row(&op, 0, id, Some(7), i64::from(id), false),
+                            &mut Discard,
+                        )
+                        .await
+                        .unwrap();
+                    }
+                    eprintln!(
+                        "STR122 begin outer={left_outer} rocks={rocks} stage={stage} retained={end}"
+                    );
+                    for field in ["stat", "status", "io"] {
+                        eprintln!(
+                            "STR122 process_start field={field} raw={:?}",
+                            std::fs::read_to_string(format!("/proc/self/{field}")).unwrap()
+                        );
+                    }
+                    let started = std::time::Instant::now();
+                    // No matches and NULL keys must not trigger spurious opposite transitions.
+                    let mut absent = Capture::default();
+                    op.change(1, row(&op, 1, 210, Some(99), 77, false), &mut absent)
+                        .await
+                        .unwrap();
+                    op.change(1, row(&op, 1, 211, None, 88, false), &mut absent)
+                        .await
+                        .unwrap();
+                    assert!(absent.0.is_empty());
+                    op.change(1, row(&op, 1, 210, Some(99), 77, true), &mut absent)
+                        .await
+                        .unwrap();
+                    op.change(1, row(&op, 1, 211, None, 88, true), &mut absent)
+                        .await
+                        .unwrap();
+                    for cycle in 0..4 {
+                        for (id, retract, transition) in [
+                            (200, false, true),
+                            (201, false, false),
+                            (200, true, false),
+                            (201, true, true),
+                        ] {
+                            eprintln!(
+                                "STR122 change stage={stage} cycle={cycle} id={id} retract={retract}"
+                            );
+                            let mut capture = Capture::default();
+                            op.change(1, row(&op, 1, id, Some(7), 20, retract), &mut capture)
+                                .await
+                                .unwrap();
+                            let got = changes(&capture);
+                            let mut expected = Vec::new();
+                            for left in 1..=end {
+                                if left_outer && transition && !retract {
+                                    expected.push((true, Some(i64::from(left)), None));
+                                }
+                                expected.push((retract, Some(i64::from(left)), Some(20)));
+                                if left_outer && transition && retract {
+                                    expected.push((false, Some(i64::from(left)), None));
+                                }
+                            }
+                            assert_eq!(
+                                got.iter()
+                                    .map(|(r, _, l, v)| (*r, *l, *v))
+                                    .collect::<Vec<_>>(),
+                                expected
+                            );
+                            assert_eq!(
+                                got.iter()
+                                    .map(|(_, id, _, _)| id)
+                                    .collect::<std::collections::HashSet<_>>()
+                                    .len(),
+                                got.len()
+                            );
+                            completed += 1;
+                            outputs += got.len();
+                        }
+                    }
+                    eprintln!(
+                        "STR122 end outer={left_outer} rocks={rocks} stage={stage} completed={completed} outputs={outputs} elapsed_ns={}",
+                        started.elapsed().as_nanos()
+                    );
+                    for field in ["stat", "status", "io"] {
+                        eprintln!(
+                            "STR122 process field={field} raw={:?}",
+                            std::fs::read_to_string(format!("/proc/self/{field}")).unwrap()
+                        );
+                    }
+                }
+                let notify = Arc::new(tokio::sync::Notify::new());
+                // The collector signal proves cancellation happens during real output,
+                // after the deterministic preflight, rather than during a backend read.
+                struct Slow(Arc<tokio::sync::Notify>);
+                #[async_trait::async_trait]
+                impl Collector for Slow {
+                    async fn collect(&mut self, _: RecordBatch) -> DataflowResult<()> {
+                        self.0.notify_one();
+                        std::future::pending().await
+                    }
+                    async fn broadcast_watermark(
+                        &mut self,
+                        _: arroyo_types::Watermark,
+                    ) -> DataflowResult<()> {
+                        Ok(())
+                    }
+                }
+                let mut slow = Slow(notify.clone());
+                let mut pending =
+                    Box::pin(op.change(1, row(&op, 1, 200, Some(7), 20, false), &mut slow));
+                tokio::select! {
+                    _ = notify.notified() => {},
+                    result = &mut pending => panic!("slow collector returned: {result:?}"),
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => panic!("collector not reached"),
+                }
+                drop(pending);
+                for passer in &op.passers {
+                    assert!(passer.read().unwrap().is_none());
+                }
+                let scope = op.store.as_ref().unwrap().begin().await.unwrap();
+                assert!(
+                    scope
+                        .get(&identity_key(1, &[200; 16]))
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
+                drop(scope);
+                // Exact probe bound succeeds above; the same change one below must publish nothing and roll back.
+                op.limits.max_probe_rows = 47;
+                let mut capture = Capture::default();
+                let err = op
+                    .change(1, row(&op, 1, 200, Some(7), 20, false), &mut capture)
+                    .await
+                    .unwrap_err();
+                assert!(err.to_string().contains("max-probe-rows"), "{err}");
+                assert!(capture.0.is_empty());
+                let scope = op.store.as_ref().unwrap().begin().await.unwrap();
+                assert!(
+                    scope
+                        .get(&identity_key(1, &[200; 16]))
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
+                drop(scope);
+                drop(history);
+                drop(op);
+                drop(manager);
+                drop(backend);
+                if let Some(native) = native {
+                    Arc::try_unwrap(native)
+                        .unwrap_or_else(|_| panic!("retained backend"))
+                        .close_and_remove()
+                        .await
+                        .unwrap();
+                    std::fs::remove_dir_all(root).unwrap();
+                }
+            }
+        }
     }
 
     #[tokio::test]
