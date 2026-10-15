@@ -11,7 +11,8 @@ import unittest
 
 
 REPO = Path(__file__).resolve().parents[2]
-CONTAINER_SHELL = '"$@"; result=$?; sccache --stop-server >/dev/null 2>&1; exit "$result"'
+IMAGE_ID = "b" * 64
+CONTAINER_SHELL = '/usr/local/bin/streamr-rocksdb-cache-guard && "$@"; result=$?; sccache --stop-server >/dev/null 2>&1; exit "$result"'
 
 
 class CargoDevTest(unittest.TestCase):
@@ -26,7 +27,7 @@ class CargoDevTest(unittest.TestCase):
         shutil.copy2(REPO / "docker/cargo-dev-config.toml",
                      self.root / "docker/cargo-dev-config.toml")
         shutil.copy2(REPO / "docker/rustc-cache", self.root / "docker/rustc-cache")
-        for name in ("build-rocksdb-prebuilt", "rocksdb-prebuilt.json", "rocksdb-build-mode.py"):
+        for name in ("build-rocksdb-prebuilt", "rocksdb-prebuilt.json", "rocksdb-build-mode.py", "rocksdb-rustc-wrapper", "rocksdb-select", "rocksdb-cache-guard", "rocksdb_native_lock.py"):
             shutil.copy2(REPO / "docker" / name, self.root / "docker" / name)
         shutil.copy2(REPO / "Cargo.lock", self.root / "Cargo.lock")
         shutil.copy2(REPO / "Cargo.toml", self.root / "Cargo.toml")
@@ -51,6 +52,7 @@ class CargoDevTest(unittest.TestCase):
         self.write_stub("podman", """
 record = {'command': 'podman', 'args': sys.argv[1:], 'cwd': os.getcwd(),
           'queue': os.environ.get('RUST_BUILD_QUEUE_HELD')}
+record['auxiliary'] = (sys.argv[1:3] == ['image', 'inspect'] and '{{.Id}}' in sys.argv) or any(x.startswith('streamr-native-lock-check-') for x in sys.argv)
 if sys.argv[1] == 'build':
     context = pathlib.Path(sys.argv[-1])
     record['context'] = str(context)
@@ -59,9 +61,18 @@ if sys.argv[1] == 'build':
     record['dockerfile'] = (context / 'Dockerfile.dev').read_text()
 with open(os.environ['WRAPPER_TEST_LOG'], 'a') as log:
     log.write(json.dumps(record) + '\\n')
+if sys.argv[1:3] == ['image', 'inspect'] and '{{.Id}}' in sys.argv:
+    print(os.environ.get('IMAGE_ID', 'b' * 64))
+    sys.exit(0)
+if any(x.startswith('streamr-native-lock-check-') for x in sys.argv):
+    if sys.argv[1] == 'run':
+        lock = pathlib.Path('Cargo.lock').read_text()
+        print(json.dumps({'build_lock':lock, 'build_lock_sha256':[hashlib.sha256(lock.encode()).hexdigest()]}))
+        sys.exit(int(os.environ.get('NATIVE_HELPER_STATUS', '0')))
+    sys.exit(0)
 if sys.argv[1:3] == ['image', 'inspect']:
     pin = json.loads(pathlib.Path('docker/rocksdb-prebuilt.json').read_text())
-    expected = ':'.join(pin[k] for k in ('version', 'checksum', 'lz4_version', 'lz4_checksum'))
+    expected = ':'.join(pin[k] for k in ('version', 'checksum', 'lz4_version', 'lz4_checksum')) + ':' + hashlib.sha256(pathlib.Path('docker/rocksdb-prebuilt.json').read_bytes()).hexdigest()
     print(os.environ.get('PREBUILT_PIN', expected))
     sys.exit(int(os.environ.get('INSPECT_STATUS', '0')))
 if sys.argv[1:3] == ['image', 'exists']:
@@ -69,13 +80,14 @@ if sys.argv[1:3] == ['image', 'exists']:
 if sys.argv[1] == 'run' and os.environ.get('EXECUTE_CONTAINER_SHELL'):
     import subprocess
     shell_index = sys.argv.index('sh')
+    sys.argv[shell_index+2] = sys.argv[shell_index+2].replace('/usr/local/bin/streamr-rocksdb-cache-guard && ', '')
     sys.exit(subprocess.call(sys.argv[shell_index:]))
 sys.exit(int(os.environ.get('COMMAND_STATUS', '0')))
 """)
 
     def write_stub(self, name, source):
         path = self.bin / name
-        path.write_text("#!/usr/bin/env python3\nimport json, os, pathlib, sys\n" + source)
+        path.write_text("#!/usr/bin/env python3\nimport hashlib, json, os, pathlib, sys\n" + source)
         path.chmod(0o755)
 
     def run_wrapper(self, *args, name="cargo-dev", **env):
@@ -85,7 +97,7 @@ sys.exit(int(os.environ.get('COMMAND_STATUS', '0')))
                               capture_output=True, text=True, check=False, timeout=10)
 
     def records(self):
-        return [json.loads(line) for line in self.log.read_text().splitlines()]
+        return [row for line in self.log.read_text().splitlines() if not (row := json.loads(line)).get('auxiliary')]
 
     def test_container_arguments_cwd_and_queue(self):
         result = self.run_wrapper("test", "-p", "crate", "--", "a spaced argument")
@@ -96,23 +108,76 @@ sys.exit(int(os.environ.get('COMMAND_STATUS', '0')))
             'run', '--rm', '-w', '/app', '-e', 'CARGO_TARGET_DIR=/app/target/milestone2-runtime',
             '-e', 'CARGO_PROFILE_DEV_INCREMENTAL=true',
             '-e', 'CARGO_PROFILE_TEST_INCREMENTAL=true', '-e', 'ROCKSDB_COMPILE=0',
+            '-e', 'STREAMR_ROCKSDB_SOURCE_REASON=',
+            '-e', 'RUSTC_WRAPPER=/usr/local/bin/streamr-rocksdb-rustc-wrapper',
             '-e', 'CARGO_BUILD_JOBS=4',
             '-v', f'{self.root}:/app:z',
             '-v', f'{self.root}/target:/app/target:z',
             '-v', 'streamr-cargo-registry:/usr/local/cargo/registry',
             '-v', 'streamr-cargo-git:/usr/local/cargo/git',
             '-v', 'streamr-sccache:/var/cache/sccache',
-            'arroyo-dev', 'sh', '-c', CONTAINER_SHELL, 'sh', 'cargo', 'test', '-p', 'crate', '--', 'a spaced argument'])
+            IMAGE_ID, 'sh', '-c', CONTAINER_SHELL, 'sh', 'cargo', 'test', '-p', 'crate', '--', 'a spaced argument'])
         self.assertEqual(run['cwd'], str(self.root))
         self.assertEqual(run['queue'], str(self.base / 'cache/rust-build/build.lock'))
         self.assertIsNone(image['queue'])
+
+    def test_build_database_and_migrations_use_owned_network(self):
+        db = 'a' * 64
+        result = self.run_wrapper('build', STREAMR_BUILD_DATABASE_CONTAINER=db,
+                                  DATABASE_URL='postgres://fixture', STREAMR_BUILD_MIGRATE='1')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        run = self.records()[-1]['args']
+        self.assertIn('container:' + db, run)
+        self.assertIn('DATABASE_URL=postgres://fixture', run)
+        self.assertTrue(any('bash scripts/migrate-build-db.sh' in x for x in run))
+        result = self.run_wrapper('build', STREAMR_BUILD_DATABASE_CONTAINER='unowned-name',
+                                  DATABASE_URL='postgres://fixture')
+        self.assertEqual(result.returncode, 2)
+        self.assertFalse(self.log.exists())
+        result = self.run_wrapper('build', STREAMR_BUILD_MIGRATE='1')
+        self.assertEqual(result.returncode, 2)
+
+    def test_snapshot_shared_target_override(self):
+        result = self.run_wrapper('build', STREAMR_SHARED_TARGET_DIR=str(self.base / 'shared'))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(str(self.base / 'shared') + ':/app/target:z', self.records()[-1]['args'])
+        result = self.run_wrapper('build', STREAMR_SHARED_TARGET_DIR='relative')
+        self.assertEqual(result.returncode, 2)
+        self.assertFalse(any(r['args'][0] == 'run' for r in self.records()))
+
+    def test_isolated_cache_namespace_and_owned_container(self):
+        result = self.run_wrapper('build', STREAMR_CACHE_NAMESPACE='streamr-test-cold',
+                                  STREAMR_BUILD_CONTAINER_NAME='streamr-build-pin-test')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        run = self.records()[-1]['args']
+        self.assertIn('streamr-test-cold-sccache:/var/cache/sccache', run)
+        self.assertIn('streamr-build-pin-test', run)
+        result = self.run_wrapper('build', STREAMR_CACHE_NAMESPACE='../unsafe')
+        self.assertEqual(result.returncode, 2)
+
+    def test_finite_container_command_uses_maintained_environment(self):
+        result = self.run_wrapper('--exec', 'python3', '/app/scripts/probe.py', 'spaced argument')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.records()[-1]['args'][-3:],
+                         ['python3', '/app/scripts/probe.py', 'spaced argument'])
+        self.assertEqual(self.run_wrapper('--exec').returncode, 2)
+
+    def test_native_metadata_probe_is_owned_and_failure_stops_build(self):
+        result = self.run_wrapper('build', NATIVE_HELPER_STATUS='42')
+        self.assertEqual(result.returncode, 2, result.stderr)
+        rows = [json.loads(line) for line in self.log.read_text().splitlines()]
+        helpers = [r['args'] for r in rows if any(x.startswith('streamr-native-lock-check-') for x in r['args'])]
+        self.assertEqual(len(helpers), 2)
+        name = helpers[0][helpers[0].index('--name') + 1]
+        self.assertEqual(helpers[1], ['rm', '--force', '--ignore', name])
+        self.assertFalse(any(r['args'][0] == 'run' and not r.get('auxiliary') for r in rows))
 
     def test_stats_uses_same_container_shell_and_cache(self):
         result = self.run_wrapper('--stats')
         self.assertEqual(result.returncode, 0, result.stderr)
         image, inspect, run = self.records()
         self.assertEqual(run['args'][-7:],
-                         ['arroyo-dev', 'sh', '-c', CONTAINER_SHELL, 'sh',
+                         [IMAGE_ID, 'sh', '-c', CONTAINER_SHELL, 'sh',
                           'sccache', '--show-stats'])
         self.assertIn('streamr-sccache:/var/cache/sccache', run['args'])
 
@@ -183,17 +248,20 @@ sys.exit(37)
         self.assertEqual(result.returncode, 101)
         image, inspect, run = self.records()
         self.assertEqual(image['args'][-1], 'custom:image')
-        self.assertIn('custom:image', run['args'])
+        self.assertIn(IMAGE_ID, run['args'])
         self.assertIn('CARGO_BUILD_JOBS=2', run['args'])
 
-    def test_native_source_override_and_release_preserve_source_compilation(self):
-        for args, env in [(('build',), {'ROCKSDB_COMPILE': '1'}),
-                          (('build', '--release'), {}),
-                          (('test', '--profile=release'), {})]:
-            with self.subTest(args=args, env=env):
-                result = self.run_wrapper(*args, **env)
-                self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertIn('ROCKSDB_COMPILE=1', self.records()[-1]['args'])
+    def test_native_source_override_requires_reason_and_release_uses_archives(self):
+        result = self.run_wrapper('build', ROCKSDB_COMPILE='1',
+                                  STREAMR_ROCKSDB_SOURCE_REASON='native comparison')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('ROCKSDB_COMPILE=1', self.records()[-1]['args'])
+        result = self.run_wrapper('build', ROCKSDB_COMPILE='1')
+        self.assertNotEqual(result.returncode, 0)
+        for args in [('build', '--release'), ('test', '--profile=release')]:
+            result = self.run_wrapper(*args)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn('ROCKSDB_COMPILE=0', self.records()[-1]['args'])
 
     def test_old_or_mismatched_prebuilt_image_fails_before_build(self):
         result = self.run_wrapper('build', PREBUILT_PIN='old-image')
@@ -207,13 +275,16 @@ sys.exit(37)
         self.assertIn('ROCKSDB_COMPILE=0', self.records()[-1]['args'])
 
     def test_custom_native_profile_uses_source_and_forwards_settings(self):
-        result = self.run_wrapper('build', CARGO_PROFILE_DEV_OPT_LEVEL='2')
+        result = self.run_wrapper('build', CARGO_PROFILE_DEV_OPT_LEVEL='2', STREAMR_ROCKSDB_SOURCE_REASON='unsupported profile')
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('ROCKSDB_COMPILE=1', self.records()[-1]['args'])
         self.assertIn('CARGO_PROFILE_DEV_OPT_LEVEL=2', self.records()[-1]['args'])
         manifest = self.root / 'Cargo.toml'
         manifest.write_text(manifest.read_text().replace('[profile.dev]', '[profile.dev]\nopt-level = 2'))
         result = self.run_wrapper('build')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(any(r['args'][0] == 'run' for r in self.records()))
+        result = self.run_wrapper('build', STREAMR_ROCKSDB_SOURCE_REASON='unsupported manifest profile')
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('ROCKSDB_COMPILE=1', self.records()[-1]['args'])
 
@@ -243,7 +314,11 @@ sys.exit(37)
                 self.assertEqual(record['files'], ['Cargo.lock', 'Dockerfile.dev', 'docker',
                                                    'docker/build-rocksdb-prebuilt',
                                                    'docker/cargo-dev-config.toml',
+                                                   'docker/rocksdb-cache-guard',
                                                    'docker/rocksdb-prebuilt.json',
+                                                   'docker/rocksdb-rustc-wrapper',
+                                                   'docker/rocksdb-select',
+                                                   'docker/rocksdb_native_lock.py',
                                                    'docker/rustc-cache'])
                 self.assertEqual(record['cargo_config'],
                                  (REPO / 'docker/cargo-dev-config.toml').read_text())

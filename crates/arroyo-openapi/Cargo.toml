@@ -3,6 +3,11 @@ name = "arroyo-openapi"
 version = "0.16.0-dev"
 edition = "2024"
 
+[features]
+# Keep the host API's rust-embed runtime aligned with its shared derive macro
+# when packaging opts into embedding UI assets in a development build.
+embedded-ui = ["arroyo-api/embedded-ui"]
+
 [dependencies]
 progenitor-client = { git = "https://github.com/oxidecomputer/progenitor" }
 reqwest = { workspace = true, features = ["json", "stream"] }

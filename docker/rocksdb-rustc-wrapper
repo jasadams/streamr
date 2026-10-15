@@ -1,0 +1,24 @@
+#!/usr/bin/env python3
+"""Keep upstream build.rs intact; wrap only its executable to select native inputs."""
+import os
+from pathlib import Path
+import shlex
+import subprocess
+import sys
+
+args = sys.argv[1:]
+status = subprocess.call(['/usr/local/bin/streamr-rustc-cache', *args])
+if status or os.environ.get('CARGO_PKG_NAME') != 'librocksdb-sys':
+    sys.exit(status)
+if '--crate-name' not in args or args[args.index('--crate-name') + 1] != 'build_script_build':
+    sys.exit(0)
+if '--out-dir' not in args or not any('link' in a for a in args if a.startswith('--emit=')):
+    sys.exit(0)
+extra = next((a.split('=', 1)[1] for a in args if a.startswith('extra-filename=')), '')
+binary = Path(args[args.index('--out-dir') + 1]) / ('build_script_build' + extra)
+original = binary.with_name(binary.name + '.streamr-upstream')
+# Rename the compiler output rather than changing an inode possibly shared with
+# cache artifacts. The new launcher is a separate inode.
+binary.replace(original)
+binary.write_text('#!/bin/sh\nexec /usr/local/bin/streamr-rocksdb-select ' + shlex.quote(str(original.resolve())) + ' "$@"\n')
+binary.chmod(0o755)
