@@ -2,7 +2,10 @@
 
 Campaign 3 passed the scoped build, package, native correctness and worker
 recovery acceptance at source `f46c641565c28a4c09446854f8a7c71d78f35ea7`.
-This is evidence for that source, not the pending rebased branch or current main.
+Rebased source `71f248a3428850520c04c793221e5f705200e19f` subsequently passed
+current-source dev/release packaging, UI, worker recovery and focused native
+correctness checks. The original cold/source-native evidence remains bound to
+its campaign source; current-source runs used warm caches.
 No engine SQL, state, checkpoint, recovery or resource semantics changed.
 
 ## Source and evidence
@@ -181,7 +184,7 @@ the real native correctness test.
 ## Checks and preserved failed attempts
 
 At validated source, affected script checks exited 0: cargo-dev 21 tests,
-native selection 24 tests, build-pin 17 tests, preflight Clippy wrapper six tests,
+native selection 25 tests, build-pin 17 tests, preflight Clippy wrapper six tests,
 ticket guard 48 checks, shell syntax and whitespace checks. Independent review
 and these checks supplement the completed native/package/runtime evidence.
 
@@ -194,6 +197,10 @@ Earlier failures are retained in the evidence root and `campaign2/`:
   host API: the shared rust-embed derive macro enabled `debug-embed`, while its
   host library did not. Optional packaging feature forwarding aligns both host
   and runtime libraries. Ordinary dev defaults remain unchanged.
+- The first repaired warm CLI compiled, but the frozen-input guard caught a
+  bytecode cache created by the host preflight import. The helper now disables
+  bytecode writes before importing; an isolated subprocess regression preserves
+  the strict inventory check. That failed packaging attempt remains recorded.
 - A previous build database left an anonymous volume. It was removed only after
   confirming zero container references; maintained owned-database cleanup now
   removes its anonymous volumes while preserving named Cargo caches.
@@ -202,11 +209,55 @@ Failed attempts remain failed. Their logs, exact exits and cleanup audits were
 not replaced by the successful campaign. The repaired warm diagnostic was not
 relabeled cold; campaign 3 supplied fresh cold prerequisites.
 
-## Remaining current-source delivery gap
+## Completed current-source verification and remaining delivery
 
-Main has advanced to `277adcb8` after the campaign's validated source. Rebase,
-reconciliation of applicable guidance, and current-source package plus runtime
-verification are **pending**. The campaign 3 results do not establish that future
-rebased source passes. Fresh independent review of material changes and
-current-head PR CI are also pending. No merge, release, deployment, broader
-engine qualification or runtime performance speedup is claimed here.
+The branch was rebased onto main `277adcb8` at source
+`71f248a3428850520c04c793221e5f705200e19f`. Applicable guidance and dependency
+pins were reconciled and unchanged. Main was refetched and remained `277adcb8`.
+`/home/jason/qa-evidence/str127-build-pinning-20261015/current-main/current-source-complete.json`
+records the subsequent completed checks at that exact rebased source, using the
+same immutable image and native archive identities recorded above.
+
+Both profiles produced packages with empty compiled-input diffs. Preserved
+native mappings prove dev O0/debug, release runtime O3/debug, and release host
+O0/no debug selected the exact matching image archives, with no RocksDB C++
+compilation. These runs reused the shared target and caches; **no current-source
+cold-build claim** is made. Campaign 3 retains the earlier source-bound cold,
+source-edit reuse and genuine source-native compilation evidence at `f46c6415`.
+
+| Current-source phase / result receipt | Complete wrapper seconds | Cargo command seconds |
+| --- | --- | --- |
+| `dev-rebased-current-result.json` | 171.12880757497624 | 134.0609471789794 |
+| `dev-recovery-result.json` | 90.86627445102204 | — |
+| `release-rebased-current-result.json` | 452.6962609270122 | 413.7088528579334 |
+| `release-recovery-result.json` | 97.44305664300919 | — |
+| `current-prebuilt-native-result.json` | 15.238503213971853 | — |
+
+All five current-source phase wrappers and container cleanup commands exited 0.
+The retained package executable hashes are:
+
+| Current-source package | Executable SHA-256 |
+| --- | --- |
+| dev | `303d9412bd98dee7a0c2341fb35cbc0037e43a92d730ad3011f0d73fdd54f76f` |
+| release | `72bb3abea127464b28c4e517b36c7ac9419916745415c8548cc4178a0f3514d8` |
+
+Both packages again passed source-free real-worker recovery: checkpoint epoch 1,
+generation 1 loss and generation 2 replacement, exact raw rows 0 through 999,
+and exact final count 1000, sum 499500, minimum 0 and maximum 999. Both UI HTTP
+checks returned 200/4728 bytes with the same exact served-asset SHA-256 recorded
+above. Full results and identities are under `current-main/*-runtime-cases/`.
+Each runtime result retains actual CLI exit -9 from finite post-success cleanup,
+job state `Finished`, cleanup complete and no cleanup errors; supervisor exit 0
+does not substitute for a graceful CLI exit. No checkout was mounted.
+
+The exact prebuilt-mode test
+`live::rocks::tests::rocks_conforms_and_reopens_explicitly` also passed at the
+rebased source (1 passed, 0 failed), separate from the earlier positive
+source-compilation comparison. Its command, native selection, test output,
+wrapper timing and cleanup are preserved in `current-prebuilt-native-result.json`
+and the corresponding log.
+
+Final independent review approved the implementation, rebased source and
+completed evidence/report with no remaining acceptance gap. Current-head PR CI
+is tracked separately on the pull request. No merge, release, deployment,
+broader engine qualification or runtime performance speedup is claimed here.
