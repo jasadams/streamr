@@ -1184,7 +1184,6 @@ impl IncrementalAggregatingFunc {
         let aggregate = &self.aggregates[aggregate_index];
         let prefix = native_member_prefix(group, generation, aggregate_index)?;
         let mut accumulator = aggregate.func.create_accumulator()?;
-        let mut after = None;
         if aggregate.collection_output_limit == Some(0) {
             let stats = CollectionStats::decode(
                 scope
@@ -1202,29 +1201,27 @@ impl IncrementalAggregatingFunc {
                 )));
             }
         }
-        let mut selected = 0usize;
-        while aggregate
-            .collection_output_limit
-            .is_none_or(|limit| selected < limit)
-        {
-            let Some((key, stored)) = scope.first_from(&prefix, after.as_deref()).await? else {
-                break;
-            };
+        let mut update = |stored: &[u8]| -> Result<()> {
             let args = if aggregate.collection {
-                native_collection_member(&stored)?.1
+                native_collection_member(stored)?.1
             } else {
-                stored.as_slice()
+                stored
             };
             let parser = aggregate.row_converter.parser();
             let columns = aggregate
                 .row_converter
                 .convert_rows(std::iter::once(parser.parse(args)))?;
             accumulator.update_batch(&columns)?;
-            selected += 1;
-            if !aggregate.collection {
-                break;
-            }
-            after = Some(key);
+            Ok(())
+        };
+        if aggregate.collection {
+            scope
+                .visit_prefix(&prefix, aggregate.collection_output_limit, |_, stored| {
+                    update(stored)
+                })
+                .await?;
+        } else if let Some((_, stored)) = scope.first(&prefix).await? {
+            update(&stored)?;
         }
         Ok(accumulator.evaluate_mut()?)
     }
@@ -4007,6 +4004,57 @@ mod tests {
         filtered: bool,
         limit: Option<u64>,
     ) -> Result<IncrementalAggregatingFunc> {
+        native_array_operator_with_limits(
+            distinct,
+            ignore_nulls,
+            filtered,
+            limit,
+            native_test_config(),
+        )
+    }
+
+    fn native_array_operator_with_limits(
+        distinct: bool,
+        ignore_nulls: bool,
+        filtered: bool,
+        limit: Option<u64>,
+        native_config: AggregateStateConfig,
+    ) -> Result<IncrementalAggregatingFunc> {
+        native_array_operator_with_options(
+            distinct,
+            ignore_nulls,
+            filtered,
+            limit,
+            native_config,
+            true,
+        )
+    }
+
+    fn native_array_operator_with_order(
+        distinct: bool,
+        ignore_nulls: bool,
+        filtered: bool,
+        limit: Option<u64>,
+        ordered: bool,
+    ) -> Result<IncrementalAggregatingFunc> {
+        native_array_operator_with_options(
+            distinct,
+            ignore_nulls,
+            filtered,
+            limit,
+            native_test_config(),
+            ordered,
+        )
+    }
+
+    fn native_array_operator_with_options(
+        distinct: bool,
+        ignore_nulls: bool,
+        filtered: bool,
+        limit: Option<u64>,
+        native_config: AggregateStateConfig,
+        ordered: bool,
+    ) -> Result<IncrementalAggregatingFunc> {
         let schema = input_schema();
         let value: Arc<dyn PhysicalExpr> = Arc::new(Column::new("value", 0));
         let sequence: Arc<dyn PhysicalExpr> = Arc::new(Column::new("sequence", 1));
@@ -4020,7 +4068,7 @@ mod tests {
             .alias("items");
         if distinct {
             builder = builder.distinct();
-        } else {
+        } else if ordered {
             builder = builder.order_by(LexOrdering::new(vec![PhysicalSortExpr::new(
                 sequence,
                 SortOptions {
@@ -4101,7 +4149,7 @@ mod tests {
         IncrementalAggregatingConstructor::build_with_native_config(
             config,
             Arc::new(registry),
-            Some(native_test_config()),
+            Some(native_config),
         )
     }
 
@@ -6261,7 +6309,10 @@ mod tests {
                 LiveTableManager::new(backends[0].clone(), ownership.clone()).unwrap();
             let table = manager.register(NATIVE_AGGREGATE_TABLE).unwrap();
             let namespace = table.namespace().clone();
-            let limits = native_test_store().limits();
+            let limits = AggregateStoreLimits {
+                page_entries: 2,
+                ..native_test_store().limits()
+            };
             let store =
                 AggregateStore::new(backends[0].clone(), table, resources.clone(), limits).unwrap();
             let mut operator = native_array_operator(false, false, false);
@@ -6340,6 +6391,18 @@ mod tests {
                 array_members(restored_store, &fresh).await,
                 vec![ScalarValue::Utf8(Some("winner".into()))]
             );
+            // Recovered full output spans multiple admitted pages, including
+            // a null member; bounded selection must retain all of that state.
+            fresh.aggregates[0].collection_output_limit = None;
+            assert_eq!(
+                array_members(restored_store, &fresh).await,
+                vec![
+                    ScalarValue::Utf8(Some("winner".into())),
+                    ScalarValue::Utf8(Some("next".into())),
+                    ScalarValue::Utf8(None)
+                ]
+            );
+            fresh.aggregates[0].collection_output_limit = Some(1);
             let mut scope = restored_store.begin().await.unwrap();
             let totals = CollectionStats::decode(
                 scope
@@ -9253,5 +9316,517 @@ mod tests {
         let actual = fresh.evaluate(&GLOBAL_KEY).unwrap();
         assert_eq!(actual[0], ScalarValue::Int64(Some(2)));
         assert_eq!(actual[1], ScalarValue::Int64(Some(2)));
+    }
+    /// Opt-in end-to-end fallback diagnostic; wrapper counts actual admitted
+    /// backend pages, including entries the caller fetched but did not select.
+    #[tokio::test]
+    #[ignore = "opt-in STR-121 finite collection page utilisation diagnostic"]
+    async fn native_collection_page_utilisation_pilot() {
+        use arroyo_state::live::{
+            self, LastEntryRequest, ReadOptions, ScanPage, ScanRequest, SnapshotReader, StateKey,
+            StateSnapshot, WriteBatch, lifecycle::RocksStateConfig, rocks::RocksLiveState,
+            write::AdmittedWriteBatch,
+        };
+        use std::sync::atomic::{AtomicU64, Ordering};
+        #[derive(Default)]
+        struct Counts {
+            pages: AtomicU64,
+            entries: AtomicU64,
+            bytes: AtomicU64,
+        }
+        struct Reader {
+            inner: StateSnapshot,
+            counts: Arc<Counts>,
+        }
+        #[async_trait::async_trait]
+        impl SnapshotReader for Reader {
+            async fn get(&self, k: &StateKey, o: ReadOptions) -> live::Result<Option<Vec<u8>>> {
+                self.inner.get(k, o).await
+            }
+            async fn try_get(&self, k: &StateKey, o: ReadOptions) -> live::Result<Option<Vec<u8>>> {
+                self.inner.try_get(k, o).await
+            }
+            async fn multi_get(
+                &self,
+                k: &[StateKey],
+                o: ReadOptions,
+            ) -> live::Result<Vec<Option<Vec<u8>>>> {
+                self.inner.multi_get(k, o).await
+            }
+            async fn scan(&self, r: ScanRequest) -> live::Result<ScanPage> {
+                self.try_scan(r).await
+            }
+            async fn try_scan(&self, r: ScanRequest) -> live::Result<ScanPage> {
+                let p = self.inner.try_scan(r).await?;
+                self.counts.pages.fetch_add(1, Ordering::Relaxed);
+                self.counts
+                    .entries
+                    .fetch_add(p.entries.len() as u64, Ordering::Relaxed);
+                self.counts.bytes.fetch_add(
+                    p.entries
+                        .iter()
+                        .map(|e| (e.key.key.len() + e.value.len()) as u64)
+                        .sum::<u64>(),
+                    Ordering::Relaxed,
+                );
+                Ok(p)
+            }
+            async fn last_in_range(&self, r: LastEntryRequest) -> live::Result<ScanPage> {
+                self.inner.last_in_range(r).await
+            }
+        }
+        struct Backend {
+            inner: Arc<RocksLiveState>,
+            counts: Arc<Counts>,
+        }
+        #[async_trait::async_trait]
+        impl LiveStateBackend for Backend {
+            async fn get(&self, k: &StateKey, o: ReadOptions) -> live::Result<Option<Vec<u8>>> {
+                self.inner.get(k, o).await
+            }
+            async fn try_get(&self, k: &StateKey, o: ReadOptions) -> live::Result<Option<Vec<u8>>> {
+                self.inner.try_get(k, o).await
+            }
+            async fn multi_get(
+                &self,
+                k: &[StateKey],
+                o: ReadOptions,
+            ) -> live::Result<Vec<Option<Vec<u8>>>> {
+                self.inner.multi_get(k, o).await
+            }
+            async fn write_batch(&self, b: WriteBatch) -> live::Result<()> {
+                self.inner.write_batch(b).await
+            }
+            async fn snapshot(&self) -> live::Result<StateSnapshot> {
+                Ok(StateSnapshot(Arc::new(Reader {
+                    inner: self.inner.snapshot().await?,
+                    counts: self.counts.clone(),
+                })))
+            }
+            fn try_admit_write(&self, b: usize, n: usize) -> live::Result<AdmittedWriteBatch> {
+                self.inner.try_admit_write(b, n)
+            }
+            async fn admit_write(&self, b: usize, n: usize) -> live::Result<AdmittedWriteBatch> {
+                self.inner.admit_write(b, n).await
+            }
+            async fn write_admitted(&self, b: AdmittedWriteBatch) -> live::Result<()> {
+                self.inner.write_admitted(b).await
+            }
+        }
+        let repeats = std::env::var("STR121_PILOT_REPEAT")
+            .map(|s| vec![s.parse::<usize>().unwrap()])
+            .unwrap_or_else(|_| (0..3).collect());
+        for repeat in repeats {
+            // DISTINCT gives the supported unordered ARRAY_AGG path. Ordinary
+            // ordered output additionally exercises duplicate multiplicity.
+            for (scenario, distinct, value_len, page_entries, limit) in [
+                ("ordered", false, 24, 16, None),
+                ("unordered_distinct", true, 24, 16, None),
+                ("bounded", false, 24, 16, Some(7)),
+                ("zero", false, 24, 16, Some(0)),
+                ("byte_limited", false, 384, 128, Some(1)),
+            ] {
+                let root = std::env::temp_dir().join(format!("str121-{}", uuid::Uuid::new_v4()));
+                let template = native_test_store();
+                let resources = template.resources().clone();
+                let mut limits = template.limits();
+                limits.page_entries = page_entries;
+                if scenario == "byte_limited" {
+                    // Existing documented aggregate key/value/output settings;
+                    // tighter page bytes exercise byte rather than entry limits.
+                    limits.key_bytes = 512;
+                    limits.value_bytes = 32768;
+                    limits.page_bytes = 35 * 1024;
+                }
+                drop(template);
+                let rocks = Arc::new(
+                    RocksLiveState::open(
+                        RocksStateConfig {
+                            root: root.clone(),
+                            job_id: "str121".into(),
+                            operator_id: "collection".into(),
+                            subtask: 0,
+                            generation: 0,
+                            attempt: 0,
+                        },
+                        resources.clone(),
+                    )
+                    .await
+                    .unwrap(),
+                );
+                let counts = Arc::new(Counts::default());
+                let backend: Arc<dyn LiveStateBackend> = Arc::new(Backend {
+                    inner: rocks.clone(),
+                    counts: counts.clone(),
+                });
+                let mut manager = LiveTableManager::new(
+                    backend.clone(),
+                    Ownership::PartitionLocal {
+                        subtask: 0,
+                        parallelism: 1,
+                    },
+                )
+                .unwrap();
+                let table = manager.register(NATIVE_AGGREGATE_TABLE).unwrap();
+                let namespace = table.namespace().clone();
+                let store = AggregateStore::new(backend.clone(), table, resources, limits).unwrap();
+                let mut config = native_test_config();
+                if scenario == "byte_limited" {
+                    config.key_bytes = limits.key_bytes;
+                    config.value_bytes = limits.value_bytes;
+                    config.max_pending_output_bytes = 524288;
+                }
+                let mut operator =
+                    native_array_operator_with_limits(distinct, false, false, limit, config)
+                        .unwrap();
+                operator.native_store = Some(store);
+                let store = operator.native_store.as_ref().unwrap();
+                eprintln!(
+                    "STR121_SETTINGS scenario={scenario} key_bytes={} value_bytes={} output_bytes={} member_bound={} limit={limit:?}",
+                    limits.key_bytes,
+                    limits.value_bytes,
+                    config.max_pending_output_bytes,
+                    operator.aggregates[0].collection_member_bound
+                );
+                let mut expected = Vec::<(i64, Option<String>)>::new();
+                // Full collections retain 8/16/24 rows under unchanged fixture
+                // output admission. Bounded longer-value state retains 48/96/144.
+                // Every phase retracts/reinserts a duplicate-containing prefix.
+                let growth = if scenario == "byte_limited" { 48 } else { 8 };
+                for third in 0..3 {
+                    let values = (0..growth)
+                        .map(|i| {
+                            if i % 11 == 0 {
+                                None
+                            } else {
+                                Some(format!(
+                                    "{:03}-{}",
+                                    third * growth + i / 2,
+                                    "x".repeat(value_len)
+                                ))
+                            }
+                        })
+                        .collect::<Vec<_>>();
+                    let refs = values.iter().map(|v| v.as_deref()).collect::<Vec<_>>();
+                    let orders = (0..growth)
+                        .map(|i| (third * growth + i) as i64)
+                        .collect::<Vec<_>>();
+                    let input = batch(&refs, &orders, &vec![Some(true); growth]);
+                    let inputs = operator.compute_inputs(&input).unwrap();
+                    for row in 0..growth {
+                        let mut scope = store.begin().await.unwrap();
+                        operator
+                            .native_process_event(
+                                &mut scope,
+                                &GLOBAL_KEY,
+                                &inputs,
+                                row,
+                                false,
+                                Some(&test_row_id(&input, row)),
+                            )
+                            .await
+                            .unwrap();
+                        scope.commit().await.unwrap();
+                        expected.push((orders[row], values[row].clone()));
+                    }
+                    for retract in [true, false] {
+                        for row in 0..8 {
+                            let mut scope = store.begin().await.unwrap();
+                            operator
+                                .native_process_event(
+                                    &mut scope,
+                                    &GLOBAL_KEY,
+                                    &inputs,
+                                    row,
+                                    retract,
+                                    Some(&test_row_id(&input, row)),
+                                )
+                                .await
+                                .unwrap();
+                            scope.commit().await.unwrap();
+                        }
+                    }
+                    let mut wanted = expected.iter().map(|(_, v)| v.clone()).collect::<Vec<_>>();
+                    if distinct {
+                        wanted.sort();
+                        wanted.dedup();
+                    }
+                    if let Some(limit) = limit {
+                        wanted.truncate(limit as usize);
+                    }
+                    if scenario == "byte_limited" && third > 0 {
+                        let snapshot = backend.snapshot().await.unwrap();
+                        let page = snapshot
+                            .try_scan(ScanRequest {
+                                range: live::ScanRange {
+                                    namespace: namespace.clone(),
+                                    prefix: Some(native_member_prefix(&GLOBAL_KEY, 0, 0).unwrap()),
+                                    start: None,
+                                    end: None,
+                                },
+                                max_entries: limits.page_entries,
+                                max_bytes: limits.page_bytes,
+                                cursor: None,
+                            })
+                            .await
+                            .unwrap();
+                        assert!(page.entries.len() < limits.page_entries);
+                        assert!(
+                            page.next_cursor.is_some(),
+                            "byte cutoff must leave retained members"
+                        );
+                        eprintln!(
+                            "STR121_BYTE_PAGE repeat={repeat} third={third} entries={} configured_entries={}",
+                            page.entries.len(),
+                            limits.page_entries
+                        );
+                    }
+                    counts.pages.store(0, Ordering::Relaxed);
+                    counts.entries.store(0, Ordering::Relaxed);
+                    counts.bytes.store(0, Ordering::Relaxed);
+                    eprintln!(
+                        "STR121_PHASE repeat={repeat} scenario={scenario} third={third} start"
+                    );
+                    for file in ["stat", "io"] {
+                        let contents =
+                            std::fs::read_to_string(format!("/proc/self/{file}")).unwrap();
+                        eprintln!(
+                            "STR121_PROCESS initial_{file}={}",
+                            contents.replace('\n', ";")
+                        );
+                    }
+                    let start = std::time::Instant::now();
+                    let actual = array_members(store, &operator).await;
+                    let elapsed = start.elapsed();
+                    let mut actual = actual
+                        .into_iter()
+                        .map(|v| match v {
+                            ScalarValue::Utf8(v) => v,
+                            other => panic!("unexpected {other:?}"),
+                        })
+                        .collect::<Vec<_>>();
+                    if distinct {
+                        actual.sort();
+                    }
+                    assert_eq!(actual, wanted);
+                    eprintln!(
+                        "STR121 repeat={repeat} scenario={scenario} third={third} retained={} selected={} completed_outputs=1 elapsed_ns={} fetched_pages={} fetched_entries={} fetched_payload_bytes={} page_entries={} page_bytes={}",
+                        expected.len(),
+                        actual.len(),
+                        elapsed.as_nanos(),
+                        counts.pages.load(Ordering::Relaxed),
+                        counts.entries.load(Ordering::Relaxed),
+                        counts.bytes.load(Ordering::Relaxed),
+                        limits.page_entries,
+                        limits.page_bytes
+                    );
+                    for file in ["status", "stat", "io"] {
+                        let contents =
+                            std::fs::read_to_string(format!("/proc/self/{file}")).unwrap();
+                        eprintln!("STR121_PROCESS {file}={}", contents.replace('\n', ";"));
+                    }
+                    eprintln!("STR121_PHASE repeat={repeat} scenario={scenario} third={third} end");
+                }
+                drop(operator);
+                drop(manager);
+                drop(backend);
+                Arc::try_unwrap(rocks)
+                    .unwrap_or_else(|_| panic!("retained collection backend"))
+                    .close_and_remove()
+                    .await
+                    .unwrap();
+                std::fs::remove_dir_all(root).unwrap();
+            }
+        }
+    }
+    #[tokio::test]
+    async fn native_unordered_array_preserves_multiplicity_nulls_and_retraction() {
+        for page_entries in [1, 3] {
+            let mut operator =
+                native_array_operator_with_order(false, false, false, None, false).unwrap();
+            assert!(operator.aggregates[0].func.order_bys().is_none());
+            let mut limits = native_test_store().limits();
+            limits.page_entries = page_entries;
+            operator.native_store = Some(native_test_store_with_limits(limits));
+            let store = operator.native_store.as_ref().unwrap();
+            let input = batch(
+                &[Some("b"), Some("a"), Some("b"), None],
+                &[1, 2, 3, 4],
+                &[Some(true); 4],
+            );
+            let inputs = operator.compute_inputs(&input).unwrap();
+            for row in 0..input.num_rows() {
+                let mut scope = store.begin().await.unwrap();
+                operator
+                    .native_process_event(
+                        &mut scope,
+                        &GLOBAL_KEY,
+                        &inputs,
+                        row,
+                        false,
+                        Some(&test_row_id(&input, row)),
+                    )
+                    .await
+                    .unwrap();
+                scope.commit().await.unwrap();
+            }
+            let sorted = |values: Vec<ScalarValue>| {
+                let mut values = values
+                    .into_iter()
+                    .map(|v| match v {
+                        ScalarValue::Utf8(value) => value,
+                        other => panic!("unexpected unordered ARRAY_AGG member {other:?}"),
+                    })
+                    .collect::<Vec<_>>();
+                values.sort();
+                values
+            };
+            assert_eq!(
+                sorted(array_members(store, &operator).await),
+                vec![None, Some("a".into()), Some("b".into()), Some("b".into())]
+            );
+            let mut scope = store.begin().await.unwrap();
+            operator
+                .native_process_event(
+                    &mut scope,
+                    &GLOBAL_KEY,
+                    &inputs,
+                    0,
+                    true,
+                    Some(&test_row_id(&input, 0)),
+                )
+                .await
+                .unwrap();
+            scope.commit().await.unwrap();
+            assert_eq!(
+                sorted(array_members(store, &operator).await),
+                vec![None, Some("a".into()), Some("b".into())]
+            );
+            let mut scope = store.begin().await.unwrap();
+            operator
+                .native_process_event(
+                    &mut scope,
+                    &GLOBAL_KEY,
+                    &inputs,
+                    3,
+                    true,
+                    Some(&test_row_id(&input, 3)),
+                )
+                .await
+                .unwrap();
+            scope.commit().await.unwrap();
+            assert_eq!(
+                sorted(array_members(store, &operator).await),
+                vec![Some("a".into()), Some("b".into())]
+            );
+        }
+    }
+    #[tokio::test]
+    async fn native_collection_pages_decode_selected_wide_values_on_both_backends() {
+        use arroyo_state::live::{lifecycle::RocksStateConfig, rocks::RocksLiveState};
+        for rocks in [false, true] {
+            let root =
+                std::env::temp_dir().join(format!("str121-selected-wide-{}", uuid::Uuid::new_v4()));
+            let resources = native_test_store().resources().clone();
+            let backend: Arc<dyn LiveStateBackend> = if rocks {
+                Arc::new(
+                    RocksLiveState::open(
+                        RocksStateConfig {
+                            root: root.clone(),
+                            job_id: "wide-array".into(),
+                            operator_id: "aggregate".into(),
+                            subtask: 0,
+                            generation: 0,
+                            attempt: 0,
+                        },
+                        resources.clone(),
+                    )
+                    .await
+                    .unwrap(),
+                )
+            } else {
+                Arc::new(MemoryLiveState::bounded(resources.clone(), 8 * 1024 * 1024).unwrap())
+            };
+            let mut manager = LiveTableManager::new(
+                backend.clone(),
+                Ownership::PartitionLocal {
+                    subtask: 0,
+                    parallelism: 1,
+                },
+            )
+            .unwrap();
+            let table = manager.register(NATIVE_AGGREGATE_TABLE).unwrap();
+            let limits = AggregateStoreLimits {
+                key_bytes: 512,
+                page_entries: 1,
+                ..native_test_store().limits()
+            };
+            let mut operator = native_array_operator_with_limits(
+                false,
+                false,
+                false,
+                None,
+                AggregateStateConfig {
+                    key_bytes: 512,
+                    ..native_test_config()
+                },
+            )
+            .unwrap();
+            operator.native_store =
+                Some(AggregateStore::new(backend.clone(), table, resources, limits).unwrap());
+            let store = operator.native_store.as_ref().unwrap();
+            let wide = "x".repeat(384);
+            let input = batch(
+                &[Some(wide.as_str()), Some("next")],
+                &[1, 2],
+                &[Some(true); 2],
+            );
+            let inputs = operator.compute_inputs(&input).unwrap();
+            for row in 0..2 {
+                let mut scope = store.begin_point().await.unwrap();
+                operator
+                    .native_process_event(
+                        &mut scope,
+                        &GLOBAL_KEY,
+                        &inputs,
+                        row,
+                        false,
+                        Some(&test_row_id(&input, row)),
+                    )
+                    .await
+                    .unwrap();
+                scope.commit().await.unwrap();
+            }
+            assert_eq!(
+                array_members(store, &operator).await,
+                vec![
+                    ScalarValue::Utf8(Some(wide.clone())),
+                    ScalarValue::Utf8(Some("next".into()))
+                ]
+            );
+            let mut scope = store.begin().await.unwrap();
+            operator
+                .native_process_event(
+                    &mut scope,
+                    &GLOBAL_KEY,
+                    &inputs,
+                    0,
+                    true,
+                    Some(&test_row_id(&input, 0)),
+                )
+                .await
+                .unwrap();
+            scope.commit().await.unwrap();
+            assert_eq!(
+                array_members(store, &operator).await,
+                vec![ScalarValue::Utf8(Some("next".into()))]
+            );
+            drop(operator);
+            drop(manager);
+            if rocks {
+                backend.close().await.unwrap();
+                std::fs::remove_dir_all(root).unwrap();
+            }
+        }
     }
 }

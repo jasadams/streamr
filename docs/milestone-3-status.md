@@ -5,6 +5,13 @@
 - Final probe-free locked worker check, strict Clippy, fmt, 3 store tests, 69 incremental tests (3 ignored), and explicit pilot passed. Independent source/finite evidence review approved. Three matched debug actual-batch pairs reduce deleted skips 18,144→63; round-robin/batch1 counters remain unchanged. These are finite diagnostics, not production throughput or combined qualification.
 - Evidence: `docs/str-119-validation.md` and `/home/jason/qa-evidence/str119-duplicates-20261015/` (including original failures, source/pins, final gates and reviews). Integrated main `67910724` with only a ledger conflict; worker/state/RPC inputs unchanged and prior exact gates retained. Incoming SESSION delivery `5862fc2c` also integrated; duplicate-path source unchanged. Next: final integration review and current-head PR CI. No user decision or deferral; broader qualification remains separate.
 
+## Active STR-121 collection page utilisation — 2026-10-15
+
+- Coordinator `/root`, implementer `/root/implement`; branch `jason/str-121-collections-20261015`, frozen measurement base `5862fc2c39c0b3287f3b0e7c69301586a0423c42`, integrated onto `5f326ae5` preserving merged STR-119. Current ticket and AGENTS/build/team/ledger/plan read; no user decision pending.
+- Collection fallback consumes bounded prefix pages and merges overlay writes; exact scalar/accumulator behavior and resource caps unchanged. All eight alternating native/timing arms passed0 (360 exact output evaluations); ordered seeks9/17/25→1/1/2 and fetched44/152/280→8/16/24. Zero scans0; no production speed or RSS claim. Failures/refusals preserved, native probe removed.
+- Integrated independent source/evidence review approved. Final locked worker check/strict Clippy/fmt/test builds all0; serial incremental71passed/0failed/4ignored, store4passed/0failed, explicit STR121 diagnostic1passed. Actual fresh Engine worker-task SQL checkpoint recovery memory/controller/batch1 and Rocks/controller/batch1 both pass exact maintained array CDC comparison; no OS-process-loss claim.
+- Final combined reservation source unchanged; worker pin `74a725f8…`, SQL pin `173f490a…`. Next: coordinator final acceptance review, publication/current-head CI. [Report](str-121-validation.md); evidence `/home/jason/qa-evidence/str121-collections-20261015/integrated-gates/` and `integrated-gates-worker/`. Full qualification remains STR-103/126.
+
 ## Active STR-118 SESSION history traversal — 2026-10-15
 
 - Coordinator `/root`, implementer `/root/implement`; branch `jason/str-118-history-20261015`, fetched base `277adcb8a2ff8d2821530de4ba4fc2abd613db66`. Read current ticket, AGENTS.md, build/team guidance, ledger/work plan; invoking changes preserved, guard CLEAR under owned reservation.
