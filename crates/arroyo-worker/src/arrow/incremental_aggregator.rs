@@ -1420,10 +1420,16 @@ impl IncrementalAggregatingFunc {
                 // when Q proves an unchanged reference and this original CDC
                 // contribution cannot affect membership. Relevant changes still
                 // rebuild in bucket order, including floating-point SUM.
+                let first_day = reference
+                    .checked_sub(calendar.horizon_days() - 1)
+                    .context("calendar reference horizon exceeds Date32 range")?;
                 let affects_horizon = selected.is_some()
-                    && contribution_day.is_some_and(|day| {
-                        day <= reference && day >= reference - (calendar.horizon_days() - 1)
-                    });
+                    && contribution_day.is_some_and(|day| day <= reference && day >= first_day);
+                // An absent G starts with empty accumulators. Valid-state cleanup
+                // removes all old generation contributions before deleting G;
+                // an irrelevant first append cannot add a bucket in this horizon.
+                // Existing tombstones and TTL rollovers retain G and do not qualify.
+                let fresh_empty = previous.is_none() && !retract && !affects_horizon;
                 // A relevant change rebuilds anyway, so do not add a Q read
                 // to that path merely to avoid its existing reference write.
                 let reuse = !affects_horizon
@@ -1436,9 +1442,11 @@ impl IncrementalAggregatingFunc {
                         .await?;
                 if !reuse {
                     self.calendar_set_reference(scope, group_key, generation, calendar, reference)?;
-                    *state = self
-                        .calendar_recalculate(scope, group_key, generation, calendar, reference)
-                        .await?;
+                    if !fresh_empty {
+                        *state = self
+                            .calendar_recalculate(scope, group_key, generation, calendar, reference)
+                            .await?;
+                    }
                 }
                 continue;
             }
@@ -4158,8 +4166,12 @@ mod tests {
     }
 
     fn native_calendar_operator_with_filters(shared: bool) -> IncrementalAggregatingFunc {
+        native_calendar_operator_options(shared, false)
+    }
+
+    fn native_calendar_operator_options(shared: bool, sum: bool) -> IncrementalAggregatingFunc {
         use arroyo_rpc::grpc::api::CalendarAggregateDescriptor;
-        let (mut config, registry) = native_config();
+        let (mut config, mut registry) = native_config();
         let mut plan = PhysicalPlanNode::decode(config.aggregate_exec.as_slice()).unwrap();
         let Some(PhysicalPlanType::Aggregate(aggregate)) = &mut plan.physical_plan_type else {
             panic!("expected aggregate");
@@ -4167,6 +4179,26 @@ mod tests {
         aggregate.aggr_expr[7] = aggregate.aggr_expr[6].clone();
         aggregate.aggr_expr_name[7] = "selected_week".into();
         aggregate.filter_expr[7] = aggregate.filter_expr[6].clone();
+        if sum {
+            let function = datafusion::functions_aggregate::sum::sum_udaf();
+            Arc::get_mut(&mut registry)
+                .unwrap()
+                .register_udaf(function.clone())
+                .unwrap();
+            let expression = Arc::new(
+                AggregateExprBuilder::new(
+                    function,
+                    vec![Arc::new(Column::new("sequence", 1)) as Arc<dyn PhysicalExpr>],
+                )
+                .schema(input_schema())
+                .alias("selected_week")
+                .build()
+                .unwrap(),
+            );
+            aggregate.aggr_expr[7] =
+                serialize_physical_aggr_expr(expression, &DefaultPhysicalExtensionCodec {})
+                    .unwrap();
+        }
         if !shared {
             aggregate.filter_expr[7].expr = None;
         }
@@ -4197,9 +4229,16 @@ mod tests {
                 .push(CalendarAggregateDescriptor {
                     aggregate_index: index,
                     horizon_days: horizon,
-                    argument: serialize_physical_expr(&one, &codec)
-                        .unwrap()
-                        .encode_to_vec(),
+                    argument: serialize_physical_expr(
+                        &if sum && index == 7 {
+                            Arc::new(Column::new("sequence", 1)) as Arc<dyn PhysicalExpr>
+                        } else {
+                            one.clone()
+                        },
+                        &codec,
+                    )
+                    .unwrap()
+                    .encode_to_vec(),
                     static_filter: static_filters[position].clone(),
                     contribution_date: serialize_physical_expr(&date, &codec)
                         .unwrap()
@@ -4240,19 +4279,47 @@ mod tests {
         retract: bool,
         id: &[u8],
     ) {
+        calendar_test_event_for_group(
+            operator,
+            &GLOBAL_KEY,
+            Some(day),
+            reference,
+            include,
+            retract,
+            id,
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn calendar_test_event_for_group(
+        operator: &mut IncrementalAggregatingFunc,
+        group: &[u8],
+        day: Option<i32>,
+        reference: i32,
+        include: Option<bool>,
+        retract: bool,
+        id: &[u8],
+    ) -> Result<()> {
         let input = batch(&[Some("value")], &[1], &[include]);
         for calendar in &mut operator.calendars {
-            calendar.test_dates(day, reference);
+            calendar.test_dates(day.unwrap_or(0), reference);
         }
-        let calendar_inputs = operator.calendar_inputs(&input).unwrap();
-        let inputs = operator.compute_inputs(&input).unwrap();
+        let mut calendar_inputs = operator.calendar_inputs(&input)?;
+        if day.is_none() {
+            for input in &mut calendar_inputs {
+                input.contribution = arrow_array::Date32Array::from(vec![None::<i32>]);
+            }
+        }
+        operator.validate_calendar_inputs(&calendar_inputs).await?;
+        let inputs = operator.compute_inputs(&input)?;
         let store = operator.native_store.as_ref().unwrap();
-        let mut scope = store.begin().await.unwrap();
+        let mut scope = store.begin().await?;
         operator
             .native_process_calendar_event(
                 &mut scope,
                 NativeCalendarEvent {
-                    group_key: &GLOBAL_KEY,
+                    group_key: group,
                     inputs: &inputs,
                     row: 0,
                     retract,
@@ -4260,12 +4327,19 @@ mod tests {
                     calendar_inputs: &calendar_inputs,
                 },
             )
-            .await
-            .unwrap();
-        scope.commit().await.unwrap();
+            .await?;
+        scope.commit().await?;
+        Ok(())
     }
 
     async fn calendar_test_values(operator: &IncrementalAggregatingFunc) -> Vec<ScalarValue> {
+        calendar_test_values_for_group(operator, &GLOBAL_KEY).await
+    }
+
+    async fn calendar_test_values_for_group(
+        operator: &IncrementalAggregatingFunc,
+        key: &[u8],
+    ) -> Vec<ScalarValue> {
         let scope = operator
             .native_store
             .as_ref()
@@ -4274,7 +4348,7 @@ mod tests {
             .await
             .unwrap();
         let bytes = scope
-            .get(&native_group_key(b'G', &GLOBAL_KEY).unwrap())
+            .get(&native_group_key(b'G', key).unwrap())
             .await
             .unwrap()
             .unwrap();
@@ -4660,6 +4734,244 @@ mod tests {
         drop(manager);
         backend.close().await.unwrap();
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn calendar_fresh_empty_preserves_date32_and_raw_watermark_rejection() {
+        let mut operator = native_calendar_operator_options(true, true);
+        // Feed the typed Date32 boundary directly: constructing an invalid-date
+        // physical Literal formats it through chrono before the handler runs.
+        // This helper-level call retains the same raw-progress validation gate.
+        let input = batch(&[Some("value")], &[1], &[Some(false)]);
+        let inputs = operator.compute_inputs(&input).unwrap();
+        let calendar_inputs = operator
+            .calendars
+            .iter()
+            .map(|_| CalendarInput {
+                contribution: arrow_array::Date32Array::from(vec![None::<i32>]),
+                reference: arrow_array::Date32Array::from(vec![i32::MIN]),
+            })
+            .collect::<Vec<_>>();
+        operator
+            .validate_calendar_inputs(&calendar_inputs)
+            .await
+            .unwrap();
+        let mut scope = operator
+            .native_store
+            .as_ref()
+            .unwrap()
+            .begin()
+            .await
+            .unwrap();
+        let error = operator
+            .native_process_calendar_event(
+                &mut scope,
+                NativeCalendarEvent {
+                    group_key: &GLOBAL_KEY,
+                    inputs: &inputs,
+                    row: 0,
+                    retract: false,
+                    row_id: Some(&[1; 16]),
+                    calendar_inputs: &calendar_inputs,
+                },
+            )
+            .await
+            .unwrap_err();
+        drop(scope);
+        assert!(error.to_string().contains("Date32 range"));
+        let scope = operator
+            .native_store
+            .as_ref()
+            .unwrap()
+            .begin()
+            .await
+            .unwrap();
+        assert!(
+            scope
+                .get(&native_group_key(b'G', &GLOBAL_KEY).unwrap())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        drop(scope);
+        operator
+            .calendar_watermark(arroyo_types::Watermark::EventTime(
+                arroyo_types::event_time::from_signed_nanos(200 * 86_400_000_000_000).unwrap(),
+            ))
+            .await
+            .unwrap();
+        let error = calendar_test_event_for_group(
+            &mut operator,
+            &GLOBAL_KEY,
+            None,
+            199,
+            Some(false),
+            false,
+            &[2; 16],
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("precedes admitted watermark context")
+        );
+        let scope = operator
+            .native_store
+            .as_ref()
+            .unwrap()
+            .begin()
+            .await
+            .unwrap();
+        assert!(
+            scope
+                .get(&native_group_key(b'G', &GLOBAL_KEY).unwrap())
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn calendar_fresh_empty_recreates_with_terminal_cleanup_marker() {
+        let mut operator = native_calendar_operator_options(true, true);
+        let mut fields = operator.schema_without_metadata.fields().to_vec();
+        fields.insert(0, Arc::new(Field::new("group_key", DataType::Utf8, false)));
+        operator.schema_without_metadata = Arc::new(Schema::new(fields));
+        operator.key_converter = RowConverter::new(vec![SortField::new(DataType::Utf8)]).unwrap();
+        let keys: Vec<ArrayRef> = vec![Arc::new(StringArray::from(vec!["recreated"]))];
+        let rows = operator.key_converter.convert_columns(&keys).unwrap();
+        let key = rows.row(0).as_ref().to_vec();
+        let id = ScalarValue::FixedSizeBinary(16, None).to_array().unwrap();
+        let metadata = StructArray::new(
+            updating_meta_fields(),
+            vec![Arc::new(BooleanArray::from(vec![false])), id],
+            None,
+        );
+        operator.metadata_expr = Arc::new(Literal::new(ScalarValue::Struct(Arc::new(metadata))));
+        let mut output = SchemaBuilder::from(operator.schema_without_metadata.as_ref().clone());
+        output.push(Field::new(
+            UPDATING_META_FIELD,
+            DataType::Struct(updating_meta_fields()),
+            false,
+        ));
+        let mut ctx = native_input_context(input_schema()).await;
+        ctx.out_schema = Some(Arc::new(
+            ArroyoSchema::from_schema_unkeyed(Arc::new(output.finish())).unwrap(),
+        ));
+        let mut collector = AggregateCollector::default();
+        calendar_test_event_for_group(
+            &mut operator,
+            &key,
+            Some(200),
+            200,
+            Some(true),
+            false,
+            &[1; 16],
+        )
+        .await
+        .unwrap();
+        operator
+            .drain_native_dirty(&mut ctx, &mut collector)
+            .await
+            .unwrap();
+        calendar_test_event_for_group(
+            &mut operator,
+            &key,
+            Some(190),
+            200,
+            Some(true),
+            true,
+            &[1; 16],
+        )
+        .await
+        .unwrap();
+        operator
+            .drain_native_dirty(&mut ctx, &mut collector)
+            .await
+            .unwrap();
+        let store = operator.native_store.as_ref().unwrap();
+        let marker = native_cleanup_key(&key, 0).unwrap();
+        let group_key = native_group_key(b'G', &key).unwrap();
+        let mut progress = NativeCleanupProgress::new(store);
+        let mut reached_terminal = false;
+        for _ in 0..64 {
+            assert!(
+                operator
+                    .cleanup_native_with_progress(&mut progress)
+                    .await
+                    .unwrap()
+            );
+            let scope = store.begin().await.unwrap();
+            if scope.get(&group_key).await.unwrap().is_none() {
+                assert_eq!(scope.get(&marker).await.unwrap(), Some(b"T".to_vec()));
+                reached_terminal = true;
+                break;
+            }
+        }
+        assert!(reached_terminal);
+        drop(progress);
+        calendar_test_event_for_group(
+            &mut operator,
+            &key,
+            Some(193),
+            200,
+            Some(true),
+            false,
+            &[2; 16],
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            calendar_test_values_for_group(&operator, &key).await,
+            vec![
+                ScalarValue::Int64(Some(1)),
+                ScalarValue::Int64(Some(0)),
+                ScalarValue::Int64(None)
+            ]
+        );
+        let scope = operator
+            .native_store
+            .as_ref()
+            .unwrap()
+            .begin()
+            .await
+            .unwrap();
+        for calendar in &operator.calendars {
+            assert!(
+                operator
+                    .calendar_reference_matches(&scope, &key, 0, calendar, 200)
+                    .await
+                    .unwrap()
+            );
+        }
+        drop(scope);
+        // The old terminal marker must not remove the newly live G.
+        let mut cleanup = NativeCleanupProgress::new(operator.native_store.as_ref().unwrap());
+        operator
+            .cleanup_native_with_progress(&mut cleanup)
+            .await
+            .unwrap();
+        drop(cleanup);
+        calendar_test_event_for_group(
+            &mut operator,
+            &key,
+            Some(200),
+            200,
+            Some(true),
+            false,
+            &[3; 16],
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            calendar_test_values_for_group(&operator, &key).await,
+            vec![
+                ScalarValue::Int64(Some(2)),
+                ScalarValue::Int64(Some(1)),
+                ScalarValue::Int64(Some(1))
+            ]
+        );
     }
 
     #[tokio::test]
@@ -6377,6 +6689,213 @@ mod tests {
                 .await
                 .unwrap()
         );
+    }
+
+    #[tokio::test]
+    async fn calendar_fresh_empty_checkpoint_restores_count_sum_and_reference() {
+        use arroyo_rpc::grpc::rpc::DiskKeyedTableConfig;
+        use arroyo_state::live::{checkpoint, lifecycle::RocksStateConfig, rocks::RocksLiveState};
+        for (day, include) in [
+            (Some(193), Some(true)),
+            (Some(201), Some(true)),
+            (None, Some(true)),
+            (Some(200), Some(false)),
+            (Some(200), None),
+        ] {
+            for rocks in [false, true] {
+                let root = std::env::temp_dir()
+                    .join(format!("calendar-fresh-empty-{}", uuid::Uuid::new_v4()));
+                let remote = root.join("checkpoint");
+                std::fs::create_dir_all(&remote).unwrap();
+                // The production exporter requests pages up to 1 MiB; Rocks
+                // admits their copies/cursors independently of aggregate pages.
+                let resources = WorkerStateResources::new(ResourceConfig {
+                    max_open_databases: 2,
+                    scan_page_bytes: 16 * 1024 * 1024,
+                    queued_write_bytes: 16 * 1024 * 1024,
+                    decoded_value_bytes: 32 * 1024 * 1024,
+                    ..native_test_store().resources().config().clone()
+                })
+                .unwrap();
+                let mut native = Vec::new();
+                let mut backends: Vec<Arc<dyn LiveStateBackend>> = Vec::new();
+                for generation in [0, 1] {
+                    if rocks {
+                        let backend = Arc::new(
+                            RocksLiveState::open(
+                                RocksStateConfig {
+                                    root: root.join("live"),
+                                    job_id: "calendar-fresh-empty".into(),
+                                    operator_id: "aggregate".into(),
+                                    subtask: 0,
+                                    generation,
+                                    attempt: 0,
+                                },
+                                resources.clone(),
+                            )
+                            .await
+                            .unwrap(),
+                        );
+                        backends.push(backend.clone());
+                        native.push(backend);
+                    } else {
+                        backends.push(Arc::new(
+                            MemoryLiveState::bounded(resources.clone(), 8 * 1024 * 1024).unwrap(),
+                        ));
+                    }
+                }
+                let ownership = Ownership::PartitionLocal {
+                    subtask: 0,
+                    parallelism: 1,
+                };
+                let mut manager =
+                    LiveTableManager::new(backends[0].clone(), ownership.clone()).unwrap();
+                let table = manager.register(NATIVE_AGGREGATE_TABLE).unwrap();
+                let namespace = table.namespace().clone();
+                let limits = AggregateStoreLimits {
+                    page_entries: 1,
+                    ..native_test_store().limits()
+                };
+                let store =
+                    AggregateStore::new(backends[0].clone(), table, resources.clone(), limits)
+                        .unwrap();
+                let mut operator = native_calendar_operator_options(true, true);
+                operator.native_store = Some(store);
+                calendar_test_event_for_group(
+                    &mut operator,
+                    &GLOBAL_KEY,
+                    day,
+                    200,
+                    include,
+                    false,
+                    &[1; 16],
+                )
+                .await
+                .unwrap();
+                assert_eq!(
+                    calendar_test_values(&operator).await,
+                    vec![
+                        ScalarValue::Int64(Some(1)),
+                        ScalarValue::Int64(Some(0)),
+                        ScalarValue::Int64(None),
+                    ]
+                );
+                let scope = operator
+                    .native_store
+                    .as_ref()
+                    .unwrap()
+                    .begin()
+                    .await
+                    .unwrap();
+                for calendar in &operator.calendars {
+                    assert!(
+                        operator
+                            .calendar_reference_matches(&scope, &GLOBAL_KEY, 0, calendar, 200)
+                            .await
+                            .unwrap()
+                    );
+                }
+                drop(scope);
+                let snapshot = backends[0].snapshot().await.unwrap();
+                let storage = arroyo_state::get_storage_provider(
+                    &arroyo_state::StorageProviderFor::Controller {
+                        storage_url: Some(format!("file://{}", remote.display())),
+                    },
+                )
+                .await
+                .unwrap();
+                let config = DiskKeyedTableConfig {
+                    table_name: NATIVE_AGGREGATE_TABLE.into(),
+                    encoding_version: 1,
+                    schema_identity: operator.native_schema_identity.clone(),
+                };
+                let receipt = checkpoint::export(
+                    &snapshot,
+                    &namespace,
+                    &config,
+                    &storage,
+                    "checkpoint-1/aggregate",
+                    1,
+                    0,
+                    0,
+                )
+                .await
+                .unwrap();
+                checkpoint::restore(
+                    backends[1].as_ref(),
+                    &namespace,
+                    &config,
+                    &receipt,
+                    &storage,
+                )
+                .await
+                .unwrap();
+                let mut restored_manager =
+                    LiveTableManager::new(backends[1].clone(), ownership).unwrap();
+                let restored_table = restored_manager.register(NATIVE_AGGREGATE_TABLE).unwrap();
+                let restored_store = AggregateStore::new(
+                    backends[1].clone(),
+                    restored_table,
+                    resources.clone(),
+                    limits,
+                )
+                .unwrap();
+                let mut fresh = native_calendar_operator_options(true, true);
+                fresh.native_store = Some(restored_store);
+                assert_eq!(
+                    calendar_test_values(&fresh).await,
+                    vec![
+                        ScalarValue::Int64(Some(1)),
+                        ScalarValue::Int64(Some(0)),
+                        ScalarValue::Int64(None),
+                    ]
+                );
+                let scope = fresh.native_store.as_ref().unwrap().begin().await.unwrap();
+                for calendar in &fresh.calendars {
+                    assert!(
+                        fresh
+                            .calendar_reference_matches(&scope, &GLOBAL_KEY, 0, calendar, 200)
+                            .await
+                            .unwrap()
+                    );
+                }
+                drop(scope);
+                calendar_test_event(&mut fresh, 200, 200, Some(true), false, &[2; 16]).await;
+                assert_eq!(
+                    calendar_test_values(&fresh).await,
+                    vec![
+                        ScalarValue::Int64(Some(2)),
+                        ScalarValue::Int64(Some(1)),
+                        ScalarValue::Int64(Some(1)),
+                    ]
+                );
+                // Retraction must recover the original calendar day. Other indexed
+                // aggregates in this fixture require their truthful before-image filter.
+                calendar_test_event(&mut fresh, 190, 200, Some(true), true, &[2; 16]).await;
+                assert_eq!(
+                    calendar_test_values(&fresh).await,
+                    vec![
+                        ScalarValue::Int64(Some(1)),
+                        ScalarValue::Int64(Some(0)),
+                        ScalarValue::Int64(None),
+                    ]
+                );
+                drop(snapshot);
+                drop(operator);
+                drop(fresh);
+                drop(manager);
+                drop(restored_manager);
+                drop(backends);
+                for backend in native {
+                    Arc::try_unwrap(backend)
+                        .unwrap_or_else(|_| panic!("retained Rocks backend"))
+                        .close_and_remove()
+                        .await
+                        .unwrap();
+                }
+                std::fs::remove_dir_all(root).unwrap();
+            }
+        }
     }
 
     #[tokio::test]
