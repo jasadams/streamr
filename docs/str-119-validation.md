@@ -262,3 +262,18 @@ These tests use real native member/batch methods and fresh checkpoint backends
 inside the worker harness. They are not full SQL execution or external worker/
 controller process-loss qualification. Broader integrated capacity/1.2M and
 process recovery remain their existing consolidated acceptance scope.
+
+## Delivery integration
+
+Rebased reviewed implementation `f53a10ad` onto fetched main
+`6791072438b9bbf7c1c32bb1061eebeaaf27687c` (merged build/pin tooling).
+Only the ledger required manual resolution; both ticket entries are preserved.
+Re-read `AGENTS.md`, `.claude/build-test.md`, `.claude/team.md`, ledger and
+work plan. The new maintained CLI packaging/native selector guidance applies
+to future builds; this increment does not create a CLI package. All worker,
+state and RPC inputs in the final passing receipt remain byte-identical.
+`integration-receipt.json` records that comparison. Local Cargo/Clippy/tests
+were not repeated for this documentation-only integration; the exact
+probe-free executable evidence above remains source-bound to the unchanged code.
+Static whitespace/conflict/scope checks and independent integration review
+are delivery gates; current-head CI remains required before handoff.
