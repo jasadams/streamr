@@ -410,6 +410,20 @@ impl TableSnapshot {
             .map(|bytes| decode(&bytes, &self.descriptor, self.limits, permit))
             .transpose()
     }
+    /// Enumerate this table in primary-key order at this snapshot's visibility.
+    /// Use [`Self::get`] when the key is already known.
+    ///
+    /// Start with `None`, then pass each returned `next_cursor` unchanged to
+    /// the same snapshot. Stop when `next_cursor` is `None`: calling with
+    /// `None` again restarts enumeration. Cursors cannot be reused with another
+    /// table, snapshot or restored backend. Later writes do not change this view.
+    ///
+    /// Both entry and encoded-byte limits bound each page; an entry that cannot
+    /// fit errors rather than being skipped. Drop consumed pages and rows before
+    /// requesting more to release their reservations. A retained row keeps its
+    /// entire page's shared decoded reservation, independently of the page's
+    /// encoded-byte reservation. Dropping a pending scan releases its owned
+    /// reservations after any already-running native operation finishes.
     pub async fn scan(&self, cursor: Option<ScanCursor>) -> Result<TablePage> {
         let permit = self.resources.try_scan_page(
             self.limits
