@@ -432,7 +432,7 @@ impl NativeSession {
                 .next_row(&snapshot, group, session, after.as_deref())
                 .await?
             {
-                after = Some(row.key.clone());
+                after = Some(row.key);
                 sender.send(row.batch).await.map_err(|_| {
                     anyhow::anyhow!("native SESSION final aggregate stopped before consuming rows")
                 })?;
@@ -729,8 +729,9 @@ mod tests {
             table::LiveTableManager,
         };
         use std::time::{Duration, UNIX_EPOCH};
-        {
-            let query = "CREATE TABLE session_input (timestamp TIMESTAMP NOT NULL, ordinal BIGINT NOT NULL,
+        for rocks in [false, true] {
+            for decoded_value_bytes in [9 * 8192, 1024 * 1024] {
+                let query = "CREATE TABLE session_input (timestamp TIMESTAMP NOT NULL, ordinal BIGINT NOT NULL,
                 metric BIGINT NOT NULL, attribute TEXT NOT NULL, selected BOOLEAN NOT NULL,
                 WATERMARK FOR timestamp AS timestamp - INTERVAL '1 minute')
                 WITH (connector = 'single_file', path = '/tmp/native-session-plan-input.jsonl',
@@ -742,225 +743,272 @@ mod tests {
                     FIRST_VALUE(attribute ORDER BY ordinal) FILTER (WHERE attribute <> '') AS first_attribute,
                     LAST_VALUE(attribute ORDER BY ordinal) FILTER (WHERE attribute <> '') AS last_attribute
                 FROM session_input GROUP BY window";
-            async fn compile(query: &str) -> api::SessionWindowAggregateOperator {
-                let compiled = arroyo_planner::parse_and_get_program(
-                    query,
-                    arroyo_planner::ArroyoSchemaProvider::new(),
-                    arroyo_planner::SqlConfig {
-                        default_parallelism: 1,
-                    },
-                )
-                .await
-                .unwrap();
-                let operator = compiled
-                    .program
-                    .graph
-                    .node_weights()
-                    .flat_map(|node| node.operator_chain.iter())
-                    .map(|(operator, _)| operator)
-                    .find(|operator| {
-                        operator.operator_name
-                            == arroyo_datastream::logical::OperatorName::SessionWindowAggregate
-                    })
-                    .unwrap();
-                api::SessionWindowAggregateOperator::decode(operator.operator_config.as_slice())
-                    .unwrap()
-            }
-            let limits = WindowStateConfig {
-                key_bytes: 128,
-                partial_bytes: 8192,
-                page_bytes: 32768,
-                page_entries: 1,
-                write_bytes: 65536,
-                write_operations: 16,
-                max_resident_bytes: 8 * 1024 * 1024,
-            };
-            let registry = Arc::new(arroyo_planner::physical::new_registry());
-            let config = compile(query).await;
-            let mut operator = NativeSession::new(&config, registry.clone(), limits).unwrap();
-            assert_eq!(
-                *operator
-                    .finish
-                    .as_any()
-                    .downcast_ref::<AggregateExec>()
-                    .unwrap()
-                    .mode(),
-                datafusion::physical_plan::aggregates::AggregateMode::Single
-            );
-            let expanded = compile(&query.replace(
-                "ARRAY_AGG(attribute ORDER BY timestamp, ordinal)",
-                "ARRAY_AGG(REPEAT(attribute, 1000000000) ORDER BY timestamp, ordinal)",
-            ))
-            .await;
-            let error = NativeSession::new(&expanded, registry, limits)
-                .err()
-                .expect("expanded collection expression was admitted");
-            assert!(error.to_string().contains("direct"), "{error}");
-            let state = WorkerStateResources::new(ResourceConfig {
-                block_cache_bytes: 1024 * 1024,
-                memtable_bytes: 1024 * 1024,
-                queued_write_bytes: 1024 * 1024,
-                decoded_value_bytes: 1024 * 1024,
-                scan_page_bytes: 1024 * 1024,
-                max_blocking_operations: 2,
-                max_snapshots: 2,
-                max_open_databases: 1,
-                disk_reserve_bytes: 0,
-            })
-            .unwrap();
-            let backend: Arc<dyn LiveStateBackend> = Arc::new(
-                MemoryLiveState::bounded(state.clone(), limits.max_resident_bytes).unwrap(),
-            );
-            let mut tables = LiveTableManager::new(
-                backend.clone(),
-                Ownership::PartitionLocal {
-                    subtask: 0,
-                    parallelism: 1,
-                },
-            )
-            .unwrap();
-            let table = tables.register(TABLE).unwrap();
-            let schema = operator.input_schema.schema.clone();
-            let store = SessionStore::new(
-                backend,
-                table,
-                state.clone(),
-                schema.clone(),
-                limits,
-                operator.gap,
-            )
-            .unwrap();
-            for (time, ordinal, metric, attribute, selected) in
-                [(9, 0, 3, "later", true), (0, 1, 5, "", false)]
-            {
-                let columns: Vec<Arc<dyn Array>> = schema
-                    .fields()
-                    .iter()
-                    .map(|field| match field.data_type() {
-                        DataType::Timestamp(_, _) => {
-                            Arc::new(TimestampNanosecondArray::from(vec![time])) as Arc<dyn Array>
-                        }
-                        DataType::Int64 => Arc::new(arrow_array::Int64Array::from(vec![if field
-                            .name()
-                            == "ordinal"
-                        {
-                            ordinal
-                        } else {
-                            metric
-                        }])) as Arc<dyn Array>,
-                        DataType::Utf8 => {
-                            Arc::new(StringArray::from(vec![attribute])) as Arc<dyn Array>
-                        }
-                        DataType::Boolean => {
-                            Arc::new(arrow_array::BooleanArray::from(vec![selected]))
-                                as Arc<dyn Array>
-                        }
-                        other => panic!("unexpected planned input field {other:?}"),
-                    })
-                    .collect();
-                store
-                    .insert(
-                        &[],
-                        time,
-                        &RecordBatch::try_new(schema.clone(), columns).unwrap(),
+                async fn compile(query: &str) -> api::SessionWindowAggregateOperator {
+                    let compiled = arroyo_planner::parse_and_get_program(
+                        query,
+                        arroyo_planner::ArroyoSchemaProvider::new(),
+                        arroyo_planner::SqlConfig {
+                            default_parallelism: 1,
+                        },
                     )
                     .await
                     .unwrap();
-            }
-            operator.store = Some(store);
-            let mut fields = operator.finish.schema().fields().to_vec();
-            fields.insert(operator.window_index, operator.window_field.clone());
-            fields.push(Arc::new(Field::new(
-                arroyo_rpc::TIMESTAMP_FIELD,
-                DataType::Timestamp(arrow_schema::TimeUnit::Nanosecond, None),
-                false,
-            )));
-            let output_schema =
-                Arc::new(ArroyoSchema::from_schema_unkeyed(Arc::new(Schema::new(fields))).unwrap());
-            let (control_tx, _control_rx) = channel(16);
-            let mut ctx = OperatorContext::new(
-                Arc::new(arroyo_types::get_test_task_info()),
-                None,
-                control_tx,
-                1,
-                vec![operator.input_schema.clone()],
-                Some(output_schema),
-                HashMap::new(),
-            )
-            .await;
-            ctx.watermarks.set(
-                0,
-                arroyo_types::Watermark::EventTime(UNIX_EPOCH + Duration::from_secs(2)),
-            );
-            let mut collector = RecordedSessionCollector::default();
-            operator
-                .handle_watermark(&mut ctx, &mut collector, &Converter::new(vec![]).unwrap())
-                .await
-                .unwrap();
-            assert_eq!(collector.0.len(), 1);
-            let output = &collector.0[0];
-            // SQL aliases are applied by the downstream projection; inspect
-            // the physical aggregate columns in the query's declared order.
-            let column = |index: usize| output.column(index).clone();
-            let list = |index| {
-                column(index)
-                    .as_any()
-                    .downcast_ref::<arrow_array::ListArray>()
-                    .unwrap()
-                    .value(0)
-            };
-            assert_eq!(
-                column(1)
-                    .as_any()
-                    .downcast_ref::<arrow_array::Int64Array>()
-                    .unwrap()
-                    .value(0),
-                2
-            );
-            assert_eq!(
-                list(2)
-                    .as_any()
-                    .downcast_ref::<arrow_array::Int64Array>()
-                    .unwrap()
-                    .values()
-                    .as_ref(),
-                &[5, 3]
-            );
-            let attributes = list(3);
-            let attributes = attributes.as_any().downcast_ref::<StringArray>().unwrap();
-            assert_eq!(
-                attributes.iter().collect::<Vec<_>>(),
-                vec![Some(""), Some("later")]
-            );
-            let selected = list(4);
-            let selected = selected
-                .as_any()
-                .downcast_ref::<arrow_array::BooleanArray>()
-                .unwrap();
-            assert_eq!(
-                selected.iter().collect::<Vec<_>>(),
-                vec![Some(false), Some(true)]
-            );
-            for index in [5, 6] {
-                assert_eq!(
-                    column(index)
-                        .as_any()
-                        .downcast_ref::<StringArray>()
+                    let operator = compiled
+                        .program
+                        .graph
+                        .node_weights()
+                        .flat_map(|node| node.operator_chain.iter())
+                        .map(|(operator, _)| operator)
+                        .find(|operator| {
+                            operator.operator_name
+                                == arroyo_datastream::logical::OperatorName::SessionWindowAggregate
+                        })
+                        .unwrap();
+                    api::SessionWindowAggregateOperator::decode(operator.operator_config.as_slice())
                         .unwrap()
-                        .value(0),
-                    "later"
+                }
+                let limits = WindowStateConfig {
+                    key_bytes: 128,
+                    partial_bytes: 8192,
+                    page_bytes: 32768,
+                    page_entries: 1,
+                    write_bytes: 65536,
+                    write_operations: 16,
+                    max_resident_bytes: 8 * 1024 * 1024,
+                };
+                let registry = Arc::new(arroyo_planner::physical::new_registry());
+                let config = compile(query).await;
+                let mut operator = NativeSession::new(&config, registry.clone(), limits).unwrap();
+                assert_eq!(
+                    *operator
+                        .finish
+                        .as_any()
+                        .downcast_ref::<AggregateExec>()
+                        .unwrap()
+                        .mode(),
+                    datafusion::physical_plan::aggregates::AggregateMode::Single
                 );
-            }
-            assert!(
-                operator
-                    .store()
-                    .unwrap()
-                    .first_due(None)
+                let expanded = compile(&query.replace(
+                    "ARRAY_AGG(attribute ORDER BY timestamp, ordinal)",
+                    "ARRAY_AGG(REPEAT(attribute, 1000000000) ORDER BY timestamp, ordinal)",
+                ))
+                .await;
+                let error = NativeSession::new(&expanded, registry, limits)
+                    .err()
+                    .expect("expanded collection expression was admitted");
+                assert!(error.to_string().contains("direct"), "{error}");
+                let state = WorkerStateResources::new(ResourceConfig {
+                    block_cache_bytes: 1024 * 1024,
+                    memtable_bytes: 1024 * 1024,
+                    queued_write_bytes: 1024 * 1024,
+                    decoded_value_bytes,
+                    scan_page_bytes: 1024 * 1024,
+                    max_blocking_operations: 2,
+                    max_snapshots: 2,
+                    max_open_databases: 1,
+                    disk_reserve_bytes: 0,
+                })
+                .unwrap();
+                let root = std::env::temp_dir().join(format!(
+                    "str118-native-{}-{decoded_value_bytes}",
+                    std::process::id()
+                ));
+                let backend: Arc<dyn LiveStateBackend> = if rocks {
+                    arroyo_state::live::worker::construct_backend(
+                        arroyo_state::live::worker::BackendConstruction::Rocksdb(
+                            arroyo_state::live::lifecycle::RocksStateConfig {
+                                root: root.clone(),
+                                job_id: "str118-native".into(),
+                                operator_id: "session".into(),
+                                subtask: 0,
+                                generation: 0,
+                                attempt: 0,
+                            },
+                        ),
+                        state.clone(),
+                    )
                     .await
                     .unwrap()
-                    .is_none()
-            );
-            assert_snapshot_capacity(&state);
+                } else {
+                    Arc::new(
+                        MemoryLiveState::bounded(state.clone(), limits.max_resident_bytes).unwrap(),
+                    )
+                };
+                let mut tables = LiveTableManager::new(
+                    backend.clone(),
+                    Ownership::PartitionLocal {
+                        subtask: 0,
+                        parallelism: 1,
+                    },
+                )
+                .unwrap();
+                let table = tables.register(TABLE).unwrap();
+                let schema = operator.input_schema.schema.clone();
+                let store = SessionStore::new(
+                    backend.clone(),
+                    table,
+                    state.clone(),
+                    schema.clone(),
+                    limits,
+                    operator.gap,
+                )
+                .unwrap();
+                for (time, ordinal, metric, attribute, selected) in
+                    [(9, 0, 3, "later", true), (0, 1, 5, "", false)]
+                {
+                    let columns: Vec<Arc<dyn Array>> = schema
+                        .fields()
+                        .iter()
+                        .map(|field| match field.data_type() {
+                            DataType::Timestamp(_, _) => {
+                                Arc::new(TimestampNanosecondArray::from(vec![time]))
+                                    as Arc<dyn Array>
+                            }
+                            DataType::Int64 => {
+                                Arc::new(arrow_array::Int64Array::from(vec![if field.name()
+                                    == "ordinal"
+                                {
+                                    ordinal
+                                } else {
+                                    metric
+                                }])) as Arc<dyn Array>
+                            }
+                            DataType::Utf8 => {
+                                Arc::new(StringArray::from(vec![attribute])) as Arc<dyn Array>
+                            }
+                            DataType::Boolean => {
+                                Arc::new(arrow_array::BooleanArray::from(vec![selected]))
+                                    as Arc<dyn Array>
+                            }
+                            other => panic!("unexpected planned input field {other:?}"),
+                        })
+                        .collect();
+                    store
+                        .insert(
+                            &[],
+                            time,
+                            &RecordBatch::try_new(schema.clone(), columns).unwrap(),
+                        )
+                        .await
+                        .unwrap();
+                }
+                operator.store = Some(store);
+                let mut fields = operator.finish.schema().fields().to_vec();
+                fields.insert(operator.window_index, operator.window_field.clone());
+                fields.push(Arc::new(Field::new(
+                    arroyo_rpc::TIMESTAMP_FIELD,
+                    DataType::Timestamp(arrow_schema::TimeUnit::Nanosecond, None),
+                    false,
+                )));
+                let output_schema = Arc::new(
+                    ArroyoSchema::from_schema_unkeyed(Arc::new(Schema::new(fields))).unwrap(),
+                );
+                let (control_tx, _control_rx) = channel(16);
+                let mut ctx = OperatorContext::new(
+                    Arc::new(arroyo_types::get_test_task_info()),
+                    None,
+                    control_tx,
+                    1,
+                    vec![operator.input_schema.clone()],
+                    Some(output_schema),
+                    HashMap::new(),
+                )
+                .await;
+                ctx.watermarks.set(
+                    0,
+                    arroyo_types::Watermark::EventTime(UNIX_EPOCH + Duration::from_secs(2)),
+                );
+                let mut collector = RecordedSessionCollector::default();
+                operator
+                    .handle_watermark(&mut ctx, &mut collector, &Converter::new(vec![]).unwrap())
+                    .await
+                    .unwrap();
+                assert_eq!(collector.0.len(), 1);
+                let output = &collector.0[0];
+                let window = output
+                    .column(operator.window_index)
+                    .as_any()
+                    .downcast_ref::<StructArray>()
+                    .unwrap();
+                let time = |array: &Arc<dyn Array>| {
+                    array
+                        .as_any()
+                        .downcast_ref::<TimestampNanosecondArray>()
+                        .unwrap()
+                        .value(0)
+                };
+                assert_eq!(time(window.column(0)), 0);
+                assert_eq!(time(window.column(1)), 1_000_000_009);
+                assert_eq!(time(output.columns().last().unwrap()), 1_000_000_008);
+
+                // SQL aliases are applied by the downstream projection; inspect
+                // the physical aggregate columns in the query's declared order.
+                let column = |index: usize| output.column(index).clone();
+                let list = |index| {
+                    column(index)
+                        .as_any()
+                        .downcast_ref::<arrow_array::ListArray>()
+                        .unwrap()
+                        .value(0)
+                };
+                assert_eq!(
+                    column(1)
+                        .as_any()
+                        .downcast_ref::<arrow_array::Int64Array>()
+                        .unwrap()
+                        .value(0),
+                    2
+                );
+                assert_eq!(
+                    list(2)
+                        .as_any()
+                        .downcast_ref::<arrow_array::Int64Array>()
+                        .unwrap()
+                        .values()
+                        .as_ref(),
+                    &[5, 3]
+                );
+                let attributes = list(3);
+                let attributes = attributes.as_any().downcast_ref::<StringArray>().unwrap();
+                assert_eq!(
+                    attributes.iter().collect::<Vec<_>>(),
+                    vec![Some(""), Some("later")]
+                );
+                let selected = list(4);
+                let selected = selected
+                    .as_any()
+                    .downcast_ref::<arrow_array::BooleanArray>()
+                    .unwrap();
+                assert_eq!(
+                    selected.iter().collect::<Vec<_>>(),
+                    vec![Some(false), Some(true)]
+                );
+                for index in [5, 6] {
+                    assert_eq!(
+                        column(index)
+                            .as_any()
+                            .downcast_ref::<StringArray>()
+                            .unwrap()
+                            .value(0),
+                        "later"
+                    );
+                }
+                assert!(
+                    operator
+                        .store()
+                        .unwrap()
+                        .first_due(None)
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
+                assert_snapshot_capacity(&state);
+                drop((operator, tables));
+                if rocks {
+                    backend.close().await.unwrap();
+                    std::fs::remove_dir_all(root).unwrap();
+                }
+            }
         }
     }
 
