@@ -144,6 +144,23 @@ struct NativeCalendarEvent<'a> {
     calendar_inputs: &'a [CalendarInput],
 }
 
+fn native_decoded_resource_exhausted(error: &anyhow::Error) -> bool {
+    use arroyo_state::live::{LiveStateError, resources::ResourceError};
+    let resource = error.downcast_ref::<ResourceError>().or_else(|| {
+        match error.downcast_ref::<LiveStateError>() {
+            Some(LiveStateError::Resource(resource)) => Some(resource),
+            _ => None,
+        }
+    });
+    matches!(
+        resource,
+        Some(ResourceError::ResourceExhausted {
+            resource: "decoded_value_bytes",
+            ..
+        })
+    )
+}
+
 /// One indexed aggregate member change within an admitted state scope.
 struct NativeMemberChange<'a> {
     group: &'a [u8],
@@ -1087,7 +1104,7 @@ impl IncrementalAggregatingFunc {
             } else {
                 let prefix = &secondary[..secondary.len() - 8];
                 scope
-                    .first(prefix)
+                    .first_member(prefix)
                     .await?
                     .context("native aggregate retracts a nonmatching indexed member")?
             };
@@ -1120,7 +1137,13 @@ impl IncrementalAggregatingFunc {
             }
             scope.delete(&secondary_key)?;
             scope.delete(&primary_key)?;
+            if !aggregate.injected_timestamp {
+                scope.member_deleted(&secondary_key);
+            }
         } else {
+            // An append can create an earlier ordinal in a helper/replay or a
+            // new generation. Conservatively invalidate before any member put.
+            scope.reset_member_progress();
             if aggregate.injected_timestamp {
                 ensure!(
                     scope.get(&secondary).await?.is_none(),
@@ -1574,6 +1597,13 @@ impl IncrementalAggregatingFunc {
             rows_per_chunk > 0,
             "native aggregate budget cannot admit one worst-case event"
         );
+        // One optional logical member bound for this serial input batch only.
+        // Error/cancellation, the next input batch and recovery are always cold.
+        let mut member_progress = None;
+        let mut allow_member_progress = true;
+        let unknown_members = self.aggregates.iter().any(|aggregate| {
+            aggregate.accumulator_type == AccumulatorType::Batch && !aggregate.injected_timestamp
+        });
         for start in (0..batch.num_rows()).step_by(rows_per_chunk) {
             let end = batch.num_rows().min(start + rows_per_chunk);
             // Without member indexes, the existing point-read path is safe
@@ -1581,28 +1611,62 @@ impl IncrementalAggregatingFunc {
             // and TTL rollover) also use only keyed reads and this owner's overlay.
             let has_retracts =
                 changelog.is_some_and(|(flags, _)| (start..end).any(|row| flags.value(row)));
-            let mut scope = if self.calendars.is_empty() && (fallback == 0 || !has_retracts) {
-                store.begin_point().await?
-            } else {
-                store.begin().await?
-            };
-            for (row, key) in keys.iter().enumerate().take(end).skip(start) {
-                let retract = changelog.is_some_and(|(flags, _)| flags.value(row));
-                let row_id = changelog.map(|(_, ids)| ids.value(row));
-                self.native_process_calendar_event(
-                    &mut scope,
-                    NativeCalendarEvent {
-                        group_key: key,
-                        inputs: &inputs,
-                        row,
-                        retract,
-                        row_id,
-                        calendar_inputs: &calendar_inputs,
-                    },
-                )
-                .await?;
+            loop {
+                let mut had_progress = member_progress.is_some();
+                let prepared: Result<AggregateScope<'_>> = async {
+                    // Taking ownership before admission makes every failure and
+                    // cancellation drop the optional key with its permit.
+                    let mut pending = member_progress.take();
+                    let mut scope = if self.calendars.is_empty() && (fallback == 0 || !has_retracts)
+                    {
+                        store.begin_point().await?
+                    } else {
+                        store.begin().await?
+                    };
+                    if allow_member_progress && has_retracts && unknown_members && pending.is_none()
+                    {
+                        pending = store.try_member_progress(
+                            self.native_config
+                                .context("native aggregate limits missing")?
+                                .max_pending_output_bytes,
+                        );
+                    }
+                    had_progress |= pending.is_some();
+                    scope.set_member_progress(pending);
+                    for (row, key) in keys.iter().enumerate().take(end).skip(start) {
+                        let retract = changelog.is_some_and(|(flags, _)| flags.value(row));
+                        let row_id = changelog.map(|(_, ids)| ids.value(row));
+                        self.native_process_calendar_event(
+                            &mut scope,
+                            NativeCalendarEvent {
+                                group_key: key,
+                                inputs: &inputs,
+                                row,
+                                retract,
+                                row_id,
+                                calendar_inputs: &calendar_inputs,
+                            },
+                        )
+                        .await?;
+                    }
+                    Ok(scope)
+                }
+                .await;
+                let scope = match prepared {
+                    Err(error) if had_progress && native_decoded_resource_exhausted(&error) => {
+                        // Preparation never writes the backend. Its failed
+                        // scope has dropped; retry only this uncommitted chunk
+                        // cold and keep optional progress disabled this batch.
+                        allow_member_progress = false;
+                        member_progress = None;
+                        continue;
+                    }
+                    result => result?,
+                };
+                // Never retry a commit: application may precede its ACK.
+                member_progress = scope.commit_member_progress().await?;
+                break;
             }
-            scope.commit().await?;
         }
         Ok(())
     }
@@ -1711,28 +1775,15 @@ impl IncrementalAggregatingFunc {
         &self,
         progress: &mut NativeCleanupProgress,
     ) -> Result<bool> {
-        use arroyo_state::live::{LiveStateError, resources::ResourceError};
         let result = self.cleanup_native_step(progress).await;
         // Another owner can consume decoded headroom after cursor creation.
         // The failed step has released its uncommitted scope before we discard
         // optional keys and retry the established cold path. Other failures,
         // including write admission, keep their original error and cursor.
         if progress._permit.is_some()
-            && result.as_ref().is_err_and(|error| {
-                let resource = error.downcast_ref::<ResourceError>().or_else(|| match error
-                    .downcast_ref::<LiveStateError>(
-                ) {
-                    Some(LiveStateError::Resource(resource)) => Some(resource),
-                    _ => None,
-                });
-                matches!(
-                    resource,
-                    Some(ResourceError::ResourceExhausted {
-                        resource: "decoded_value_bytes",
-                        ..
-                    })
-                )
-            })
+            && result
+                .as_ref()
+                .is_err_and(native_decoded_resource_exhausted)
         {
             *progress = NativeCleanupProgress::default();
             self.cleanup_native_step(progress).await
@@ -3680,6 +3731,9 @@ mod tests {
     mod aggregate_cleanup_tests {
         include!("aggregate_cleanup_tests.rs");
     }
+    mod aggregate_duplicate_tests {
+        include!("aggregate_duplicate_tests.rs");
+    }
     mod aggregate_cleanup_boundary_tests {
         include!("aggregate_cleanup_boundary_tests.rs");
     }
@@ -5419,15 +5473,27 @@ mod tests {
     }
 
     fn native_test_changelog(base: &RecordBatch, retracts: &[bool]) -> RecordBatch {
-        assert_eq!(base.num_rows(), retracts.len());
         let ids = (0..base.num_rows())
-            .map(|row| test_row_id(base, row).to_vec())
+            .map(|row| test_row_id(base, row))
             .collect::<Vec<_>>();
+        native_test_changelog_with_ids(base, retracts, &ids)
+    }
+
+    fn native_test_changelog_with_ids(
+        base: &RecordBatch,
+        retracts: &[bool],
+        ids: &[[u8; 16]],
+    ) -> RecordBatch {
+        assert_eq!(base.num_rows(), retracts.len());
+        assert_eq!(base.num_rows(), ids.len());
         let metadata = StructArray::new(
             updating_meta_fields(),
             vec![
                 Arc::new(BooleanArray::from(retracts.to_vec())),
-                Arc::new(FixedSizeBinaryArray::try_from_iter(ids.into_iter()).unwrap()),
+                Arc::new(
+                    FixedSizeBinaryArray::try_from_iter(ids.iter().map(|id| id.as_slice()))
+                        .unwrap(),
+                ),
             ],
             None,
         );
@@ -6361,6 +6427,274 @@ mod tests {
                 .native_collection_budget(&scope, std::iter::once((0, totals)))
                 .is_err()
         );
+    }
+
+    /// Finite real operator-member diagnostic; no SQL/output throughput claim.
+    #[tokio::test]
+    #[ignore = "opt-in STR119 finite duplicate churn diagnostic"]
+    async fn native_duplicate_churn_pilot() {
+        use arroyo_state::live::{lifecycle::RocksStateConfig, rocks::RocksLiveState};
+        let root = std::env::temp_dir().join(format!("str119-{}", uuid::Uuid::new_v4()));
+        let template = native_test_store();
+        let resources = template.resources().clone();
+        let limits = AggregateStoreLimits {
+            page_entries: 1,
+            ..template.limits()
+        };
+        drop(template);
+        let backend = Arc::new(
+            RocksLiveState::open(
+                RocksStateConfig {
+                    root: root.clone(),
+                    job_id: "duplicate-pilot".into(),
+                    operator_id: "aggregate".into(),
+                    subtask: 0,
+                    generation: 0,
+                    attempt: 0,
+                },
+                resources.clone(),
+            )
+            .await
+            .unwrap(),
+        );
+        let mut manager = LiveTableManager::new(
+            backend.clone(),
+            Ownership::PartitionLocal {
+                subtask: 0,
+                parallelism: 1,
+            },
+        )
+        .unwrap();
+        let table = manager.register(NATIVE_AGGREGATE_TABLE).unwrap();
+        let mut operator = native_array_operator_with_limit(false, false, false, Some(1)).unwrap();
+        operator.native_store =
+            Some(AggregateStore::new(backend.clone(), table, resources, limits).unwrap());
+        let store = operator.native_store.as_ref().unwrap();
+        let input = batch(&[Some("equal"), None], &[1, 1], &[Some(true); 2]);
+        let inputs = operator.compute_inputs(&input).unwrap();
+        let values = (0..2)
+            .map(|row| inputs[0].selected_values(Some(row)).unwrap().unwrap())
+            .collect::<Vec<_>>();
+        // Every value has equal tuples but interleaved global ordinal gaps.
+        for group in 0_u64..3 {
+            for ordinal in 0_u64..192 {
+                for (row, value) in values.iter().enumerate() {
+                    let mut scope = store.begin().await.unwrap();
+                    operator
+                        .native_member_delta(
+                            &mut scope,
+                            NativeMemberChange {
+                                group: &group.to_be_bytes(),
+                                generation: 0,
+                                aggregate_index: 0,
+                                values: value,
+                                ordinal: ordinal * 2 + row as u64,
+                                retract: false,
+                                row_id: None,
+                            },
+                        )
+                        .await
+                        .unwrap();
+                    scope.commit().await.unwrap();
+                }
+            }
+        }
+        // Pin pre-deletion history identically in both arms; default compaction remains enabled.
+        let history = backend.snapshot().await.unwrap();
+        eprintln!(
+            "STR119 settings groups=3 values=2 occurrences=192 survivors=8 output_limit=1 page_entries=1 pinned_history=true auto_compaction=default limits={limits:?} resources={:?}",
+            store.resources().config()
+        );
+        let mut completed: usize = 0;
+        let mut member_progress =
+            store.try_member_progress(native_test_config().max_pending_output_bytes);
+        let mut started = std::time::Instant::now();
+        let block_size = std::env::var("STR119_BLOCK")
+            .map(|n| n.parse::<usize>().unwrap())
+            .unwrap_or(32);
+        assert!(matches!(block_size, 1 | 32));
+        for block in 0..184_usize.div_ceil(block_size) {
+            for group in 0_u64..3 {
+                for value in &values {
+                    for _ in 0..block_size.min(184 - block * block_size) {
+                        let mut scope = store.begin().await.unwrap();
+                        scope.set_member_progress(member_progress.take());
+                        operator
+                            .native_member_delta(
+                                &mut scope,
+                                NativeMemberChange {
+                                    group: &group.to_be_bytes(),
+                                    generation: 0,
+                                    aggregate_index: 0,
+                                    values: value,
+                                    ordinal: 0,
+                                    retract: true,
+                                    row_id: None,
+                                },
+                            )
+                            .await
+                            .unwrap();
+                        member_progress = scope.commit_member_progress().await.unwrap();
+                        completed += 1;
+                    }
+                }
+            }
+            if completed.is_multiple_of(192) || completed == 1104 {
+                eprintln!(
+                    "STR119 completed={completed} elapsed_ns={} block_size={block_size}",
+                    started.elapsed().as_nanos()
+                );
+                for field in ["stat", "status", "io"] {
+                    eprintln!(
+                        "STR119 process completed={completed} field={field} raw={:?}",
+                        std::fs::read_to_string(format!("/proc/self/{field}")).unwrap()
+                    );
+                }
+                started = std::time::Instant::now();
+            }
+        }
+        assert_eq!(completed, 1104);
+        drop(member_progress);
+        // Comparison: exact secondary-key gets, mechanism only (not injected-ID operator).
+        let started = std::time::Instant::now();
+        for _ in 0..23 {
+            for group in 0_u64..3 {
+                for (row, value) in values.iter().enumerate() {
+                    for ordinal in 184_u64..192 {
+                        let (_, key, _) = operator
+                            .native_member_keys(
+                                &group.to_be_bytes(),
+                                0,
+                                0,
+                                value,
+                                ordinal * 2 + row as u64,
+                            )
+                            .unwrap();
+                        let scope = store.begin_point().await.unwrap();
+                        assert!(scope.get(&key).await.unwrap().is_some());
+                    }
+                }
+            }
+        }
+        eprintln!(
+            "STR119 exact_point_reads=1104 elapsed_ns={}",
+            started.elapsed().as_nanos()
+        );
+        // Also exercise the actual injected-event-time explicit-ID member path.
+        let explicit = native_operator();
+        let explicit_input = batch_at(&[Some("equal")], &[1], &[10]);
+        let explicit_values = explicit.compute_inputs(&explicit_input).unwrap()[8]
+            .selected_values(Some(0))
+            .unwrap()
+            .unwrap();
+        for ordinal in 0_u64..1104 {
+            let mut id = [0_u8; 16];
+            id[..8].copy_from_slice(&ordinal.to_be_bytes());
+            let mut scope = store.begin_point().await.unwrap();
+            explicit
+                .native_member_delta(
+                    &mut scope,
+                    NativeMemberChange {
+                        group: b"explicit",
+                        generation: 0,
+                        aggregate_index: 8,
+                        values: &explicit_values,
+                        ordinal,
+                        retract: false,
+                        row_id: Some(&id),
+                    },
+                )
+                .await
+                .unwrap();
+            scope.commit().await.unwrap();
+        }
+        let started = std::time::Instant::now();
+        for ordinal in 0_u64..1104 {
+            let mut id = [0_u8; 16];
+            id[..8].copy_from_slice(&ordinal.to_be_bytes());
+            let mut scope = store.begin_point().await.unwrap();
+            explicit
+                .native_member_delta(
+                    &mut scope,
+                    NativeMemberChange {
+                        group: b"explicit",
+                        generation: 0,
+                        aggregate_index: 8,
+                        values: &explicit_values,
+                        ordinal,
+                        retract: true,
+                        row_id: Some(&id),
+                    },
+                )
+                .await
+                .unwrap();
+            scope.commit().await.unwrap();
+        }
+        eprintln!(
+            "STR119 actual_explicit_id_retracts=1104 elapsed_ns={} secondary_scans=0",
+            started.elapsed().as_nanos()
+        );
+
+        for group in 0_u64..3 {
+            let scope = store.begin().await.unwrap();
+            assert_eq!(
+                CollectionStats::decode(
+                    scope
+                        .get(&native_collection_totals_key(&group.to_be_bytes(), 0).unwrap())
+                        .await
+                        .unwrap()
+                )
+                .unwrap()
+                .members,
+                16
+            );
+        }
+        // The actual process_native_batch path, including unchanged chunk admission.
+        // Its completed denominator is retracted members, not CDC output.
+        let mut batched = native_array_operator_with_limit(false, false, false, Some(1)).unwrap();
+        batched.native_store = operator.native_store.take();
+        let raw = batch(&[Some("batched"); 192], &[1; 192], &[Some(true); 192]);
+        let ids = (0_u64..192)
+            .map(|number| {
+                let mut id = [0_u8; 16];
+                id[..8].copy_from_slice(&number.to_be_bytes());
+                id
+            })
+            .collect::<Vec<_>>();
+        let seed = native_test_changelog_with_ids(&raw, &[false; 192], &ids);
+        let retract = native_test_changelog_with_ids(&raw, &[true; 192], &ids);
+        let mut ctx = native_input_context(seed.schema()).await;
+        batched.process_native_batch(&seed, &mut ctx).await.unwrap();
+        let batch_rows = std::env::var("STR119_BATCH_ROWS")
+            .map(|n| n.parse::<usize>().unwrap())
+            .unwrap_or(192);
+        assert!(matches!(batch_rows, 1 | 192));
+        let started = std::time::Instant::now();
+        for offset in (0..192).step_by(batch_rows) {
+            batched
+                .process_native_batch(&retract.slice(offset, batch_rows), &mut ctx)
+                .await
+                .unwrap();
+        }
+        eprintln!(
+            "STR119 actual_batch_retracts=192 input_batch_rows={batch_rows} elapsed_ns={}",
+            started.elapsed().as_nanos()
+        );
+        assert!(
+            array_members(batched.native_store.as_ref().unwrap(), &batched)
+                .await
+                .is_empty()
+        );
+        drop(batched);
+        drop(history);
+        drop(operator);
+        drop(manager);
+        Arc::try_unwrap(backend)
+            .unwrap_or_else(|_| panic!("retained backend"))
+            .close_and_remove()
+            .await
+            .unwrap();
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]

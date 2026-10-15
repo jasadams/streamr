@@ -1,3 +1,10 @@
+## STR-119 duplicate occurrence lookup — ready for publication 2026-10-15
+
+- Branch `jason/str-119-duplicates-20261015`, fetched base `277adcb8a2ff8d2821530de4ba4fc2abd613db66`; instructions `AGENTS.md`, `.claude/team.md`, `.claude/build-test.md`, this ledger/work plan and current STR-119. SESSION remains with its owner.
+- Batch-local optional admitted logical progress preserves lowest-ordinal retraction, insertion invalidation, commit acknowledgment and cold recovery. Dynamic decoded-pressure fallback retries only uncommitted chunk preparation; explicit IDs retain point reads. No resource limits or SQL/checkpoint contract changed.
+- Final probe-free locked worker check, strict Clippy, fmt, 3 store tests, 69 incremental tests (3 ignored), and explicit pilot passed. Independent source/finite evidence review approved. Three matched debug actual-batch pairs reduce deleted skips 18,144→63; round-robin/batch1 counters remain unchanged. These are finite diagnostics, not production throughput or combined qualification.
+- Evidence: `docs/str-119-validation.md` and `/home/jason/qa-evidence/str119-duplicates-20261015/` (including original failures, source/pins, final gates and reviews). Next: integrate incoming build-tooling main, independent final confirmation, publish and verify current-head CI. No user decision or deferral; broader qualification remains separate.
+
 ## Active STR-127 build pinning — 2026-10-15
 
 - Coordinator `/root`; branch `jason/str-127-build-pinning`, fetched base `cd9520ee89f6ba1e4e9c7362b4b306fc257c78e1`, worktree `/home/jason/repos/streamr-str-127`. Read current ticket, `AGENTS.md`, `.claude/build-test.md`, `.claude/team.md`, this ledger and feature plan. Invoking dirty checkout preserved. Pickup guard CLEAR with verified merged instruction-only branch excluded.

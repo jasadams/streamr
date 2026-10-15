@@ -404,11 +404,11 @@ async fn cleanup_generations_restore_mid_page_on_both_backends() {
 
 /// Pauses only a real cleanup write; all reads, snapshots and admissions are
 /// forwarded to the bounded backend unchanged.
-struct CleanupCommitGate {
-    inner: Arc<dyn LiveStateBackend>,
+pub(super) struct CleanupCommitGate {
+    pub(super) inner: Arc<dyn LiveStateBackend>,
     // 1: before commit; 2: after commit; 0: ordinary forwarding.
-    gate: std::sync::atomic::AtomicU8,
-    release: tokio::sync::Notify,
+    pub(super) gate: std::sync::atomic::AtomicU8,
+    pub(super) release: tokio::sync::Notify,
 }
 
 #[async_trait::async_trait]
