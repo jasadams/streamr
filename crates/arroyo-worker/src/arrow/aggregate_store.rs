@@ -61,6 +61,13 @@ pub(crate) struct AggregateExpiryProgress {
     _permit: ResourcePermit,
 }
 
+/// One optional admitted logical duplicate-member bound, owned by a serial
+/// input batch. Never a snapshot cursor and never retained across input batches.
+pub(crate) struct AggregateMemberProgress {
+    after: Option<Vec<u8>>,
+    _permit: ResourcePermit,
+}
+
 pub(crate) struct AggregateScope<'a> {
     store: &'a AggregateStore,
     // Scan scopes retain the original stable view. Point-only scopes belong to
@@ -69,6 +76,7 @@ pub(crate) struct AggregateScope<'a> {
     writes: AdmittedWriteBatch,
     overlay: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
     overlay_bytes: usize,
+    member_progress: Option<AggregateMemberProgress>,
     _decoded_permit: ResourcePermit,
 }
 
@@ -171,18 +179,43 @@ impl AggregateStore {
             writes,
             overlay: BTreeMap::new(),
             overlay_bytes: 0,
+            member_progress: None,
             _decoded_permit: decoded,
         })
     }
 
+    pub fn try_member_progress(&self, output_bytes: usize) -> Option<AggregateMemberProgress> {
+        Some(AggregateMemberProgress {
+            after: None,
+            _permit: self.try_progress_permit(
+                output_bytes,
+                std::mem::size_of::<AggregateMemberProgress>(),
+            )?,
+        })
+    }
+
     pub fn try_expiry_progress(&self, output_bytes: usize) -> Option<AggregateExpiryProgress> {
+        Some(AggregateExpiryProgress {
+            after: None,
+            _permit: self.try_progress_permit(
+                output_bytes,
+                std::mem::size_of::<AggregateExpiryProgress>(),
+            )?,
+        })
+    }
+
+    fn try_progress_permit(
+        &self,
+        output_bytes: usize,
+        header_bytes: usize,
+    ) -> Option<ResourcePermit> {
         // Native decoding can grow a Vec to up to twice its logical size;
         // cover replacement and shrinking as well as the retained/request key.
         let charge = self
             .limits
             .key_bytes
             .checked_mul(4)?
-            .checked_add(std::mem::size_of::<AggregateExpiryProgress>() + 128)?;
+            .checked_add(header_bytes + 128)?;
         // Headroom is optional. Preserve configurations that can only admit
         // the original scope and dirty-output reservations without this key.
         let mandatory = self
@@ -195,10 +228,7 @@ impl AggregateStore {
         if mandatory.checked_add(charge)? > self.resources.config().decoded_value_bytes {
             return None;
         }
-        Some(AggregateExpiryProgress {
-            after: None,
-            _permit: self.resources.try_decoded_value(charge).ok()?,
-        })
+        self.resources.try_decoded_value(charge).ok()
     }
 
     pub fn limits(&self) -> AggregateStoreLimits {
@@ -280,6 +310,43 @@ impl AggregateScope<'_> {
             .delete(&self.store.table.key(key.to_vec(), None))?;
         self.overlay.insert(key.to_vec(), None);
         Ok(())
+    }
+
+    /// Transfer the serial input batch's admitted progress into this scope.
+    pub fn set_member_progress(&mut self, progress: Option<AggregateMemberProgress>) {
+        self.member_progress = progress;
+    }
+
+    pub fn reset_member_progress(&mut self) {
+        if let Some(progress) = &mut self.member_progress {
+            progress.after = None;
+        }
+    }
+
+    /// Only duplicate-member retractions use this bound. Generic prefix scans
+    /// retain their stable-view behavior. Exact tuple prefixes include group,
+    /// generation, aggregate and the complete encoded argument (including NULL).
+    pub async fn first_member(&self, prefix: &[u8]) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+        let after = self.member_progress.as_ref().and_then(|progress| {
+            progress.after.as_deref().filter(|key| {
+                key.len() == prefix.len().saturating_add(8) && key.starts_with(prefix)
+            })
+        });
+        self.first_from(prefix, after).await
+    }
+
+    /// Stage only a successfully validated pair of primary/secondary deletes.
+    /// Dropping the scope or its commit future also drops this staged bound.
+    pub fn member_deleted(&mut self, key: &[u8]) {
+        if let Some(progress) = &mut self.member_progress {
+            progress.after = Some(key.to_vec());
+        }
+    }
+
+    pub async fn commit_member_progress(mut self) -> Result<Option<AggregateMemberProgress>> {
+        let progress = self.member_progress.take();
+        self.commit().await?;
+        Ok(progress)
     }
 
     /// First live logical entry in a prefix, including this scope's mutations.
