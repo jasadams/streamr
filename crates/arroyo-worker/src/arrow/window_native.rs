@@ -1460,6 +1460,10 @@ mod tests {
         collection: bool,
         exact: bool,
     ) {
+        closure_fixture(hopping, collection, exact, false).await;
+    }
+
+    async fn closure_fixture(hopping: bool, collection: bool, exact: bool, diagnostic: bool) {
         use arroyo_planner::physical::{ArroyoMemExec, new_registry};
         use datafusion::functions_aggregate::{
             array_agg::array_agg_udaf, count::count_udaf, sum::sum_udaf,
@@ -1529,13 +1533,66 @@ mod tests {
                 partial()
             };
             let (store, state) = store_for_schema(schema.clone());
+            let (store, diagnostic_owner) = if diagnostic {
+                drop(store);
+                let root = std::env::temp_dir().join(format!(
+                    "str124-operator-{}-{hopping}-{collection}",
+                    std::process::id()
+                ));
+                std::fs::create_dir_all(&root).unwrap();
+                let backend: Arc<dyn LiveStateBackend> = Arc::new(
+                    arroyo_state::live::rocks::RocksLiveState::open(
+                        arroyo_state::live::lifecycle::RocksStateConfig {
+                            root: root.join("live"),
+                            job_id: "str124".into(),
+                            operator_id: "window".into(),
+                            subtask: 0,
+                            generation: 1,
+                            attempt: 0,
+                        },
+                        state.clone(),
+                    )
+                    .await
+                    .unwrap(),
+                );
+                let mut tables = LiveTableManager::new(
+                    backend.clone(),
+                    Ownership::PartitionLocal {
+                        subtask: 0,
+                        parallelism: 1,
+                    },
+                )
+                .unwrap();
+                let store = WindowStore::new(
+                    backend.clone(),
+                    tables.register("window").unwrap(),
+                    state.clone(),
+                    schema.clone(),
+                    WindowStoreLimits {
+                        key_bytes: 128,
+                        value_bytes: 8192,
+                        page_bytes: 32768,
+                        page_entries: 1,
+                        write_bytes: 65536,
+                        write_operations: 16,
+                        max_resident_bytes: 8 * 1024 * 1024,
+                    },
+                )
+                .unwrap();
+                drop(tables);
+                (store, Some((backend, root)))
+            } else {
+                (store, None)
+            };
             // Many panes, with a hot first pane spanning many one-entry pages.
-            for pane in 0..48 {
-                for _ in 0..if pane == 0 { 128 } else { 1 } {
-                    store
-                        .append(&[], pane * if exact { 1 } else { 10 }, &row)
-                        .await
-                        .unwrap();
+            if !diagnostic {
+                for pane in 0..48 {
+                    for _ in 0..if pane == 0 { 128 } else { 1 } {
+                        store
+                            .append(&[], pane * if exact { 1 } else { 10 }, &row)
+                            .await
+                            .unwrap();
+                    }
                 }
             }
             let input: Arc<dyn ExecutionPlan> =
@@ -1637,6 +1694,15 @@ mod tests {
                 HashMap::new(),
             )
             .await;
+            if diagnostic {
+                diagnostic_operator_phases(&mut operator, &mut ctx, &row, collection).await;
+                drop(operator);
+                drop(ctx);
+                let (backend, root) = diagnostic_owner.unwrap();
+                backend.close().await.unwrap();
+                std::fs::remove_dir_all(root).unwrap();
+                return;
+            }
             ctx.watermarks.set(
                 0,
                 arroyo_types::Watermark::EventTime(
@@ -1875,6 +1941,271 @@ mod tests {
                     .try_decoded_value(state.config().decoded_value_bytes)
                     .unwrap(),
             );
+        }
+    }
+    struct ScanDiagnosticCollector {
+        expected: std::collections::BTreeMap<i64, i64>,
+        collection: bool,
+        outputs: usize,
+    }
+
+    #[async_trait::async_trait]
+    impl Collector for ScanDiagnosticCollector {
+        async fn collect(&mut self, batch: RecordBatch) -> arroyo_rpc::errors::DataflowResult<()> {
+            assert_eq!(batch.num_rows(), 1);
+            let start = batch
+                .column(batch.num_columns() - 1)
+                .as_any()
+                .downcast_ref::<PrimitiveArray<TimestampNanosecondType>>()
+                .unwrap()
+                .value(0);
+            let count = self
+                .expected
+                .remove(&start)
+                .expect("unexpected/duplicate window");
+            if self.collection {
+                for (column, length) in [(0, count as usize), (1, 1)] {
+                    let items = batch
+                        .column(column)
+                        .as_any()
+                        .downcast_ref::<ListArray>()
+                        .unwrap()
+                        .value(0);
+                    assert_eq!(items.len(), length);
+                    assert!(
+                        items
+                            .as_any()
+                            .downcast_ref::<Int64Array>()
+                            .unwrap()
+                            .iter()
+                            .all(|v| v == Some(1))
+                    );
+                }
+                assert_eq!(
+                    batch
+                        .column(2)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .unwrap()
+                        .value(0),
+                    1
+                );
+            } else {
+                assert_eq!(
+                    batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .unwrap()
+                        .value(0),
+                    count
+                );
+            }
+            self.outputs += 1;
+            Ok(())
+        }
+        async fn broadcast_watermark(
+            &mut self,
+            _: arroyo_types::Watermark,
+        ) -> arroyo_rpc::errors::DataflowResult<()> {
+            unreachable!()
+        }
+    }
+
+    fn diagnostic_process_sample() -> (u64, u64, u64, u64) {
+        let stat = std::fs::read_to_string("/proc/self/stat").unwrap();
+        let fields = stat[stat.rfind(')').unwrap() + 2..]
+            .split_whitespace()
+            .collect::<Vec<_>>();
+        let ticks = fields[11].parse::<u64>().unwrap() + fields[12].parse::<u64>().unwrap();
+        let io = std::fs::read_to_string("/proc/self/io").unwrap();
+        let counter = |name: &str| {
+            io.lines()
+                .find_map(|line| line.strip_prefix(name))
+                .unwrap()
+                .trim()
+                .parse::<u64>()
+                .unwrap()
+        };
+        let status = std::fs::read_to_string("/proc/self/status").unwrap();
+        let rss = status
+            .lines()
+            .find_map(|line| line.strip_prefix("VmRSS:"))
+            .unwrap()
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        (ticks, counter("read_bytes:"), counter("write_bytes:"), rss)
+    }
+
+    async fn diagnostic_insert(
+        operator: &mut NativeWindow,
+        ctx: &mut OperatorContext,
+        row: &RecordBatch,
+        oracle: &mut std::collections::BTreeMap<i64, i64>,
+        time: i64,
+        count: usize,
+        accepted: bool,
+    ) {
+        operator.binning = Arc::new(datafusion::physical_expr::expressions::Literal::new(
+            ScalarValue::TimestampNanosecond(Some(time), None),
+        ));
+        for _ in 0..count {
+            operator.process_batch(row.clone(), ctx).await.unwrap();
+            if accepted {
+                *oracle.entry(time).or_default() += 1;
+                if operator.hopping {
+                    *oracle.entry(time - 10).or_default() += 1;
+                }
+            }
+        }
+    }
+
+    async fn diagnostic_watermark(
+        operator: &mut NativeWindow,
+        ctx: &mut OperatorContext,
+        oracle: &mut std::collections::BTreeMap<i64, i64>,
+        case: &str,
+        phase: &str,
+        watermark: u128,
+        declared_retained_rows: usize,
+    ) {
+        let collection = operator.collection_output;
+        let terminal = watermark == u64::MAX as u128;
+        let width = if operator.hopping { 20 } else { 10 };
+        let keys = oracle
+            .keys()
+            .copied()
+            .filter(|start| terminal || (*start + width) as u128 <= watermark)
+            .collect::<Vec<_>>();
+        let expected = keys
+            .into_iter()
+            .map(|key| (key, oracle.remove(&key).unwrap()))
+            .collect();
+        let mut collector = ScanDiagnosticCollector {
+            expected,
+            collection,
+            outputs: 0,
+        };
+        let expected_outputs = collector.expected.len();
+        ctx.watermarks.set(
+            0,
+            arroyo_types::Watermark::EventTime(arroyo_types::from_nanos(watermark)),
+        );
+        let before = diagnostic_process_sample();
+        eprintln!(
+            "STR124 operator_begin case={case} phase={phase} watermark={watermark} expected_outputs={expected_outputs} declared_retained_rows={declared_retained_rows}"
+        );
+        let start = std::time::Instant::now();
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            operator.handle_watermark(ctx, &mut collector),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let wall_ns = start.elapsed().as_nanos();
+        let after = diagnostic_process_sample();
+        assert!(collector.expected.is_empty());
+        assert_eq!(collector.outputs, expected_outputs);
+        eprintln!(
+            "STR124 operator_end case={case} phase={phase} outputs={} wall_ns={wall_ns} cpu_ticks={} read_bytes={} write_bytes={} rss_begin_kib={} rss_end_kib={}",
+            collector.outputs,
+            after.0 - before.0,
+            after.1 - before.1,
+            after.2 - before.2,
+            before.3,
+            after.3
+        );
+    }
+
+    async fn diagnostic_operator_phases(
+        operator: &mut NativeWindow,
+        ctx: &mut OperatorContext,
+        row: &RecordBatch,
+        collection: bool,
+    ) {
+        let case = format!(
+            "{}-{}",
+            if operator.hopping { "hop" } else { "tumble" },
+            if collection { "collection" } else { "scalar" }
+        );
+        let mut oracle = std::collections::BTreeMap::new();
+        for (time, count) in [(0, 16), (10, 1), (20, 1), (1_000_000_000, 1)] {
+            diagnostic_insert(operator, ctx, row, &mut oracle, time, count, true).await;
+        }
+        diagnostic_watermark(operator, ctx, &mut oracle, &case, "equal-small", 0, 19).await;
+        diagnostic_insert(operator, ctx, row, &mut oracle, 0, 112, true).await;
+        for time in [30, 40, 50, 60] {
+            diagnostic_insert(operator, ctx, row, &mut oracle, time, 1, true).await;
+        }
+        diagnostic_watermark(operator, ctx, &mut oracle, &case, "equal-growth", 0, 135).await;
+        diagnostic_watermark(operator, ctx, &mut oracle, &case, "repeat-equal", 0, 135).await;
+        diagnostic_watermark(
+            operator,
+            ctx,
+            &mut oracle,
+            &case,
+            "large-jump",
+            1_000_000_000,
+            135,
+        )
+        .await;
+        diagnostic_watermark(
+            operator,
+            ctx,
+            &mut oracle,
+            &case,
+            "repeat-jump",
+            1_000_000_000,
+            1,
+        )
+        .await;
+        diagnostic_insert(operator, ctx, row, &mut oracle, 20, 1, false).await;
+        diagnostic_insert(operator, ctx, row, &mut oracle, 1_000_000_000, 1, true).await;
+        diagnostic_insert(operator, ctx, row, &mut oracle, 1_000_000_010, 1, true).await;
+        diagnostic_watermark(
+            operator,
+            ctx,
+            &mut oracle,
+            &case,
+            "equal-boundary-growth",
+            1_000_000_000,
+            3,
+        )
+        .await;
+        diagnostic_watermark(
+            operator,
+            ctx,
+            &mut oracle,
+            &case,
+            "EOF-MAX",
+            u64::MAX as u128,
+            3,
+        )
+        .await;
+        diagnostic_watermark(
+            operator,
+            ctx,
+            &mut oracle,
+            &case,
+            "repeat-EOF",
+            u64::MAX as u128,
+            0,
+        )
+        .await;
+        assert!(oracle.is_empty());
+    }
+
+    #[tokio::test]
+    #[ignore = "STR-124 finite native operator watermark measurements"]
+    async fn str124_operator_watermarks() {
+        for hopping in [false, true] {
+            for collection in [false, true] {
+                closure_fixture(hopping, collection, false, true).await;
+            }
         }
     }
 }
