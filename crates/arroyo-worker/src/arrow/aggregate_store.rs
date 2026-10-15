@@ -438,6 +438,86 @@ impl AggregateScope<'_> {
         })
     }
 
+    /// Visit live prefix entries in logical order, merging this scope's writes.
+    /// The callback borrows each value while its page and any backend scan
+    /// reservation (or admitted overlay) remain alive. Only one page is retained.
+    pub async fn visit_prefix(
+        &self,
+        prefix: &[u8],
+        limit: Option<usize>,
+        mut visit: impl FnMut(&[u8], &[u8]) -> Result<()> + Send,
+    ) -> Result<()> {
+        self.check_key(prefix)?;
+        let mut remaining = limit.unwrap_or(usize::MAX);
+        if remaining == 0 {
+            return Ok(());
+        }
+        let snapshot = self
+            .snapshot
+            .as_ref()
+            .context("native aggregate point-read scope cannot scan")?;
+        let mut overlay = self.overlay.range(prefix.to_vec()..).peekable();
+        let mut cursor = None;
+        loop {
+            let mut page = snapshot
+                .try_scan(ScanRequest {
+                    range: ScanRange {
+                        namespace: self.store.table.namespace().clone(),
+                        prefix: Some(prefix.to_vec()),
+                        start: None,
+                        end: None,
+                    },
+                    max_entries: self.store.limits.page_entries.min(remaining),
+                    max_bytes: self.store.limits.page_bytes,
+                    cursor,
+                })
+                .await?;
+            for entry in &page.entries {
+                while overlay.peek().is_some_and(|(key, _)| {
+                    key.starts_with(prefix) && key.as_slice() <= entry.key.key.as_slice()
+                }) {
+                    let (key, value) = overlay.next().expect("peeked overlay entry");
+                    if let Some(value) = value {
+                        visit(key, value)?;
+                        remaining -= 1;
+                        if remaining == 0 {
+                            return Ok(());
+                        }
+                    }
+                }
+                // Any overlay value, including a deletion, supersedes the
+                // stable backend entry. It was consumed above in key order.
+                if !self.overlay.contains_key(&entry.key.key) {
+                    visit(&entry.key.key, &entry.value)?;
+                    remaining -= 1;
+                    if remaining == 0 {
+                        return Ok(());
+                    }
+                }
+            }
+            let next = page.next_cursor.take();
+            // Release the scan reservation before asking for another page.
+            drop(page);
+            match next {
+                Some(next) => cursor = Some(next),
+                None => break,
+            }
+        }
+        for (key, value) in overlay {
+            if !key.starts_with(prefix) {
+                break;
+            }
+            if let Some(value) = value {
+                visit(key, value)?;
+                remaining -= 1;
+                if remaining == 0 {
+                    break;
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub async fn commit(self) -> Result<()> {
         self.store.backend.write_admitted(self.writes).await?;
         Ok(())
@@ -701,5 +781,294 @@ mod tests {
             .unwrap(),
             None
         );
+    }
+    #[tokio::test]
+    async fn prefix_visitor_merges_pages_overlay_limits_and_error_retry() {
+        for rocks in [false, true] {
+            for page_entries in [1, 3] {
+                let resources = WorkerStateResources::new(ResourceConfig {
+                    block_cache_bytes: 1024 * 1024,
+                    memtable_bytes: 1024 * 1024,
+                    queued_write_bytes: 1024 * 1024,
+                    decoded_value_bytes: 1024 * 1024,
+                    scan_page_bytes: 1024 * 1024,
+                    max_blocking_operations: 2,
+                    max_snapshots: 2,
+                    max_open_databases: 1,
+                    disk_reserve_bytes: 0,
+                })
+                .unwrap();
+                let root = std::env::temp_dir()
+                    .join(format!("aggregate-visitor-{}", uuid::Uuid::new_v4()));
+                let backend: Arc<dyn LiveStateBackend> = if rocks {
+                    Arc::new(
+                        RocksLiveState::open(
+                            RocksStateConfig {
+                                root: root.clone(),
+                                job_id: "visitor".into(),
+                                operator_id: "visitor".into(),
+                                subtask: 0,
+                                generation: 0,
+                                attempt: 0,
+                            },
+                            resources.clone(),
+                        )
+                        .await
+                        .unwrap(),
+                    )
+                } else {
+                    Arc::new(MemoryLiveState::bounded(resources.clone(), 1024 * 1024).unwrap())
+                };
+                let mut manager = LiveTableManager::new(
+                    backend.clone(),
+                    Ownership::PartitionLocal {
+                        subtask: 0,
+                        parallelism: 1,
+                    },
+                )
+                .unwrap();
+                let table = manager.register("aggregate-visitor").unwrap();
+                let store = AggregateStore::new(
+                    backend.clone(),
+                    table,
+                    resources.clone(),
+                    AggregateStoreLimits {
+                        key_bytes: 64,
+                        value_bytes: 512,
+                        page_bytes: 1024,
+                        page_entries,
+                        write_bytes: 4096,
+                        write_operations: 16,
+                        overlay_bytes: 4096,
+                    },
+                )
+                .unwrap();
+                let committed = [
+                    (b"member-".as_slice(), b"left".as_slice()),
+                    (b"member/b", b"old-b"),
+                    (b"member/d", b"old-d"),
+                    (b"member/f", b"old-f"),
+                    (b"member/h", b"old-h"),
+                    (b"member0", b"right"),
+                ];
+                let mut scope = store.begin().await.unwrap();
+                for (key, value) in committed {
+                    scope.put(key, value).unwrap();
+                }
+                scope.commit().await.unwrap();
+                for i in 0..8 {
+                    let mut scope = store.begin().await.unwrap();
+                    scope
+                        .put(format!("wide/{i}").as_bytes(), &vec![i as u8; 400])
+                        .unwrap();
+                    scope.commit().await.unwrap();
+                }
+                let mut scope = store.begin().await.unwrap();
+                if page_entries == 3 {
+                    let page = scope
+                        .snapshot
+                        .as_ref()
+                        .unwrap()
+                        .try_scan(ScanRequest {
+                            range: ScanRange {
+                                namespace: store.table.namespace().clone(),
+                                prefix: Some(b"wide/".to_vec()),
+                                start: None,
+                                end: None,
+                            },
+                            max_entries: 3,
+                            max_bytes: 1024,
+                            cursor: None,
+                        })
+                        .await
+                        .unwrap();
+                    assert!(
+                        !page.entries.is_empty()
+                            && page.entries.len() < 3
+                            && page.next_cursor.is_some()
+                    );
+                    drop(page);
+                }
+                let mut wide = Vec::new();
+                scope
+                    .visit_prefix(b"wide/", None, |k, v| {
+                        if rocks {
+                            assert!(
+                                resources
+                                    .try_scan_page(resources.config().scan_page_bytes)
+                                    .is_err(),
+                                "callback must retain its Rocks page reservation"
+                            );
+                        }
+                        wide.push((k.to_vec(), v.to_vec()));
+                        Ok(())
+                    })
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    wide,
+                    (0..8)
+                        .map(|i| (format!("wide/{i}").into_bytes(), vec![i as u8; 400]))
+                        .collect::<Vec<_>>()
+                );
+                scope.put(b"member/a", b"insert-before").unwrap();
+                scope.put(b"member/c", b"insert-between").unwrap();
+                scope.put(b"member/z", b"insert-after").unwrap();
+                scope.put(b"member/d", b"replacement").unwrap();
+                scope.delete(b"member/b").unwrap();
+                scope.delete(b"member/f").unwrap();
+                scope.put(b"member.", b"overlay-left").unwrap();
+                scope.put(b"member1", b"overlay-right").unwrap();
+                let expected = [
+                    (b"member/a".to_vec(), b"insert-before".to_vec()),
+                    (b"member/c".to_vec(), b"insert-between".to_vec()),
+                    (b"member/d".to_vec(), b"replacement".to_vec()),
+                    (b"member/h".to_vec(), b"old-h".to_vec()),
+                    (b"member/z".to_vec(), b"insert-after".to_vec()),
+                ];
+                // Holding the entire backend scan pool proves zero consumes no page.
+                let held = resources
+                    .try_scan_page(resources.config().scan_page_bytes)
+                    .unwrap();
+                scope
+                    .visit_prefix(b"member/", Some(0), |_, _| {
+                        anyhow::bail!("zero limit called visitor")
+                    })
+                    .await
+                    .unwrap();
+                drop(held);
+                let point = store.begin_point().await.unwrap();
+                point
+                    .visit_prefix(b"member/", Some(0), |_, _| {
+                        anyhow::bail!("zero limit called visitor")
+                    })
+                    .await
+                    .unwrap();
+                assert!(
+                    point
+                        .visit_prefix(b"member/", Some(1), |_, _| Ok(()))
+                        .await
+                        .is_err()
+                );
+                drop(point);
+                if rocks {
+                    // Occupy both native-worker slots before polling a visitor.
+                    // The scan has admitted its page but cannot submit work;
+                    // cancelling here must release the page immediately.
+                    let mut blockers = Vec::new();
+                    for _ in 0..resources.config().max_blocking_operations {
+                        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+                        let (release_tx, release_rx) = std::sync::mpsc::channel();
+                        let blocking_resources = resources.clone();
+                        let task = tokio::spawn(async move {
+                            blocking_resources
+                                .run_blocking(move || {
+                                    started_tx.send(()).unwrap();
+                                    release_rx
+                                        .recv_timeout(std::time::Duration::from_secs(10))
+                                        .unwrap();
+                                })
+                                .await
+                                .unwrap();
+                        });
+                        tokio::time::timeout(std::time::Duration::from_secs(10), started_rx)
+                            .await
+                            .unwrap()
+                            .unwrap();
+                        blockers.push((release_tx, task));
+                    }
+                    let mut visiting = Box::pin(scope.visit_prefix(b"member/", None, |_, _| {
+                        anyhow::bail!("scan must still be waiting")
+                    }));
+                    assert!(futures::poll!(&mut visiting).is_pending());
+                    assert!(
+                        resources
+                            .try_scan_page(resources.config().scan_page_bytes)
+                            .is_err()
+                    );
+                    drop(visiting);
+                    drop(
+                        resources
+                            .try_scan_page(resources.config().scan_page_bytes)
+                            .unwrap(),
+                    );
+                    for (release, task) in blockers {
+                        release.send(()).unwrap();
+                        tokio::time::timeout(std::time::Duration::from_secs(10), task)
+                            .await
+                            .unwrap()
+                            .unwrap();
+                    }
+                }
+                for limit in [Some(1), Some(3), Some(5), Some(9), None] {
+                    let mut actual = Vec::new();
+                    scope
+                        .visit_prefix(b"member/", limit, |k, v| {
+                            actual.push((k.to_vec(), v.to_vec()));
+                            Ok(())
+                        })
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        actual,
+                        expected[..limit.unwrap_or(expected.len()).min(expected.len())]
+                    );
+                }
+                let mut calls = 0;
+                let error = scope
+                    .visit_prefix(b"member/", None, |_, _| {
+                        calls += 1;
+                        if calls == 2 {
+                            anyhow::bail!("visitor stopped");
+                        }
+                        Ok(())
+                    })
+                    .await
+                    .unwrap_err();
+                assert!(error.to_string().contains("visitor stopped"));
+                assert_eq!(calls, 2);
+                // Error releases the admitted Rocks page even while scope lives.
+                drop(
+                    resources
+                        .try_scan_page(resources.config().scan_page_bytes)
+                        .unwrap(),
+                );
+                let mut retried = Vec::new();
+                scope
+                    .visit_prefix(b"member/", None, |k, v| {
+                        retried.push((k.to_vec(), v.to_vec()));
+                        Ok(())
+                    })
+                    .await
+                    .unwrap();
+                assert_eq!(retried, expected);
+                // Visitor never commits or mutates the overlay. Dropping the
+                // scope restores the original committed values on a fresh read.
+                drop(scope);
+                let scope = store.begin().await.unwrap();
+                let mut original = Vec::new();
+                scope
+                    .visit_prefix(b"member/", None, |k, v| {
+                        original.push((k.to_vec(), v.to_vec()));
+                        Ok(())
+                    })
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    original,
+                    committed[1..5]
+                        .iter()
+                        .map(|(k, v)| (k.to_vec(), v.to_vec()))
+                        .collect::<Vec<_>>()
+                );
+                drop(scope);
+                drop(store);
+                drop(manager);
+                if rocks {
+                    backend.close().await.unwrap();
+                    std::fs::remove_dir_all(root).unwrap();
+                }
+            }
+        }
     }
 }
