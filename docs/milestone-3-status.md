@@ -1,3 +1,13 @@
+## Active STR-118 SESSION history traversal — 2026-10-15
+
+- Coordinator `/root`, implementer `/root/implement`; branch `jason/str-118-history-20261015`, fetched base `277adcb8a2ff8d2821530de4ba4fc2abd613db66`. Read current ticket, AGENTS.md, build/team guidance, ledger/work plan; invoking changes preserved, guard CLEAR under owned reservation.
+- Own row aggregation reads and normal/fallback retirement in `session_store.rs`, directly needed operator tests, and `docs/str-118-validation.md`. Preserve established inclusive timestamps, arrival ordinals, output/recovery semantics and backend limits.
+- Acceptance: finite matched growth/churn measurements before/after with actual native traversal, exact neighbor/value/cancellation/resource/recovery checks, affected container gates, independent review and green open PR. Full combined qualification remains STR-103/126.
+- Frozen baseline build/diagnostic passed: five finite paged/fallback/one-entry/byte-limited/hot-history scenarios with exact rows/neighbors and cleanup. Candidate tightens physical session bounds, advances strict row-key successors and reuses key-only one-entry retirement; no cap/API change.
+- All eight alternating diagnostic/timing arms passed exact rows/order/neighbors/cleanup; independent raw240-phase audit matched receipts. Paged retirement seeks40/40/39→20/20/20 per20 sessions; candidate measured deleted skips0, mixed timing retained without production-speedup claim. Initial SESSION24/1/2 failure and reviewed fixture-only checkpoint-page configuration repair are preserved; backend limits unchanged. Temporary state probes removed; final source differs from measured production only by a clarified backend-accounting comment.
+- Final no-probe locked worker check/strict Clippy/fmt all passed; serial SESSION25passed/0failed/2ignored and exact STR-118 diagnostic1/1 passed. Eight fresh-backend recovery combinations and four native planned-output combinations passed within their outer tests. Final fresh=false pin `092f4413…`, unchanged source hashes, preserved outside caches in the same reservation.
+- Next: final independent source/evidence verdict, commit/PR and current-head CI. No user decision or local validation gap remains. Evidence `/home/jason/qa-evidence/str118-history-20261015/`, report `docs/str-118-validation.md`; full integrated qualification remains STR-103/126.
+
 ## STR-117 metadata discovery ready for publication — 2026-10-15
 
 - Branch `jason/str-117-metadata-20261015`; frozen comparison base `aaab7727200defe3c5b00e13975ef61a379084e1`. Current ticket/guidance read; STR-112/116 owners preserved. Delivery base `cd9520ee` preserves the incoming STR-112 ledger and build guidance; all five validated source hashes are unchanged.

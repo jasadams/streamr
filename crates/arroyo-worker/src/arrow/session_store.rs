@@ -850,6 +850,19 @@ impl SessionStore {
         Ok(Some((group, SessionMeta { start, end })))
     }
 
+    fn row_range(&self, group: &[u8], session: SessionMeta) -> Result<ScanRange> {
+        let mut end = row_key(group, session.end, u64::MAX)?;
+        // An exclusive logical successor includes every arrival ordinal at
+        // the inclusive end timestamp, without timestamp/ordinal overflow.
+        end.push(0);
+        Ok(ScanRange {
+            namespace: self.table.namespace().clone(),
+            prefix: Some(prefix(ROW, group)?),
+            start: Some(row_key(group, session.start, 0)?),
+            end: Some(end),
+        })
+    }
+
     pub async fn next_row(
         &self,
         snapshot: &StateSnapshot,
@@ -857,84 +870,79 @@ impl SessionStore {
         session: SessionMeta,
         after: Option<&[u8]>,
     ) -> Result<Option<SessionRow>> {
-        let prefix = prefix(ROW, group)?;
-        let mut start = prefix.clone();
-        start.extend_from_slice(&ordered_time(session.start));
-        let lower = after.map(<[u8]>::to_vec).unwrap_or(start);
-        ensure!(
-            lower.starts_with(&prefix),
-            "native SESSION row cursor left group"
-        );
-        let mut cursor = None;
-        loop {
-            let page = snapshot
-                .try_scan(ScanRequest {
-                    range: ScanRange {
-                        namespace: self.table.namespace().clone(),
-                        prefix: Some(prefix.clone()),
-                        start: Some(lower.clone()),
-                        end: None,
-                    },
-                    max_entries: self.limits.page_entries.min(2),
-                    max_bytes: self.limits.page_bytes,
-                    cursor,
-                })
-                .await?;
-            for entry in page.entries {
-                if after.is_some_and(|key| entry.key.key.as_slice() <= key) {
-                    continue;
-                }
-                ensure!(
-                    entry.key.key.len() == prefix.len() + 16
-                        && entry.value.len() <= self.limits.partial_bytes,
-                    "native SESSION retained row key/value is malformed"
-                );
-                let time = decode_time(&entry.key.key[prefix.len()..prefix.len() + 8])?;
-                if time > session.end {
-                    return Ok(None);
-                }
-                let permit = self
-                    .resources
-                    .try_decoded_value(self.limits.partial_bytes.saturating_mul(3))?;
-                let mut reader = StreamReader::try_new(Cursor::new(&entry.value), None)?;
-                ensure!(
-                    reader.schema() == self.schema,
-                    "native SESSION retained row schema changed"
-                );
-                let decoded = reader
-                    .next()
-                    .transpose()?
-                    .context("native SESSION retained row is empty")?;
-                ensure!(
-                    decoded.num_rows() == 1 && reader.next().transpose()?.is_none(),
-                    "native SESSION retained value must contain one Arrow row"
-                );
-                // IPC arrays can share the whole record body as backing storage.
-                // Compact the row before retention/aggregation so each member
-                // does not appear to own the body once per source column. The
-                // three-value reader permit covers IPC, decoded and copied row.
-                let indices = arrow_array::UInt32Array::from(vec![0]);
-                let columns = decoded
-                    .columns()
-                    .iter()
-                    .map(|column| arrow::compute::take(column, &indices, None))
-                    .collect::<arrow::error::Result<Vec<_>>>()?;
-                let batch = RecordBatch::try_new(self.schema.clone(), columns)?;
-                ensure!(
-                    batch.get_array_memory_size() <= self.limits.partial_bytes,
-                    "native SESSION decoded retained row exceeds configured value limit"
-                );
-                return Ok(Some(SessionRow {
-                    key: entry.key.key,
-                    batch,
-                    _permit: permit,
-                }));
-            }
-            let Some(next) = page.next_cursor else {
-                return Ok(None);
-            };
-            cursor = Some(next);
+        let mut range = self.row_range(group, session)?;
+        let prefix = range.prefix.as_ref().expect("row group prefix");
+        if let Some(after) = after {
+            ensure!(
+                after.starts_with(prefix),
+                "native SESSION row cursor left group"
+            );
+            let mut next = after.to_vec();
+            // Skip the exact previous row before native positioning, rather
+            // than reading/decoding it again on each one-entry page.
+            next.push(0);
+            range.start = Some(range.start.take().expect("row lower bound").max(next));
         }
+        if range.start >= range.end {
+            return Ok(None);
+        }
+        let prefix_len = prefix.len();
+        let page = snapshot
+            .try_scan(ScanRequest {
+                range,
+                max_entries: 1,
+                max_bytes: self.limits.page_bytes,
+                cursor: None,
+            })
+            .await?;
+        let Some(entry) = page.entries.into_iter().next() else {
+            return Ok(None);
+        };
+        ensure!(
+            entry.key.key.len() == prefix_len + 16
+                && entry.value.len() <= self.limits.partial_bytes,
+            "native SESSION retained row key/value is malformed"
+        );
+        let time = decode_time(&entry.key.key[prefix_len..prefix_len + 8])?;
+        if time > session.end {
+            return Ok(None);
+        }
+        let permit = self
+            .resources
+            .try_decoded_value(self.limits.partial_bytes.saturating_mul(3))?;
+        let mut reader = StreamReader::try_new(Cursor::new(&entry.value), None)?;
+        ensure!(
+            reader.schema() == self.schema,
+            "native SESSION retained row schema changed"
+        );
+        let decoded = reader
+            .next()
+            .transpose()?
+            .context("native SESSION retained row is empty")?;
+        ensure!(
+            decoded.num_rows() == 1 && reader.next().transpose()?.is_none(),
+            "native SESSION retained value must contain one Arrow row"
+        );
+        // IPC arrays can share the whole record body as backing storage.
+        // Compact the row before retention/aggregation so each member
+        // does not appear to own the body once per source column. The
+        // three-value reader permit covers IPC, decoded and copied row.
+        let indices = arrow_array::UInt32Array::from(vec![0]);
+        let columns = decoded
+            .columns()
+            .iter()
+            .map(|column| arrow::compute::take(column, &indices, None))
+            .collect::<arrow::error::Result<Vec<_>>>()?;
+        let batch = RecordBatch::try_new(self.schema.clone(), columns)?;
+        ensure!(
+            batch.get_array_memory_size() <= self.limits.partial_bytes,
+            "native SESSION decoded retained row exceeds configured value limit"
+        );
+        Ok(Some(SessionRow {
+            key: entry.key.key,
+            batch,
+            _permit: permit,
+        }))
     }
 
     async fn retire_single_rows(
@@ -943,23 +951,10 @@ impl SessionStore {
         group: &[u8],
         session: SessionMeta,
     ) -> Result<()> {
-        let mut after = None;
-        while let Some(row) = self
-            .next_row(snapshot, group, session, after.as_deref())
-            .await?
-        {
-            after = Some(row.key.clone());
-            let key = self.table.key(row.key, None);
-            let mut writes = AdmittedWriteBatch::try_reserve(
-                self.resources.clone(),
-                self.limits.write_bytes,
-                self.limits.write_operations,
-            )?;
-            writes.delete(&key)?;
-            self.backend.write_admitted(writes).await?;
-            tokio::task::yield_now().await;
-        }
-        Ok(())
+        // One-entry requests bound owned key/value buffers; RocksDB also
+        // admits them in its scan pool. Retirement needs key/size validation,
+        // never Arrow IPC arrays/copies.
+        self.retire_pages(snapshot, group, session, 1).await
     }
 
     async fn retire_pages(
@@ -969,15 +964,8 @@ impl SessionStore {
         session: SessionMeta,
         max_entries: usize,
     ) -> Result<()> {
-        let prefix = prefix(ROW, group)?;
-        let mut start = prefix.clone();
-        start.extend_from_slice(&ordered_time(session.start));
-        let range = ScanRange {
-            namespace: self.table.namespace().clone(),
-            prefix: Some(prefix.clone()),
-            start: Some(start),
-            end: None,
-        };
+        let range = self.row_range(group, session)?;
+        let prefix_len = range.prefix.as_ref().expect("row group prefix").len();
         let mut cursor = None;
         loop {
             let page = snapshot
@@ -1005,11 +993,11 @@ impl SessionStore {
             let mut past_end = false;
             for entry in page.entries {
                 ensure!(
-                    entry.key.key.len() == prefix.len() + 16
+                    entry.key.key.len() == prefix_len + 16
                         && entry.value.len() <= self.limits.partial_bytes,
                     "native SESSION retained row key/value is malformed"
                 );
-                let time = decode_time(&entry.key.key[prefix.len()..prefix.len() + 8])?;
+                let time = decode_time(&entry.key.key[prefix_len..prefix_len + 8])?;
                 if time > session.end {
                     past_end = true;
                     break;
@@ -1140,6 +1128,7 @@ pub(super) mod tests {
         inner: Arc<dyn LiveStateBackend>,
         snapshots: std::sync::atomic::AtomicUsize,
         pause_write: std::sync::atomic::AtomicBool,
+        writes_before_pause: std::sync::atomic::AtomicUsize,
         paused_write_reached: std::sync::atomic::AtomicBool,
     }
 
@@ -1148,7 +1137,15 @@ pub(super) mod tests {
             self.paused_write_reached
                 .load(std::sync::atomic::Ordering::SeqCst)
         }
+        fn pause_after_writes(&self, count: usize) {
+            self.writes_before_pause
+                .store(count, std::sync::atomic::Ordering::SeqCst);
+            self.pause_write
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
         pub(in crate::arrow) fn pause_writes(&self, paused: bool) {
+            self.writes_before_pause
+                .store(0, std::sync::atomic::Ordering::SeqCst);
             self.paused_write_reached
                 .store(false, std::sync::atomic::Ordering::SeqCst);
             self.pause_write
@@ -1182,7 +1179,16 @@ pub(super) mod tests {
             &self,
             batch: AdmittedWriteBatch,
         ) -> arroyo_state::live::Result<()> {
-            if self.pause_write.load(std::sync::atomic::Ordering::SeqCst) {
+            if self.pause_write.load(std::sync::atomic::Ordering::SeqCst)
+                && self
+                    .writes_before_pause
+                    .fetch_update(
+                        std::sync::atomic::Ordering::SeqCst,
+                        std::sync::atomic::Ordering::SeqCst,
+                        |remaining| remaining.checked_sub(1),
+                    )
+                    .is_err()
+            {
                 self.paused_write_reached
                     .store(true, std::sync::atomic::Ordering::SeqCst);
                 std::future::pending::<()>().await;
@@ -1201,6 +1207,7 @@ pub(super) mod tests {
             inner: store.backend.clone(),
             snapshots: std::sync::atomic::AtomicUsize::new(0),
             pause_write: std::sync::atomic::AtomicBool::new(false),
+            writes_before_pause: std::sync::atomic::AtomicUsize::new(0),
             paused_write_reached: std::sync::atomic::AtomicBool::new(false),
         });
         store.backend = observed.clone();
@@ -1450,6 +1457,576 @@ pub(super) mod tests {
                     std::fs::remove_dir_all(root).unwrap();
                 }
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn history_bounds_retirement_and_cancelled_checkpoint_recovery() {
+        // Checkpoint worker configuration is process-global. Follow the
+        // existing checkpoint test's isolated exact-child convention.
+        const CHILD: &str = "STR118_CONFIGURED_CHECKPOINT_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["arrow::session_store::tests::history_bounds_retirement_and_cancelled_checkpoint_recovery", "--exact", "--nocapture"])
+                .env(CHILD, "1")
+                .spawn().unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            loop {
+                match child.try_wait() {
+                    Ok(Some(result)) => {
+                        assert!(
+                            result.success(),
+                            "configured history recovery child failed: {result}"
+                        );
+                        return;
+                    }
+                    Ok(None) if std::time::Instant::now() < deadline => {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    result => {
+                        let killed = child.kill();
+                        let waited = child.wait();
+                        panic!(
+                            "configured history recovery child did not complete: poll={result:?}, kill={killed:?}, wait={waited:?}"
+                        );
+                    }
+                }
+            }
+        }
+        let configuration =
+            std::env::temp_dir().join(format!("str118-checkpoint-config-{}", std::process::id()));
+        std::fs::create_dir_all(&configuration).unwrap();
+        let config_path = configuration.join("worker.yaml");
+        // Runtime backend pools remain exactly the declared fixture budgets.
+        // Checkpoint writer pools are explicitly configured independently:
+        // decoded1MiB is not the tight live reader's9216B constraint.
+        std::fs::write(
+            &config_path,
+            r#"worker:
+  live-state-resources:
+    block-cache-bytes: 1048576
+    memtable-bytes: 1048576
+    queued-write-bytes: 1048576
+    decoded-value-bytes: 1048576
+    scan-page-bytes: 1048576
+    max-blocking-operations: 2
+    max-snapshots: 8
+    max-open-databases: 1
+    disk-reserve-bytes: 0
+"#,
+        )
+        .unwrap();
+        arroyo_rpc::config::initialize_config(Some(&config_path), None);
+        use arroyo_state::live::{
+            lifecycle::RocksStateConfig,
+            worker::{BackendConstruction, construct_backend},
+        };
+        for rocks in [false, true] {
+            for budget in [9 * 1024, 1024 * 1024] {
+                for (page_entries, page_bytes) in [(1, 8192), (8, 1400)] {
+                    let template = store_with_decoded(budget);
+                    let resources = template.resources.clone();
+                    let schema = template.schema.clone();
+                    let mut limits = template.limits;
+                    limits.page_entries = page_entries;
+                    limits.page_bytes = page_bytes;
+                    drop(template);
+                    let root = std::env::temp_dir().join(format!(
+                        "str118-recovery-{}-{rocks}-{budget}-{page_entries}",
+                        std::process::id()
+                    ));
+                    let construction = |attempt| {
+                        if rocks {
+                            BackendConstruction::Rocksdb(RocksStateConfig {
+                                root: root.clone(),
+                                job_id: "str118-recovery".into(),
+                                operator_id: "session".into(),
+                                subtask: 0,
+                                generation: 0,
+                                attempt,
+                            })
+                        } else {
+                            BackendConstruction::Memory {
+                                max_resident_bytes: limits.max_resident_bytes,
+                            }
+                        }
+                    };
+                    let backend = construct_backend(construction(0), resources.clone())
+                        .await
+                        .unwrap();
+                    let ownership = Ownership::PartitionLocal {
+                        subtask: 0,
+                        parallelism: 1,
+                    };
+                    let mut tables =
+                        LiveTableManager::new(backend.clone(), ownership.clone()).unwrap();
+                    let table = tables.register("session").unwrap();
+                    let mut store = SessionStore::new(
+                        backend.clone(),
+                        table,
+                        resources.clone(),
+                        schema.clone(),
+                        limits,
+                        10,
+                    )
+                    .unwrap();
+                    let observed = observe(&mut store);
+                    for (time, value) in [
+                        (-100, 1),
+                        (-99, 2),
+                        (0, 3),
+                        (1, 4),
+                        (1, 5),
+                        (2, 6),
+                        (100, 7),
+                    ] {
+                        store
+                            .insert(b"a", time, &row(schema.clone(), value))
+                            .await
+                            .unwrap();
+                    }
+                    store
+                        .insert(b"b", 1, &row(schema.clone(), 99))
+                        .await
+                        .unwrap();
+                    let closed = SessionMeta { start: 0, end: 2 };
+                    assert_eq!(
+                        metadata_rows(&store, b"a", closed).await,
+                        vec![(0, 3), (1, 4), (1, 5), (2, 6)]
+                    );
+                    // The largest ordinal is still a member of the inclusive endpoint.
+                    let snapshot = store.snapshot().await.unwrap();
+                    let page = snapshot
+                        .try_scan(ScanRequest {
+                            range: ScanRange {
+                                namespace: store.table.namespace().clone(),
+                                prefix: Some(prefix(ROW, b"a").unwrap()),
+                                start: Some(row_key(b"a", 2, 0).unwrap()),
+                                end: Some(row_key(b"a", 3, 0).unwrap()),
+                            },
+                            max_entries: 1,
+                            max_bytes: limits.page_bytes,
+                            cursor: None,
+                        })
+                        .await
+                        .unwrap();
+                    let mut writes = AdmittedWriteBatch::try_reserve(
+                        resources.clone(),
+                        limits.write_bytes,
+                        limits.write_operations,
+                    )
+                    .unwrap();
+                    writes
+                        .put(
+                            &store.table.key(row_key(b"a", 2, u64::MAX).unwrap(), None),
+                            &page.entries[0].value,
+                        )
+                        .unwrap();
+                    backend.write_admitted(writes).await.unwrap();
+                    drop((page, snapshot));
+                    assert_eq!(
+                        metadata_rows(&store, b"a", closed).await,
+                        vec![(0, 3), (1, 4), (1, 5), (2, 6), (2, 6)]
+                    );
+                    store.mark_closing(b"a", closed).await.unwrap();
+                    // Commit one actual retirement page, then cancel while
+                    // its next admitted write is paused. Restore a cold owner.
+                    store.limits.write_operations = 1;
+                    observed.pause_after_writes(1);
+                    let mut pending = Box::pin(store.retire(b"a", closed));
+                    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                        tokio::select! {
+                            result=&mut pending => panic!("retirement completed before cancellation: {result:?}"),
+                            _=async {while !observed.paused_write_reached() {tokio::task::yield_now().await;}} => {},
+                        }
+                    }).await.unwrap();
+                    drop(pending);
+                    observed.pause_writes(false);
+                    store.limits.write_operations = limits.write_operations;
+                    let storage = arroyo_state::get_storage_provider(
+                        &arroyo_state::StorageProviderFor::Controller {
+                            storage_url: Some(format!("file://{}/checkpoint", root.display())),
+                        },
+                    )
+                    .await
+                    .unwrap();
+                    let config = arroyo_rpc::grpc::rpc::DiskKeyedTableConfig {
+                        table_name: "session".into(),
+                        encoding_version: 1,
+                        schema_identity: b"native-session-raw.v2".to_vec(),
+                    };
+                    let snapshot = store.snapshot().await.unwrap();
+                    let checkpoint = arroyo_state::live::checkpoint::export(
+                        &snapshot,
+                        store.table.namespace(),
+                        &config,
+                        &storage,
+                        "checkpoint/session",
+                        1,
+                        0,
+                        0,
+                    )
+                    .await
+                    .unwrap();
+                    drop((snapshot, store, observed, tables));
+                    backend.close().await.unwrap();
+                    let backend = construct_backend(construction(1), resources.clone())
+                        .await
+                        .unwrap();
+                    let mut tables = LiveTableManager::new(backend.clone(), ownership).unwrap();
+                    let table = tables.register("session").unwrap();
+                    arroyo_state::live::checkpoint::restore(
+                        backend.as_ref(),
+                        table.namespace(),
+                        &config,
+                        &checkpoint,
+                        &storage,
+                    )
+                    .await
+                    .unwrap();
+                    let recovered =
+                        SessionStore::new(backend.clone(), table, resources, schema, limits, 10)
+                            .unwrap();
+                    assert!(recovered.is_closing(b"a", closed).await.unwrap());
+                    assert_eq!(
+                        metadata_rows(&recovered, b"a", closed).await,
+                        vec![(1, 4), (1, 5), (2, 6), (2, 6)]
+                    );
+                    recovered.retire(b"a", closed).await.unwrap();
+                    assert!(metadata_rows(&recovered, b"a", closed).await.is_empty());
+                    assert_eq!(
+                        metadata_rows(
+                            &recovered,
+                            b"a",
+                            SessionMeta {
+                                start: -100,
+                                end: -99
+                            }
+                        )
+                        .await,
+                        vec![(-100, 1), (-99, 2)]
+                    );
+                    assert_eq!(
+                        metadata_rows(
+                            &recovered,
+                            b"a",
+                            SessionMeta {
+                                start: 100,
+                                end: 100
+                            }
+                        )
+                        .await,
+                        vec![(100, 7)]
+                    );
+                    assert_eq!(
+                        metadata_rows(&recovered, b"b", SessionMeta { start: 1, end: 1 }).await,
+                        vec![(1, 99)]
+                    );
+                    drop((recovered, tables, storage));
+                    backend.close().await.unwrap();
+                    std::fs::remove_dir_all(root).unwrap();
+                }
+            }
+        }
+        std::fs::remove_dir_all(configuration).unwrap();
+    }
+
+    #[tokio::test]
+    async fn normal_and_fallback_retirement_reject_malformed_keys_and_oversized_values() {
+        for budget in [9 * 1024, 1024 * 1024] {
+            for malformed_key in [false, true] {
+                let store = store_with_decoded(budget);
+                store
+                    .insert(b"a", 0, &row(store.schema.clone(), 1))
+                    .await
+                    .unwrap();
+                store
+                    .insert(b"a", 100, &row(store.schema.clone(), 2))
+                    .await
+                    .unwrap();
+                let mut corrupt = row_key(b"a", 0, 1).unwrap();
+                if malformed_key {
+                    corrupt.push(99);
+                }
+                let key = store.table.key(corrupt, None);
+                let value = if malformed_key {
+                    vec![]
+                } else {
+                    vec![0; store.limits.partial_bytes + 1]
+                };
+                let mut writes = AdmittedWriteBatch::try_reserve(
+                    store.resources.clone(),
+                    store.limits.write_bytes,
+                    store.limits.write_operations,
+                )
+                .unwrap();
+                writes.put(&key, &value).unwrap();
+                store.backend.write_admitted(writes).await.unwrap();
+                let closed = SessionMeta { start: 0, end: 0 };
+                let error = store.retire(b"a", closed).await.unwrap_err();
+                assert!(
+                    error
+                        .to_string()
+                        .contains("retained row key/value is malformed"),
+                    "{error}"
+                );
+                assert_eq!(store.next_session(b"a", None).await.unwrap(), Some(closed));
+                assert_eq!(
+                    metadata_rows(
+                        &store,
+                        b"a",
+                        SessionMeta {
+                            start: 100,
+                            end: 100
+                        }
+                    )
+                    .await,
+                    vec![(100, 2)]
+                );
+                let mut writes = AdmittedWriteBatch::try_reserve(
+                    store.resources.clone(),
+                    store.limits.write_bytes,
+                    store.limits.write_operations,
+                )
+                .unwrap();
+                writes.delete(&key).unwrap();
+                store.backend.write_admitted(writes).await.unwrap();
+                store.retire(b"a", closed).await.unwrap();
+                assert_eq!(
+                    store.next_session(b"a", None).await.unwrap(),
+                    Some(SessionMeta {
+                        start: 100,
+                        end: 100
+                    })
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "finite STR-118 row history comparison"]
+    async fn str118_history_comparison() {
+        use arroyo_state::live::{
+            lifecycle::RocksStateConfig,
+            worker::{BackendConstruction, construct_backend},
+        };
+        for scenario in ["paged", "fallback", "one_entry", "byte_limited", "hot"] {
+            let template = store_with_decoded(if scenario == "fallback" {
+                9 * 1024
+            } else {
+                1024 * 1024
+            });
+            let resources = template.resources.clone();
+            let schema = template.schema.clone();
+            let mut limits = template.limits;
+            if scenario == "one_entry" {
+                limits.page_entries = 1;
+            }
+            if scenario == "byte_limited" {
+                limits.page_bytes = 1400;
+            }
+            drop(template);
+            let root =
+                std::env::temp_dir().join(format!("str118-{}-{scenario}", std::process::id()));
+            let backend = construct_backend(
+                BackendConstruction::Rocksdb(RocksStateConfig {
+                    root: root.clone(),
+                    job_id: "str118".into(),
+                    operator_id: "session".into(),
+                    subtask: 0,
+                    generation: 0,
+                    attempt: 0,
+                }),
+                resources.clone(),
+            )
+            .await
+            .unwrap();
+            let mut tables = LiveTableManager::new(
+                backend.clone(),
+                Ownership::PartitionLocal {
+                    subtask: 0,
+                    parallelism: 1,
+                },
+            )
+            .unwrap();
+            let table = tables.register("session").unwrap();
+            let store =
+                SessionStore::new(backend.clone(), table, resources, schema, limits, 10).unwrap();
+            let max_key = store.table.key(vec![0; limits.key_bytes], None);
+            let max_entries = limits
+                .page_entries
+                .min(limits.write_operations)
+                .min(limits.write_bytes / encoding::encoded_key_size(&max_key).unwrap());
+            let charge = limits.page_bytes * 3 + max_entries * std::mem::size_of::<ScanEntry>() * 2;
+            let permit = store.resources.try_decoded_value(charge);
+            assert_eq!(permit.is_err(), scenario == "fallback");
+            drop(permit);
+            eprintln!(
+                "STR118_SETTINGS scenario={scenario} fallback={} page_bytes={} page_entries={}",
+                scenario == "fallback",
+                limits.page_bytes,
+                limits.page_entries
+            );
+            let count = if scenario == "hot" { 3 } else { 60 };
+            let members = if scenario == "hot" { 180 } else { 8 };
+            for index in 0..count {
+                for ordinal in 0..members {
+                    let time = index * 100 + ordinal % 4;
+                    store
+                        .insert(
+                            b"a",
+                            time,
+                            &row(store.schema.clone(), index * 1000 + ordinal),
+                        )
+                        .await
+                        .unwrap();
+                }
+                // Deleted physical row keys surround every interval, without
+                // manufacturing extra session metadata or changing its extent.
+                for offset in [-8, -7, -6, -5, -4, -3, -2, -1, 4, 5, 6, 7, 8, 9, 10, 11] {
+                    let key = store
+                        .table
+                        .key(row_key(b"a", index * 100 + offset, u64::MAX).unwrap(), None);
+                    for delete in [false, true] {
+                        let mut writes = AdmittedWriteBatch::try_reserve(
+                            store.resources.clone(),
+                            store.limits.write_bytes,
+                            store.limits.write_operations,
+                        )
+                        .unwrap();
+                        if delete {
+                            writes.delete(&key).unwrap();
+                        } else {
+                            writes.put(&key, &[]).unwrap();
+                        }
+                        store.backend.write_admitted(writes).await.unwrap();
+                    }
+                }
+            }
+            store
+                .insert(b"b", 0, &row(store.schema.clone(), -1))
+                .await
+                .unwrap();
+            if scenario == "byte_limited" {
+                let snapshot = store.snapshot().await.unwrap();
+                let page = snapshot
+                    .try_scan(ScanRequest {
+                        range: ScanRange {
+                            namespace: store.table.namespace().clone(),
+                            prefix: Some(prefix(ROW, b"a").unwrap()),
+                            start: None,
+                            end: None,
+                        },
+                        max_entries: limits.page_entries,
+                        max_bytes: limits.page_bytes,
+                        cursor: None,
+                    })
+                    .await
+                    .unwrap();
+                assert!(
+                    !page.entries.is_empty()
+                        && page.entries.len() < limits.page_entries
+                        && page.next_cursor.is_some()
+                );
+                eprintln!(
+                    "STR118_BYTE_PAGE entries={} configured_entries={} bytes={}",
+                    page.entries.len(),
+                    limits.page_entries,
+                    limits.page_bytes
+                );
+            }
+            for operation in ["read", "retire"] {
+                for third in 0..3 {
+                    eprintln!(
+                        "STR118_PHASE scenario={scenario} operation={operation} third={third} start"
+                    );
+                    for file in ["stat", "io"] {
+                        eprintln!(
+                            "STR118_PROCESS initial_{file}={}",
+                            std::fs::read_to_string(format!("/proc/self/{file}"))
+                                .unwrap()
+                                .replace('\n', ";")
+                        );
+                    }
+                    let started = std::time::Instant::now();
+                    for index in third * count / 3..(third + 1) * count / 3 {
+                        let session = SessionMeta {
+                            start: index * 100,
+                            end: index * 100 + 3,
+                        };
+                        if operation == "read" {
+                            let actual = metadata_rows(&store, b"a", session).await;
+                            let mut expected: Vec<_> = (0..members)
+                                .map(|ordinal| (index * 100 + ordinal % 4, index * 1000 + ordinal))
+                                .collect();
+                            expected.sort_by_key(|(time, _)| *time);
+                            assert_eq!(actual, expected);
+                        } else {
+                            store.retire(b"a", session).await.unwrap();
+                        }
+                    }
+                    eprintln!(
+                        "STR118 scenario={scenario} operation={operation} third={third} completed={} rows={} elapsed_ns={}",
+                        count / 3,
+                        count / 3 * members,
+                        started.elapsed().as_nanos()
+                    );
+                    for file in ["status", "stat", "io"] {
+                        let contents =
+                            std::fs::read_to_string(format!("/proc/self/{file}")).unwrap();
+                        if file == "status" {
+                            eprintln!(
+                                "STR118_PROCESS {}",
+                                contents
+                                    .lines()
+                                    .filter(|line| line.starts_with("VmRSS:")
+                                        || line.starts_with("VmHWM:"))
+                                    .collect::<Vec<_>>()
+                                    .join(" ")
+                            );
+                        } else {
+                            eprintln!("STR118_PROCESS {file}={}", contents.replace('\n', ";"));
+                        }
+                    }
+                    eprintln!(
+                        "STR118_PHASE scenario={scenario} operation={operation} third={third} end"
+                    );
+                    // Assertions run outside the measured phase; verify both
+                    // completed deletions and every still-live neighbor.
+                    if operation == "retire" {
+                        for index in 0..count {
+                            let actual = metadata_rows(
+                                &store,
+                                b"a",
+                                SessionMeta {
+                                    start: index * 100,
+                                    end: index * 100 + 3,
+                                },
+                            )
+                            .await;
+                            let mut expected: Vec<_> = if index < (third + 1) * count / 3 {
+                                vec![]
+                            } else {
+                                (0..members)
+                                    .map(|ordinal| {
+                                        (index * 100 + ordinal % 4, index * 1000 + ordinal)
+                                    })
+                                    .collect()
+                            };
+                            expected.sort_by_key(|(time, _)| *time);
+                            assert_eq!(actual, expected);
+                        }
+                    }
+                }
+            }
+            assert!(store.next_session(b"a", None).await.unwrap().is_none());
+            assert_eq!(
+                metadata_rows(&store, b"b", SessionMeta { start: 0, end: 0 }).await,
+                vec![(0, -1)]
+            );
+            drop((store, tables));
+            backend.close().await.unwrap();
+            std::fs::remove_dir_all(root).unwrap();
         }
     }
 
