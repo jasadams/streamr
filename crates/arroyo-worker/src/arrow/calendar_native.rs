@@ -5,6 +5,7 @@
 use super::*;
 use crate::arrow::aggregate_codec::{
     CalendarCleanup, CalendarProgress, decode_calendar_contribution, encode_calendar_contribution,
+    encode_group,
 };
 use arrow_array::Date32Array;
 use arroyo_rpc::grpc::api::CalendarAggregateDescriptor;
@@ -773,7 +774,12 @@ impl IncrementalAggregatingFunc {
         self.calendar_schedule(scope, group_key, group.generation, reference)
             .await?;
         group.accumulator_state = self.native_state_values(&mut accumulators)?;
-        scope.put(&key, &encode_group(&group, scope.limits().value_bytes)?)?;
+        scope.put(
+            &key,
+            &self
+                .native_group_codec()?
+                .encode(&group, scope.limits().value_bytes)?,
+        )?;
         scope.put(&native_group_key(b'D', group_key)?, &[1])?;
         Ok(Some(Self::calendar_next_boundary(reference)?))
     }

@@ -2,7 +2,7 @@
 mod calendar_native;
 use calendar_native::{CalendarAggregate, CalendarContributionChange, CalendarInput};
 
-use crate::arrow::aggregate_codec::{EncodedGroup, GroupCodec, decode_group, encode_group};
+use crate::arrow::aggregate_codec::{EncodedGroup, GroupCodec, decode_group};
 use crate::arrow::aggregate_store::{
     AggregateExpiryProgress, AggregateScope, AggregateStore, AggregateStoreLimits,
 };
@@ -826,7 +826,7 @@ impl IncrementalAggregatingFunc {
             .context("native collection workspace overflow")?;
         ensure!(
             // Keep a conservative per-group preflight under the value limit.
-            // Arrow IPC framing is checked exactly by encode_group before the
+            // Group framing is checked exactly by the cached codec before the
             // group is written; the eightfold transient materialization
             // allowance belongs to the separate pending-output pool.
             working <= scope.limits().value_bytes
@@ -5718,7 +5718,9 @@ mod tests {
         let mut operator = native_calendar_operator();
         operator.native_store = Some(native_test_store_with_limits(AggregateStoreLimits {
             key_bytes: 256,
-            value_bytes: 256,
+            // Compact scalar groups fit the former 256-byte fixture.
+            // Keep this an actual encoded-capacity failure.
+            value_bytes: 80,
             page_bytes: 8192,
             page_entries: 4,
             write_bytes: 64 * 1024,
@@ -6259,7 +6261,11 @@ mod tests {
                 scope
                     .put(
                         &key,
-                        &encode_group(&previous, scope.limits().value_bytes).unwrap(),
+                        &operator
+                            .native_group_codec()
+                            .unwrap()
+                            .encode(&previous, scope.limits().value_bytes)
+                            .unwrap(),
                     )
                     .unwrap();
                 scope
@@ -7166,6 +7172,56 @@ mod tests {
                     .unwrap();
                 scope.commit().await.unwrap();
             }
+            // Persist a mixed List<UTF8>/timestamp last-emitted row before
+            // checkpointing, so recovery must retain the exact prior CDC row.
+            let metadata = StructArray::new(
+                updating_meta_fields(),
+                vec![
+                    Arc::new(BooleanArray::from(vec![false])),
+                    ScalarValue::FixedSizeBinary(16, None).to_array().unwrap(),
+                ],
+                None,
+            );
+            operator.metadata_expr =
+                Arc::new(Literal::new(ScalarValue::Struct(Arc::new(metadata))));
+            let metadata_expr = operator.metadata_expr.clone();
+            let mut ctx = native_input_context(input.schema()).await;
+            let mut output = SchemaBuilder::from(operator.schema_without_metadata.as_ref().clone());
+            output.push(Field::new(
+                UPDATING_META_FIELD,
+                DataType::Struct(updating_meta_fields()),
+                false,
+            ));
+            ctx.out_schema = Some(Arc::new(
+                ArroyoSchema::from_schema_unkeyed(Arc::new(output.finish())).unwrap(),
+            ));
+            let mut before = AggregateCollector::default();
+            operator
+                .drain_native_dirty(&mut ctx, &mut before)
+                .await
+                .unwrap();
+            assert_eq!(
+                before
+                    .batches
+                    .iter()
+                    .map(RecordBatch::num_rows)
+                    .sum::<usize>(),
+                1
+            );
+            let prior = before.batches[0]
+                .columns()
+                .iter()
+                .take(2)
+                .map(|array| ScalarValue::try_from_array(array, 0).unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                prior[0],
+                ScalarValue::List(ScalarValue::new_list(
+                    &[ScalarValue::Utf8(Some("winner".into()))],
+                    &DataType::Utf8,
+                    true
+                ))
+            );
             let snapshot = backends[0].snapshot().await.unwrap();
             let storage =
                 arroyo_state::get_storage_provider(&arroyo_state::StorageProviderFor::Controller {
@@ -7190,8 +7246,21 @@ mod tests {
             )
             .await
             .unwrap();
+            // The fresh owner continues after every original owner/snapshot
+            // reference is released; the restored backend has a separate path.
+            drop(snapshot);
+            drop(operator);
+            drop(manager);
+            drop(backends.remove(0));
+            if rocks {
+                Arc::try_unwrap(native.remove(0))
+                    .unwrap_or_else(|_| panic!("retained original Rocks backend"))
+                    .close_and_remove()
+                    .await
+                    .unwrap();
+            }
             checkpoint::restore(
-                backends[1].as_ref(),
+                backends[0].as_ref(),
                 &namespace,
                 &config,
                 &receipt,
@@ -7200,10 +7269,10 @@ mod tests {
             .await
             .unwrap();
             let mut restored_manager =
-                LiveTableManager::new(backends[1].clone(), ownership).unwrap();
+                LiveTableManager::new(backends[0].clone(), ownership).unwrap();
             let restored_table = restored_manager.register(NATIVE_AGGREGATE_TABLE).unwrap();
             let restored_store = AggregateStore::new(
-                backends[1].clone(),
+                backends[0].clone(),
                 restored_table,
                 resources.clone(),
                 limits,
@@ -7211,6 +7280,7 @@ mod tests {
             .unwrap();
             let mut fresh = native_array_operator(false, false, false);
             fresh.aggregates[0].collection_output_limit = Some(1);
+            fresh.metadata_expr = metadata_expr;
             fresh.native_store = Some(restored_store);
             let restored_store = fresh.native_store.as_ref().unwrap();
             assert_eq!(
@@ -7254,10 +7324,46 @@ mod tests {
                 array_members(restored_store, &fresh).await,
                 vec![ScalarValue::Utf8(Some("next".into()))]
             );
-            drop(snapshot);
-            drop(operator);
+            let mut resumed = AggregateCollector::default();
+            fresh
+                .drain_native_dirty(&mut ctx, &mut resumed)
+                .await
+                .unwrap();
+            let mut changes = Vec::new();
+            for batch in &resumed.batches {
+                let retracts = IncrementalAggregatingFunc::get_retracts(batch).unwrap();
+                for row in 0..batch.num_rows() {
+                    changes.push((
+                        retracts.value(row),
+                        batch
+                            .columns()
+                            .iter()
+                            .take(2)
+                            .map(|array| ScalarValue::try_from_array(array, row).unwrap())
+                            .collect::<Vec<_>>(),
+                    ));
+                }
+            }
+            let next = vec![
+                ScalarValue::List(ScalarValue::new_list(
+                    &[ScalarValue::Utf8(Some("next".into()))],
+                    &DataType::Utf8,
+                    true,
+                )),
+                prior[1].clone(),
+            ];
+            assert_eq!(changes, vec![(true, prior), (false, next)]);
+            let count = resumed.batches.len();
+            fresh
+                .drain_native_dirty(&mut ctx, &mut resumed)
+                .await
+                .unwrap();
+            assert_eq!(
+                resumed.batches.len(),
+                count,
+                "recovery re-emitted unchanged complex row"
+            );
             drop(fresh);
-            drop(manager);
             drop(restored_manager);
             drop(backends);
             for backend in native {
@@ -8107,17 +8213,20 @@ mod tests {
         }
         let mut previous = current.clone();
         previous[0] = ScalarValue::Utf8(Some("prior".into()));
-        let encoded = encode_group(
-            &EncodedGroup {
-                last_update_nanos: to_nanos(SystemTime::now()) as i64,
-                generation: 0,
-                next_ordinal: 1,
-                accumulator_state: operator.native_state_values(&mut accumulators).unwrap(),
-                last_emitted: Some(previous),
-            },
-            scope.limits().value_bytes,
-        )
-        .unwrap();
+        let encoded = operator
+            .native_group_codec()
+            .unwrap()
+            .encode(
+                &EncodedGroup {
+                    last_update_nanos: to_nanos(SystemTime::now()) as i64,
+                    generation: 0,
+                    next_ordinal: 1,
+                    accumulator_state: operator.native_state_values(&mut accumulators).unwrap(),
+                    last_emitted: Some(previous),
+                },
+                scope.limits().value_bytes,
+            )
+            .unwrap();
         drop(scope);
         let mut scope = store.begin().await.unwrap();
         scope
@@ -9466,7 +9575,11 @@ mod tests {
             scope
                 .put(
                     &native_group_key(b'G', key.as_bytes()).unwrap(),
-                    &encode_group(&group, scope.limits().value_bytes).unwrap(),
+                    &operator
+                        .native_group_codec()
+                        .unwrap()
+                        .encode(&group, scope.limits().value_bytes)
+                        .unwrap(),
                 )
                 .unwrap();
             scope
@@ -9517,7 +9630,11 @@ mod tests {
         scope
             .put(
                 &native_group_key(b'G', b"earlier").unwrap(),
-                &encode_group(&group, scope.limits().value_bytes).unwrap(),
+                &operator
+                    .native_group_codec()
+                    .unwrap()
+                    .encode(&group, scope.limits().value_bytes)
+                    .unwrap(),
             )
             .unwrap();
         scope
@@ -9584,7 +9701,11 @@ mod tests {
         scope
             .put(
                 &native_group_key(b'G', b"fallback").unwrap(),
-                &encode_group(&group, scope.limits().value_bytes).unwrap(),
+                &operator
+                    .native_group_codec()
+                    .unwrap()
+                    .encode(&group, scope.limits().value_bytes)
+                    .unwrap(),
             )
             .unwrap();
         scope
@@ -9626,17 +9747,20 @@ mod tests {
         let mut scope = store.begin().await.unwrap();
         for number in 0..5 {
             let group = format!("k{number}");
-            let encoded = encode_group(
-                &EncodedGroup {
-                    last_update_nanos: 0,
-                    generation: 0,
-                    next_ordinal: 0,
-                    accumulator_state: state.clone(),
-                    last_emitted: None,
-                },
-                scope.limits().value_bytes,
-            )
-            .unwrap();
+            let encoded = operator
+                .native_group_codec()
+                .unwrap()
+                .encode(
+                    &EncodedGroup {
+                        last_update_nanos: 0,
+                        generation: 0,
+                        next_ordinal: 0,
+                        accumulator_state: state.clone(),
+                        last_emitted: None,
+                    },
+                    scope.limits().value_bytes,
+                )
+                .unwrap();
             scope
                 .put(&native_group_key(b'G', group.as_bytes()).unwrap(), &encoded)
                 .unwrap();
