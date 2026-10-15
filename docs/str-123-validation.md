@@ -232,8 +232,10 @@ frozen source, package/source/native manifests, commands, logs, checkpoint proof
 worker identities and every golden oracle are under `recovery/`; the compact
 result is `recovery/final-recovery-summary.json`. Its CLI executable SHA256 is
 `a17519e3ea1bb4174925988b34e225b8eba53912c186a71d108f8ba0f31bd775`.
-The unchanged worker source freeze and all current compiled inputs match the
-package's frozen inputs. Image remains `bad108ab…`, profile dev, native mode
+At the original base `2368459d` plus the reviewed STR-123 patch, the worker
+source freeze and all compiled inputs matched that package's frozen inputs.
+This is original-source recovery evidence, not a CLI run of the later integrated
+join/window source described below. Image remains `bad108ab…`, profile dev, native mode
 prebuilt. These final documentation updates do not change compiled inputs.
 
 Both RocksDB batch1 checkpoint protocols passed actual worker SIGKILL/restart:
@@ -283,3 +285,43 @@ Independent local source/evidence review is approved in
 The final report/recovery evidence review, publication and current-head CI remain
 with the coordinator. No local execution acceptance is deferred; broader
 combined production/capacity qualification remains separate.
+
+
+## Integration onto main0755547c
+
+Coordinator implementation commit `26c47b18` was rebased onto fetched
+`0755547c6d4f88fe54236531898cf55b32f7555f`, producing
+`1543c647a77ce221bfce68b27adaa87f61b1a588`. Only the ledger conflicted;
+complete STR-123, STR-124 and STR-122 blocks are preserved. Both aggregate source
+files are byte-identical to the original tested/measured source (SHA256
+`74595bbc…` store and `77e4e5ed…` aggregator). Incoming production changes are
+only `updating_join.rs`, `window_native.rs` and `window_store.rs`; state sources,
+Cargo dependencies/lock, build scripts, AGENTS/build/team guidance and feature
+plan are unchanged. `integration/equivalence.json` records the exact comparisons
+and source-bound decision. The changed ledger entries were read and reconciled.
+
+Fresh integration checks, test build/pin and dependent focused runs completed
+inside one supported reservation `80d96e766a59`, foreground exit0. Purpose was
+integration correctness; profile normal dev/test, matching precompiled RocksDB
+O0 archive, immutable image `bad108ab…`, disk151 GiB free before the run.
+`integration/receipt.json` retains every exact command, elapsed time, source
+inventory and artifact; binaries/source copies are outside the evictable shared
+cache. Current integration test pin SHA256 is
+`2bb1ea04342963627cf21e69097f1b0706af03134ed31a8b3c263a7a8191e39b`.
+
+| Integration command | Exit / result |
+| --- | --- |
+| `scripts/cargo-dev check --locked -p arroyo-worker` |0|
+| `scripts/preflight-clippy.sh -p arroyo-worker` |0, strict all targets|
+| `scripts/cargo-dev fmt --all -- --check` |0|
+| `scripts/cargo-dev test --locked --no-fail-fast -p arroyo-worker --lib --no-run --message-format=json` |0, pinned before reservation release|
+| `scripts/cargo-dev test --locked --no-fail-fast -p arroyo-worker --lib arrow::aggregate_store -- --test-threads=1` |0,4 passed|
+| `scripts/cargo-dev test --locked --no-fail-fast -p arroyo-worker --lib arrow::incremental_aggregator -- --test-threads=1` |0,72 passed /5 ignored diagnostics|
+
+No selected integration failure or repair occurred. Static whitespace/conflict
+checks also pass. The unchanged aggregate contract and state/dependencies justify
+retaining the original paired measurements and original-base OS recovery;
+these were not rerun after integrating join/windows. This is **not** integrated
+CLI/OS recovery or new performance evidence. Independent integration verdict,
+publication and current-head CI remain coordinator delivery gates. No new
+standalone commit or push was made by the integration worker.
