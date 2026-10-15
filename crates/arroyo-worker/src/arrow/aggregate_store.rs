@@ -371,6 +371,28 @@ impl AggregateScope<'_> {
         after: Option<&[u8]>,
         end: Option<&[u8]>,
     ) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+        self.first_from_bounded_entries(prefix, after, end, self.store.limits.page_entries)
+            .await
+    }
+
+    /// Dirty enumeration consumes only the first live marker, never the rest
+    /// of a page. Include room for the inclusive `after` entry in a stable view;
+    /// the ordinary overlay/pagination merge still handles additional deletes.
+    pub async fn first_dirty_from(
+        &self,
+        after: Option<&[u8]>,
+    ) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+        self.first_from_bounded_entries(b"D", after, None, 1 + usize::from(after.is_some()))
+            .await
+    }
+
+    async fn first_from_bounded_entries(
+        &self,
+        prefix: &[u8],
+        after: Option<&[u8]>,
+        end: Option<&[u8]>,
+        entries: usize,
+    ) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
         let snapshot = self
             .snapshot
             .as_ref()
@@ -401,7 +423,7 @@ impl AggregateScope<'_> {
                         start: after.map(<[u8]>::to_vec),
                         end: end.map(<[u8]>::to_vec),
                     },
-                    max_entries: self.store.limits.page_entries,
+                    max_entries: self.store.limits.page_entries.min(entries),
                     max_bytes: self.store.limits.page_bytes,
                     cursor,
                 })
@@ -863,6 +885,64 @@ mod tests {
                         .unwrap();
                     scope.commit().await.unwrap();
                 }
+                // Dirty first-read page reduction preserves stable snapshots,
+                // overlay insertion/deletion order, short pages and cold retry.
+                let mut dirty = store.begin().await.unwrap();
+                for key in [b"D0", b"D2", b"D4", b"D6", b"D8"] {
+                    dirty.put(key, b"marker").unwrap();
+                }
+                dirty.commit().await.unwrap();
+                let mut dirty = store.begin().await.unwrap();
+                dirty.delete(b"D0").unwrap();
+                dirty.put(b"D1", b"new").unwrap();
+                let mut after = None;
+                let mut found = Vec::new();
+                loop {
+                    let next = dirty.first_dirty_from(after.as_deref()).await.unwrap();
+                    assert_eq!(
+                        next,
+                        dirty.first_from(b"D", after.as_deref()).await.unwrap()
+                    );
+                    let Some((key, _)) = next else { break };
+                    dirty.delete(&key).unwrap();
+                    found.push(key.clone());
+                    after = Some(key);
+                }
+                assert_eq!(found, [b"D1", b"D2", b"D4", b"D6", b"D8"]);
+                drop(dirty);
+                let mut dirty = store.begin().await.unwrap();
+                assert_eq!(
+                    dirty.first_dirty_from(None).await.unwrap().unwrap().0,
+                    b"D0"
+                );
+                dirty.delete(b"D0").unwrap();
+                dirty.commit().await.unwrap();
+                let mut dirty = store.begin().await.unwrap();
+                // A committed prior chunk's `after` need not exist in the new
+                // snapshot. The inclusive request must still find its successor.
+                assert_eq!(
+                    dirty
+                        .first_dirty_from(Some(b"D0"))
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .0,
+                    b"D2"
+                );
+                for key in [b"D2", b"D4", b"D6", b"D8"] {
+                    dirty.delete(key).unwrap();
+                }
+                dirty.commit().await.unwrap();
+                let mut dirty = store.begin_point().await.unwrap();
+                dirty.put(b"D0", b"earlier").unwrap();
+                assert!(dirty.first_dirty_from(None).await.is_err());
+                dirty.commit().await.unwrap();
+                let dirty = store.begin().await.unwrap();
+                assert_eq!(
+                    dirty.first_dirty_from(None).await.unwrap().unwrap().0,
+                    b"D0"
+                );
+                drop(dirty);
                 let mut scope = store.begin().await.unwrap();
                 if page_entries == 3 {
                     let page = scope
@@ -977,21 +1057,31 @@ mod tests {
                             .unwrap();
                         blockers.push((release_tx, task));
                     }
-                    let mut visiting = Box::pin(scope.visit_prefix(b"member/", None, |_, _| {
-                        anyhow::bail!("scan must still be waiting")
-                    }));
-                    assert!(futures::poll!(&mut visiting).is_pending());
-                    assert!(
-                        resources
-                            .try_scan_page(resources.config().scan_page_bytes)
-                            .is_err()
-                    );
-                    drop(visiting);
-                    drop(
-                        resources
-                            .try_scan_page(resources.config().scan_page_bytes)
-                            .unwrap(),
-                    );
+                    for dirty_first in [false, true] {
+                        let mut visiting = Box::pin(async {
+                            if dirty_first {
+                                scope.first_dirty_from(None).await.map(|_| ())
+                            } else {
+                                scope
+                                    .visit_prefix(b"member/", None, |_, _| {
+                                        anyhow::bail!("scan must still be waiting")
+                                    })
+                                    .await
+                            }
+                        });
+                        assert!(futures::poll!(&mut visiting).is_pending());
+                        assert!(
+                            resources
+                                .try_scan_page(resources.config().scan_page_bytes)
+                                .is_err()
+                        );
+                        drop(visiting);
+                        drop(
+                            resources
+                                .try_scan_page(resources.config().scan_page_bytes)
+                                .unwrap(),
+                        );
+                    }
                     for (release, task) in blockers {
                         release.send(()).unwrap();
                         tokio::time::timeout(std::time::Duration::from_secs(10), task)

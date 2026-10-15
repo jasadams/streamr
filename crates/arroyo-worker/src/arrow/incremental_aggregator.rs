@@ -2055,7 +2055,7 @@ impl IncrementalAggregatingFunc {
             let mut scanned = 0usize;
             let mut exhausted = false;
             while scanned < max_dirty_groups {
-                let Some((dirty_key, _)) = scope.first_from(b"D", after.as_deref()).await? else {
+                let Some((dirty_key, _)) = scope.first_dirty_from(after.as_deref()).await? else {
                     exhausted = true;
                     break;
                 };
@@ -5445,6 +5445,275 @@ mod tests {
         }
     }
 
+    /// Isolates D enumeration from codec and sink cardinality; not SQL throughput.
+    #[tokio::test]
+    #[ignore = "opt-in STR123 finite sparse dirty-history diagnostic"]
+    async fn native_dirty_history_pilot() {
+        use arroyo_state::live::{lifecycle::RocksStateConfig, rocks::RocksLiveState};
+        let root = std::env::temp_dir().join(format!("str123-{}", uuid::Uuid::new_v4()));
+        let template = native_test_store();
+        let resources = template.resources().clone();
+        let limits = template.limits();
+        drop(template);
+        let backend = Arc::new(
+            RocksLiveState::open(
+                RocksStateConfig {
+                    root: root.clone(),
+                    job_id: "dirty-pilot".into(),
+                    operator_id: "aggregate".into(),
+                    subtask: 0,
+                    generation: 0,
+                    attempt: 0,
+                },
+                resources.clone(),
+            )
+            .await
+            .unwrap(),
+        );
+        let mut manager = LiveTableManager::new(
+            backend.clone(),
+            Ownership::PartitionLocal {
+                subtask: 0,
+                parallelism: 1,
+            },
+        )
+        .unwrap();
+        let table = manager.register(NATIVE_AGGREGATE_TABLE).unwrap();
+        let mut operator = native_operator();
+        operator.native_store =
+            Some(AggregateStore::new(backend.clone(), table, resources, limits).unwrap());
+        let store = operator.native_store.as_ref().unwrap();
+        let dirty = |i: u64| native_group_key(b'D', &i.to_be_bytes()).unwrap();
+        // Pin pre-delete versions; ordinary compaction remains enabled. G absent
+        // deliberately isolates the established stale-marker cleanup branch.
+        for i in 0..2048_u64 {
+            let mut scope = store.begin_point().await.unwrap();
+            scope.put(&dirty(i), &[1]).unwrap();
+            scope.commit().await.unwrap();
+        }
+        let history = backend.snapshot().await.unwrap();
+        for i in 0..2048_u64 {
+            let mut scope = store.begin_point().await.unwrap();
+            scope.delete(&dirty(i)).unwrap();
+            scope.commit().await.unwrap();
+        }
+        let mut ctx = native_input_context(input_schema()).await;
+        let mut collector = AggregateCollector::default();
+        eprintln!(
+            "STR123 settings history=2048 cycles=96 dirty_per_cycle=4 pinned_history=true auto_compaction=default limits={limits:?} resources={:?}",
+            store.resources().config()
+        );
+        let mut started = std::time::Instant::now();
+        for cycle in 0..96_u64 {
+            let mut scope = store.begin_point().await.unwrap();
+            // Alternation includes freshly dirtied earlier keys after later keys.
+            let keys = if cycle % 2 == 0 {
+                [0, 1023, 2047, 3000]
+            } else {
+                [1, 1024, 2046, 3001]
+            };
+            for key in keys {
+                scope.put(&dirty(key), &[1]).unwrap();
+            }
+            scope.commit().await.unwrap();
+            operator
+                .drain_native_dirty(&mut ctx, &mut collector)
+                .await
+                .unwrap();
+            let scope = store.begin_point().await.unwrap();
+            for key in keys {
+                assert!(scope.get(&dirty(key)).await.unwrap().is_none());
+            }
+            if (cycle + 1) % 32 == 0 {
+                eprintln!(
+                    "STR123 completed_cycles={} completed_dirty={} elapsed_ns={}",
+                    cycle + 1,
+                    (cycle + 1) * 4,
+                    started.elapsed().as_nanos()
+                );
+                for field in ["stat", "status", "io"] {
+                    eprintln!(
+                        "STR123 process cycle={} field={field} raw={:?}",
+                        cycle + 1,
+                        std::fs::read_to_string(format!("/proc/self/{field}")).unwrap()
+                    );
+                }
+                started = std::time::Instant::now();
+            }
+        }
+        assert!(collector.batches.is_empty());
+        drop(history);
+        drop(operator);
+        drop(manager);
+        backend.close().await.unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn native_dirty_sparse_earlier_key_exact_cdc_and_suppression() {
+        use arroyo_state::live::{lifecycle::RocksStateConfig, rocks::RocksLiveState};
+        for rocks in [false, true] {
+            let root = std::env::temp_dir().join(format!("dirty-cdc-{}", uuid::Uuid::new_v4()));
+            let template = native_test_store();
+            let resources = template.resources().clone();
+            let limits = template.limits();
+            drop(template);
+            let backend: Arc<dyn LiveStateBackend> = if rocks {
+                Arc::new(
+                    RocksLiveState::open(
+                        RocksStateConfig {
+                            root: root.clone(),
+                            job_id: "dirty-cdc".into(),
+                            operator_id: "aggregate".into(),
+                            subtask: 0,
+                            generation: 0,
+                            attempt: 0,
+                        },
+                        resources.clone(),
+                    )
+                    .await
+                    .unwrap(),
+                )
+            } else {
+                Arc::new(MemoryLiveState::bounded(resources.clone(), 8 * 1024 * 1024).unwrap())
+            };
+            let mut manager = LiveTableManager::new(
+                backend.clone(),
+                Ownership::PartitionLocal {
+                    subtask: 0,
+                    parallelism: 1,
+                },
+            )
+            .unwrap();
+            let table = manager.register(NATIVE_AGGREGATE_TABLE).unwrap();
+            let mut operator = ttl_keyed_operator();
+            operator.retain_indefinitely = true;
+            operator.native_store = Some(
+                AggregateStore::new(backend.clone(), table, resources.clone(), limits).unwrap(),
+            );
+            let columns: Vec<ArrayRef> = vec![Arc::new(StringArray::from(vec!["a", "z"]))];
+            let rows = operator.key_converter.convert_columns(&columns).unwrap();
+            let keys: Vec<_> = rows.iter().map(|r| r.as_ref().to_vec()).collect();
+            let old = batch(&[Some("a")], &[1], &[Some(true)]);
+            let next = batch(&[Some("z")], &[2], &[Some(true)]);
+            let mut ctx = native_input_context(old.schema()).await;
+            let mut output = SchemaBuilder::from(operator.schema_without_metadata.as_ref().clone());
+            output.push(Field::new(
+                UPDATING_META_FIELD,
+                DataType::Struct(updating_meta_fields()),
+                false,
+            ));
+            ctx.out_schema = Some(Arc::new(
+                ArroyoSchema::from_schema_unkeyed(Arc::new(output.finish())).unwrap(),
+            ));
+            let mut collector = AggregateCollector::default();
+            // Every invocation is cold: a newly dirty earlier key must still be
+            // found after the prior invocation finished at z.
+            for (group, input, retract) in [
+                (0, &old, false),
+                (1, &old, false),
+                (1, &next, false),
+                (0, &next, false),
+                (0, &next, true),
+                (0, &old, true),
+                (0, &old, false),
+            ] {
+                let store = operator.native_store.as_ref().unwrap();
+                let mut scope = store.begin().await.unwrap();
+                operator
+                    .native_process_event(
+                        &mut scope,
+                        &keys[group],
+                        &operator.compute_inputs(input).unwrap(),
+                        0,
+                        retract,
+                        Some(&test_row_id(input, 0)),
+                    )
+                    .await
+                    .unwrap();
+                scope.commit().await.unwrap();
+                operator
+                    .drain_native_dirty(&mut ctx, &mut collector)
+                    .await
+                    .unwrap();
+                let emitted = collector
+                    .batches
+                    .iter()
+                    .map(RecordBatch::num_rows)
+                    .sum::<usize>();
+                // An explicitly dirty unchanged group emits no duplicate CDC.
+                let mut scope = store.begin_point().await.unwrap();
+                scope
+                    .put(&native_group_key(b'D', &keys[group]).unwrap(), &[1])
+                    .unwrap();
+                scope.commit().await.unwrap();
+                operator
+                    .drain_native_dirty(&mut ctx, &mut collector)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    collector
+                        .batches
+                        .iter()
+                        .map(RecordBatch::num_rows)
+                        .sum::<usize>(),
+                    emitted
+                );
+            }
+            let mut actual = Vec::new();
+            for output in &collector.batches {
+                let retracts = IncrementalAggregatingFunc::get_retracts(output).unwrap();
+                for row in 0..output.num_rows() {
+                    actual.push((
+                        output.column(0).as_string::<i32>().value(row).to_string(),
+                        retracts.value(row),
+                        ScalarValue::try_from_array(output.column(6), row).unwrap(),
+                        ScalarValue::try_from_array(output.column(1), row).unwrap(),
+                        ScalarValue::try_from_array(output.column(2), row).unwrap(),
+                        ScalarValue::try_from_array(output.column(9), row).unwrap(),
+                    ));
+                }
+            }
+            let value = |key: &str, retract, count, first: &str, last: &str, time| {
+                (
+                    key.to_owned(),
+                    retract,
+                    ScalarValue::Int64(Some(count)),
+                    ScalarValue::Utf8(Some(first.into())),
+                    ScalarValue::Utf8(Some(last.into())),
+                    ScalarValue::TimestampNanosecond(Some(time), None),
+                )
+            };
+            assert_eq!(
+                actual,
+                vec![
+                    value("a", false, 1, "a", "a", 1),
+                    value("z", false, 1, "a", "a", 1),
+                    value("z", true, 1, "a", "a", 1),
+                    value("z", false, 2, "a", "z", 2),
+                    value("a", true, 1, "a", "a", 1),
+                    value("a", false, 2, "a", "z", 2),
+                    value("a", true, 2, "a", "z", 2),
+                    value("a", false, 1, "a", "a", 1),
+                    value("a", true, 1, "a", "a", 1),
+                    value("a", false, 1, "a", "a", 1)
+                ],
+                "rocks={rocks}"
+            );
+            drop(operator);
+            drop(manager);
+            backend.close().await.unwrap();
+            assert!(
+                resources
+                    .try_decoded_value(resources.config().decoded_value_bytes)
+                    .is_ok()
+            );
+            if rocks {
+                std::fs::remove_dir_all(root).unwrap();
+            }
+        }
+    }
+
     fn native_test_config() -> AggregateStateConfig {
         AggregateStateConfig {
             key_bytes: 256,
@@ -5937,6 +6206,44 @@ mod tests {
                     .try_decoded_value(state_resources.config().decoded_value_bytes)
                     .is_ok()
             );
+            // Established ordering commits the marker and before-value before
+            // collector completion. A cold retry must not emit it twice, even
+            // when the collector await was cancelled after that commit.
+            let scope = operator
+                .native_store
+                .as_ref()
+                .unwrap()
+                .begin()
+                .await
+                .unwrap();
+            assert!(
+                scope
+                    .get(&native_group_key(b'D', &GLOBAL_KEY).unwrap())
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            let bytes = scope
+                .get(&native_group_key(b'G', &GLOBAL_KEY).unwrap())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                operator
+                    .native_group_codec()
+                    .unwrap()
+                    .decode(&bytes, scope.limits().value_bytes)
+                    .unwrap()
+                    .last_emitted
+                    .is_some()
+            );
+            drop(scope);
+            let mut retry = AggregateCollector::default();
+            operator
+                .drain_native_dirty(&mut ctx, &mut retry)
+                .await
+                .unwrap();
+            assert!(retry.batches.is_empty());
         }
     }
 

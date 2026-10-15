@@ -1,3 +1,10 @@
+## Active STR-123 dirty flush traversal — 2026-10-15
+
+- Branch `jason/str-123-dirty-20261015`, fresh fetched base `2368459dacd53f9e3aa5024fb5a4f31ba96f8dab`. Read current STR-123, AGENTS/build/team guidance, ledger/work plan and build QA notes; STR-120 extrema/member and STR-122 join ownership preserved.
+- Acceptance: finite repeated sparse D flushes with retained deletion history and native work/resource counters, smallest measured contract-preserving repair, exact CDC/suppression/retraction/earlier-key/cancellation/backend checks and actual fresh-worker recovery, required gates and independent review. No caps, semantics or checkpoint redesign.
+- Final probe-free locked worker check/strict Clippy/fmt/build passed;4 store/72 incremental (5 ignored)/1 explicit diagnostic tests passed. All10 alternating arms passed: seeks480 unchanged, fetched1344→768, deleted491227→392782; residual cold history and one timing regression retained, no stable production/RSS gain claim. Original fixture failure, disk refusals and exact-restorable archived historical pins preserved; final raw test pin `3e1180d2…` remains.
+- Actual source-free RocksDB OS worker SIGKILL recovery passed controller/worker batch1 (2/2), source prefix2/checkpoint2, fresh PID/start/generation, exact aggregate CDC final5 rows and all existing oracles, complete cleanup. Maintained dev/prebuilt CLI pin `a17519e3…`, reservation `35389ad87c92`; sampled RSS below512MiB is not continuous peak. No local execution gap or user decision pending. Local source/evidence review approved; next: coordinator final report/recovery review, publication/current-head CI. Evidence `/home/jason/qa-evidence/str123-dirty-20261015/`, [report](str-123-validation.md).
+
 ## Active STR-124 TUMBLE/HOP scans — 2026-10-15
 
 - Coordinator `/root`, implementer `/root/implement`; branch `jason/str-124-windows-20261015`, fetched base `2368459dacd53f9e3aa5024fb5a4f31ba96f8dab`. Current ticket and AGENTS/build/team/ledger/work plan read; adjacent ownership preserved.
