@@ -1,3 +1,10 @@
+## STR-140 co-located keyed membership — 2026-10-17
+
+- User approved one experiment, including +8 encoded G bytes under unchanged caps. Fresh fetched base68539f93ecc2c7df01bb22f6b6f98eb693fcaaaf; isolated branchjason/str-140-group-liveness-20261017; current AGENTS/build/team/ledger/work-plan read, ownedclaim/inflightCLEAR; invoking checkout preserved.
+- Plan7ef1f499aa8a46e3d65ac6f79f9fcfe4be277f0b56caa4cc3842f02031f5c072 moves P count into G and removes duplicate requests. Preserve global/keyed SQL lifecycle, conservative existing scopes/chunks, caps, scans and checkpoint/ACK contract. Three independent pre-code SQL/storage/performance reviews APPROVE; implementation and two independent formatted-source reviews APPROVE. Shared B/J codec records also grow8 bytes under unchanged caps, with unused count0.
+- Dev gates2: maintained fmt/check/strictClippy0; codec20passed, aggregate80passed/5historicalignored, store4passed. First codecgate19pass/1fail was stale corruption offset33 now valid counter; fixture repaired/reviewed and full gates rerun0. Both-backend fresh checkpoint continuation, overflow/cap/TTL/quiet/cleanup/ACK checks pass; no scan/batch-bound changes.
+- Next: freeze reviewed product and exact12probe inverse/source controls, then one maintained release <=599.5s matched campaign. Saved STR139688128/599.585510=1147.672832/s is BEFORE; no rerun. Preserve full per-second slowdown/CPU/RSS/CP/native/host/oracle/cleanup evidence. Stop/report for user KEEP/publication decision; no automatic repeat/PR/merge. Evidence `/home/jason/qa-evidence/str140-group-liveness-20261017/`.
+
 ## STR-139 telemetry-only old-value reads — 2026-10-17
 
 - User approved exact Rocks logical-key/byte observations becoming unavailable for one experiment. Fresh fetched baseabbac28b2049819809fe699c96a2f85b6f6dbf7f; branchjason/str-139-telemetry-20261017; currentAGENTS/build/team/ledger read, ownedclaim/inflightCLEAR; invokingcheckout preserved.

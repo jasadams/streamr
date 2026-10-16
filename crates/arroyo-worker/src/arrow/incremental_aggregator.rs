@@ -632,13 +632,6 @@ fn native_collection_totals_key(group: &[u8], aggregate: usize) -> Result<Vec<u8
     Ok(key)
 }
 
-// A keyed GROUP BY has no output row after its last input is retracted.
-// Aggregate values cannot establish that fact: COUNT(*) evaluates to zero,
-// while filtered aggregates may be NULL even for a live group.
-fn native_live_rows_key(group: &[u8]) -> Result<Vec<u8>> {
-    native_group_key(b'P', group)
-}
-
 fn native_collection_member(value: &[u8]) -> Result<(usize, &[u8])> {
     ensure!(value.len() >= 8, "invalid native collection member value");
     Ok((
@@ -932,21 +925,24 @@ impl IncrementalAggregatingFunc {
         self.schema_without_metadata.fields().len() > self.aggregates.len()
     }
 
+    #[cfg(test)]
     async fn native_group_is_live(
         &self,
         scope: &AggregateScope<'_>,
         group_key: &[u8],
     ) -> Result<bool> {
         if !self.native_has_group_keys() {
-            // A global SQL aggregate retains its single row on empty input.
             return Ok(true);
         }
-        let count = scope
-            .get(&native_live_rows_key(group_key)?)
+        let bytes = scope
+            .get(&native_group_key(b'G', group_key)?)
             .await?
-            .context("native aggregate keyed group is missing its live-row count")?;
-        ensure!(count.len() == 8, "invalid native aggregate live-row count");
-        Ok(u64::from_be_bytes(count.as_slice().try_into()?) > 0)
+            .context("native aggregate keyed group is missing")?;
+        Ok(self
+            .native_group_codec()?
+            .decode(&bytes, scope.limits().value_bytes)?
+            .live_rows
+            > 0)
     }
 
     fn native_accumulators(&self, group: Option<&EncodedGroup>) -> Result<Vec<IncrementalState>> {
@@ -1289,33 +1285,14 @@ impl IncrementalAggregatingFunc {
                     .decode(&bytes, scope.limits().value_bytes)
             })
             .transpose()?;
-        let live_rows_key = self
-            .native_has_group_keys()
-            .then(|| native_live_rows_key(group_key))
-            .transpose()?;
-        let prior_rows = if let Some(key) = &live_rows_key {
-            let encoded = scope.get(key).await?;
-            ensure!(
-                previous.is_some() == encoded.is_some(),
-                "native aggregate keyed group is missing its live-row count"
-            );
-            encoded
-                .map(|bytes| {
-                    ensure!(bytes.len() == 8, "invalid native aggregate live-row count");
-                    Ok(u64::from_be_bytes(bytes.as_slice().try_into()?))
-                })
-                .transpose()?
-                .unwrap_or(0)
-        } else {
-            0
-        };
+        let prior_rows = previous.as_ref().map_or(0, |group| group.live_rows);
         let now = to_nanos(SystemTime::now()) as i64;
         let ttl_nanos = i64::try_from(self.ttl.as_nanos())?;
         let expired = !self.retain_indefinitely
             && previous
                 .as_ref()
                 .is_some_and(|group| now.saturating_sub(group.last_update_nanos) >= ttl_nanos);
-        let next_group_rows = if let Some(key) = &live_rows_key {
+        let next_group_rows = if self.native_has_group_keys() {
             let rows = if expired { 0 } else { prior_rows };
             let next_rows = if retract {
                 rows.checked_sub(1)
@@ -1324,7 +1301,6 @@ impl IncrementalAggregatingFunc {
                 rows.checked_add(1)
                     .context("native aggregate live-row count overflow")?
             };
-            scope.put(key, &next_rows.to_be_bytes())?;
             Some(next_rows)
         } else {
             None
@@ -1535,6 +1511,7 @@ impl IncrementalAggregatingFunc {
             last_update_nanos: now,
             generation,
             next_ordinal,
+            live_rows: next_group_rows.unwrap_or(0),
             calendar_references,
             accumulator_state: self.native_state_values(&mut accumulators)?,
             last_emitted: previous.and_then(|group| group.last_emitted),
@@ -1603,6 +1580,8 @@ impl IncrementalAggregatingFunc {
             .iter()
             .filter(|aggregate| aggregate.collection)
             .count();
+        // Retain the conservative keyed workspace allowance so membership
+        // co-location does not change admitted chunk/commit boundaries.
         let worst_operations = (2 + usize::from(self.native_has_group_keys()))
             .checked_add(fallback.saturating_mul(2))
             .and_then(|value| value.checked_add(collections.saturating_mul(2)))
@@ -1725,6 +1704,8 @@ impl IncrementalAggregatingFunc {
             .ok_or_else(|| anyhow!("native aggregate store missing"))?;
         let ttl_nanos = i64::try_from(self.ttl.as_nanos())?;
         let now = to_nanos(SystemTime::now()) as i64;
+        // Retain the conservative keyed workspace allowance so membership
+        // co-location does not change admitted chunk/commit boundaries.
         let operations_per_expiry = 4
             + usize::from(self.native_has_group_keys())
             + self.aggregates.iter().filter(|a| a.collection).count();
@@ -1770,6 +1751,7 @@ impl IncrementalAggregatingFunc {
                         .checked_add(1)
                         .ok_or_else(|| anyhow!("aggregate generation overflow"))?;
                     group.next_ordinal = 0;
+                    group.live_rows = 0;
                     group.calendar_references.clear();
                     group.accumulator_state =
                         self.native_state_values(&mut self.native_accumulators(None)?)?;
@@ -1781,9 +1763,6 @@ impl IncrementalAggregatingFunc {
                             .encode(&group, scope.limits().value_bytes)?,
                     )?;
                     scope.put(&native_group_key(b'D', group_key)?, &[1])?;
-                    if self.native_has_group_keys() {
-                        scope.put(&native_live_rows_key(group_key)?, &0_u64.to_be_bytes())?;
-                    }
                     scope.put(&native_cleanup_key(group_key, old_generation)?, b"M")?;
                     for (index, aggregate) in self.aggregates.iter().enumerate() {
                         if aggregate.collection {
@@ -1888,25 +1867,19 @@ impl IncrementalAggregatingFunc {
                 scope.delete(&cleanup_key)?;
             } else {
                 let group_key = native_group_key(b'G', group)?;
-                let rows_key = native_live_rows_key(group)?;
-                let encoded_group = scope.get(&group_key).await?;
-                let encoded_rows = scope.get(&rows_key).await?;
-                ensure!(
-                    encoded_group.is_some() == encoded_rows.is_some(),
-                    "native aggregate keyed group is missing its live-row count"
-                );
-                if let (Some(_), Some(rows)) = (encoded_group, encoded_rows) {
-                    ensure!(rows.len() == 8, "invalid native aggregate live-row count");
-                    if u64::from_be_bytes(rows.as_slice().try_into()?) == 0
+                if let Some(bytes) = scope.get(&group_key).await? {
+                    let current = self
+                        .native_group_codec()?
+                        .decode(&bytes, scope.limits().value_bytes)?;
+                    if current.live_rows == 0
                         && scope.get(&native_group_key(b'D', group)?).await?.is_none()
                     {
                         // The serial owner has already drained the dirty row,
-                        // including its emitted retract. The pair is one
-                        // admitted atomic write batch. Leave the harmless T
+                        // including its emitted retract. G owns membership
+                        // atomically. Leave the harmless T
                         // marker until the next cleanup step; its only
                         // remaining action is to delete itself.
                         scope.delete(&group_key)?;
-                        scope.delete(&rows_key)?;
                         marker_retired = false;
                     } else {
                         scope.delete(&cleanup_key)?;
@@ -2063,6 +2036,8 @@ impl IncrementalAggregatingFunc {
             "native aggregate pending-output rows must fit one retract/append pair"
         );
         let store_limits = store.limits();
+        // Retain the conservative keyed workspace allowance so membership
+        // co-location does not change admitted chunk/commit boundaries.
         let writes_per_group = 2
             + usize::from(self.native_has_group_keys())
             + usize::from(self.native_has_group_keys() && !self.retain_indefinitely);
@@ -2127,7 +2102,7 @@ impl IncrementalAggregatingFunc {
                             }
                         });
                     }
-                    let append = self.native_group_is_live(&scope, &group_key).await?;
+                    let append = !self.native_has_group_keys() || group.live_rows > 0;
                     let unchanged = append
                         && group.last_emitted.as_ref().is_some_and(|old| {
                             old.iter()
@@ -6925,14 +6900,7 @@ mod tests {
                     .unwrap();
                 assert_eq!(current.generation, 1);
                 assert_eq!(current.next_ordinal, 5);
-                assert_eq!(
-                    scope
-                        .get(&native_live_rows_key(group).unwrap())
-                        .await
-                        .unwrap()
-                        .unwrap(),
-                    5_u64.to_be_bytes()
-                );
+                assert_eq!(current.live_rows, 5);
                 assert_eq!(
                     scope
                         .get(&native_cleanup_key(group, 0).unwrap())
@@ -8407,6 +8375,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn keyed_membership_overflow_preserves_committed_group() {
+        let store = native_test_store();
+        let mut operator = native_operator();
+        let mut fields = operator.schema_without_metadata.fields().to_vec();
+        fields.insert(0, Arc::new(Field::new("group_key", DataType::Utf8, false)));
+        operator.schema_without_metadata = Arc::new(Schema::new(fields));
+        let group = b"overflow";
+        let storage = native_group_key(b'G', group).unwrap();
+        let state = EncodedGroup {
+            calendar_references: CalendarReferences::default(),
+            last_update_nanos: to_nanos(SystemTime::now()) as i64,
+            generation: 0,
+            next_ordinal: 0,
+            live_rows: u64::MAX,
+            accumulator_state: operator
+                .native_state_values(&mut operator.native_accumulators(None).unwrap())
+                .unwrap(),
+            last_emitted: None,
+        };
+        let value = operator
+            .native_group_codec()
+            .unwrap()
+            .encode(&state, store.limits().value_bytes)
+            .unwrap();
+        let mut scope = store.begin().await.unwrap();
+        scope.put(&storage, &value).unwrap();
+        scope.commit().await.unwrap();
+        let input = batch(&[Some("value")], &[1], &[Some(true)]);
+        let inputs = operator.compute_inputs(&input).unwrap();
+        let mut scope = store.begin().await.unwrap();
+        let error = operator
+            .native_process_event(
+                &mut scope,
+                group,
+                &inputs,
+                0,
+                false,
+                Some(&test_row_id(&input, 0)),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("live-row count overflow"),
+            "{error:#}"
+        );
+        drop(scope);
+        let scope = store.begin().await.unwrap();
+        assert_eq!(scope.get(&storage).await.unwrap(), Some(value));
+        assert!(
+            scope
+                .get(&native_group_key(b'D', group).unwrap())
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
     async fn keyed_native_group_tracks_last_retraction_independently_of_aggregate_values() {
         let store = native_test_store();
         let mut operator = native_operator();
@@ -8541,13 +8567,6 @@ mod tests {
         assert!(
             reloaded
                 .get(&native_group_key(b'G', &group).unwrap())
-                .await
-                .unwrap()
-                .is_none()
-        );
-        assert!(
-            reloaded
-                .get(&native_live_rows_key(&group).unwrap())
                 .await
                 .unwrap()
                 .is_none()
@@ -8861,6 +8880,7 @@ mod tests {
                     last_update_nanos: to_nanos(SystemTime::now()) as i64,
                     generation: 0,
                     next_ordinal: 1,
+                    live_rows: 0,
                     accumulator_state: operator.native_state_values(&mut accumulators).unwrap(),
                     last_emitted: Some(previous),
                 },
@@ -10014,6 +10034,30 @@ mod tests {
                             .unwrap(),
                         );
                         operator = fresh;
+                        let restored_scope = operator
+                            .native_store
+                            .as_ref()
+                            .unwrap()
+                            .begin()
+                            .await
+                            .unwrap();
+                        for (key, expected) in [(&keys[0], 0), (&keys[1], 2)] {
+                            let bytes = restored_scope
+                                .get(&native_group_key(b'G', key).unwrap())
+                                .await
+                                .unwrap()
+                                .unwrap();
+                            let restored_group = operator
+                                .native_group_codec()
+                                .unwrap()
+                                .decode(&bytes, limits.value_bytes)
+                                .unwrap();
+                            assert_eq!(
+                                restored_group.live_rows, expected,
+                                "restored membership rocks={rocks} tight={tight}"
+                            );
+                        }
+                        drop(restored_scope);
                         // A recovered worker has no retained minimum. A newly
                         // earlier stale entry must be discovered and removed.
                         let mut scope = operator
@@ -10200,6 +10244,7 @@ mod tests {
                 last_update_nanos: 0,
                 generation: 0,
                 next_ordinal: 0,
+                live_rows: 0,
                 accumulator_state: state.clone(),
                 last_emitted: None,
             };
@@ -10256,6 +10301,7 @@ mod tests {
             last_update_nanos: -1_000_000_000,
             generation: 0,
             next_ordinal: 0,
+            live_rows: 0,
             accumulator_state: state,
             last_emitted: None,
         };
@@ -10388,6 +10434,7 @@ mod tests {
                         last_update_nanos: 0,
                         generation: 0,
                         next_ordinal: 0,
+                        live_rows: 0,
                         accumulator_state: state.clone(),
                         last_emitted: None,
                     },

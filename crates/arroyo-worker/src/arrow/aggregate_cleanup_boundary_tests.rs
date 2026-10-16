@@ -163,7 +163,7 @@ async fn cleanup_next_drain_sees_lower_marker_and_new_live_generation() {
 }
 
 #[tokio::test]
-async fn cleanup_terminal_preserves_later_generation_and_retires_pair_atomically() {
+async fn cleanup_terminal_preserves_later_generation_and_retires_group_atomically() {
     let mut operator = native_operator();
     let mut fields = operator.schema_without_metadata.fields().to_vec();
     fields.insert(0, Arc::new(Field::new("group_key", DataType::Utf8, false)));
@@ -172,7 +172,6 @@ async fn cleanup_terminal_preserves_later_generation_and_retires_pair_atomically
     let store = operator.native_store.as_ref().unwrap();
     let group = b"keyed";
     let storage = native_group_key(b'G', group).unwrap();
-    let rows = native_live_rows_key(group).unwrap();
     let earlier = native_cleanup_key(group, 0).unwrap();
     let later = native_cleanup_key(group, 1).unwrap();
     let state = EncodedGroup {
@@ -180,6 +179,7 @@ async fn cleanup_terminal_preserves_later_generation_and_retires_pair_atomically
         last_update_nanos: 0,
         generation: 2,
         next_ordinal: 0,
+        live_rows: 0,
         accumulator_state: operator
             .native_state_values(&mut operator.native_accumulators(None).unwrap())
             .unwrap(),
@@ -192,7 +192,6 @@ async fn cleanup_terminal_preserves_later_generation_and_retires_pair_atomically
         .unwrap();
     let mut scope = store.begin().await.unwrap();
     scope.put(&storage, &value).unwrap();
-    scope.put(&rows, &0_u64.to_be_bytes()).unwrap();
     scope.put(&earlier, b"T").unwrap();
     scope.put(&later, b"T").unwrap();
     scope.commit().await.unwrap();
@@ -206,7 +205,6 @@ async fn cleanup_terminal_preserves_later_generation_and_retires_pair_atomically
     let scope = store.begin().await.unwrap();
     assert!(scope.get(&earlier).await.unwrap().is_none());
     assert_eq!(scope.get(&storage).await.unwrap(), Some(value.clone()));
-    assert!(scope.get(&rows).await.unwrap().is_some());
     drop(scope);
     assert!(
         operator
@@ -216,7 +214,6 @@ async fn cleanup_terminal_preserves_later_generation_and_retires_pair_atomically
     );
     let scope = store.begin().await.unwrap();
     assert!(scope.get(&storage).await.unwrap().is_none());
-    assert!(scope.get(&rows).await.unwrap().is_none());
     assert_eq!(scope.get(&later).await.unwrap(), Some(b"T".to_vec()));
     drop(scope);
     assert!(!progress.completed);

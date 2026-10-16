@@ -654,6 +654,7 @@ impl IncrementalAggregatingFunc {
             last_update_nanos: 0,
             generation,
             next_ordinal: 0,
+            live_rows: 0,
             accumulator_state: accumulator.state()?,
             last_emitted: None,
         };
