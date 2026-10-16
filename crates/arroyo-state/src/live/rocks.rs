@@ -147,7 +147,9 @@ impl RocksLiveState {
                         return Err(error);
                     }
                 };
-                let health = health::BackendHealth::new("rocksdb", !reopen);
+                // Exact logical accounting would require reading every touched
+                // old value. Rocks exposes native health, not a logical baseline.
+                let health = health::BackendHealth::new("rocksdb", false);
                 health.sample_native(&db, &path);
                 task_resources.observe_health(&health);
                 let (finished, completion) = oneshot::channel();
@@ -206,60 +208,22 @@ impl RocksLiveState {
                 resources
                     .ensure_disk_space(&path, bytes as u64)
                     .map_err(LiveStateError::from)?;
-                // Serialize touched-key observations with the native commit. The
-                // map contains only the final operation per admitted key, so
-                // repeated puts/deletes within one atomic batch count once.
+                // Preserve final-operation ordering and atomic native commits.
+                // The map contains only the final operation per admitted key.
                 let _write = db.write_lock.lock().map_err(backend)?;
                 let mut final_values = std::collections::BTreeMap::new();
                 for operation in batch.operations {
                     match operation {
                         WriteOperation::Put { key, value } => {
-                            final_values.insert(
-                                encode_key(&key)?,
-                                (key.key.len(), Some(encode_value(&value))),
-                            );
+                            final_values.insert(encode_key(&key)?, Some(encode_value(&value)));
                         }
                         WriteOperation::Delete { key } => {
-                            final_values.insert(encode_key(&key)?, (key.key.len(), None));
+                            final_values.insert(encode_key(&key)?, None);
                         }
                     }
                 }
-                let mut logical = db
-                    .health
-                    .as_ref()
-                    .and_then(|health| *health.logical.lock().unwrap_or_else(|e| e.into_inner()));
                 let mut native = rocksdb::WriteBatch::default();
-                for (key, (key_bytes, value)) in final_values {
-                    if logical.is_some() {
-                        // Pinned access avoids copying an old value merely to
-                        // measure it. Telemetry read failures make the baseline
-                        // unavailable; they never veto an otherwise valid write.
-                        match db.get_pinned(&key) {
-                            Ok(old) => {
-                                let size = logical.as_mut().expect("known logical baseline");
-                                if let Some(old) = old {
-                                    if let Some(old_bytes) = old.len().checked_sub(1) {
-                                        size.keys -= 1;
-                                        size.key_bytes -= key_bytes as u64;
-                                        size.value_bytes -= old_bytes as u64;
-                                    } else {
-                                        logical = None;
-                                    }
-                                }
-                                if let Some(size) = &mut logical
-                                    && let Some(value) = &value
-                                {
-                                    size.keys += 1;
-                                    size.key_bytes += key_bytes as u64;
-                                    size.value_bytes += (value.len() - 1) as u64;
-                                }
-                            }
-                            Err(error) => {
-                                tracing::warn!(%error, "logical state measurement unavailable");
-                                logical = None;
-                            }
-                        }
-                    }
+                for (key, value) in final_values {
                     if let Some(value) = value {
                         native.put(key, value);
                     } else {
@@ -269,9 +233,6 @@ impl RocksLiveState {
                 let options = durability.options();
                 let result = db.write_opt(native, &options).map_err(backend);
                 if let Some(health) = &db.health {
-                    if result.is_ok() {
-                        *health.logical.lock().unwrap_or_else(|e| e.into_inner()) = logical;
-                    }
                     health.sample_native(&db, &path);
                 }
                 result
@@ -951,6 +912,35 @@ mod tests {
             assert_eq!(
                 health_value(
                     registry,
+                    "arroyo_live_state_health_observations",
+                    &[
+                        ("measurement", "logical"),
+                        (
+                            "outcome",
+                            if backend == "memory" {
+                                "available"
+                            } else {
+                                "unavailable"
+                            }
+                        )
+                    ]
+                ),
+                1.0
+            );
+            if backend == "rocksdb" {
+                assert_eq!(
+                    health_value(
+                        registry,
+                        "arroyo_live_state_health_observations",
+                        &[("measurement", "logical"), ("outcome", "available")]
+                    ),
+                    0.0
+                );
+                return;
+            }
+            assert_eq!(
+                health_value(
+                    registry,
                     "arroyo_live_state_logical_keys",
                     &[("backend", backend)]
                 ),
@@ -971,8 +961,22 @@ mod tests {
         assert_size(0.0, 0.0, 0.0);
         state.put(key(), vec![1; 7], 1024).await.unwrap();
         assert_size(1.0, key_bytes, 7.0);
+        assert_eq!(
+            state
+                .get(&key(), ReadOptions { max_bytes: 1024 })
+                .await
+                .unwrap(),
+            Some(vec![1; 7])
+        );
         state.put(key(), vec![2; 3], 1024).await.unwrap();
         assert_size(1.0, key_bytes, 3.0);
+        assert_eq!(
+            state
+                .get(&key(), ReadOptions { max_bytes: 1024 })
+                .await
+                .unwrap(),
+            Some(vec![2; 3])
+        );
         state
             .write_batch(WriteBatch {
                 operations: vec![
@@ -991,6 +995,13 @@ mod tests {
             .await
             .unwrap();
         assert_size(1.0, key_bytes, 5.0);
+        assert_eq!(
+            state
+                .get(&key(), ReadOptions { max_bytes: 1024 })
+                .await
+                .unwrap(),
+            Some(vec![4; 5])
+        );
         assert!(
             state
                 .write_batch(WriteBatch {
@@ -1004,6 +1015,13 @@ mod tests {
                 .is_err()
         );
         assert_size(1.0, key_bytes, 5.0);
+        assert_eq!(
+            state
+                .get(&key(), ReadOptions { max_bytes: 1024 })
+                .await
+                .unwrap(),
+            Some(vec![4; 5])
+        );
         state
             .write_batch(WriteBatch {
                 operations: vec![
@@ -1015,6 +1033,13 @@ mod tests {
             .await
             .unwrap();
         assert_size(0.0, 0.0, 0.0);
+        assert_eq!(
+            state
+                .get(&key(), ReadOptions { max_bytes: 1024 })
+                .await
+                .unwrap(),
+            None
+        );
         state
             .write_batch(WriteBatch {
                 operations: vec![WriteOperation::Delete { key: key() }],
@@ -1023,10 +1048,17 @@ mod tests {
             .await
             .unwrap();
         assert_size(0.0, 0.0, 0.0);
+        assert_eq!(
+            state
+                .get(&key(), ReadOptions { max_bytes: 1024 })
+                .await
+                .unwrap(),
+            None
+        );
     }
 
     #[tokio::test]
-    async fn health_accounting_matches_atomic_memory_and_rocks_batches() {
+    async fn health_memory_exact_rocks_unavailable_and_atomic_batches() {
         for backend in ["memory", "rocksdb"] {
             let resources = resources();
             let registry = prometheus::Registry::new();
@@ -1070,10 +1102,17 @@ mod tests {
                 let weak = Arc::downgrade(state.db.health.as_ref().unwrap());
                 let snapshot = state.snapshot().await.unwrap();
                 assert_eq!(
+                    snapshot
+                        .get(&key(), ReadOptions { max_bytes: 1024 })
+                        .await
+                        .unwrap(),
+                    Some(vec![1; 4])
+                );
+                assert_eq!(
                     health_value(
                         &registry,
-                        "arroyo_live_state_logical_keys",
-                        &[("backend", backend)]
+                        "arroyo_live_state_health_observations",
+                        &[("measurement", "logical"), ("outcome", "unavailable")]
                     ),
                     1.0
                 );
@@ -1093,7 +1132,21 @@ mod tests {
                     ),
                     1.0
                 );
+                assert_eq!(
+                    state
+                        .get(&key(), ReadOptions { max_bytes: 1024 })
+                        .await
+                        .unwrap(),
+                    Some(vec![1; 4])
+                );
                 state.put(key(), vec![2; 2], 1024).await.unwrap();
+                assert_eq!(
+                    state
+                        .get(&key(), ReadOptions { max_bytes: 1024 })
+                        .await
+                        .unwrap(),
+                    Some(vec![2; 2])
+                );
                 assert_eq!(
                     health_value(
                         &registry,
