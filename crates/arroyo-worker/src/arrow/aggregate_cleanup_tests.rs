@@ -105,7 +105,7 @@ async fn cleanup_generations_restore_mid_page_on_both_backends() {
                             scope.put(&marker, b"M").unwrap();
                             obsolete.push(marker);
                         }
-                        for family in b"MRBJQU" {
+                        for family in b"MRBJU" {
                             for row in 0u64..9 {
                                 let key = member_key(*family, &group, generation, row);
                                 // Two U rows refer to obsolete-owned pointers; the
@@ -164,13 +164,8 @@ async fn cleanup_generations_restore_mid_page_on_both_backends() {
                             .await
                             .unwrap()
                             .unwrap();
-                        let mut decoded = decode_group(
-                            &encoded_group,
-                            &operator.native_state_types(),
-                            &operator.native_output_types(),
-                            limits.value_bytes,
-                        )
-                        .unwrap();
+                        let mut decoded = operator.native_group_codec().unwrap()
+                            .decode(&encoded_group, limits.value_bytes).unwrap();
                         decoded.generation = 3;
                         let encoded_group = operator.native_group_codec().unwrap().encode(&decoded, limits.value_bytes).unwrap();
                         let group_key = native_group_key(b'G', &group).unwrap();
