@@ -1,7 +1,10 @@
 //! Configured-backend SQL SESSION owner. The existing DataFusion aggregate
 //! remains the final computation; only retained input and scheduling move to
 //! the bounded live-state table.
-use super::session_store::{SessionMeta, SessionStore};
+use super::{
+    session_accumulator::SessionAccumulatorPlan,
+    session_store::{AdmittedSessionState, SessionMeta, SessionStore},
+};
 use anyhow::{Context, Result, ensure};
 use arrow::compute::take;
 use arrow_array::{
@@ -231,6 +234,7 @@ pub(crate) struct NativeSession {
     acknowledged_closure: Option<(Vec<u8>, SessionMeta)>,
     identity: Vec<u8>,
     store: Option<SessionStore>,
+    incremental: Option<SessionAccumulatorPlan>,
 }
 
 impl NativeSession {
@@ -258,8 +262,43 @@ impl NativeSession {
             .try_into_physical_plan(registry.as_ref(), &runtime, &codec)?;
         let finish = normalize_collection_plan(finish, &input_schema.schema)?;
         validate_aggregates(finish.as_ref(), &input_schema.schema)?;
+        let mut incremental = None;
+        if let Some(resources) = configured_worker_resources()? {
+            // Construction-only admission: classification/template creation may
+            // allocate bounded Arrow metadata, never event history.
+            {
+                // A transient busy pool must not change the persisted execution
+                // mode. Only deterministic capacity/eligibility selects fallback.
+                let _permit =
+                    resources.try_decoded_value(limits.partial_bytes.saturating_mul(3))?;
+                if let Some(plan) =
+                    SessionAccumulatorPlan::try_new(&finish, &input_schema.schema, limits)?
+                    && SessionStore::supports_incremental(
+                        limits,
+                        resources.config(),
+                        &plan.layout,
+                        arroyo_state::live::encoding::encoded_namespace_size(
+                            &arroyo_state::live::StateNamespace {
+                                ownership: arroyo_state::live::Ownership::PartitionLocal {
+                                    subtask: 0,
+                                    parallelism: 1,
+                                },
+                                table: TABLE.as_bytes().to_vec(),
+                            },
+                        )?,
+                    )
+                {
+                    incremental = Some(plan);
+                }
+            }
+        }
         let mut identity = Sha256::new();
-        identity.update(b"streamr.native-session-raw.v2");
+        if let Some(plan) = &incremental {
+            identity.update(b"streamr.native-session-incremental.v1");
+            identity.update(&plan.layout.identity);
+        } else {
+            identity.update(b"streamr.native-session-raw.v2");
+        }
         identity.update(gap.to_be_bytes());
         identity.update(u64::try_from(config.final_aggregation_plan.len())?.to_be_bytes());
         identity.update(&config.final_aggregation_plan);
@@ -283,6 +322,7 @@ impl NativeSession {
             acknowledged_closure: None,
             identity: identity.finalize().to_vec(),
             store: None,
+            incremental,
         })
     }
 
@@ -330,14 +370,26 @@ impl NativeSession {
             .table_manager
             .register_live_table(TABLE, backend.clone())
             .await?;
-        self.store = Some(SessionStore::new(
-            backend,
-            table,
-            resources,
-            self.input_schema.schema.clone(),
-            self.limits,
-            self.gap,
-        )?);
+        self.store = Some(if let Some(plan) = &self.incremental {
+            SessionStore::new_incremental(
+                backend,
+                table,
+                resources,
+                self.input_schema.schema.clone(),
+                self.limits,
+                self.gap,
+                plan.layout.clone(),
+            )?
+        } else {
+            SessionStore::new(
+                backend,
+                table,
+                resources,
+                self.input_schema.schema.clone(),
+                self.limits,
+                self.gap,
+            )?
+        });
         Ok(())
     }
 
@@ -380,13 +432,19 @@ impl NativeSession {
             if floor.is_some_and(|floor| timestamps.value(index) < floor) {
                 continue;
             }
-            let indices = UInt32Array::from(vec![u32::try_from(index)?]);
-            let columns = batch
-                .columns()
-                .iter()
-                .map(|column| take(column, &indices, None))
-                .collect::<arrow::error::Result<Vec<_>>>()?;
-            let row = RecordBatch::try_new(batch.schema(), columns)?;
+            // Eligible state consumes column views synchronously; do not copy
+            // unrelated payload columns merely to feed COUNT/SUM state.
+            let row = if self.incremental.is_some() {
+                batch.slice(index, 1)
+            } else {
+                let indices = UInt32Array::from(vec![u32::try_from(index)?]);
+                let columns = batch
+                    .columns()
+                    .iter()
+                    .map(|column| take(column, &indices, None))
+                    .collect::<arrow::error::Result<Vec<_>>>()?;
+                RecordBatch::try_new(batch.schema(), columns)?
+            };
             let group = if group_count == 0 {
                 Vec::new()
             } else {
@@ -395,9 +453,15 @@ impl NativeSession {
                     .as_ref()
                     .to_vec()
             };
-            self.store()?
-                .insert(&group, timestamps.value(index), &row)
-                .await?;
+            if let Some(plan) = &self.incremental {
+                self.store()?
+                    .insert_incremental(&group, timestamps.value(index), || plan.updater(&row))
+                    .await?;
+            } else {
+                self.store()?
+                    .insert(&group, timestamps.value(index), &row)
+                    .await?;
+            }
         }
         Ok(())
     }
@@ -409,9 +473,8 @@ impl NativeSession {
         ctx: &mut OperatorContext,
         collector: &mut dyn Collector,
         converter: &Converter,
+        state: Option<AdmittedSessionState>,
     ) -> Result<()> {
-        let _queue = self.store()?.reserve_final_input_queue()?;
-        let snapshot = self.store()?.snapshot().await?;
         let output_fields = ctx
             .out_schema
             .as_ref()
@@ -421,41 +484,59 @@ impl NativeSession {
             .len();
         let output_bytes =
             output_allowance(self.finish.schema().as_ref(), output_fields, self.limits)?;
-        let (sender, receiver) = channel(1);
-        *self.finish_receiver.write().unwrap() = Some(receiver);
-        self.finish.reset()?;
-        let mut finish = self.finish.execute(0, self.task_context.clone())?;
-        let store = self.store()?;
-        let producer = async move {
-            let mut after = None;
-            while let Some(row) = store
-                .next_row(&snapshot, group, session, after.as_deref())
-                .await?
-            {
-                after = Some(row.key);
-                sender.send(row.batch).await.map_err(|_| {
-                    anyhow::anyhow!("native SESSION final aggregate stopped before consuming rows")
-                })?;
-            }
-            Ok::<_, anyhow::Error>(())
+        // Retain admitted aggregate-state ownership through output acknowledgment.
+        let aggregate_state = state;
+        ensure!(
+            self.incremental.is_some() == aggregate_state.is_some(),
+            "SESSION output state mode changed"
+        );
+        let _queue = if self.incremental.is_none() {
+            Some(self.store()?.reserve_final_input_queue()?)
+        } else {
+            None
         };
-        let consumer = async {
-            let mut result = None;
-            while let Some(batch) = finish.next().await {
-                let batch = batch?;
-                if batch.num_rows() == 0 {
-                    continue;
+        let result = if let (Some(plan), Some(state)) = (&self.incremental, &aggregate_state) {
+            plan.evaluate(&state.batch)?
+        } else {
+            let snapshot = self.store()?.snapshot().await?;
+            let (sender, receiver) = channel(1);
+            *self.finish_receiver.write().unwrap() = Some(receiver);
+            self.finish.reset()?;
+            let mut finish = self.finish.execute(0, self.task_context.clone())?;
+            let store = self.store()?;
+            let producer = async move {
+                let mut after = None;
+                while let Some(row) = store
+                    .next_row(&snapshot, group, session, after.as_deref())
+                    .await?
+                {
+                    after = Some(row.key);
+                    sender.send(row.batch).await.map_err(|_| {
+                        anyhow::anyhow!(
+                            "native SESSION final aggregate stopped before consuming rows"
+                        )
+                    })?;
                 }
-                ensure!(
-                    result.is_none() && batch.num_rows() == 1,
-                    "native SESSION final aggregate returned more than one row"
-                );
-                result = Some(batch);
-            }
-            Ok::<_, anyhow::Error>(result)
+                Ok::<_, anyhow::Error>(())
+            };
+            let consumer = async {
+                let mut result = None;
+                while let Some(batch) = finish.next().await {
+                    let batch = batch?;
+                    if batch.num_rows() == 0 {
+                        continue;
+                    }
+                    ensure!(
+                        result.is_none() && batch.num_rows() == 1,
+                        "native SESSION final aggregate returned more than one row"
+                    );
+                    result = Some(batch);
+                }
+                Ok::<_, anyhow::Error>(result)
+            };
+            let (_, result) = try_join!(producer, consumer)?;
+            result.context("native SESSION final aggregate returned no row")?
         };
-        let (_, result) = try_join!(producer, consumer)?;
-        let result = result.context("native SESSION final aggregate returned no row")?;
         ensure!(
             result.get_array_memory_size() <= self.limits.partial_bytes,
             "native SESSION output aggregate exceeds configured value limit"
@@ -525,15 +606,25 @@ impl NativeSession {
             Some(i64::try_from(to_nanos(watermark))?)
         };
         loop {
-            let due = match &self.acknowledged_closure {
-                Some(pending) => Some(pending.clone()),
-                None => self.store()?.first_due(floor).await?,
+            let (due, closing) = if let Some((group, session)) = &self.acknowledged_closure {
+                (Some((group.clone(), *session, None)), true)
+            } else if self.incremental.is_some() {
+                let due = self.store()?.first_due_incremental(floor).await?;
+                let closing = due.as_ref().is_some_and(|(_, _, state)| state.is_none());
+                (due, closing)
+            } else {
+                let due = self.store()?.first_due(floor).await?;
+                let closing = match &due {
+                    Some((group, session)) => self.store()?.is_closing(group, *session).await?,
+                    None => false,
+                };
+                (due.map(|(group, session)| (group, session, None)), closing)
             };
-            let Some((group, session)) = due else { break };
-            if self.acknowledged_closure.is_none()
-                && !self.store()?.is_closing(&group, session).await?
-            {
-                self.emit(&group, session, ctx, collector, converter)
+            let Some((group, session, state)) = due else {
+                break;
+            };
+            if self.acknowledged_closure.is_none() && !closing {
+                self.emit(&group, session, ctx, collector, converter, state)
                     .await?;
                 // Set synchronously after acknowledgment: cancellation while
                 // persisting the phase cannot re-emit on this worker.
@@ -553,6 +644,75 @@ mod tests {
     use super::*;
     use arrow_array::StringArray;
     use arrow_schema::Schema;
+
+    #[tokio::test]
+    #[ignore = "requires externally declared SQL, worker config and receipt paths"]
+    async fn declared_incremental_session_route() {
+        let path = |name| std::path::PathBuf::from(std::env::var(name).expect(name));
+        let sql_path = path("STREAMR_DECLARED_SESSION_SQL");
+        let config_path = path("STREAMR_DECLARED_SESSION_CONFIG");
+        let receipt_path = path("STREAMR_DECLARED_SESSION_RECEIPT");
+        let sql = std::fs::read(&sql_path).unwrap();
+        let config_bytes = std::fs::read(&config_path).unwrap();
+        arroyo_rpc::config::initialize_config(Some(&config_path), None);
+        let limits = config()
+            .worker
+            .window_state
+            .expect("declared window-state limits");
+        let compiled = arroyo_planner::parse_and_get_program(
+            std::str::from_utf8(&sql).unwrap(),
+            arroyo_planner::ArroyoSchemaProvider::new(),
+            arroyo_planner::SqlConfig {
+                default_parallelism: 1,
+            },
+        )
+        .await
+        .unwrap();
+        let registry = Arc::new(arroyo_planner::physical::new_registry());
+        let mut sessions = Vec::new();
+        for node in compiled.program.graph.node_weights() {
+            for (operator, _) in node.operator_chain.iter() {
+                if operator.operator_name
+                    != arroyo_datastream::logical::OperatorName::SessionWindowAggregate
+                {
+                    continue;
+                }
+                let declared = api::SessionWindowAggregateOperator::decode(
+                    operator.operator_config.as_slice(),
+                )
+                .unwrap();
+                let native = NativeSession::new(&declared, registry.clone(), limits).unwrap();
+                let incremental = native
+                    .incremental
+                    .as_ref()
+                    .expect("declared SESSION must use incremental state");
+                sessions.push(serde_json::json!({
+                    "name": declared.name,
+                    "operator_config_sha256": format!("{:x}", Sha256::digest(&operator.operator_config)),
+                    "input_schema": native.input_schema.schema,
+                    "routing_keys": native.input_schema.routing_keys(),
+                    "state_schema": incremental.layout.schema,
+                    "finish_schema": native.finish.schema(),
+                    "max_encoded_bytes": incremental.layout.max_encoded_bytes,
+                    "decoded_working_bytes": incremental.layout.decoded_working_bytes,
+                    "layout_identity_hex": incremental.layout.identity.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+                    "incremental": true
+                }));
+            }
+        }
+        assert!(
+            !sessions.is_empty(),
+            "declared SQL contains no SESSION operator"
+        );
+        let receipt = serde_json::json!({
+            "sql_sha256": format!("{:x}", Sha256::digest(&sql)),
+            "config_sha256": format!("{:x}", Sha256::digest(&config_bytes)),
+            "sql_path": sql_path, "config_path": config_path,
+            "scope": "actual planner and NativeSession constructor; no on_start or source processing",
+            "sessions": sessions
+        });
+        std::fs::write(receipt_path, serde_json::to_vec_pretty(&receipt).unwrap()).unwrap();
+    }
 
     #[test]
     fn output_allowance_counts_each_variable_aggregate() {
@@ -1182,6 +1342,7 @@ mod tests {
                 acknowledged_closure: None,
                 identity: vec![],
                 store: Some(store),
+                incremental: None,
             };
             let (control_tx, _control_rx) = channel(16);
             let mut ctx = OperatorContext::new(
@@ -1442,6 +1603,428 @@ mod tests {
                 &(200..328).map(|time| (time, 1)).collect::<Vec<_>>(),
             )
             .await;
+        }
+    }
+    #[tokio::test]
+    async fn incremental_sql_native_lifecycle_checkpoint_fresh_owner() {
+        use std::time::{Duration, UNIX_EPOCH};
+        const CHILD: &str = "STR138_NATIVE_LIFECYCLE_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["arrow::session_native::tests::incremental_sql_native_lifecycle_checkpoint_fresh_owner", "--exact", "--nocapture"])
+                .env(CHILD, "1").spawn().unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(90);
+            loop {
+                match child.try_wait() {
+                    Ok(Some(status)) => {
+                        assert!(status.success(), "native lifecycle child: {status}");
+                        return;
+                    }
+                    Ok(None) if std::time::Instant::now() < deadline => {
+                        std::thread::sleep(Duration::from_millis(10))
+                    }
+                    result => {
+                        let killed = child.kill();
+                        let joined = child.wait();
+                        panic!("native lifecycle child timeout: {result:?}/{killed:?}/{joined:?}");
+                    }
+                }
+            }
+        }
+        use arroyo_state::live::{Ownership, StateNamespace, checkpoint};
+        let root = std::env::temp_dir().join(format!("str138-native-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("worker.yaml");
+        std::fs::write(&path, serde_json::to_vec(&serde_json::json!({
+            "checkpoint-url": format!("file://{}", root.join("remote").display()),
+            "worker": { "sql-state-backend": "memory", "disk-sql-state": { "directory": root.join("live"), "max-row-bytes": 8192 },
+                "live-state-resources": { "block-cache-bytes": 1048576, "memtable-bytes": 524288, "queued-write-bytes": 8388608,
+                    "decoded-value-bytes": 8388608, "scan-page-bytes": 2097152, "max-blocking-operations": 2,
+                    "max-snapshots": 8, "max-open-databases": 4, "disk-reserve-bytes": 0 } }
+        })).unwrap()).unwrap();
+        arroyo_rpc::config::initialize_config(Some(&path), None);
+        let query = "CREATE TABLE session_input (k TEXT, amount BIGINT, timestamp TIMESTAMP NOT NULL, WATERMARK FOR timestamp AS timestamp - INTERVAL '1 minute') WITH (connector='single_file',path='/tmp/native-session-incremental.jsonl',format='json',type='source'); SELECT k, SESSION(INTERVAL '10 seconds') AS window, COUNT(*) AS n, SUM(amount) AS total FROM session_input GROUP BY k, window";
+        let compiled = arroyo_planner::parse_and_get_program(
+            query,
+            arroyo_planner::ArroyoSchemaProvider::new(),
+            arroyo_planner::SqlConfig {
+                default_parallelism: 1,
+            },
+        )
+        .await
+        .unwrap();
+        let node = compiled
+            .program
+            .graph
+            .node_weights()
+            .flat_map(|n| n.operator_chain.iter())
+            .map(|(o, _)| o)
+            .find(|o| {
+                o.operator_name == arroyo_datastream::logical::OperatorName::SessionWindowAggregate
+            })
+            .unwrap();
+        let config =
+            api::SessionWindowAggregateOperator::decode(node.operator_config.as_slice()).unwrap();
+        let limits = WindowStateConfig {
+            key_bytes: 512,
+            partial_bytes: 32768,
+            page_bytes: 131072,
+            page_entries: 1,
+            write_bytes: 524288,
+            write_operations: 64,
+            max_resident_bytes: 8 * 1024 * 1024,
+        };
+        async fn start(
+            config: &api::SessionWindowAggregateOperator,
+            limits: WindowStateConfig,
+        ) -> (NativeSession, OperatorContext, Converter) {
+            let mut operator = NativeSession::new(
+                config,
+                Arc::new(arroyo_planner::physical::new_registry()),
+                limits,
+            )
+            .unwrap();
+            assert!(
+                operator.incremental.is_some(),
+                "actual constructor must select eligible SQL state"
+            );
+            let input = operator.input_schema.clone();
+            let count = input.routing_keys().map_or(0, Vec::len);
+            let converter = Converter::new(
+                input
+                    .schema
+                    .fields()
+                    .iter()
+                    .take(count)
+                    .map(|f| arrow::row::SortField::new(f.data_type().clone()))
+                    .collect(),
+            )
+            .unwrap();
+            let mut fields = input
+                .schema
+                .fields()
+                .iter()
+                .take(count)
+                .map(|f| f.as_ref().clone())
+                .collect::<Vec<_>>();
+            fields.insert(
+                operator.window_index,
+                operator.window_field.as_ref().clone(),
+            );
+            fields.extend(
+                operator
+                    .finish
+                    .schema()
+                    .fields()
+                    .iter()
+                    .map(|f| f.as_ref().clone()),
+            );
+            fields.push(Field::new(
+                arroyo_rpc::TIMESTAMP_FIELD,
+                DataType::Timestamp(arrow_schema::TimeUnit::Nanosecond, None),
+                false,
+            ));
+            let output =
+                Arc::new(ArroyoSchema::from_schema_unkeyed(Arc::new(Schema::new(fields))).unwrap());
+            let (control_tx, _control_rx) = channel(32);
+            let mut ctx = OperatorContext::new(
+                Arc::new(arroyo_types::get_test_task_info()),
+                None,
+                control_tx,
+                1,
+                vec![input],
+                Some(output),
+                operator.tables(),
+            )
+            .await;
+            operator.on_start(&mut ctx).await.unwrap();
+            (operator, ctx, converter)
+        }
+        fn input(operator: &NativeSession, time: i64, value: i64) -> RecordBatch {
+            let columns = operator
+                .input_schema
+                .schema
+                .fields()
+                .iter()
+                .map(|f| match f.data_type() {
+                    DataType::Int64 => datafusion::common::ScalarValue::Int64(Some(value))
+                        .to_array_of_size(1)
+                        .unwrap(),
+                    DataType::Utf8 => datafusion::common::ScalarValue::Utf8(Some("key".into()))
+                        .to_array_of_size(1)
+                        .unwrap(),
+                    DataType::Timestamp(arrow_schema::TimeUnit::Nanosecond, tz) => {
+                        datafusion::common::ScalarValue::TimestampNanosecond(Some(time), tz.clone())
+                            .to_array_of_size(1)
+                            .unwrap()
+                    }
+                    t => panic!("unexpected native SQL input: {t:?}"),
+                })
+                .collect();
+            RecordBatch::try_new(operator.input_schema.schema.clone(), columns).unwrap()
+        }
+        #[derive(Default)]
+        struct AckCollector {
+            rows: Vec<RecordBatch>,
+        }
+        #[async_trait::async_trait]
+        impl Collector for AckCollector {
+            async fn collect(
+                &mut self,
+                batch: RecordBatch,
+            ) -> arroyo_rpc::errors::DataflowResult<()> {
+                self.rows.push(batch);
+                Ok(())
+            }
+            async fn broadcast_watermark(
+                &mut self,
+                _watermark: arroyo_types::Watermark,
+            ) -> arroyo_rpc::errors::DataflowResult<()> {
+                Ok(())
+            }
+        }
+        const SECOND: i64 = 1_000_000_000;
+        for rocks in [false, true] {
+            arroyo_rpc::config::update(|c| {
+                c.worker.sql_state_backend = if rocks {
+                    arroyo_rpc::config::SqlStateBackend::Rocksdb
+                } else {
+                    arroyo_rpc::config::SqlStateBackend::Memory
+                }
+            });
+            let (mut operator, mut ctx, converter) = start(&config, limits).await;
+            for (time, value) in [(0, 2), (20 * SECOND, 3)] {
+                operator
+                    .process_batch(input(&operator, time, value), &mut ctx, &converter)
+                    .await
+                    .unwrap();
+            }
+            let namespace = StateNamespace {
+                ownership: Ownership::PartitionLocal {
+                    subtask: 0,
+                    parallelism: 1,
+                },
+                table: TABLE.as_bytes().to_vec(),
+            };
+            let disk_config =
+                DiskKeyedTableConfig::decode(operator.tables()[TABLE].config.as_slice()).unwrap();
+            let storage =
+                arroyo_state::get_storage_provider(&arroyo_state::StorageProviderFor::Controller {
+                    storage_url: Some(format!(
+                        "file://{}",
+                        root.join(if rocks {
+                            "checkpoint-rocks"
+                        } else {
+                            "checkpoint-memory"
+                        })
+                        .display()
+                    )),
+                })
+                .await
+                .unwrap();
+            let backend = operator.store().unwrap().testing_backend();
+            let snapshot = backend.snapshot().await.unwrap();
+            let receipt = checkpoint::export(
+                &snapshot,
+                &namespace,
+                &disk_config,
+                &storage,
+                "checkpoint-1/session",
+                1,
+                0,
+                0,
+            )
+            .await
+            .unwrap();
+            drop(snapshot);
+            let (mut restored, mut restored_ctx, restored_converter) = start(&config, limits).await;
+            let restored_backend = restored.store().unwrap().testing_backend();
+            assert!(!Arc::ptr_eq(&backend, &restored_backend));
+            checkpoint::restore(
+                restored_backend.as_ref(),
+                &namespace,
+                &disk_config,
+                &receipt,
+                &storage,
+            )
+            .await
+            .unwrap();
+            restored
+                .process_batch(
+                    input(&restored, 10 * SECOND, 5),
+                    &mut restored_ctx,
+                    &restored_converter,
+                )
+                .await
+                .unwrap();
+            restored_ctx.watermarks.set(
+                0,
+                arroyo_types::Watermark::EventTime(UNIX_EPOCH + Duration::from_secs(31)),
+            );
+            let observed =
+                crate::arrow::session_store::tests::observe(restored.store.as_mut().unwrap());
+            observed.pause_writes(true);
+            let mut collector = AckCollector::default();
+            let mut pending = Box::pin(restored.handle_watermark(
+                &mut restored_ctx,
+                &mut collector,
+                &restored_converter,
+            ));
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    assert!(futures::poll!(&mut pending).is_pending());
+                    if observed.paused_write_reached() {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            drop(pending);
+            assert_eq!(collector.rows.len(), 1);
+            assert!(restored.acknowledged_closure.is_some());
+            let result = &collector.rows[0];
+            let aggregate = restored
+                .finish
+                .as_any()
+                .downcast_ref::<AggregateExec>()
+                .unwrap();
+            let aggregate_name = |name: &str| {
+                let index = aggregate
+                    .aggr_expr()
+                    .iter()
+                    .position(|expr| expr.fun().name().eq_ignore_ascii_case(name))
+                    .unwrap();
+                restored.finish.schema().field(index).name().clone()
+            };
+            let count_name = aggregate_name("count");
+            let sum_name = aggregate_name("sum");
+            eprintln!("STR138 native emitted schema: {:?}", result.schema());
+            assert_eq!(
+                result.schema(),
+                restored_ctx.out_schema.as_ref().unwrap().schema
+            );
+            assert_eq!(
+                result
+                    .column_by_name(&count_name)
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<arrow_array::Int64Array>()
+                    .unwrap()
+                    .value(0),
+                3
+            );
+            assert_eq!(
+                result
+                    .column_by_name(&sum_name)
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<arrow_array::Int64Array>()
+                    .unwrap()
+                    .value(0),
+                10
+            );
+            observed.pause_writes(false);
+            restored.prepare_checkpoint().await.unwrap();
+            let snapshot = restored_backend.snapshot().await.unwrap();
+            let receipt = checkpoint::export(
+                &snapshot,
+                &namespace,
+                &disk_config,
+                &storage,
+                "checkpoint-2/session",
+                2,
+                0,
+                0,
+            )
+            .await
+            .unwrap();
+            drop(snapshot);
+            let (mut closing, mut closing_ctx, closing_converter) = start(&config, limits).await;
+            let closing_backend = closing.store().unwrap().testing_backend();
+            checkpoint::restore(
+                closing_backend.as_ref(),
+                &namespace,
+                &disk_config,
+                &receipt,
+                &storage,
+            )
+            .await
+            .unwrap();
+            closing_ctx.watermarks.set(
+                0,
+                arroyo_types::Watermark::EventTime(UNIX_EPOCH + Duration::from_secs(31)),
+            );
+            let mut output = AckCollector::default();
+            closing
+                .handle_watermark(&mut closing_ctx, &mut output, &closing_converter)
+                .await
+                .unwrap();
+            assert!(
+                output.rows.is_empty(),
+                "acknowledged output re-emitted after fresh recovery"
+            );
+            closing
+                .process_batch(
+                    input(&closing, 100 * SECOND, 7),
+                    &mut closing_ctx,
+                    &closing_converter,
+                )
+                .await
+                .unwrap();
+            closing_ctx.watermarks.set(
+                0,
+                arroyo_types::Watermark::EventTime(UNIX_EPOCH + Duration::from_secs(111)),
+            );
+            closing
+                .handle_watermark(&mut closing_ctx, &mut output, &closing_converter)
+                .await
+                .unwrap();
+            assert_eq!(output.rows.len(), 1);
+            assert_eq!(
+                output.rows[0].schema(),
+                closing_ctx.out_schema.as_ref().unwrap().schema
+            );
+            assert_eq!(
+                output.rows[0]
+                    .column_by_name(&count_name)
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<arrow_array::Int64Array>()
+                    .unwrap()
+                    .value(0),
+                1
+            );
+            assert_eq!(
+                output.rows[0]
+                    .column_by_name(&sum_name)
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<arrow_array::Int64Array>()
+                    .unwrap()
+                    .value(0),
+                7
+            );
+            // Distinct backend/owner restoration, not OS/process loss.
+            // Drop every table/owner handle before awaiting native DB cleanup
+            // while this test's Tokio runtime is still alive.
+            drop((operator, ctx, restored, restored_ctx, closing, closing_ctx));
+            drop(observed);
+            assert_eq!(Arc::strong_count(&backend), 1, "original backend handles");
+            assert_eq!(
+                Arc::strong_count(&restored_backend),
+                1,
+                "restored backend handles"
+            );
+            assert_eq!(
+                Arc::strong_count(&closing_backend),
+                1,
+                "closing backend handles"
+            );
+            backend.close().await.unwrap();
+            restored_backend.close().await.unwrap();
+            closing_backend.close().await.unwrap();
         }
     }
 }

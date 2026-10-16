@@ -40,6 +40,7 @@ pub mod incremental_aggregator;
 pub mod instant_join;
 pub mod join_with_expiration;
 pub mod lookup_join;
+mod session_accumulator;
 pub mod session_aggregating_window;
 mod session_native;
 mod session_store;

@@ -1,7 +1,8 @@
 //! Paged, backend-neutral state for SQL SESSION windows.
 //!
-//! Rows are retained as bounded Arrow IPC records. Session and deadline indexes
-//! are metadata only; merging sessions never copies their histories.
+//! Row mode retains bounded Arrow IPC records and metadata indexes. Eligible
+//! fixed-state mode co-locates one bounded accumulator in each session record.
+use super::session_accumulator::{SessionStateLayout, SessionStateUpdate};
 use anyhow::{Context, Result, ensure};
 use arrow::ipc::{reader::StreamReader, writer::StreamWriter};
 use arrow_array::RecordBatch;
@@ -37,7 +38,13 @@ pub(crate) struct SessionRow {
     _permit: ResourcePermit,
 }
 
+pub(super) struct AdmittedSessionState {
+    pub batch: RecordBatch,
+    _permit: ResourcePermit,
+}
+
 pub(crate) struct SessionStore {
+    incremental: Option<SessionStateLayout>,
     backend: Arc<dyn LiveStateBackend>,
     table: LiveTable,
     resources: WorkerStateResources,
@@ -145,6 +152,11 @@ fn deadline_key(group: &[u8], start: i64, deadline: i64) -> Result<Vec<u8>> {
 }
 
 impl SessionStore {
+    #[cfg(test)]
+    pub(super) fn testing_backend(&self) -> Arc<dyn LiveStateBackend> {
+        self.backend.clone()
+    }
+
     pub fn new(
         backend: Arc<dyn LiveStateBackend>,
         table: LiveTable,
@@ -211,6 +223,7 @@ impl SessionStore {
                 _permit: permit,
             });
         Ok(Self {
+            incremental: None,
             backend,
             table,
             resources,
@@ -220,6 +233,395 @@ impl SessionStore {
             last_group: Mutex::new(None),
             deadline: Mutex::new(deadline),
         })
+    }
+
+    // The operation permit covers the opaque accumulator, one decoded source,
+    // IPC serialization growth and bounded logical key workspace. A backend
+    // point read has its own permit and must fit concurrently with this one.
+    fn incremental_charge(limits: WindowStateConfig, layout: &SessionStateLayout) -> Option<usize> {
+        layout
+            .decoded_working_bytes
+            .checked_add(layout.max_encoded_bytes.checked_add(10)?.checked_mul(3)?)?
+            .checked_add(limits.key_bytes.checked_mul(16)?)?
+            .checked_add(4096)
+    }
+
+    fn incremental_peak(limits: WindowStateConfig, layout: &SessionStateLayout) -> Option<usize> {
+        Self::incremental_charge(limits, layout)?
+            .checked_add(limits.partial_bytes.checked_mul(3)?)?
+            .checked_add(limits.key_bytes.checked_mul(4)?)?
+            .checked_add(1024)
+    }
+
+    pub(super) fn supports_incremental(
+        limits: WindowStateConfig,
+        resources: &arroyo_state::live::resources::ResourceConfig,
+        layout: &SessionStateLayout,
+        namespace_bytes: usize,
+    ) -> bool {
+        let fits = || -> Option<bool> {
+            let value = layout.max_encoded_bytes.checked_add(10)?;
+            let key = namespace_bytes
+                .checked_add(limits.key_bytes.checked_mul(2)?)?
+                .checked_add(2)?;
+            let write = key.checked_mul(5)?.checked_add(value)?.checked_add(2)?;
+            Some(
+                limits.write_operations >= 5
+                    && value <= limits.partial_bytes
+                    && write <= limits.write_bytes
+                    && key.checked_add(value)?.checked_add(1)? <= limits.page_bytes
+                    && Self::incremental_charge(limits, layout)? <= limits.max_resident_bytes
+                    && Self::incremental_peak(limits, layout)? <= resources.decoded_value_bytes,
+            )
+        };
+        fits() == Some(true)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn new_incremental(
+        backend: Arc<dyn LiveStateBackend>,
+        table: LiveTable,
+        resources: WorkerStateResources,
+        schema: SchemaRef,
+        limits: WindowStateConfig,
+        gap: i64,
+        layout: SessionStateLayout,
+    ) -> Result<Self> {
+        ensure!(
+            Self::supports_incremental(
+                limits,
+                resources.config(),
+                &layout,
+                encoding::encoded_namespace_size(table.namespace())?
+            ),
+            "native SESSION incremental layout exceeds configured capacity"
+        );
+        let mut store = Self::new(backend, table, resources, schema, limits, gap)?;
+        // Re-admit the optional proof only above the incremental operation peak.
+        *store
+            .deadline
+            .lock()
+            .map_err(|_| anyhow::anyhow!("native SESSION deadline cache lock poisoned"))? = None;
+        store.incremental = Some(layout);
+        if let Some(permit) = store
+            .mandatory_decoded_peak()
+            .and_then(|peak| {
+                Self::deadline_cache_charge(limits).filter(|charge| {
+                    peak.checked_add(*charge)
+                        .is_some_and(|sum| sum <= store.resources.config().decoded_value_bytes)
+                })
+            })
+            .and_then(|charge| store.resources.try_decoded_value(charge).ok())
+        {
+            *store
+                .deadline
+                .lock()
+                .map_err(|_| anyhow::anyhow!("native SESSION deadline cache lock poisoned"))? =
+                Some(CachedDeadline {
+                    proof: DeadlineProof::Unknown,
+                    minimum: None,
+                    _permit: permit,
+                });
+        }
+        Ok(store)
+    }
+
+    fn mandatory_decoded_peak(&self) -> Option<usize> {
+        match &self.incremental {
+            Some(layout) => Self::incremental_peak(self.limits, layout),
+            None => self.limits.partial_bytes.checked_mul(9),
+        }
+    }
+
+    fn metadata_limit(&self) -> usize {
+        self.incremental
+            .as_ref()
+            .map_or(10, |layout| layout.max_encoded_bytes.saturating_add(10))
+    }
+
+    fn valid_metadata(&self, value: &[u8]) -> bool {
+        value.len() >= 10
+            && value[0] == VERSION
+            && value[9] <= 1
+            && match &self.incremental {
+                None => value.len() == 10,
+                Some(_) if value[9] == 1 => value.len() == 10,
+                Some(_) => value.len() > 10 && value.len() <= self.metadata_limit(),
+            }
+    }
+
+    fn decode_aggregate(&self, value: &[u8], session: SessionMeta) -> Result<RecordBatch> {
+        let layout = self
+            .incremental
+            .as_ref()
+            .context("native SESSION is not incremental")?;
+        ensure!(
+            self.valid_metadata(value)
+                && value[9] == 0
+                && i64::from_be_bytes(value[1..9].try_into()?) == session.end,
+            "native SESSION aggregate metadata is malformed or closing"
+        );
+        let mut reader = StreamReader::try_new(Cursor::new(&value[10..]), None)?;
+        ensure!(
+            reader.schema() == layout.schema,
+            "native SESSION aggregate schema changed"
+        );
+        let batch = reader
+            .next()
+            .transpose()?
+            .context("native SESSION aggregate state missing")?;
+        ensure!(
+            reader.next().transpose()?.is_none()
+                && batch.num_rows() == 1
+                && batch.get_array_memory_size() <= layout.decoded_working_bytes,
+            "native SESSION aggregate state exceeds compiled bound"
+        );
+        Ok(batch)
+    }
+
+    #[cfg(test)]
+    async fn aggregate_state(
+        &self,
+        group: &[u8],
+        session: SessionMeta,
+    ) -> Result<AdmittedSessionState> {
+        let layout = self
+            .incremental
+            .as_ref()
+            .context("native SESSION is not incremental")?;
+        let permit = self.resources.try_decoded_value(
+            Self::incremental_charge(self.limits, layout)
+                .context("native SESSION aggregate charge overflow")?,
+        )?;
+        let snapshot = self.snapshot().await?;
+        let value = snapshot
+            .try_get(
+                &self.table.key(session_key(group, session.start)?, None),
+                ReadOptions {
+                    max_bytes: self.metadata_limit(),
+                },
+            )
+            .await?
+            .context("native SESSION aggregate state missing")?;
+        let batch = self.decode_aggregate(&value, session)?;
+        Ok(AdmittedSessionState {
+            batch,
+            _permit: permit,
+        })
+    }
+
+    /// One point can join only its immediate predecessor and successor in a
+    /// canonical disjoint SESSION catalogue. All old states remain visible until
+    /// the single admitted S/D batch commits; an ambiguous input is never retried
+    /// by this owner. Recovery constructs a fresh backend from its checkpoint.
+    pub(super) async fn insert_incremental<U: SessionStateUpdate>(
+        &self,
+        group: &[u8],
+        time: i64,
+        make_update: impl FnOnce() -> Result<U>,
+    ) -> Result<()> {
+        let layout = self
+            .incremental
+            .as_ref()
+            .context("native SESSION is not incremental")?;
+        ensure!(
+            group
+                .len()
+                .checked_add(21)
+                .is_some_and(|len| len <= self.limits.key_bytes),
+            "native SESSION key exceeds configured limit"
+        );
+        let upper = time
+            .checked_add(self.gap)
+            .context("native SESSION deadline overflow")?;
+        let _permit = self.resources.try_decoded_value(
+            Self::incremental_charge(self.limits, layout)
+                .context("native SESSION aggregate charge overflow")?,
+        )?;
+        let mut update = make_update()?;
+        let point = SessionMeta {
+            start: time,
+            end: time,
+        };
+        let mut sources = [None, None];
+        let prior = self.cached_proof(group)?;
+        let snapshot = match prior {
+            Some(GroupProof::Empty | GroupProof::Sole(_)) => None,
+            Some(GroupProof::Unknown) | None => Some(self.snapshot().await?),
+        };
+        match prior {
+            Some(GroupProof::Empty) => {}
+            Some(GroupProof::Sole(existing)) => {
+                if self.overlaps(point, existing)? {
+                    sources[0] = Some(existing);
+                }
+            }
+            Some(GroupProof::Unknown) | None => {
+                let snapshot = snapshot
+                    .as_ref()
+                    .context("native SESSION discovery snapshot missing")?;
+                let prefix = prefix(SESSION, group)?;
+                let mut inclusive = session_key(group, time)?;
+                inclusive.push(0);
+                {
+                    let page = snapshot
+                        .try_last_in_range(LastEntryRequest {
+                            range: ScanRange {
+                                namespace: self.table.namespace().clone(),
+                                prefix: Some(prefix.clone()),
+                                start: None,
+                                end: Some(inclusive.clone()),
+                            },
+                            max_bytes: self.limits.page_bytes,
+                        })
+                        .await?;
+                    if let Some(entry) = page.entries.first() {
+                        let existing = self.decode_session(entry, &prefix)?;
+                        if self.overlaps(point, existing)? {
+                            sources[0] = Some(existing);
+                        }
+                    }
+                } // Release the predecessor page before obtaining the successor page.
+                let mut end = session_key(group, upper)?;
+                end.push(0);
+                let mut cursor = None;
+                loop {
+                    let page = snapshot
+                        .try_scan(ScanRequest {
+                            range: ScanRange {
+                                namespace: self.table.namespace().clone(),
+                                prefix: Some(prefix.clone()),
+                                start: Some(inclusive.clone()),
+                                end: Some(end.clone()),
+                            },
+                            max_entries: 1,
+                            max_bytes: self.limits.page_bytes,
+                            cursor: cursor.clone(),
+                        })
+                        .await?;
+                    if let Some(entry) = page.entries.first() {
+                        let existing = self.decode_session(entry, &prefix)?;
+                        ensure!(
+                            existing.start > time && existing.start <= upper,
+                            "native SESSION successor outside requested bounds"
+                        );
+                        sources[1] = Some(existing);
+                        break;
+                    }
+                    let Some(next) = page.next_cursor else {
+                        break;
+                    };
+                    ensure!(
+                        cursor.as_ref() != Some(&next),
+                        "native SESSION successor cursor made no progress"
+                    );
+                    cursor = Some(next);
+                }
+            }
+        }
+        let mut merged = point;
+        for source in sources.iter().flatten() {
+            // The page has been released. Only one source IPC/Arrow batch is
+            // live alongside the compiled target accumulator at any instant.
+            let key = session_key(group, source.start)?;
+            let value = if let Some(snapshot) = &snapshot {
+                snapshot
+                    .try_get(
+                        &self.table.key(key, None),
+                        ReadOptions {
+                            max_bytes: self.metadata_limit(),
+                        },
+                    )
+                    .await?
+            } else {
+                self.table
+                    .get(
+                        key,
+                        None,
+                        ReadOptions {
+                            max_bytes: self.metadata_limit(),
+                        },
+                    )
+                    .await?
+            }
+            .context("native SESSION aggregate source missing")?;
+            let batch = self.decode_aggregate(&value, *source)?;
+            update.merge(&batch)?;
+            merged.start = merged.start.min(source.start);
+            merged.end = merged.end.max(source.end);
+        }
+        drop(snapshot);
+        let state = update.state()?;
+        ensure!(
+            state.schema() == layout.schema
+                && state.num_rows() == 1
+                && state.get_array_memory_size() <= layout.decoded_working_bytes,
+            "native SESSION accumulator returned an invalid bounded state"
+        );
+        let mut output = CappedWriter {
+            bytes: Vec::new(),
+            max: layout.max_encoded_bytes,
+        };
+        {
+            let mut writer = StreamWriter::try_new(&mut output, &layout.schema)?;
+            writer.write(&state)?;
+            writer.finish()?;
+        }
+        drop(state);
+        drop(update);
+        let mut value = Vec::with_capacity(output.bytes.len() + 10);
+        value.push(VERSION);
+        value.extend_from_slice(&merged.end.to_be_bytes());
+        value.push(0);
+        value.extend_from_slice(&output.bytes);
+        drop(output);
+        let target = session_key(group, merged.start)?;
+        let deadline = merged
+            .end
+            .checked_add(self.gap)
+            .context("native SESSION deadline overflow")?;
+        let target_deadline = deadline_key(group, merged.start, deadline)?;
+        let mut writes = AdmittedWriteBatch::try_reserve(
+            self.resources.clone(),
+            self.limits.write_bytes,
+            self.limits.write_operations,
+        )?;
+        writes.put(&self.table.key(target.clone(), None), &value)?;
+        for source in sources.iter().flatten() {
+            let old = session_key(group, source.start)?;
+            if old != target {
+                writes.delete(&self.table.key(old, None))?;
+            }
+            let old_deadline = deadline_key(
+                group,
+                source.start,
+                source
+                    .end
+                    .checked_add(self.gap)
+                    .context("native SESSION deadline overflow")?,
+            )?;
+            if old_deadline != target_deadline {
+                writes.delete(&self.table.key(old_deadline, None))?;
+            }
+        }
+        writes.put(&self.table.key(target_deadline, None), &[])?;
+        // Invalidate every proof before the only backend write, including
+        // cancellation or an apply-before-ACK failure. Never retry this batch.
+        self.invalidate_group(group)?;
+        self.remember_deadline_minimum(None)?;
+        self.update_deadline(|proof| match proof {
+            DeadlineProof::Unknown => DeadlineProof::Unknown,
+            DeadlineProof::Empty => DeadlineProof::LowerBound(deadline),
+            DeadlineProof::LowerBound(bound) => DeadlineProof::LowerBound(bound.min(deadline)),
+        })?;
+        self.backend.write_admitted(writes).await?;
+        let proof = match prior {
+            Some(GroupProof::Empty) => GroupProof::Sole(merged),
+            Some(GroupProof::Sole(_)) if sources[0].is_some() => GroupProof::Sole(merged),
+            _ => GroupProof::Unknown,
+        };
+        self.remember_group(group, proof)?;
+        Ok(())
     }
 
     fn deadline_cache_charge(limits: WindowStateConfig) -> Option<usize> {
@@ -345,9 +747,7 @@ impl SessionStore {
             0
         };
         if self
-            .limits
-            .partial_bytes
-            .checked_mul(9)
+            .mandatory_decoded_peak()
             .and_then(|required| required.checked_add(deadline_charge))
             .and_then(|required| required.checked_add(charge))
             .is_none_or(|required| required > self.resources.config().decoded_value_bytes)
@@ -381,11 +781,9 @@ impl SessionStore {
             }))
     }
 
-    fn decode_session(entry: &ScanEntry, prefix: &[u8]) -> Result<SessionMeta> {
+    fn decode_session(&self, entry: &ScanEntry, prefix: &[u8]) -> Result<SessionMeta> {
         ensure!(
-            entry.key.key.len() == prefix.len() + 8
-                && entry.value.len() == 10
-                && entry.value[0] == VERSION,
+            entry.key.key.len() == prefix.len() + 8 && self.valid_metadata(&entry.value),
             "native SESSION metadata is malformed"
         );
         let start = decode_time(&entry.key.key[prefix.len()..])?;
@@ -434,7 +832,7 @@ impl SessionStore {
         let proof = if proof_page.next_cursor.is_none() {
             match proof_page.entries.as_slice() {
                 [] => GroupProof::Empty,
-                [entry] => GroupProof::Sole(Self::decode_session(entry, &prefix)?),
+                [entry] => GroupProof::Sole(self.decode_session(entry, &prefix)?),
                 _ => GroupProof::Unknown,
             }
         } else {
@@ -452,7 +850,7 @@ impl SessionStore {
         proof_page
             .entries
             .first()
-            .map(|entry| Self::decode_session(entry, &prefix))
+            .map(|entry| self.decode_session(entry, &prefix))
             .transpose()
     }
 
@@ -483,7 +881,7 @@ impl SessionStore {
                 if start.as_ref().is_some_and(|key| entry.key.key <= *key) {
                     continue;
                 }
-                return Ok(Some(Self::decode_session(&entry, &prefix)?));
+                return Ok(Some(self.decode_session(&entry, &prefix)?));
             }
             let Some(next) = page.next_cursor else {
                 return Ok(None);
@@ -548,14 +946,14 @@ impl SessionStore {
             .get(
                 session_key(group, session.start)?,
                 None,
-                ReadOptions { max_bytes: 10 },
+                ReadOptions {
+                    max_bytes: self.metadata_limit(),
+                },
             )
             .await?
             .context("native SESSION closing metadata missing")?;
         ensure!(
-            value.len() == 10
-                && value[0] == VERSION
-                && value[9] <= 1
+            self.valid_metadata(&value)
                 && i64::from_be_bytes(value[1..9].try_into()?) == session.end,
             "native SESSION closing metadata is malformed"
         );
@@ -668,7 +1066,7 @@ impl SessionStore {
                 .await?;
             page.entries
                 .first()
-                .map(|entry| Self::decode_session(entry, &prefix))
+                .map(|entry| self.decode_session(entry, &prefix))
                 .transpose()?
         }; // Drop the admitted page before any awaited write/read.
         let mut current = predecessor;
@@ -755,6 +1153,30 @@ impl SessionStore {
         &self,
         watermark: Option<i64>,
     ) -> Result<Option<(Vec<u8>, SessionMeta)>> {
+        Ok(self
+            .first_due_state(watermark, false)
+            .await?
+            .map(|(group, meta, _)| (group, meta)))
+    }
+
+    /// Reads the selected S value once. None state means output was already
+    /// acknowledged and the persisted closing phase must only be retired.
+    pub(super) async fn first_due_incremental(
+        &self,
+        watermark: Option<i64>,
+    ) -> Result<Option<(Vec<u8>, SessionMeta, Option<AdmittedSessionState>)>> {
+        ensure!(
+            self.incremental.is_some(),
+            "native SESSION is not incremental"
+        );
+        self.first_due_state(watermark, true).await
+    }
+
+    async fn first_due_state(
+        &self,
+        watermark: Option<i64>,
+        aggregate: bool,
+    ) -> Result<Option<(Vec<u8>, SessionMeta, Option<AdmittedSessionState>)>> {
         if self.no_deadline_due(watermark)? {
             return Ok(None);
         }
@@ -774,12 +1196,15 @@ impl SessionStore {
             max_bytes: self.limits.page_bytes,
             cursor: None,
         };
-        let page = snapshot.try_scan(request.clone()).await?;
-        let Some(entry) = page.entries.into_iter().next() else {
+        let (entry, exhausted) = {
+            let page = snapshot.try_scan(request.clone()).await?;
+            (page.entries.into_iter().next(), page.next_cursor.is_none())
+        }; // Release the D scan page before any nested scan or S read.
+        let Some(entry) = entry else {
             // A watermark-limited empty range is not globally Empty. Peek at
             // the global minimum using the same snapshot, but do not surface
             // future malformed metadata or optional read errors before due.
-            if watermark.is_none() && page.next_cursor.is_none() {
+            if watermark.is_none() && exhausted {
                 self.update_deadline(|_| DeadlineProof::Empty)?;
                 return Ok(None);
             }
@@ -825,17 +1250,43 @@ impl SessionStore {
         );
         let group = entry.key.key[13..13 + group_len].to_vec();
         let start = decode_time(&entry.key.key[13 + group_len..])?;
-        let metadata = self
-            .table
-            .get(
-                session_key(&group, start)?,
-                None,
-                ReadOptions { max_bytes: 10 },
+        let permit = if aggregate {
+            let layout = self
+                .incremental
+                .as_ref()
+                .context("native SESSION is not incremental")?;
+            Some(
+                self.resources.try_decoded_value(
+                    Self::incremental_charge(self.limits, layout)
+                        .context("native SESSION aggregate charge overflow")?,
+                )?,
             )
-            .await?
-            .context("native SESSION deadline points to missing session")?;
+        } else {
+            None
+        };
+        let metadata = if aggregate {
+            snapshot
+                .try_get(
+                    &self.table.key(session_key(&group, start)?, None),
+                    ReadOptions {
+                        max_bytes: self.metadata_limit(),
+                    },
+                )
+                .await?
+        } else {
+            self.table
+                .get(
+                    session_key(&group, start)?,
+                    None,
+                    ReadOptions {
+                        max_bytes: self.metadata_limit(),
+                    },
+                )
+                .await?
+        }
+        .context("native SESSION deadline points to missing session")?;
         ensure!(
-            metadata.len() == 10 && metadata[0] == VERSION,
+            self.valid_metadata(&metadata),
             "native SESSION metadata version changed"
         );
         let end = i64::from_be_bytes(metadata[1..9].try_into()?);
@@ -847,7 +1298,20 @@ impl SessionStore {
         // minimum inclusive until retirement, so cancellation cannot skip it.
         // Insertions invalidate this proof before writing any earlier key.
         self.remember_deadline_minimum(Some(&entry.key.key))?;
-        Ok(Some((group, SessionMeta { start, end })))
+        let session = SessionMeta { start, end };
+        let state = if let Some(permit) = permit {
+            if metadata[9] == 0 {
+                Some(AdmittedSessionState {
+                    batch: self.decode_aggregate(&metadata, session)?,
+                    _permit: permit,
+                })
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        Ok(Some((group, session, state)))
     }
 
     fn row_range(&self, group: &[u8], session: SessionMeta) -> Result<ScanRange> {
@@ -1024,6 +1488,9 @@ impl SessionStore {
     /// delete from live state. A retry starts with a fresh snapshot and sees
     /// only rows still present; no raw result history is retained here.
     pub async fn retire(&self, group: &[u8], session: SessionMeta) -> Result<()> {
+        if self.incremental.is_some() {
+            return self.remove_session(group, session).await;
+        }
         let snapshot = self.snapshot().await?;
         let max_key = self.table.key(vec![0; self.limits.key_bytes], None);
         let max_delete_bytes = encoding::encoded_key_size(&max_key)?;
@@ -1130,6 +1597,8 @@ pub(super) mod tests {
         pause_write: std::sync::atomic::AtomicBool,
         writes_before_pause: std::sync::atomic::AtomicUsize,
         paused_write_reached: std::sync::atomic::AtomicBool,
+        admitted_writes: std::sync::atomic::AtomicUsize,
+        error_after_apply: std::sync::atomic::AtomicBool,
     }
 
     impl ObservedBackend {
@@ -1193,7 +1662,18 @@ pub(super) mod tests {
                     .store(true, std::sync::atomic::Ordering::SeqCst);
                 std::future::pending::<()>().await;
             }
-            self.inner.write_admitted(batch).await
+            self.admitted_writes
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.write_admitted(batch).await?;
+            if self
+                .error_after_apply
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(arroyo_state::live::LiveStateError::Backend(
+                    "injected SESSION apply-before-ACK error".into(),
+                ));
+            }
+            Ok(())
         }
         async fn snapshot(&self) -> arroyo_state::live::Result<StateSnapshot> {
             self.snapshots
@@ -1209,9 +1689,310 @@ pub(super) mod tests {
             pause_write: std::sync::atomic::AtomicBool::new(false),
             writes_before_pause: std::sync::atomic::AtomicUsize::new(0),
             paused_write_reached: std::sync::atomic::AtomicBool::new(false),
+            admitted_writes: std::sync::atomic::AtomicUsize::new(0),
+            error_after_apply: std::sync::atomic::AtomicBool::new(false),
         });
         store.backend = observed.clone();
         observed
+    }
+
+    struct TestStateUpdate {
+        schema: SchemaRef,
+        value: i64,
+    }
+    impl SessionStateUpdate for TestStateUpdate {
+        fn merge(&mut self, source: &RecordBatch) -> Result<()> {
+            self.value += source
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0);
+            Ok(())
+        }
+        fn state(&mut self) -> Result<RecordBatch> {
+            Ok(row(self.schema.clone(), self.value))
+        }
+    }
+
+    fn test_layout(schema: SchemaRef) -> SessionStateLayout {
+        SessionStateLayout {
+            schema,
+            max_encoded_bytes: 1014,
+            decoded_working_bytes: 8192,
+            identity: b"session-test-state".to_vec(),
+        }
+    }
+
+    async fn put_state(store: &SessionStore, group: &[u8], time: i64, value: i64) {
+        store
+            .insert_incremental(group, time, || {
+                Ok(TestStateUpdate {
+                    schema: store.schema.clone(),
+                    value,
+                })
+            })
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn incremental_atomic_bridge_and_closing_memory_and_rocks() {
+        use arroyo_state::live::{
+            lifecycle::RocksStateConfig,
+            worker::{BackendConstruction, construct_backend},
+        };
+        for rocks in [false, true] {
+            let template = store();
+            let resources = template.resources.clone();
+            let schema = template.schema.clone();
+            let mut limits = template.limits;
+            limits.page_entries = 1; // A one-entry/short page must not lose the second neighbour.
+            limits.write_operations = 5;
+            let root =
+                std::env::temp_dir().join(format!("str138-state-{}-{rocks}", std::process::id()));
+            drop(template);
+            let construction = if rocks {
+                BackendConstruction::Rocksdb(RocksStateConfig {
+                    root: root.clone(),
+                    job_id: "str138".into(),
+                    operator_id: "session".into(),
+                    subtask: 0,
+                    generation: 0,
+                    attempt: 0,
+                })
+            } else {
+                BackendConstruction::Memory {
+                    max_resident_bytes: limits.max_resident_bytes,
+                }
+            };
+            let backend = construct_backend(construction, resources.clone())
+                .await
+                .unwrap();
+            let mut tables = LiveTableManager::new(
+                backend.clone(),
+                Ownership::PartitionLocal {
+                    subtask: 0,
+                    parallelism: 1,
+                },
+            )
+            .unwrap();
+            let table = tables.register("session").unwrap();
+            let mut store = SessionStore::new_incremental(
+                backend.clone(),
+                table.clone(),
+                resources.clone(),
+                schema.clone(),
+                limits,
+                10,
+                test_layout(schema.clone()),
+            )
+            .unwrap();
+            let observed = observe(&mut store);
+            put_state(&store, b"a", 0, 2).await;
+            put_state(&store, b"a", 20, 3).await;
+            // Cold proofs force the real predecessor+bounded successor requests.
+            *store.last_group.lock().unwrap() = None;
+            observed.pause_writes(true);
+            let mut pending = Box::pin(store.insert_incremental(b"a", 10, || {
+                Ok(TestStateUpdate {
+                    schema: schema.clone(),
+                    value: 7,
+                })
+            }));
+            for _ in 0..1000 {
+                tokio::select! { result = &mut pending => panic!("unexpected completion: {result:?}"), _ = tokio::time::sleep(std::time::Duration::from_millis(1)) => {} }
+                if observed.paused_write_reached() {
+                    break;
+                }
+            }
+            assert!(observed.paused_write_reached());
+            drop(pending);
+            assert_eq!(
+                store.next_session(b"a", None).await.unwrap(),
+                Some(SessionMeta { start: 0, end: 0 })
+            );
+            assert_eq!(
+                store.next_session(b"a", Some(0)).await.unwrap(),
+                Some(SessionMeta { start: 20, end: 20 })
+            );
+            assert_eq!(
+                observed
+                    .admitted_writes
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                2
+            );
+            // A fresh serial owner may continue the known pre-apply test backend.
+            // Ambiguous applied inputs instead recover a fresh checkpoint backend.
+            observed.pause_writes(false);
+            drop(store);
+            let store = SessionStore::new_incremental(
+                observed.clone(),
+                table.clone(),
+                resources.clone(),
+                schema.clone(),
+                limits,
+                10,
+                test_layout(schema.clone()),
+            )
+            .unwrap();
+            put_state(&store, b"a", 10, 7).await;
+            assert_eq!(
+                observed
+                    .admitted_writes
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                3
+            );
+            let session = SessionMeta { start: 0, end: 20 };
+            assert_eq!(store.next_session(b"a", Some(0)).await.unwrap(), None);
+            assert!(
+                store
+                    .first_due_incremental(Some(30))
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            let (_, actual, state) = store
+                .first_due_incremental(Some(31))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(actual, session);
+            assert_eq!(
+                state
+                    .as_ref()
+                    .unwrap()
+                    .batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .value(0),
+                12
+            );
+            drop(state);
+            // Successor-only left extension moves S and D together (four puts/deletes).
+            put_state(&store, b"left", 100, 4).await;
+            put_state(&store, b"left", 95, 5).await;
+            let state = store
+                .aggregate_state(
+                    b"left",
+                    SessionMeta {
+                        start: 95,
+                        end: 100,
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                state
+                    .batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .value(0),
+                9
+            );
+            drop(state);
+            let snapshot = store.snapshot().await.unwrap();
+            for kind in [ROW, COUNTER] {
+                let page = snapshot
+                    .try_scan(ScanRequest {
+                        range: ScanRange {
+                            namespace: table.namespace().clone(),
+                            prefix: Some(vec![kind]),
+                            start: None,
+                            end: None,
+                        },
+                        max_entries: 1,
+                        max_bytes: limits.page_bytes,
+                        cursor: None,
+                    })
+                    .await
+                    .unwrap();
+                assert!(
+                    page.entries.is_empty(),
+                    "incremental mode must not persist raw rows/counters"
+                );
+            }
+            drop(snapshot);
+            store.mark_closing(b"a", session).await.unwrap();
+            let value = table
+                .get(
+                    session_key(b"a", 0).unwrap(),
+                    None,
+                    ReadOptions { max_bytes: 1024 },
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                value.len(),
+                10,
+                "acknowledged closing discards accumulator payload"
+            );
+            drop(store);
+            let fresh = SessionStore::new_incremental(
+                backend.clone(),
+                table,
+                resources,
+                schema.clone(),
+                limits,
+                10,
+                test_layout(schema),
+            )
+            .unwrap();
+            let (_, actual, state) = fresh
+                .first_due_incremental(Some(31))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(actual, session);
+            assert!(
+                state.is_none(),
+                "closing continuation must never reevaluate output"
+            );
+            fresh.retire(b"a", session).await.unwrap();
+            assert!(
+                fresh
+                    .first_due_incremental(Some(31))
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            drop((fresh, observed, tables));
+            backend.close().await.unwrap();
+            if rocks {
+                std::fs::remove_dir_all(root).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn incremental_capacity_is_whole_mode_fallback() {
+        let store = store();
+        let layout = test_layout(store.schema.clone());
+        let namespace = encoding::encoded_namespace_size(store.table.namespace()).unwrap();
+        let fits = |limits, config: &ResourceConfig| {
+            SessionStore::supports_incremental(limits, config, &layout, namespace)
+        };
+        assert!(fits(store.limits, store.resources.config()));
+        let mut tight = store.limits;
+        tight.write_operations = 4;
+        assert!(!fits(tight, store.resources.config()));
+        tight = store.limits;
+        let key = namespace + 2 * tight.key_bytes + 2;
+        tight.write_bytes = 5 * key + layout.max_encoded_bytes + 12 - 1;
+        assert!(!fits(tight, store.resources.config()));
+        tight.write_bytes += 1;
+        assert!(fits(tight, store.resources.config()));
+        let mut config = store.resources.config().clone();
+        config.decoded_value_bytes =
+            SessionStore::incremental_peak(store.limits, &layout).unwrap() - 1;
+        assert!(!fits(store.limits, &config));
+        config.decoded_value_bytes += 1;
+        assert!(fits(store.limits, &config));
     }
 
     fn observed_store() -> (SessionStore, Arc<ObservedBackend>) {
@@ -1460,6 +2241,269 @@ pub(super) mod tests {
         }
     }
 
+    struct CountSumStateUpdate {
+        schema: SchemaRef,
+        sum: i64,
+        count: i64,
+    }
+
+    impl SessionStateUpdate for CountSumStateUpdate {
+        fn merge(&mut self, source: &RecordBatch) -> Result<()> {
+            self.sum += source
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0);
+            self.count += source
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0);
+            Ok(())
+        }
+
+        fn state(&mut self) -> Result<RecordBatch> {
+            Ok(RecordBatch::try_new(
+                self.schema.clone(),
+                vec![
+                    Arc::new(Int64Array::from(vec![self.sum])),
+                    Arc::new(Int64Array::from(vec![self.count])),
+                ],
+            )?)
+        }
+    }
+
+    async fn incremental_catalog(store: &SessionStore) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let snapshot = store.snapshot().await.unwrap();
+        let page = snapshot
+            .try_scan(ScanRequest {
+                range: ScanRange {
+                    namespace: store.table.namespace().clone(),
+                    prefix: None,
+                    start: None,
+                    end: None,
+                },
+                max_entries: 8,
+                max_bytes: store.limits.page_bytes,
+                cursor: None,
+            })
+            .await
+            .unwrap();
+        assert!(page.next_cursor.is_none());
+        page.entries
+            .into_iter()
+            .map(|entry| (entry.key.key, entry.value))
+            .collect()
+    }
+
+    // Invoked inside the existing configured-checkpoint subprocess below;
+    // checkpoint configuration is process-global and must remain isolated.
+    async fn incremental_apply_before_ack_fresh_checkpoint_replay() {
+        use arroyo_state::live::{
+            lifecycle::RocksStateConfig,
+            worker::{BackendConstruction, construct_backend},
+        };
+        for rocks in [false, true] {
+            let template = store();
+            let resources = template.resources.clone();
+            let limits = template.limits;
+            drop(template);
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("sum", DataType::Int64, false),
+                Field::new("count", DataType::Int64, false),
+            ]));
+            let root = std::env::temp_dir().join(format!(
+                "str138-applied-replay-{}-{rocks}",
+                std::process::id()
+            ));
+            let construction = |attempt| {
+                if rocks {
+                    BackendConstruction::Rocksdb(RocksStateConfig {
+                        root: root.clone(),
+                        job_id: "str138-replay".into(),
+                        operator_id: "session".into(),
+                        subtask: 0,
+                        generation: 0,
+                        attempt,
+                    })
+                } else {
+                    BackendConstruction::Memory {
+                        max_resident_bytes: limits.max_resident_bytes,
+                    }
+                }
+            };
+            let backend = construct_backend(construction(0), resources.clone())
+                .await
+                .unwrap();
+            let ownership = Ownership::PartitionLocal {
+                subtask: 0,
+                parallelism: 1,
+            };
+            let mut tables = LiveTableManager::new(backend.clone(), ownership.clone()).unwrap();
+            let table = tables.register("session").unwrap();
+            let mut store = SessionStore::new_incremental(
+                backend.clone(),
+                table,
+                resources.clone(),
+                schema.clone(),
+                limits,
+                10,
+                test_layout(schema.clone()),
+            )
+            .unwrap();
+            let observed = observe(&mut store);
+            for (time, value) in [(0, 2), (20, 3)] {
+                store
+                    .insert_incremental(b"a", time, || {
+                        Ok(CountSumStateUpdate {
+                            schema: schema.clone(),
+                            sum: value,
+                            count: 1,
+                        })
+                    })
+                    .await
+                    .unwrap();
+            }
+            let before = incremental_catalog(&store).await;
+            assert_eq!(before.len(), 4);
+            let storage =
+                arroyo_state::get_storage_provider(&arroyo_state::StorageProviderFor::Controller {
+                    storage_url: Some(format!("file://{}/checkpoint", root.display())),
+                })
+                .await
+                .unwrap();
+            let config = arroyo_rpc::grpc::rpc::DiskKeyedTableConfig {
+                table_name: "session".into(),
+                encoding_version: 1,
+                schema_identity: b"native-session-test-incremental.v1".to_vec(),
+            };
+            let snapshot = store.snapshot().await.unwrap();
+            let checkpoint = arroyo_state::live::checkpoint::export(
+                &snapshot,
+                store.table.namespace(),
+                &config,
+                &storage,
+                "checkpoint/session",
+                1,
+                0,
+                0,
+            )
+            .await
+            .unwrap();
+            drop(snapshot);
+            observed
+                .error_after_apply
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            let error = store
+                .insert_incremental(b"a", 10, || {
+                    Ok(CountSumStateUpdate {
+                        schema: schema.clone(),
+                        sum: 7,
+                        count: 1,
+                    })
+                })
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("apply-before-ACK"));
+            assert_eq!(
+                observed
+                    .admitted_writes
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                3
+            );
+            let applied = incremental_catalog(&store).await;
+            assert_eq!(
+                applied
+                    .iter()
+                    .map(|(key, _)| key.clone())
+                    .collect::<Vec<_>>(),
+                vec![
+                    deadline_key(b"a", 0, 30).unwrap(),
+                    session_key(b"a", 0).unwrap()
+                ]
+            );
+            // The failed owner is abandoned. It must never retry this input on
+            // the backend whose atomic batch has already been applied.
+            drop((store, observed, tables));
+            let abandoned_backend = Arc::downgrade(&backend);
+            backend.close().await.unwrap();
+            let restored_backend = construct_backend(construction(1), resources.clone())
+                .await
+                .unwrap();
+            assert!(!std::sync::Weak::ptr_eq(
+                &abandoned_backend,
+                &Arc::downgrade(&restored_backend),
+            ));
+            drop(abandoned_backend);
+            let mut tables = LiveTableManager::new(restored_backend.clone(), ownership).unwrap();
+            let table = tables.register("session").unwrap();
+            arroyo_state::live::checkpoint::restore(
+                restored_backend.as_ref(),
+                table.namespace(),
+                &config,
+                &checkpoint,
+                &storage,
+            )
+            .await
+            .unwrap();
+            let restored = SessionStore::new_incremental(
+                restored_backend.clone(),
+                table,
+                resources,
+                schema.clone(),
+                limits,
+                10,
+                test_layout(schema.clone()),
+            )
+            .unwrap();
+            assert!(restored.cached_proof(b"a").unwrap().is_none());
+            assert_eq!(incremental_catalog(&restored).await, before);
+            restored
+                .insert_incremental(b"a", 10, || {
+                    Ok(CountSumStateUpdate {
+                        schema: schema.clone(),
+                        sum: 7,
+                        count: 1,
+                    })
+                })
+                .await
+                .unwrap();
+            assert_eq!(
+                incremental_catalog(&restored).await,
+                applied,
+                "fresh-backend replay once must equal the original atomically applied batch"
+            );
+            let (_, session, state) = restored
+                .first_due_incremental(Some(31))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(session, SessionMeta { start: 0, end: 20 });
+            let state = state.unwrap();
+            for (index, expected) in [(0, 12), (1, 3)] {
+                assert_eq!(
+                    state
+                        .batch
+                        .column(index)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .unwrap()
+                        .value(0),
+                    expected
+                );
+            }
+            drop(state);
+            restored.mark_closing(b"a", session).await.unwrap();
+            restored.retire(b"a", session).await.unwrap();
+            assert!(incremental_catalog(&restored).await.is_empty());
+            drop((restored, tables, storage));
+            restored_backend.close().await.unwrap();
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
     #[tokio::test]
     async fn history_bounds_retirement_and_cancelled_checkpoint_recovery() {
         // Checkpoint worker configuration is process-global. Follow the
@@ -1517,6 +2561,7 @@ pub(super) mod tests {
         )
         .unwrap();
         arroyo_rpc::config::initialize_config(Some(&config_path), None);
+        incremental_apply_before_ack_fresh_checkpoint_replay().await;
         use arroyo_state::live::{
             lifecycle::RocksStateConfig,
             worker::{BackendConstruction, construct_backend},
