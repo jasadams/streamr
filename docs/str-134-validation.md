@@ -1,6 +1,6 @@
 # STR-134 — reuse calendar progress within input scopes
 
-Status: reviewed implementation and dev gates passed; one bounded release measurement completed without a demonstrated throughput gain. No publication or merge.
+Status: reviewed implementation/dev gates passed; first measurement rejected, then an explicitly user-authorized identical-binary repeat showed a modest observed gain. No publication or merge.
 
 User approved plan `66810a31f9807da1c03a5246a0879ea43adce045ef93bb942edfb74239ac780a` after three independent pre-code reviews. Fetched base `761b2575b2cf4f0c6c2acc77239667698c923a5c` includes merged STR-133. Current AGENTS.md, .claude/build-test.md, .claude/team.md, milestone-3 status/work plan read. The invoking dirty checkout is preserved. Evidence root: `/home/jason/qa-evidence/str134-calendar-progress-20261016/`; pre-code plan/reviews remain in STR133 evidence.
 
@@ -42,6 +42,20 @@ The observed result does not satisfy the approved keep gate. Preserve the local 
 
 Independent completed-work audit confirms reuse was exercised: a checkpoint-free first-pass window has183,833 native reads /50,135 calendar event children =3.66676/input, and33,428 W reads /50,135 =0.66676/input, versus saved5.33328 and2.33333. G/D/H/U/P mutations each50,135, exactly5/input;16,714 commits preserve approximately1/3input; Q0. Full2,146,891 native reads and2,665,566 mutations reconcile by family. Local calendar read await decreased531.46→423.04µs/input and read body133.54→101.79; write body252.83→184.54. These are inclusive elapsed measures, not additive or exclusive CPU. The mechanism worked, but whole-pipeline throughput did not improve. No production admission/fallback counter quantifies fallback incidence; focused both-backend tests cover fallback/cold retry, and the measured read ratio proves substantial admitted reuse. Completed dirty131.012s and SESSION writebody234.082s plus active work remain substantial; no new fix or causal runtime-I/O attribution is made.
 
-## Final decision
+## Initial decision after first campaign
 
 Independent final source/pin/package/native/control/oracle/CPU/cleanup audit recommends **REJECT as a throughput improvement**, no PR and no automatic repeat. Runtime host I/O pressure differed: PSI I/O-some33.20s versus15.95s, I/O-full26.55s versus11.97s, and host I/O-wait186.49s versus81.80s. These are host observations, not exclusive per-event attribution; no subtraction, adjusted throughput or proof of a code-caused slowdown is justified. Build-link pressure is separate evidence. The approved whole-pipeline keep gate was not met despite successful read-count reduction.
+
+## Explicitly authorized identical-binary repeat
+
+After discussing the higher I/O pressure, the user requested another run now the machine was quieter. This supersedes the initial no-repeat decision only for one identical-binary measurement. No source/build/profile/native/config changes were made. Prelaunch review approved fresh repeat-quiet paths, exact package/binary controls, normalized input equality and the same599.5s target/<=600s actual bound. The canonical exclusive gate was acquired immediately and retained through cleanup; a separate reservation receipt leaves the original evidence intact.
+
+Repeat: **475,136 minimum completed four-owner handler inputs /599.511313359s =792.538838571/s**, **+5.4529%** versus saved STR133751.557185090/s and **+23.4165%** versus the first STR134642.165784922/s. Matched own CPU1,753.95s /599.207s =2.927cores, versus2.918 baseline; **3,691.469µs CPU/progress (−4.87%)**. Sampled100ms group RSS peak**334.320MiB**. Prefix oracle and owned engine/container/client/sampler cleanup passed; no new build occurred.
+
+Two checkpoints Ready at85.366s/83.892s versus baseline88.551s/84.591s; third active at cutoff in both arms. Final repeat handler counts: SESSION475,199; other three475,136. Output prefixes: table475,235, aggregate424,362, calendar425,292, SESSION0. This remains partial output/handler progress, not full1.2M/all-output/SESSION completion or OS-loss recovery. Both baseline and repeat cross400k, but their state/update/checkpoint mixtures still differ. Host busyCPU3.833cores versus3.875 baseline; that does not itself prove lower I/O pressure or causality. Raw pressure and process evidence are retained for the independent final audit.
+
+Separate artifacts: comparison-repeat-quiet.json/.md, rate-history-repeat-quiet-summary.json/.md, host-contention-repeat-quiet-summary.json/.md, repeat-quiet/{cost-analysis,offline-prefix-result,measurement-summary}.json and repeat-quiet-reservation.json. Original comparison, initial rejection and linker-delay evidence remain untouched. The repeat supports a modest observed improvement; no universal isolated causal percentage or Flink parity is claimed. Final keep/publication recommendation follows the independent audits; no automatic third run/new hypothesis.
+
+Independent repeat audits support a **qualified keep recommendation for the user's publication decision**. Native reads3.666766/input and W0.666719 confirm reuse; exactly317,350 mutations/63,470 outer rows=5 and21,159 commits preserve approximately1/3input; Q0. Full3,092,382 mutations and2,608,942 reads reconcile by family. CP-free read await343.30µs/body99.70/admission112.28/queue45.99/resume75.63 and writebody121.39 are inclusive elapsed measures, not additive CPU or proof of exact critical-path attribution.
+
+Runtime PSI I/O-some7.653s versus33.199s in the first STR134 and15.949s in STR133; I/O-full5.715s versus26.554s/11.969s. This repeat was quieter on those I/O measures, but CPU pressure was higher than the first STR134 run and host conditions were not identical. No subtraction or causal5.45% code-only effect is claimed. Both positive and negative outcomes remain preserved; no automatic third run or publication. Final review: review-repeat-quiet-final.md; mechanism audit: native-operation-repeat-quiet.md.

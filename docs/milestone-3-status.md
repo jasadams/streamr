@@ -1,3 +1,9 @@
+## STR-134 user-authorized quieter-machine repeat — 2026-10-16
+
+- User requested one identical-pinned-binary repeat after initial rejection; no build/source/settings changes. Own reservation reacquired, original negative case preserved. repeat-quiet prelaunch controls/independent review pass; exclusive gate acquired immediately through cleanup.
+- Completed475136 minimum4-owner inputs/599.511313s=792.538839/s (+5.4529% vs STR133751.557; +23.4165% vs firstSTR134642.166). CPU/progress3691.469µs (−4.87% baseline),2.927cores,334.320MiB sampled peak. Prefix oracle/cleanupPASS,2ReadyCP/3rd active; partial output, no full/recovery claim.
+- Independent audits: qualified KEEP recommendation for user publication decision. Reuse reads3.667/W.667 preserved; PSI I/O-some7.653s vs33.199 firstSTR134/15.949 baseline, so no code-only causal percentage. Next: discuss keep/publication with user. No PR/merge/new hypothesis/third run. Evidence /home/jason/qa-evidence/str134-calendar-progress-20261016/repeat-quiet, distinct comparison-repeat-quiet reports. No build/run active.
+
 ## STR-134 rejected performance experiment — 2026-10-16
 
 - User approved three-reviewed plan66810a31f9807da1c03a5246a0879ea43adce045ef93bb942edfb74239ac780a. Fresh base761b2575; product9e211e9a, measured05dd9f74; source/probe/native/control reviews pass. Dev fmt/check/strictClippy pass; lifecycle79/store4 pass,5 historical diagnostics ignored. Gate1 fixture failures and test-only repair preserved.
