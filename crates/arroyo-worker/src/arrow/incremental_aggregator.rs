@@ -1,6 +1,8 @@
 #[path = "calendar_native.rs"]
 mod calendar_native;
-use calendar_native::{CalendarAggregate, CalendarContributionChange, CalendarInput};
+use calendar_native::{
+    CalendarAggregate, CalendarContributionChange, CalendarInput, CalendarInputProgress,
+};
 
 use crate::arrow::aggregate_codec::{CalendarReferences, EncodedGroup, GroupCodec, decode_group};
 use crate::arrow::aggregate_store::{
@@ -1250,10 +1252,21 @@ impl IncrementalAggregatingFunc {
         .await
     }
 
+    #[cfg(test)]
     async fn native_process_calendar_event(
         &self,
         scope: &mut AggregateScope<'_>,
         event: NativeCalendarEvent<'_>,
+    ) -> Result<()> {
+        self.native_process_calendar_event_with_progress(scope, event, &mut None)
+            .await
+    }
+
+    async fn native_process_calendar_event_with_progress(
+        &self,
+        scope: &mut AggregateScope<'_>,
+        event: NativeCalendarEvent<'_>,
+        progress: &mut Option<CalendarInputProgress>,
     ) -> Result<()> {
         let NativeCalendarEvent {
             group_key,
@@ -1408,6 +1421,7 @@ impl IncrementalAggregatingFunc {
                             scope,
                             calendar,
                             day,
+                            progress,
                             NativeMemberChange {
                                 group: group_key,
                                 generation,
@@ -1447,7 +1461,9 @@ impl IncrementalAggregatingFunc {
                     calendar_references.set(position, reference)?;
                     if !fresh_empty {
                         *state = self
-                            .calendar_recalculate(scope, group_key, generation, calendar, reference)
+                            .calendar_recalculate_with_progress(
+                                scope, group_key, generation, calendar, reference, progress,
+                            )
                             .await?;
                     }
                 }
@@ -1610,6 +1626,7 @@ impl IncrementalAggregatingFunc {
         // Error/cancellation, the next input batch and recovery are always cold.
         let mut member_progress = None;
         let mut allow_member_progress = true;
+        let mut allow_calendar_progress = true;
         let unknown_members = self.aggregates.iter().any(|aggregate| {
             aggregate.accumulator_type == AccumulatorType::Batch && !aggregate.injected_timestamp
         });
@@ -1642,10 +1659,23 @@ impl IncrementalAggregatingFunc {
                     }
                     had_progress |= pending.is_some();
                     scope.set_member_progress(pending);
+                    // Construct inside this preparation attempt: never carry W
+                    // across a commit, callback, cancellation or cold retry.
+                    let mut progress = if allow_calendar_progress && !self.calendars.is_empty() {
+                        CalendarInputProgress::try_new(
+                            store,
+                            self.native_config
+                                .context("native aggregate limits missing")?
+                                .max_pending_output_bytes,
+                        )
+                    } else {
+                        None
+                    };
+                    had_progress |= progress.is_some();
                     for (row, key) in keys.iter().enumerate().take(end).skip(start) {
                         let retract = changelog.is_some_and(|(flags, _)| flags.value(row));
                         let row_id = changelog.map(|(_, ids)| ids.value(row));
-                        self.native_process_calendar_event(
+                        self.native_process_calendar_event_with_progress(
                             &mut scope,
                             NativeCalendarEvent {
                                 group_key: key,
@@ -1655,6 +1685,7 @@ impl IncrementalAggregatingFunc {
                                 row_id,
                                 calendar_inputs: &calendar_inputs,
                             },
+                            &mut progress,
                         )
                         .await?;
                     }
@@ -1667,6 +1698,7 @@ impl IncrementalAggregatingFunc {
                         // scope has dropped; retry only this uncommitted chunk
                         // cold and keep optional progress disabled this batch.
                         allow_member_progress = false;
+                        allow_calendar_progress = false;
                         member_progress = None;
                         continue;
                     }
@@ -4396,6 +4428,458 @@ mod tests {
             .into_iter()
             .map(|index| state[index].evaluate().unwrap())
             .collect()
+    }
+
+    mod calendar_progress_tests {
+        use super::*;
+        use arroyo_state::live::{
+            self, LastEntryRequest, ReadOptions, ScanPage, ScanRequest, SnapshotReader, StateKey,
+            StateSnapshot, WriteBatch,
+        };
+        use std::sync::{
+            Mutex,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        #[derive(Default)]
+        struct Trace {
+            reads: Mutex<Vec<usize>>,
+            commits: AtomicUsize,
+            // Arm only input snapshots (validation is always independent).
+            // 1 injects real decoded admission failure; 2 suspends for cancellation.
+            gate: AtomicUsize,
+            faults: AtomicUsize,
+        }
+        struct Reader {
+            inner: StateSnapshot,
+            trace: Arc<Trace>,
+            index: usize,
+            resources: WorkerStateResources,
+        }
+        #[async_trait::async_trait]
+        impl SnapshotReader for Reader {
+            async fn get(
+                &self,
+                key: &StateKey,
+                options: ReadOptions,
+            ) -> live::Result<Option<Vec<u8>>> {
+                self.try_get(key, options).await
+            }
+            async fn try_get(
+                &self,
+                key: &StateKey,
+                options: ReadOptions,
+            ) -> live::Result<Option<Vec<u8>>> {
+                if key.key == b"W" {
+                    self.trace.reads.lock().unwrap()[self.index] += 1;
+                } else if self.index > 0 && self.trace.reads.lock().unwrap()[self.index] > 0 {
+                    match self.trace.gate.swap(0, Ordering::SeqCst) {
+                        1 => {
+                            // W has been successfully loaded; overlay work is
+                            // uncommitted. Fail the next read using the actual
+                            // resource pool's decoded exhaustion error.
+                            assert_eq!(self.trace.commits.load(Ordering::SeqCst), 0);
+                            self.trace.faults.fetch_add(1, Ordering::SeqCst);
+                            let _permit = self
+                                .resources
+                                .try_decoded_value(self.resources.config().decoded_value_bytes)?;
+                            unreachable!("the input scope owns decoded capacity");
+                        }
+                        2 => {
+                            self.trace.faults.fetch_add(1, Ordering::SeqCst);
+                            std::future::pending::<()>().await;
+                        }
+                        _ => {}
+                    }
+                }
+                self.inner.try_get(key, options).await
+            }
+            async fn multi_get(
+                &self,
+                keys: &[StateKey],
+                options: ReadOptions,
+            ) -> live::Result<Vec<Option<Vec<u8>>>> {
+                self.inner.multi_get(keys, options).await
+            }
+            async fn scan(&self, request: ScanRequest) -> live::Result<ScanPage> {
+                self.inner.scan(request).await
+            }
+            async fn try_scan(&self, request: ScanRequest) -> live::Result<ScanPage> {
+                self.inner.try_scan(request).await
+            }
+            async fn last_in_range(&self, request: LastEntryRequest) -> live::Result<ScanPage> {
+                self.inner.last_in_range(request).await
+            }
+        }
+        struct Backend {
+            inner: Arc<dyn LiveStateBackend>,
+            trace: Arc<Trace>,
+            resources: WorkerStateResources,
+        }
+        #[async_trait::async_trait]
+        impl LiveStateBackend for Backend {
+            async fn get(
+                &self,
+                key: &StateKey,
+                options: ReadOptions,
+            ) -> live::Result<Option<Vec<u8>>> {
+                self.inner.get(key, options).await
+            }
+            async fn try_get(
+                &self,
+                key: &StateKey,
+                options: ReadOptions,
+            ) -> live::Result<Option<Vec<u8>>> {
+                self.inner.try_get(key, options).await
+            }
+            async fn multi_get(
+                &self,
+                keys: &[StateKey],
+                options: ReadOptions,
+            ) -> live::Result<Vec<Option<Vec<u8>>>> {
+                self.inner.multi_get(keys, options).await
+            }
+            async fn write_batch(&self, batch: WriteBatch) -> live::Result<()> {
+                self.inner.write_batch(batch).await
+            }
+            async fn snapshot(&self) -> live::Result<StateSnapshot> {
+                let inner = self.inner.snapshot().await?;
+                let mut reads = self.trace.reads.lock().unwrap();
+                let index = reads.len();
+                reads.push(0);
+                Ok(StateSnapshot(Arc::new(Reader {
+                    inner,
+                    index,
+                    trace: self.trace.clone(),
+                    resources: self.resources.clone(),
+                })))
+            }
+            fn try_admit_write(
+                &self,
+                bytes: usize,
+                operations: usize,
+            ) -> live::Result<AdmittedWriteBatch> {
+                self.inner.try_admit_write(bytes, operations)
+            }
+            async fn admit_write(
+                &self,
+                bytes: usize,
+                operations: usize,
+            ) -> live::Result<AdmittedWriteBatch> {
+                self.inner.admit_write(bytes, operations).await
+            }
+            async fn write_admitted(&self, batch: AdmittedWriteBatch) -> live::Result<()> {
+                self.inner.write_admitted(batch).await?;
+                self.trace.commits.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+
+        async fn setup(
+            rocks: bool,
+            tight: bool,
+        ) -> (
+            IncrementalAggregatingFunc,
+            Arc<Trace>,
+            Arc<dyn LiveStateBackend>,
+            std::path::PathBuf,
+        ) {
+            use arroyo_state::live::{lifecycle::RocksStateConfig, rocks::RocksLiveState};
+            let root =
+                std::env::temp_dir().join(format!("calendar-progress-{}", uuid::Uuid::new_v4()));
+            // This mixed fixture has six indexed Batch aggregates plus
+            // calendar allowance: 22 worst-case writes per event. Three rows
+            // require 1,098,240 overlay bytes, just over the former 1 MiB.
+            let limits = AggregateStoreLimits {
+                overlay_bytes: 1280 * 1024,
+                write_bytes: 1280 * 1024,
+                write_operations: 128,
+                ..native_test_store().limits()
+            };
+            let resources = WorkerStateResources::new(ResourceConfig {
+                queued_write_bytes: 8 * 1024 * 1024,
+                // Retain room for mandatory backend point reads, while the
+                // optional context's conservative output headroom cannot fit.
+                decoded_value_bytes: if tight {
+                    limits.overlay_bytes + 3 * limits.value_bytes + 128 * 1024
+                } else {
+                    4 * 1024 * 1024
+                },
+                ..native_test_store().resources().config().clone()
+            })
+            .unwrap();
+            let inner: Arc<dyn LiveStateBackend> = if rocks {
+                Arc::new(
+                    RocksLiveState::open(
+                        RocksStateConfig {
+                            root: root.clone(),
+                            job_id: "calendar-progress".into(),
+                            operator_id: "aggregate".into(),
+                            subtask: 0,
+                            generation: 0,
+                            attempt: 0,
+                        },
+                        resources.clone(),
+                    )
+                    .await
+                    .unwrap(),
+                )
+            } else {
+                Arc::new(MemoryLiveState::bounded(resources.clone(), 8 * 1024 * 1024).unwrap())
+            };
+            let trace = Arc::new(Trace::default());
+            let backend: Arc<dyn LiveStateBackend> = Arc::new(Backend {
+                inner: inner.clone(),
+                trace: trace.clone(),
+                resources: resources.clone(),
+            });
+            let mut manager = LiveTableManager::new(
+                backend.clone(),
+                Ownership::PartitionLocal {
+                    subtask: 0,
+                    parallelism: 1,
+                },
+            )
+            .unwrap();
+            let table = manager.register(NATIVE_AGGREGATE_TABLE).unwrap();
+            let mut operator = native_calendar_operator();
+            operator.native_store =
+                Some(AggregateStore::new(backend, table, resources, limits).unwrap());
+            // Guard the fixture's actual production chunk admission, rather
+            // than assuming all three rows share one scope from byte limits.
+            let fallback = operator
+                .aggregates
+                .iter()
+                .filter(|aggregate| aggregate.accumulator_type == AccumulatorType::Batch)
+                .count();
+            let worst_operations = 2 + 2 * fallback + operator.calendar_write_operations();
+            let store = operator.native_store.as_ref().unwrap();
+            let rows_per_chunk = (limits.write_operations / worst_operations)
+                .min(limits.write_bytes / (worst_operations * store.max_encoded_entry_bytes()))
+                .min(
+                    limits.overlay_bytes
+                        / (worst_operations * (limits.key_bytes + limits.value_bytes)),
+                );
+            assert!(
+                rows_per_chunk >= 3,
+                "calendar progress fixture needs a three-row chunk; admits {rows_per_chunk}"
+            );
+            (operator, trace, inner, root)
+        }
+        fn input() -> RecordBatch {
+            native_test_changelog_with_ids(
+                &batch(&[Some("value"); 3], &[1, 2, 3], &[Some(true); 3]),
+                &[false; 3],
+                &[[1; 16], [2; 16], [3; 16]],
+            )
+        }
+        async fn finish(
+            operator: IncrementalAggregatingFunc,
+            backend: Arc<dyn LiveStateBackend>,
+            root: std::path::PathBuf,
+        ) {
+            drop(operator);
+            backend.close().await.unwrap();
+            if root.exists() {
+                std::fs::remove_dir_all(root).unwrap();
+            }
+        }
+
+        #[tokio::test]
+        async fn calendar_progress_real_chunk_reuse_and_tight_fallback() {
+            for rocks in [false, true] {
+                for tight in [false, true] {
+                    let (mut operator, trace, backend, root) = setup(rocks, tight).await;
+                    let input = input();
+                    let mut ctx = native_input_context(input.schema()).await;
+                    operator
+                        .process_native_batch(&input, &mut ctx)
+                        .await
+                        .unwrap();
+                    // Three real rows share one existing chunk/commit. The
+                    // independent upfront validation always reads W once.
+                    let reads = trace.reads.lock().unwrap().clone();
+                    assert_eq!(
+                        reads.len(),
+                        2,
+                        "fixture must use one multirow production chunk"
+                    );
+                    assert_eq!(reads[0], 1);
+                    if tight {
+                        assert!(reads[1] > 1);
+                    } else {
+                        assert_eq!(reads[1], 1);
+                    }
+                    assert_eq!(trace.commits.load(Ordering::SeqCst), 1);
+                    assert_eq!(
+                        calendar_test_values(&operator).await,
+                        vec![
+                            ScalarValue::Int64(Some(3)),
+                            ScalarValue::Int64(Some(3)),
+                            ScalarValue::Int64(Some(3)),
+                        ]
+                    );
+                    // A later watermark must be observed in a new input scope,
+                    // including after this scope cached absence rather than W.
+                    operator
+                        .calendar_watermark(arroyo_types::Watermark::EventTime(
+                            arroyo_types::event_time::from_signed_nanos(201 * 86_400_000_000_000)
+                                .unwrap(),
+                        ))
+                        .await
+                        .unwrap();
+                    let before = trace.commits.load(Ordering::SeqCst);
+                    let error = operator
+                        .process_native_batch(&input, &mut ctx)
+                        .await
+                        .unwrap_err();
+                    assert!(error.to_string().contains("watermark"));
+                    assert_eq!(trace.commits.load(Ordering::SeqCst), before);
+                    for calendar in &mut operator.calendars {
+                        calendar.test_dates(201, 201);
+                    }
+                    let next = native_test_changelog_with_ids(
+                        &batch(&[Some("value"); 3], &[1, 2, 3], &[Some(true); 3]),
+                        &[false; 3],
+                        &[[4; 16], [5; 16], [6; 16]],
+                    );
+                    let first = trace.reads.lock().unwrap().len();
+                    operator
+                        .process_native_batch(&next, &mut ctx)
+                        .await
+                        .unwrap();
+                    let reads = trace.reads.lock().unwrap().clone();
+                    assert_eq!(reads[first], 1);
+                    if !tight {
+                        assert_eq!(reads[first + 1], 1);
+                    }
+                    // Retractions go through the same actual production chunk.
+                    let retract = native_test_changelog_with_ids(
+                        &batch(&[Some("value"); 3], &[1, 2, 3], &[Some(true); 3]),
+                        &[true; 3],
+                        &[[4; 16], [5; 16], [6; 16]],
+                    );
+                    operator
+                        .process_native_batch(&retract, &mut ctx)
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        calendar_test_values(&operator).await,
+                        vec![
+                            ScalarValue::Int64(Some(3)),
+                            ScalarValue::Int64(Some(0)),
+                            ScalarValue::Int64(Some(3)),
+                        ]
+                    );
+                    finish(operator, backend, root).await;
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn calendar_progress_loaded_preparation_failure_and_cancellation_retry_cold() {
+            for rocks in [false, true] {
+                for gate in [1, 2] {
+                    let (operator, trace, backend, root) = setup(rocks, false).await;
+                    let input = input();
+                    let mut ctx = native_input_context(input.schema()).await;
+                    trace.gate.store(gate, Ordering::SeqCst);
+                    if gate == 2 {
+                        let mut processing =
+                            Box::pin(operator.process_native_batch(&input, &mut ctx));
+                        // RocksDB dispatch is asynchronous, so drive to the
+                        // explicit post-W gate rather than assuming one poll.
+                        tokio::select! {
+                            result = &mut processing => panic!("expected suspended preparation: {result:?}"),
+                            _ = async {
+                                while trace.faults.load(Ordering::SeqCst) == 0 { tokio::task::yield_now().await; }
+                            } => {}
+                        }
+                        assert_eq!(trace.commits.load(Ordering::SeqCst), 0);
+                        drop(processing);
+                        // Cancellation released all scope and context ownership.
+                        let resources = operator.native_store.as_ref().unwrap().resources();
+                        assert!(
+                            resources
+                                .try_decoded_value(resources.config().decoded_value_bytes)
+                                .is_ok()
+                        );
+                    }
+                    operator
+                        .process_native_batch(&input, &mut ctx)
+                        .await
+                        .unwrap();
+                    assert_eq!(trace.faults.load(Ordering::SeqCst), 1);
+                    assert_eq!(trace.commits.load(Ordering::SeqCst), 1);
+                    let reads = trace.reads.lock().unwrap().clone();
+                    assert_eq!(reads[0], 1);
+                    assert_eq!(reads[1], 1, "first preparation loaded W before failure");
+                    assert!(
+                        reads.len() >= 3,
+                        "a fresh snapshot must be opened for retry"
+                    );
+                    assert!(reads[2] >= 1, "retry must re-read W");
+                    assert_eq!(
+                        calendar_test_values(&operator).await,
+                        vec![
+                            ScalarValue::Int64(Some(3)),
+                            ScalarValue::Int64(Some(3)),
+                            ScalarValue::Int64(Some(3)),
+                        ]
+                    );
+                    finish(operator, backend, root).await;
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn calendar_progress_invalid_upfront_read_never_mutates() {
+            for rocks in [false, true] {
+                for malformed in [true, false] {
+                    let (operator, trace, backend, root) = setup(rocks, false).await;
+                    let store = operator.native_store.as_ref().unwrap();
+                    let mut scope = store.begin().await.unwrap();
+                    let value = if malformed {
+                        vec![1, 2]
+                    } else {
+                        crate::arrow::aggregate_codec::CalendarProgress {
+                            watermark_nanos: 200 * 86_400_000_000_000,
+                            first_retained_day: 0,
+                        }
+                        .encode()
+                        .to_vec()
+                    };
+                    scope.put(b"W", &value).unwrap();
+                    scope.commit().await.unwrap();
+                    let before = trace.commits.load(Ordering::SeqCst);
+                    let input = input();
+                    let mut ctx = native_input_context(input.schema()).await;
+                    let error = operator
+                        .process_native_batch(&input, &mut ctx)
+                        .await
+                        .unwrap_err();
+                    assert!(
+                        error.to_string().contains(if malformed {
+                            "calendar progress"
+                        } else {
+                            "compiled horizon"
+                        }),
+                        "{error:#}"
+                    );
+                    assert_eq!(trace.commits.load(Ordering::SeqCst), before);
+                    let scope = store.begin().await.unwrap();
+                    assert!(
+                        scope
+                            .get(&native_group_key(b'G', &GLOBAL_KEY).unwrap())
+                            .await
+                            .unwrap()
+                            .is_none()
+                    );
+                    drop(scope);
+                    finish(operator, backend, root).await;
+                }
+            }
+        }
     }
 
     #[tokio::test]
