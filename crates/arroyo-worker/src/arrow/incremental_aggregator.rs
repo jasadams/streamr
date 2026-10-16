@@ -4587,9 +4587,12 @@ mod tests {
             use arroyo_state::live::{lifecycle::RocksStateConfig, rocks::RocksLiveState};
             let root =
                 std::env::temp_dir().join(format!("calendar-progress-{}", uuid::Uuid::new_v4()));
+            // This mixed fixture has six indexed Batch aggregates plus
+            // calendar allowance: 22 worst-case writes per event. Three rows
+            // require 1,098,240 overlay bytes, just over the former 1 MiB.
             let limits = AggregateStoreLimits {
-                overlay_bytes: 1024 * 1024,
-                write_bytes: 1024 * 1024,
+                overlay_bytes: 1280 * 1024,
+                write_bytes: 1280 * 1024,
                 write_operations: 128,
                 ..native_test_store().limits()
             };
@@ -4642,6 +4645,25 @@ mod tests {
             let mut operator = native_calendar_operator();
             operator.native_store =
                 Some(AggregateStore::new(backend, table, resources, limits).unwrap());
+            // Guard the fixture's actual production chunk admission, rather
+            // than assuming all three rows share one scope from byte limits.
+            let fallback = operator
+                .aggregates
+                .iter()
+                .filter(|aggregate| aggregate.accumulator_type == AccumulatorType::Batch)
+                .count();
+            let worst_operations = 2 + 2 * fallback + operator.calendar_write_operations();
+            let store = operator.native_store.as_ref().unwrap();
+            let rows_per_chunk = (limits.write_operations / worst_operations)
+                .min(limits.write_bytes / (worst_operations * store.max_encoded_entry_bytes()))
+                .min(
+                    limits.overlay_bytes
+                        / (worst_operations * (limits.key_bytes + limits.value_bytes)),
+                );
+            assert!(
+                rows_per_chunk >= 3,
+                "calendar progress fixture needs a three-row chunk; admits {rows_per_chunk}"
+            );
             (operator, trace, inner, root)
         }
         fn input() -> RecordBatch {
