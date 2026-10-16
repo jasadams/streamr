@@ -6,7 +6,7 @@ use sha2::{Digest, Sha256};
 #[path = "aggregate_codec_complex.rs"]
 mod complex;
 
-const MAGIC: &[u8; 8] = b"STRAGG04";
+const MAGIC: &[u8; 8] = b"STRAGG05";
 const HEADER_BYTES: usize = 65;
 
 #[derive(Debug)]
@@ -14,16 +14,102 @@ pub(crate) struct EncodedGroup {
     pub last_update_nanos: i64,
     pub generation: u64,
     pub next_ordinal: u64,
+    pub calendar_references: CalendarReferences,
     pub accumulator_state: Vec<ScalarValue>,
     pub last_emitted: Option<Vec<ScalarValue>>,
 }
 
 pub(crate) struct GroupCodec {
+    calendar_count: usize,
     state_types: Vec<DataType>,
     output_types: Vec<DataType>,
     identity: [u8; 32],
     without_emitted: complex::ComplexLayout,
     with_emitted: complex::ComplexLayout,
+}
+
+/// Schema-sized reference proofs stored with their owning G accumulators.
+/// One allocation contains the initialization bitmap followed by fixed i32 slots.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct CalendarReferences {
+    count: usize,
+    bytes: Vec<u8>,
+}
+
+impl CalendarReferences {
+    fn encoded_len(count: usize) -> Result<usize> {
+        count
+            .checked_mul(4)
+            .and_then(|bytes| bytes.checked_add(count.div_ceil(8)))
+            .context("calendar reference size overflow")
+    }
+    pub(crate) fn new(count: usize, max_bytes: usize) -> Result<Self> {
+        let size = Self::encoded_len(count)?;
+        ensure!(
+            size <= max_bytes,
+            "calendar references exceed configured value limit"
+        );
+        let mut bytes = Vec::new();
+        bytes.try_reserve_exact(size)?;
+        ensure!(
+            bytes.capacity() <= max_bytes,
+            "calendar reference allocation exceeds configured limit"
+        );
+        bytes.resize(size, 0);
+        Ok(Self { count, bytes })
+    }
+    pub(crate) fn get(&self, index: usize) -> Result<Option<i32>> {
+        ensure!(
+            index < self.count,
+            "calendar reference ordinal exceeds compiled layout"
+        );
+        if self.bytes[index / 8] & (1 << (index % 8)) == 0 {
+            return Ok(None);
+        }
+        let start = self.count.div_ceil(8) + index * 4;
+        Ok(Some(i32::from_le_bytes(
+            self.bytes[start..start + 4].try_into()?,
+        )))
+    }
+    pub(crate) fn set(&mut self, index: usize, reference: i32) -> Result<()> {
+        ensure!(
+            index < self.count,
+            "calendar reference ordinal exceeds compiled layout"
+        );
+        self.bytes[index / 8] |= 1 << (index % 8);
+        let start = self.count.div_ceil(8) + index * 4;
+        self.bytes[start..start + 4].copy_from_slice(&reference.to_le_bytes());
+        Ok(())
+    }
+    pub(crate) fn clear(&mut self) {
+        self.bytes.fill(0);
+    }
+    fn validate(&self, count: usize) -> Result<()> {
+        ensure!(self.count == count, "calendar reference layout changed");
+        Self::validate_bytes(count, &self.bytes)
+    }
+    fn validate_bytes(count: usize, bytes: &[u8]) -> Result<()> {
+        ensure!(
+            bytes.len() == Self::encoded_len(count)?,
+            "calendar reference layout changed"
+        );
+        if !count.is_multiple_of(8) {
+            ensure!(
+                bytes[count / 8] >> (count % 8) == 0,
+                "invalid calendar reference bitmap padding"
+            );
+        }
+        for index in 0..count {
+            if bytes[index / 8] & (1 << (index % 8)) == 0 {
+                let start = count.div_ceil(8) + index * 4;
+                ensure!(
+                    bytes[start..start + 4] == [0; 4],
+                    "uninitialized calendar reference contains a date"
+                );
+            }
+        }
+        Ok(())
+    }
 }
 
 fn validate_type(t: &DataType) -> Result<()> {
@@ -145,8 +231,20 @@ fn workspace(bytes: usize, max: usize) -> Result<()> {
 
 impl GroupCodec {
     pub(crate) fn new(state_types: &[DataType], output_types: &[DataType]) -> Result<Self> {
+        Self::with_calendar_layout(state_types, output_types, &[])
+    }
+    pub(crate) fn with_calendar_layout(
+        state_types: &[DataType],
+        output_types: &[DataType],
+        calendar_layout: &[Vec<u8>],
+    ) -> Result<Self> {
         let mut hash = Sha256::new();
-        hash.update(b"Streamr compact aggregate v4");
+        hash.update(b"Streamr compact aggregate v5");
+        hash.update(u64::try_from(calendar_layout.len())?.to_le_bytes());
+        for descriptor in calendar_layout {
+            hash.update(u64::try_from(descriptor.len())?.to_le_bytes());
+            hash.update(descriptor);
+        }
         for types in [state_types, output_types] {
             // Validate that every ordinary type has a ScalarValue representation.
             for t in types {
@@ -164,6 +262,7 @@ impl GroupCodec {
             hash.update(bytes);
         }
         Ok(Self {
+            calendar_count: calendar_layout.len(),
             state_types: state_types.to_vec(),
             output_types: output_types.to_vec(),
             identity: hash.finalize().into(),
@@ -182,6 +281,7 @@ impl GroupCodec {
                 "aggregate emitted-row schema changed"
             );
         }
+        group.calendar_references.validate(self.calendar_count)?;
         let present = group.last_emitted.is_some();
         let types = self
             .state_types
@@ -203,7 +303,10 @@ impl GroupCodec {
                 0
             },
         )?;
-        let mut total = checked_add(HEADER_BYTES, bitmap_bytes)?;
+        let mut total = checked_add(
+            checked_add(HEADER_BYTES, bitmap_bytes)?,
+            group.calendar_references.bytes.len(),
+        )?;
         for (t, v) in types.clone().zip(values.clone()) {
             ensure!(&v.data_type() == t, "aggregate state type changed");
             if !is_complex(t) {
@@ -233,6 +336,7 @@ impl GroupCodec {
         output.extend_from_slice(&group.generation.to_le_bytes());
         output.extend_from_slice(&group.next_ordinal.to_le_bytes());
         output.extend_from_slice(&self.identity);
+        output.extend_from_slice(&group.calendar_references.bytes);
         let bitmap_start = output.len();
         output.resize(checked_add(bitmap_start, bitmap_bytes)?, 0);
         for (i, (t, v)) in self
@@ -280,6 +384,8 @@ impl GroupCodec {
             input.take(32)? == self.identity,
             "aggregate state type changed"
         );
+        let reference_bytes = input.take(CalendarReferences::encoded_len(self.calendar_count)?)?;
+        CalendarReferences::validate_bytes(self.calendar_count, reference_bytes)?;
         let state_bits = input.take(bitmap_len(self.state_types.len()))?;
         let output_bits = input.take(if present {
             bitmap_len(self.output_types.len())
@@ -293,7 +399,8 @@ impl GroupCodec {
         let containers = value_count
             .checked_mul(std::mem::size_of::<ScalarValue>())
             .context("aggregate vector size overflow")?;
-        workspace(checked_add(bytes.len(), containers)?, max_bytes)?;
+        let base = checked_add(checked_add(bytes.len(), containers)?, reference_bytes.len())?;
+        workspace(base, max_bytes)?;
         // First pass validates all direct lengths and counts owned payloads before allocation.
         let mut probe = Cursor { bytes: input.bytes };
         let mut direct_owned = 0;
@@ -319,13 +426,16 @@ impl GroupCodec {
         } else {
             &self.without_emitted
         };
-        let base = checked_add(checked_add(bytes.len(), containers)?, direct_owned)?;
+        let base = checked_add(base, direct_owned)?;
         workspace(base, max_bytes)?;
         let complex = layout.decode(&mut probe)?;
         ensure!(
             probe.bytes.is_empty(),
             "aggregate state contains trailing data"
         );
+        let mut calendar_references = CalendarReferences::new(self.calendar_count, max_bytes)?;
+        calendar_references.bytes.copy_from_slice(reference_bytes);
+        calendar_references.validate(self.calendar_count)?;
         let mut complex_index = 0;
         let mut decode_values = |types: &[DataType], bits: &[u8]| -> Result<Vec<ScalarValue>> {
             let mut values = Vec::new();
@@ -354,6 +464,7 @@ impl GroupCodec {
             last_update_nanos,
             generation,
             next_ordinal,
+            calendar_references,
             accumulator_state,
             last_emitted,
         })
@@ -775,6 +886,7 @@ pub(crate) fn encode_calendar_contribution(
     }
     encode_group(
         &EncodedGroup {
+            calendar_references: CalendarReferences::default(),
             last_update_nanos: 0,
             generation: 1,
             next_ordinal: 0,
@@ -886,6 +998,7 @@ mod tests {
     #[test]
     fn typed_state_and_last_emitted_survive_a_fresh_decode() {
         let original = EncodedGroup {
+            calendar_references: CalendarReferences::default(),
             last_update_nanos: 1234,
             generation: 7,
             next_ordinal: 29,
@@ -923,6 +1036,7 @@ mod tests {
         ));
         let nan = f64::from_bits(0x7ff8_0000_0000_1234);
         let group = EncodedGroup {
+            calendar_references: CalendarReferences::default(),
             last_update_nanos: -123456789,
             generation: u64::MAX,
             next_ordinal: 17,
@@ -948,6 +1062,7 @@ mod tests {
         let codec = GroupCodec::new(&state_types, &output_types).unwrap();
         for emitted in [true, false] {
             let group = EncodedGroup {
+                calendar_references: CalendarReferences::default(),
                 last_emitted: emitted.then(|| group.last_emitted.clone().unwrap()),
                 accumulator_state: group.accumulator_state.clone(),
                 ..group
@@ -1004,6 +1119,7 @@ mod tests {
             Box::new(ScalarValue::Utf8(Some("same".into()))),
         );
         let group = EncodedGroup {
+            calendar_references: CalendarReferences::default(),
             last_update_nanos: 0,
             generation: 1,
             next_ordinal: 2,
@@ -1020,6 +1136,7 @@ mod tests {
     #[test]
     fn empty_accumulator_state_round_trips_without_arrow() {
         let state = EncodedGroup {
+            calendar_references: CalendarReferences::default(),
             last_update_nanos: 0,
             generation: 0,
             next_ordinal: 0,

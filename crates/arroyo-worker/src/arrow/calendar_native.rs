@@ -396,6 +396,9 @@ impl IncrementalAggregatingFunc {
     }
 
     pub(super) fn calendar_write_operations(&self) -> usize {
+        // Preserve the conservative per-horizon working-update allowance and
+        // existing chunk/commit boundaries. Reference proofs now share G;
+        // reducing this upper bound would be a separate batching experiment.
         if self.calendars.is_empty() {
             return 0;
         }
@@ -593,6 +596,7 @@ impl IncrementalAggregatingFunc {
             accumulator.update_batch(values)?;
         }
         let state = EncodedGroup {
+            calendar_references: CalendarReferences::default(),
             last_update_nanos: 0,
             generation,
             next_ordinal: 0,
@@ -601,43 +605,6 @@ impl IncrementalAggregatingFunc {
         };
         scope.put(&key, &encode_group(&state, scope.limits().value_bytes)?)?;
         Ok(())
-    }
-
-    pub(super) async fn calendar_reference_matches(
-        &self,
-        scope: &AggregateScope<'_>,
-        group: &[u8],
-        generation: u64,
-        calendar: &CalendarAggregate,
-        reference: i32,
-    ) -> Result<bool> {
-        let Some(bytes) = scope
-            .get(&family_prefix(
-                b'Q',
-                group,
-                generation,
-                calendar.aggregate_index,
-            )?)
-            .await?
-        else {
-            return Ok(false);
-        };
-        ensure!(bytes.len() == 4, "invalid calendar reference date");
-        Ok(i32::from_be_bytes(bytes.as_slice().try_into()?) == reference)
-    }
-
-    pub(super) fn calendar_set_reference(
-        &self,
-        scope: &mut AggregateScope<'_>,
-        group: &[u8],
-        generation: u64,
-        calendar: &CalendarAggregate,
-        reference: i32,
-    ) -> Result<()> {
-        scope.put(
-            &family_prefix(b'Q', group, generation, calendar.aggregate_index)?,
-            &reference.to_be_bytes(),
-        )
     }
 
     pub(super) async fn calendar_recalculate(
@@ -744,7 +711,7 @@ impl IncrementalAggregatingFunc {
         if self.calendars.is_empty() {
             return Ok(None);
         }
-        // Validate the entire callback context before Q/G/due-index writes.
+        // Validate the entire callback context before group/due-index writes.
         if let Some(progress) = self.calendar_progress(scope).await? {
             Self::validate_calendar_reference(progress, reference)?;
         }
@@ -758,15 +725,12 @@ impl IncrementalAggregatingFunc {
         let Some(bytes) = scope.get(&key).await? else {
             return Ok(None);
         };
-        let mut group = decode_group(
-            &bytes,
-            &self.native_state_types(),
-            &self.native_output_types(),
-            scope.limits().value_bytes,
-        )?;
+        let mut group = self
+            .native_group_codec()?
+            .decode(&bytes, scope.limits().value_bytes)?;
         let mut accumulators = self.native_accumulators(Some(&group))?;
-        for calendar in &self.calendars {
-            self.calendar_set_reference(scope, group_key, group.generation, calendar, reference)?;
+        for (position, calendar) in self.calendars.iter().enumerate() {
+            group.calendar_references.set(position, reference)?;
             accumulators[calendar.aggregate_index] = self
                 .calendar_recalculate(scope, group_key, group.generation, calendar, reference)
                 .await?;

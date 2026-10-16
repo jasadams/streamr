@@ -11,6 +11,7 @@ fn roundtrip(values: Vec<ScalarValue>) {
         .map(ScalarValue::data_type)
         .collect::<Vec<_>>();
     let group = EncodedGroup {
+        calendar_references: CalendarReferences::default(),
         last_update_nanos: i64::MIN,
         generation: u64::MAX,
         next_ordinal: u64::MAX,
@@ -127,6 +128,7 @@ fn complex_scalar_families_and_declared_metadata_round_trip() {
             let types = [value.data_type()];
             let codec = GroupCodec::new(&types, &[]).unwrap();
             let group = EncodedGroup {
+                calendar_references: CalendarReferences::default(),
                 last_update_nanos: 0,
                 generation: 0,
                 next_ordinal: 0,
@@ -171,6 +173,7 @@ fn declared_output_identity_and_empty_presence_are_explicit() {
     let outputs = [DataType::Utf8];
     let codec = GroupCodec::new(&types, &outputs).unwrap();
     let group = EncodedGroup {
+        calendar_references: CalendarReferences::default(),
         last_update_nanos: 0,
         generation: 0,
         next_ordinal: 0,
@@ -209,6 +212,7 @@ fn primitive_layout_size_and_corruption_have_bounded_failure() {
     let codec =
         GroupCodec::new(&[DataType::Int64, DataType::Utf8, DataType::Boolean], &[]).unwrap();
     let group = EncodedGroup {
+        calendar_references: CalendarReferences::default(),
         last_update_nanos: 0,
         generation: 0,
         next_ordinal: 0,
@@ -289,6 +293,7 @@ fn caller_owned_capacity_does_not_become_a_new_admission_limit() {
     text.push('x');
     let codec = GroupCodec::new(&[DataType::Utf8], &[]).unwrap();
     let group = EncodedGroup {
+        calendar_references: CalendarReferences::default(),
         last_update_nanos: 0,
         generation: 0,
         next_ordinal: 0,
@@ -394,6 +399,7 @@ fn complex_fixture(values: Vec<ScalarValue>) -> (GroupCodec, Vec<u8>, usize) {
         .collect::<Vec<_>>();
     let codec = GroupCodec::new(&types, &[]).unwrap();
     let group = EncodedGroup {
+        calendar_references: CalendarReferences::default(),
         last_update_nanos: 0,
         generation: 0,
         next_ordinal: 0,
@@ -518,4 +524,92 @@ fn complex_preflight_rejects_dictionary_data_order_and_truncated_messages() {
                 .is_err()
         );
     }
+}
+
+#[test]
+fn calendar_reference_codec_is_schema_bound_initialized_and_fixed_size() {
+    let layout: Vec<_> = (0..8_u8).map(|index| vec![index, 7]).collect();
+    let codec = GroupCodec::with_calendar_layout(&[DataType::Int64], &[], &layout).unwrap();
+    let plain = GroupCodec::new(&[DataType::Int64], &[]).unwrap();
+    let mut group = EncodedGroup {
+        calendar_references: CalendarReferences::new(8, 32768).unwrap(),
+        last_update_nanos: -1,
+        generation: 4,
+        next_ordinal: 9,
+        accumulator_state: vec![ScalarValue::Int64(Some(3))],
+        last_emitted: None,
+    };
+    group.calendar_references.set(0, i32::MIN).unwrap();
+    group.calendar_references.set(7, i32::MAX).unwrap();
+    let encoded = codec.encode(&group, 32768).unwrap();
+    let decoded = codec.decode(&encoded, 32768).unwrap();
+    assert_eq!(decoded.calendar_references.get(0).unwrap(), Some(i32::MIN));
+    assert_eq!(decoded.calendar_references.get(1).unwrap(), None);
+    assert_eq!(decoded.calendar_references.get(7).unwrap(), Some(i32::MAX));
+    assert_eq!(decoded.generation, 4);
+    assert_eq!(decoded.next_ordinal, 9);
+    group.calendar_references = CalendarReferences::default();
+    assert_eq!(
+        encoded.len(),
+        plain.encode(&group, 32768).unwrap().len() + 33
+    );
+    assert!(plain.decode(&encoded, 32768).is_err());
+    let mut reordered = layout.clone();
+    reordered.swap(0, 1);
+    assert!(
+        GroupCodec::with_calendar_layout(&[DataType::Int64], &[], &reordered)
+            .unwrap()
+            .decode(&encoded, 32768)
+            .is_err()
+    );
+    assert!(codec.encode(&group, 32768).is_err());
+    let mut cleared = decoded.calendar_references;
+    cleared.clear();
+    assert!((0..8).all(|index| cleared.get(index).unwrap().is_none()));
+    assert!(cleared.get(8).is_err());
+    assert!(CalendarReferences::new(usize::MAX, 32768).is_err());
+}
+
+#[test]
+fn calendar_reference_codec_rejects_malformed_and_honors_tighter_value_boundary() {
+    let layout = vec![vec![1]; 9];
+    let codec = GroupCodec::with_calendar_layout(&[], &[], &layout).unwrap();
+    let group = EncodedGroup {
+        calendar_references: CalendarReferences::new(9, 4096).unwrap(),
+        last_update_nanos: 0,
+        generation: 0,
+        next_ordinal: 0,
+        accumulator_state: vec![],
+        last_emitted: None,
+    };
+    let encoded = codec.encode(&group, 4096).unwrap();
+    let mut invalid = encoded.clone();
+    invalid[HEADER_BYTES + 1] = 0x80;
+    assert!(codec.decode(&invalid, 4096).is_err());
+    let mut invalid = encoded.clone();
+    invalid[HEADER_BYTES + 2] = 1; // Noncanonical data in an uninitialized slot.
+    assert!(codec.decode(&invalid, 4096).is_err());
+    for length in 0..encoded.len() {
+        assert!(codec.decode(&encoded[..length], 4096).is_err());
+    }
+    let mut trailing = encoded;
+    trailing.push(0);
+    assert!(codec.decode(&trailing, 4096).is_err());
+
+    let layout = vec![vec![1]; 8];
+    let codec = GroupCodec::with_calendar_layout(&[DataType::Binary], &[], &layout).unwrap();
+    let plain = GroupCodec::new(&[DataType::Binary], &[]).unwrap();
+    let mut group = EncodedGroup {
+        calendar_references: CalendarReferences::new(8, 32768).unwrap(),
+        last_update_nanos: 0,
+        generation: 0,
+        next_ordinal: 0,
+        accumulator_state: vec![ScalarValue::Binary(Some(vec![7; 32665]))],
+        last_emitted: None,
+    };
+    assert_eq!(codec.encode(&group, 32768).unwrap().len(), 32768);
+    group.accumulator_state = vec![ScalarValue::Binary(Some(vec![7; 32666]))];
+    assert!(codec.encode(&group, 32768).is_err());
+    group.calendar_references = CalendarReferences::default();
+    assert_eq!(plain.encode(&group, 32768).unwrap().len(), 32736);
 }

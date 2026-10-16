@@ -2,7 +2,7 @@
 mod calendar_native;
 use calendar_native::{CalendarAggregate, CalendarContributionChange, CalendarInput};
 
-use crate::arrow::aggregate_codec::{EncodedGroup, GroupCodec, decode_group};
+use crate::arrow::aggregate_codec::{CalendarReferences, EncodedGroup, GroupCodec, decode_group};
 use crate::arrow::aggregate_store::{
     AggregateExpiryProgress, AggregateScope, AggregateStore, AggregateStoreLimits,
 };
@@ -1268,7 +1268,7 @@ impl IncrementalAggregatingFunc {
             "append-only native aggregate received a retraction",
         );
         let storage_key = native_group_key(b'G', group_key)?;
-        let previous = scope
+        let mut previous = scope
             .get(&storage_key)
             .await?
             .map(|bytes| {
@@ -1351,6 +1351,13 @@ impl IncrementalAggregatingFunc {
                 scope.put(&native_cleanup_key(group_key, group.generation)?, b"M")?;
             }
         }
+        let mut calendar_references = if expired {
+            CalendarReferences::new(self.calendars.len(), scope.limits().value_bytes)?
+        } else if let Some(group) = &mut previous {
+            std::mem::take(&mut group.calendar_references)
+        } else {
+            CalendarReferences::new(self.calendars.len(), scope.limits().value_bytes)?
+        };
         let mut calendar_families = HashMap::new();
         for (index, (input, state)) in inputs.iter().zip(accumulators.iter_mut()).enumerate() {
             let calendar = self
@@ -1417,7 +1424,7 @@ impl IncrementalAggregatingFunc {
                 }
                 let reference = calendar_inputs[position].reference_day(row)?;
                 // G already holds this horizon's accumulator. Reuse it only
-                // when Q proves an unchanged reference and this original CDC
+                // when G proves an unchanged reference and this original CDC
                 // contribution cannot affect membership. Relevant changes still
                 // rebuild in bucket order, including floating-point SUM.
                 let first_day = reference
@@ -1430,18 +1437,14 @@ impl IncrementalAggregatingFunc {
                 // an irrelevant first append cannot add a bucket in this horizon.
                 // Existing tombstones and TTL rollovers retain G and do not qualify.
                 let fresh_empty = previous.is_none() && !retract && !affects_horizon;
-                // A relevant change rebuilds anyway, so do not add a Q read
-                // to that path merely to avoid its existing reference write.
+                // Relevant changes rebuild in bucket order; only the proof
+                // belonging to this accumulator can permit reuse.
                 let reuse = !affects_horizon
                     && !expired
                     && previous.is_some()
-                    && self
-                        .calendar_reference_matches(
-                            scope, group_key, generation, calendar, reference,
-                        )
-                        .await?;
+                    && calendar_references.get(position)? == Some(reference);
                 if !reuse {
-                    self.calendar_set_reference(scope, group_key, generation, calendar, reference)?;
+                    calendar_references.set(position, reference)?;
                     if !fresh_empty {
                         *state = self
                             .calendar_recalculate(scope, group_key, generation, calendar, reference)
@@ -1516,6 +1519,7 @@ impl IncrementalAggregatingFunc {
             last_update_nanos: now,
             generation,
             next_ordinal,
+            calendar_references,
             accumulator_state: self.native_state_values(&mut accumulators)?,
             last_emitted: previous.and_then(|group| group.last_emitted),
         };
@@ -1734,6 +1738,7 @@ impl IncrementalAggregatingFunc {
                         .checked_add(1)
                         .ok_or_else(|| anyhow!("aggregate generation overflow"))?;
                     group.next_ordinal = 0;
+                    group.calendar_references.clear();
                     group.accumulator_state =
                         self.native_state_values(&mut self.native_accumulators(None)?)?;
                     group.last_update_nanos = now;
@@ -1828,7 +1833,6 @@ impl IncrementalAggregatingFunc {
                 || phase == b"R"
                 || phase == b"B"
                 || phase == b"J"
-                || phase == b"Q"
                 || phase == b"U"
                 || phase == b"T",
             "invalid aggregate cleanup phase"
@@ -1953,8 +1957,7 @@ impl IncrementalAggregatingFunc {
                 let next = match phase.as_slice() {
                     b"R" if !self.calendars.is_empty() => b"B",
                     b"B" => b"J",
-                    b"J" => b"Q",
-                    b"Q" => b"U",
+                    b"J" => b"U",
                     _ => b"T",
                 };
                 scope.put(&cleanup_key, next)?;
@@ -2155,6 +2158,7 @@ impl IncrementalAggregatingFunc {
                             .checked_add(1)
                             .context("aggregate generation overflow")?;
                         group.next_ordinal = 0;
+                        group.calendar_references.clear();
                         scope.put(&native_cleanup_key(&group_key, old_generation)?, b"M")?;
                         if !self.retain_indefinitely {
                             let deadline = group
@@ -3649,6 +3653,7 @@ impl IncrementalAggregatingConstructor {
             // source row ID. They cannot recover a CDC before row's old time.
             identity.update(b"\0injected-timestamp-row-id.v1");
         }
+        identity.update(b"\0compact-group-calendar-references.v5");
         let native_schema_identity = identity.finalize().to_vec();
 
         // An indexed-only plan has no sliding accumulator state to carry the
@@ -3722,9 +3727,14 @@ impl IncrementalAggregatingConstructor {
             native_append_only,
             calendars,
         };
-        operator.native_codec = Some(GroupCodec::new(
+        operator.native_codec = Some(GroupCodec::with_calendar_layout(
             &operator.native_state_types(),
             &operator.native_output_types(),
+            &config
+                .calendar_aggregates
+                .iter()
+                .map(|descriptor| descriptor.encode_to_vec())
+                .collect::<Vec<_>>(),
         )?);
         Ok(operator)
     }
@@ -4332,6 +4342,30 @@ mod tests {
         Ok(())
     }
 
+    async fn calendar_test_assert_references(
+        operator: &IncrementalAggregatingFunc,
+        scope: &AggregateScope<'_>,
+        key: &[u8],
+        reference: i32,
+    ) {
+        let bytes = scope
+            .get(&native_group_key(b'G', key).unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        let group = operator
+            .native_group_codec()
+            .unwrap()
+            .decode(&bytes, scope.limits().value_bytes)
+            .unwrap();
+        for position in 0..operator.calendars.len() {
+            assert_eq!(
+                group.calendar_references.get(position).unwrap(),
+                Some(reference)
+            );
+        }
+    }
+
     async fn calendar_test_values(operator: &IncrementalAggregatingFunc) -> Vec<ScalarValue> {
         calendar_test_values_for_group(operator, &GLOBAL_KEY).await
     }
@@ -4352,13 +4386,11 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let group = decode_group(
-            &bytes,
-            &operator.native_state_types(),
-            &operator.native_output_types(),
-            scope.limits().value_bytes,
-        )
-        .unwrap();
+        let group = operator
+            .native_group_codec()
+            .unwrap()
+            .decode(&bytes, scope.limits().value_bytes)
+            .unwrap();
         let mut state = operator.native_accumulators(Some(&group)).unwrap();
         [5, 6, 7]
             .into_iter()
@@ -4461,7 +4493,7 @@ mod tests {
                             .unwrap();
                         scope.commit().await.unwrap();
                     }
-                    for family in b"MRBJQU" {
+                    for family in b"MRBJU" {
                         for row in 0_u64..16 {
                             let mut key =
                                 native_generation_prefix(*family, &group, generation).unwrap();
@@ -4519,7 +4551,7 @@ mod tests {
                             .collect();
                         println!(
                             "STR116_OPERATOR repeat={repeat} completed_generations={completed} completed_members={} completed_markers={completed} pages={pages} seconds={:.9} memory={memory:?}",
-                            completed * 6 * 16,
+                            completed * 5 * 16,
                             elapsed.as_secs_f64()
                         );
                         pages = 0;
@@ -4533,7 +4565,7 @@ mod tests {
             for group_id in 0_u64..12 {
                 let group = group_id.to_be_bytes();
                 for generation in 0_u64..4 {
-                    for family in b"MRBJQU" {
+                    for family in b"MRBJU" {
                         for row in 0_u64..16 {
                             let mut key =
                                 native_generation_prefix(*family, &group, generation).unwrap();
@@ -4893,6 +4925,18 @@ mod tests {
         let store = operator.native_store.as_ref().unwrap();
         let marker = native_cleanup_key(&key, 0).unwrap();
         let group_key = native_group_key(b'G', &key).unwrap();
+        let scope = store.begin().await.unwrap();
+        let bytes = scope.get(&group_key).await.unwrap().unwrap();
+        let group = operator
+            .native_group_codec()
+            .unwrap()
+            .decode(&bytes, scope.limits().value_bytes)
+            .unwrap();
+        assert_eq!(group.generation, 1);
+        for position in 0..operator.calendars.len() {
+            assert_eq!(group.calendar_references.get(position).unwrap(), None);
+        }
+        drop(scope);
         let mut progress = NativeCleanupProgress::new(store);
         let mut reached_terminal = false;
         for _ in 0..64 {
@@ -4937,14 +4981,7 @@ mod tests {
             .begin()
             .await
             .unwrap();
-        for calendar in &operator.calendars {
-            assert!(
-                operator
-                    .calendar_reference_matches(&scope, &key, 0, calendar, 200)
-                    .await
-                    .unwrap()
-            );
-        }
+        calendar_test_assert_references(&operator, &scope, &key, 200).await;
         drop(scope);
         // The old terminal marker must not remove the newly live G.
         let mut cleanup = NativeCleanupProgress::new(operator.native_store.as_ref().unwrap());
@@ -4975,6 +5012,108 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn calendar_group_references_keep_independent_contexts_and_expiry_reset() {
+        let mut operator = native_calendar_operator();
+        for (step, (reference_day, reference_week, day, include, expected)) in [
+            (200, 201, 200, true, [1, 1, 1]),
+            (199, 201, 200, false, [2, 0, 1]),
+            (201, 202, 201, true, [3, 1, 2]),
+            (204, 202, 201, false, [4, 0, 2]),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let input = batch(&[Some("value")], &[1], &[Some(include)]);
+            operator.calendars[0].test_dates(day, reference_day);
+            operator.calendars[1].test_dates(day, reference_week);
+            let dates = operator.calendar_inputs(&input).unwrap();
+            operator.validate_calendar_inputs(&dates).await.unwrap();
+            let inputs = operator.compute_inputs(&input).unwrap();
+            let mut scope = operator
+                .native_store
+                .as_ref()
+                .unwrap()
+                .begin()
+                .await
+                .unwrap();
+            operator
+                .native_process_calendar_event(
+                    &mut scope,
+                    NativeCalendarEvent {
+                        group_key: &GLOBAL_KEY,
+                        inputs: &inputs,
+                        row: 0,
+                        retract: false,
+                        row_id: Some(&[step as u8; 16]),
+                        calendar_inputs: &dates,
+                    },
+                )
+                .await
+                .unwrap();
+            scope.commit().await.unwrap();
+            assert_eq!(
+                calendar_test_values(&operator).await,
+                expected
+                    .into_iter()
+                    .map(|value| ScalarValue::Int64(Some(value)))
+                    .collect::<Vec<_>>()
+            );
+            let scope = operator
+                .native_store
+                .as_ref()
+                .unwrap()
+                .begin()
+                .await
+                .unwrap();
+            let bytes = scope
+                .get(&native_group_key(b'G', &GLOBAL_KEY).unwrap())
+                .await
+                .unwrap()
+                .unwrap();
+            let group = operator
+                .native_group_codec()
+                .unwrap()
+                .decode(&bytes, scope.limits().value_bytes)
+                .unwrap();
+            assert_eq!(
+                group.calendar_references.get(0).unwrap(),
+                Some(reference_day)
+            );
+            assert_eq!(
+                group.calendar_references.get(1).unwrap(),
+                Some(reference_week)
+            );
+        }
+        // The ordinary expiry path must clear the reference proofs with its
+        // newly empty accumulators, even for a retained global G.
+        let mut operator = native_calendar_operator();
+        operator.retain_indefinitely = false;
+        operator.ttl = Duration::ZERO;
+        calendar_test_event(&mut operator, 200, 200, Some(true), false, &[9; 16]).await;
+        assert!(operator.expire_native(None).await.unwrap());
+        let scope = operator
+            .native_store
+            .as_ref()
+            .unwrap()
+            .begin()
+            .await
+            .unwrap();
+        let bytes = scope
+            .get(&native_group_key(b'G', &GLOBAL_KEY).unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        let group = operator
+            .native_group_codec()
+            .unwrap()
+            .decode(&bytes, scope.limits().value_bytes)
+            .unwrap();
+        assert_eq!(group.generation, 1);
+        assert_eq!(group.calendar_references.get(0).unwrap(), None);
+        assert_eq!(group.calendar_references.get(1).unwrap(), None);
+    }
+
+    #[tokio::test]
     async fn calendar_reuse_matches_full_recalculation_for_original_corrections() {
         let mut operator = native_calendar_operator();
         // Irrelevant and relevant contributions, both horizon edges, reference
@@ -5001,13 +5140,11 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
-            let group = decode_group(
-                &bytes,
-                &operator.native_state_types(),
-                &operator.native_output_types(),
-                scope.limits().value_bytes,
-            )
-            .unwrap();
+            let group = operator
+                .native_group_codec()
+                .unwrap()
+                .decode(&bytes, scope.limits().value_bytes)
+                .unwrap();
             let mut actual = operator.native_accumulators(Some(&group)).unwrap();
             for calendar in &operator.calendars {
                 let mut expected = operator
@@ -5243,7 +5380,6 @@ mod tests {
         resumed.prune_calendar_buckets().await.unwrap();
         let mut scope = store.begin().await.unwrap();
         assert_eq!(scope.get(b"V").await.unwrap(), Some(complete_bytes));
-        let (reference_key, reference_before) = scope.first(b"Q").await.unwrap().unwrap();
         let group_key = native_group_key(b'G', &GLOBAL_KEY).unwrap();
         let group_before = scope.get(&group_key).await.unwrap();
         let error = resumed
@@ -5254,10 +5390,6 @@ mod tests {
             error
                 .to_string()
                 .contains("precedes admitted watermark context")
-        );
-        assert_eq!(
-            scope.get(&reference_key).await.unwrap(),
-            Some(reference_before)
         );
         assert_eq!(scope.get(&group_key).await.unwrap(), group_before);
         scope.commit().await.unwrap();
@@ -5380,13 +5512,11 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
-            let group = decode_group(
-                &bytes,
-                &operator.native_state_types(),
-                &operator.native_output_types(),
-                scope.limits().value_bytes,
-            )
-            .unwrap();
+            let group = operator
+                .native_group_codec()
+                .unwrap()
+                .decode(&bytes, scope.limits().value_bytes)
+                .unwrap();
             let mut state = operator.native_accumulators(Some(&group)).unwrap();
             let actual: Vec<_> = [5, 6, 7]
                 .into_iter()
@@ -5561,13 +5691,11 @@ mod tests {
                     .await
                     .unwrap()
                     .unwrap();
-                let group = decode_group(
-                    &bytes,
-                    &operator.native_state_types(),
-                    &operator.native_output_types(),
-                    scope.limits().value_bytes,
-                )
-                .unwrap();
+                let group = operator
+                    .native_group_codec()
+                    .unwrap()
+                    .decode(&bytes, scope.limits().value_bytes)
+                    .unwrap();
                 let mut state = operator.native_accumulators(Some(&group)).unwrap();
                 let actual: Vec<_> = state[..6]
                     .iter_mut()
@@ -5620,13 +5748,11 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
-            let group = decode_group(
-                &bytes,
-                &operator.native_state_types(),
-                &operator.native_output_types(),
-                scope.limits().value_bytes,
-            )
-            .unwrap();
+            let group = operator
+                .native_group_codec()
+                .unwrap()
+                .decode(&bytes, scope.limits().value_bytes)
+                .unwrap();
             let mut state = operator.native_accumulators(Some(&group)).unwrap();
             let actual: Vec<_> = state[..6]
                 .iter_mut()
@@ -5754,7 +5880,7 @@ mod tests {
             .unwrap();
         drop(decoded);
         let scope = store.begin().await.unwrap();
-        for prefix in [b"G", b"J", b"B", b"H", b"Q", b"U", b"M", b"R"] {
+        for prefix in [b"G", b"J", b"B", b"H", b"U", b"M", b"R"] {
             assert!(scope.first(prefix).await.unwrap().is_none());
         }
     }
@@ -6243,13 +6369,14 @@ mod tests {
                 scope.commit().await.unwrap();
                 let mut scope = store.begin_point().await.unwrap();
                 let key = native_group_key(b'G', group).unwrap();
-                let mut previous = decode_group(
-                    &scope.get(&key).await.unwrap().unwrap(),
-                    &operator.native_state_types(),
-                    &operator.native_output_types(),
-                    scope.limits().value_bytes,
-                )
-                .unwrap();
+                let mut previous = operator
+                    .native_group_codec()
+                    .unwrap()
+                    .decode(
+                        &scope.get(&key).await.unwrap().unwrap(),
+                        scope.limits().value_bytes,
+                    )
+                    .unwrap();
                 let ttl = i64::try_from(operator.ttl.as_nanos()).unwrap();
                 scope
                     .delete(
@@ -6304,13 +6431,14 @@ mod tests {
                     scope.commit().await.unwrap();
                 }
                 let scope = store.begin().await.unwrap();
-                let current = decode_group(
-                    &scope.get(&key).await.unwrap().unwrap(),
-                    &operator.native_state_types(),
-                    &operator.native_output_types(),
-                    scope.limits().value_bytes,
-                )
-                .unwrap();
+                let current = operator
+                    .native_group_codec()
+                    .unwrap()
+                    .decode(
+                        &scope.get(&key).await.unwrap().unwrap(),
+                        scope.limits().value_bytes,
+                    )
+                    .unwrap();
                 assert_eq!(current.generation, 1);
                 assert_eq!(current.next_ordinal, 5);
                 assert_eq!(
@@ -6793,14 +6921,7 @@ mod tests {
                     .begin()
                     .await
                     .unwrap();
-                for calendar in &operator.calendars {
-                    assert!(
-                        operator
-                            .calendar_reference_matches(&scope, &GLOBAL_KEY, 0, calendar, 200)
-                            .await
-                            .unwrap()
-                    );
-                }
+                calendar_test_assert_references(&operator, &scope, &GLOBAL_KEY, 200).await;
                 drop(scope);
                 let snapshot = backends[0].snapshot().await.unwrap();
                 let storage = arroyo_state::get_storage_provider(
@@ -6857,14 +6978,7 @@ mod tests {
                     ]
                 );
                 let scope = fresh.native_store.as_ref().unwrap().begin().await.unwrap();
-                for calendar in &fresh.calendars {
-                    assert!(
-                        fresh
-                            .calendar_reference_matches(&scope, &GLOBAL_KEY, 0, calendar, 200)
-                            .await
-                            .unwrap()
-                    );
-                }
+                calendar_test_assert_references(&fresh, &scope, &GLOBAL_KEY, 200).await;
                 drop(scope);
                 calendar_test_event(&mut fresh, 200, 200, Some(true), false, &[2; 16]).await;
                 assert_eq!(
@@ -6884,6 +6998,47 @@ mod tests {
                         ScalarValue::Int64(Some(1)),
                         ScalarValue::Int64(Some(0)),
                         ScalarValue::Int64(None),
+                    ]
+                );
+                // A fresh restored owner's real-watermark callback updates the
+                // reference proofs and accumulators in the same committed G.
+                fresh
+                    .calendar_watermark(arroyo_types::Watermark::EventTime(
+                        arroyo_types::event_time::from_signed_nanos(201 * 86_400_000_000_000)
+                            .unwrap(),
+                    ))
+                    .await
+                    .unwrap();
+                let mut scope = fresh.native_store.as_ref().unwrap().begin().await.unwrap();
+                fresh
+                    .recalculate_calendar_group(&mut scope, &GLOBAL_KEY, 201)
+                    .await
+                    .unwrap();
+                scope.commit().await.unwrap();
+                let scope = fresh.native_store.as_ref().unwrap().begin().await.unwrap();
+                calendar_test_assert_references(&fresh, &scope, &GLOBAL_KEY, 201).await;
+                drop(scope);
+                // The initially future day201 becomes eligible at this real
+                // boundary. Old/null/filtered originals remain ineligible.
+                let day_count = i64::from(include == Some(true) && day == Some(201));
+                let week_sum = (include == Some(true)
+                    && day.is_some_and(|day| (195..=201).contains(&day)))
+                .then_some(1);
+                assert_eq!(
+                    calendar_test_values(&fresh).await,
+                    vec![
+                        ScalarValue::Int64(Some(1)),
+                        ScalarValue::Int64(Some(day_count)),
+                        ScalarValue::Int64(week_sum),
+                    ]
+                );
+                calendar_test_event(&mut fresh, 201, 201, Some(true), false, &[3; 16]).await;
+                assert_eq!(
+                    calendar_test_values(&fresh).await,
+                    vec![
+                        ScalarValue::Int64(Some(2)),
+                        ScalarValue::Int64(Some(day_count + 1)),
+                        ScalarValue::Int64(Some(week_sum.unwrap_or(0) + 1)),
                     ]
                 );
                 drop(snapshot);
@@ -8218,6 +8373,7 @@ mod tests {
             .unwrap()
             .encode(
                 &EncodedGroup {
+                    calendar_references: CalendarReferences::default(),
                     last_update_nanos: to_nanos(SystemTime::now()) as i64,
                     generation: 0,
                     next_ordinal: 1,
@@ -8350,13 +8506,11 @@ mod tests {
             "append-only state grew with input cardinality"
         );
         let fresh = native_append_only_operator();
-        let group = decode_group(
-            &encoded,
-            &fresh.native_state_types(),
-            &fresh.native_output_types(),
-            scope.limits().value_bytes,
-        )
-        .unwrap();
+        let group = fresh
+            .native_group_codec()
+            .unwrap()
+            .decode(&encoded, scope.limits().value_bytes)
+            .unwrap();
         let mut states = fresh.native_accumulators(Some(&group)).unwrap();
         let actual = states
             .iter_mut()
@@ -8408,13 +8562,11 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let group = decode_group(
-            &bytes,
-            &fresh.native_state_types(),
-            &fresh.native_output_types(),
-            scope.limits().value_bytes,
-        )
-        .unwrap();
+        let group = fresh
+            .native_group_codec()
+            .unwrap()
+            .decode(&bytes, scope.limits().value_bytes)
+            .unwrap();
         let mut states = fresh.native_accumulators(Some(&group)).unwrap();
         let actual = states
             .iter_mut()
@@ -8469,13 +8621,11 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let checkpoint_group = decode_group(
-            &checkpoint_bytes,
-            &operator.native_state_types(),
-            &operator.native_output_types(),
-            scope.limits().value_bytes,
-        )
-        .unwrap();
+        let checkpoint_group = operator
+            .native_group_codec()
+            .unwrap()
+            .decode(&checkpoint_bytes, scope.limits().value_bytes)
+            .unwrap();
         let mut checkpoint_state = operator
             .native_accumulators(Some(&checkpoint_group))
             .unwrap();
@@ -8946,13 +9096,11 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let group = decode_group(
-            &stored,
-            &fresh.native_state_types(),
-            &fresh.native_output_types(),
-            scope.limits().value_bytes,
-        )
-        .unwrap();
+        let group = fresh
+            .native_group_codec()
+            .unwrap()
+            .decode(&stored, scope.limits().value_bytes)
+            .unwrap();
         assert_eq!(group.next_ordinal, 2);
         assert_eq!(
             fresh
@@ -9014,13 +9162,11 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let group = decode_group(
-            &stored,
-            &operator.native_state_types(),
-            &operator.native_output_types(),
-            scope.limits().value_bytes,
-        )
-        .unwrap();
+        let group = operator
+            .native_group_codec()
+            .unwrap()
+            .decode(&stored, scope.limits().value_bytes)
+            .unwrap();
         assert_eq!(
             operator
                 .native_fallback_value(&scope, &GLOBAL_KEY, group.generation, 0)
@@ -9566,6 +9712,7 @@ mod tests {
             let key = format!("k{number}");
             let mut scope = store.begin().await.unwrap();
             let group = EncodedGroup {
+                calendar_references: CalendarReferences::default(),
                 last_update_nanos: 0,
                 generation: 0,
                 next_ordinal: 0,
@@ -9621,6 +9768,7 @@ mod tests {
         // Earlier insertion after that interrupted flush cannot be skipped.
         let mut scope = store.begin().await.unwrap();
         let group = EncodedGroup {
+            calendar_references: CalendarReferences::default(),
             last_update_nanos: -1_000_000_000,
             generation: 0,
             next_ordinal: 0,
@@ -9752,6 +9900,7 @@ mod tests {
                 .unwrap()
                 .encode(
                     &EncodedGroup {
+                        calendar_references: CalendarReferences::default(),
                         last_update_nanos: 0,
                         generation: 0,
                         next_ordinal: 0,
@@ -9783,13 +9932,11 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
-            let restored = decode_group(
-                &bytes,
-                &operator.native_state_types(),
-                &operator.native_output_types(),
-                scope.limits().value_bytes,
-            )
-            .unwrap();
+            let restored = operator
+                .native_group_codec()
+                .unwrap()
+                .decode(&bytes, scope.limits().value_bytes)
+                .unwrap();
             assert_eq!(restored.generation, 1);
             assert!(
                 scope

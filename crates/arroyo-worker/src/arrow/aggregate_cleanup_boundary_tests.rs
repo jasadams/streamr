@@ -176,6 +176,7 @@ async fn cleanup_terminal_preserves_later_generation_and_retires_pair_atomically
     let earlier = native_cleanup_key(group, 0).unwrap();
     let later = native_cleanup_key(group, 1).unwrap();
     let state = EncodedGroup {
+        calendar_references: CalendarReferences::default(),
         last_update_nanos: 0,
         generation: 2,
         next_ordinal: 0,
