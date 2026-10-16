@@ -10,6 +10,42 @@ use crate::arrow::aggregate_codec::{
 use arrow_array::Date32Array;
 use arroyo_rpc::grpc::api::CalendarAggregateDescriptor;
 
+// This context belongs to one serial input preparation attempt and its stable
+// snapshot only. Callback paths deliberately continue using calendar_progress.
+// None in Loaded is an observed absence, distinct from not having read W yet.
+enum CalendarInputProgressValue {
+    Unloaded,
+    Loaded(Option<CalendarProgress>),
+}
+
+pub(super) struct CalendarInputProgress {
+    value: CalendarInputProgressValue,
+    _permit: arroyo_state::live::resources::ResourcePermit,
+}
+
+impl CalendarInputProgress {
+    pub(super) fn try_new(store: &AggregateStore, output_bytes: usize) -> Option<Self> {
+        // Include enum padding, the retained permit and the enclosing Option.
+        // Preserve the same mandatory headroom as optional member progress;
+        // transient pressure after admission uses its existing cold retry path.
+        let charge = std::mem::size_of::<Option<Self>>();
+        let limits = store.limits();
+        let mandatory = limits
+            .overlay_bytes
+            .checked_add(limits.value_bytes.checked_mul(3)?)?
+            .checked_add(output_bytes.checked_mul(3)?)?
+            .checked_add(store.max_encoded_entry_bytes().checked_mul(2)?)?
+            .checked_add(128)?;
+        if mandatory.checked_add(charge)? > store.resources().config().decoded_value_bytes {
+            return None;
+        }
+        Some(Self {
+            value: CalendarInputProgressValue::Unloaded,
+            _permit: store.resources().try_decoded_value(charge).ok()?,
+        })
+    }
+}
+
 pub(super) struct CalendarContributionChange<'a> {
     pub group: &'a [u8],
     pub generation: u64,
@@ -222,6 +258,23 @@ impl IncrementalAggregatingFunc {
                 Ok(progress)
             })
             .transpose()
+    }
+
+    async fn calendar_input_progress(
+        &self,
+        scope: &AggregateScope<'_>,
+        context: &mut Option<CalendarInputProgress>,
+    ) -> Result<Option<CalendarProgress>> {
+        if let Some(context) = context {
+            if let CalendarInputProgressValue::Loaded(progress) = context.value {
+                return Ok(progress);
+            }
+            // Publish only a successfully decoded and horizon-validated value.
+            let progress = self.calendar_progress(scope).await?;
+            context.value = CalendarInputProgressValue::Loaded(progress);
+            return Ok(progress);
+        }
+        self.calendar_progress(scope).await
     }
 
     fn validate_calendar_reference(progress: CalendarProgress, reference: i32) -> Result<()> {
@@ -551,6 +604,7 @@ impl IncrementalAggregatingFunc {
         scope: &mut AggregateScope<'_>,
         calendar: &CalendarAggregate,
         day: i32,
+        progress: &mut Option<CalendarInputProgress>,
         change: NativeMemberChange<'_>,
     ) -> Result<()> {
         let NativeMemberChange {
@@ -560,7 +614,7 @@ impl IncrementalAggregatingFunc {
             retract,
             ..
         } = change;
-        if let Some(progress) = self.calendar_progress(scope).await?
+        if let Some(progress) = self.calendar_input_progress(scope, progress).await?
             && day < self.calendar_family_floor(progress, calendar.storage_index)?
         {
             // Original J still supplies the lifetime delta. Expired recent
@@ -615,7 +669,22 @@ impl IncrementalAggregatingFunc {
         calendar: &CalendarAggregate,
         reference: i32,
     ) -> Result<IncrementalState> {
-        if let Some(progress) = self.calendar_progress(scope).await? {
+        self.calendar_recalculate_with_progress(
+            scope, group, generation, calendar, reference, &mut None,
+        )
+        .await
+    }
+
+    pub(super) async fn calendar_recalculate_with_progress(
+        &self,
+        scope: &AggregateScope<'_>,
+        group: &[u8],
+        generation: u64,
+        calendar: &CalendarAggregate,
+        reference: i32,
+        progress: &mut Option<CalendarInputProgress>,
+    ) -> Result<IncrementalState> {
+        if let Some(progress) = self.calendar_input_progress(scope, progress).await? {
             Self::validate_calendar_reference(progress, reference)?;
         }
         let aggregate = &self.aggregates[calendar.aggregate_index];
