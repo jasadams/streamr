@@ -1,6 +1,6 @@
 # STR-134 — reuse calendar progress within input scopes
 
-Status: reviewed implementation/dev gates passed; first measurement rejected, then an explicitly user-authorized identical-binary repeat showed a modest observed gain. No publication or merge.
+Status: reviewed implementation/dev gates passed; first measurement rejected, then an explicitly user-authorized identical-binary repeat showed a modest observed gain. User has authorized keeping and merging the candidate; publication/merge is in progress.
 
 User approved plan `66810a31f9807da1c03a5246a0879ea43adce045ef93bb942edfb74239ac780a` after three independent pre-code reviews. Fetched base `761b2575b2cf4f0c6c2acc77239667698c923a5c` includes merged STR-133. Current AGENTS.md, .claude/build-test.md, .claude/team.md, milestone-3 status/work plan read. The invoking dirty checkout is preserved. Evidence root: `/home/jason/qa-evidence/str134-calendar-progress-20261016/`; pre-code plan/reviews remain in STR133 evidence.
 
@@ -59,3 +59,5 @@ Separate artifacts: comparison-repeat-quiet.json/.md, rate-history-repeat-quiet-
 Independent repeat audits support a **qualified keep recommendation for the user's publication decision**. Native reads3.666766/input and W0.666719 confirm reuse; exactly317,350 mutations/63,470 outer rows=5 and21,159 commits preserve approximately1/3input; Q0. Full3,092,382 mutations and2,608,942 reads reconcile by family. CP-free read await343.30µs/body99.70/admission112.28/queue45.99/resume75.63 and writebody121.39 are inclusive elapsed measures, not additive CPU or proof of exact critical-path attribution.
 
 Runtime PSI I/O-some7.653s versus33.199s in the first STR134 and15.949s in STR133; I/O-full5.715s versus26.554s/11.969s. This repeat was quieter on those I/O measures, but CPU pressure was higher than the first STR134 run and host conditions were not identical. No subtraction or causal5.45% code-only effect is claimed. Both positive and negative outcomes remain preserved; no automatic third run or publication. Final review: review-repeat-quiet-final.md; mechanism audit: native-operation-repeat-quiet.md.
+
+The user explicitly selected KEEP and authorized publication and merge to main after the identical-binary repeat. This settles the publication decision; normal CI, independent review and merge gates remain. No further executable input changed after the tested/reviewed v2 source.
