@@ -1,3 +1,10 @@
+## STR-143 existing Rust UDF export repair — 2026-10-17
+
+- Fresh fetched base `ad0a4814d5b7c07d74dce54753f5e6e9aaa7a062`; branch `agent/str-143-udf-unsafe-export-20261017`. Read current AGENTS/build/team/ledger/work-plan; original dirty checkout preserved.
+- Actual public compiler/API scalar UDF failed: generated crate uses Rust2024, public UDF macro emits bare no_mangle. Repair only the required unsafe export annotation; preserve symbol names, FFI, SQL and application boundary. No state/resource/checkpoint or scan change.
+- Acceptance: maintained fmt/dev check/public sync+async integration tests/strict Clippy PASS. Actual official compiler/API scalar MERGE and worker SIGKILL recovery PASS (source2/epoch2, exact4outputs, committed76B, one physically fresh row, cleanup complete); old CLI and patched plugin sources explicitly separate. Independent source review APPROVE; final runtime audit/current-head CI pending.
+- Report `docs/str-143-udf-exports.md`; source-bound original failure, gates and smoke3 evidence `/home/jason/qa-evidence/arc17-native-mvp-20261017/profile-runtime/`. Next: final evidence review, draft PR and required current-head CI; no application parity/cutover claim.
+
 ## STR-103/126 MVP qualification — 2026-10-17
 
 - User explicitly deferred remaining exhaustive performance-only checks; exact MVP correctness/resources/recovery retained. Fresh base68539f93, producte2ff41e7 carries accepted140/tree-identicalc91787be; rejected141142 excluded. Productionpin0e6078d2/manifest229d2d97, immutablebad108ab/precompiledrelease. Old dirtySTR126worktree/failed512/interrupted768 evidence preserved.
