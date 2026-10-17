@@ -1,11 +1,14 @@
 # syntax=docker/dockerfile:1.4
 
-FROM rust:1-bookworm AS builder
+ARG RUST_IMAGE=rust:1-bookworm
+FROM ${RUST_IMAGE} AS builder
 WORKDIR /app
 ARG GIT_SHA
 ARG TARGETPLATFORM
 ARG PROFILE=release
 ARG FEATURES=python
+ARG CARGO_BUILD_JOBS=2
+ENV CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS}
 
 RUN apt-get update && \
     apt-get -y install curl pkg-config unzip build-essential libssl-dev openssl \
@@ -51,7 +54,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,id=${TARGETPLATFORM}-${P
     sudo -u postgres psql -c "CREATE USER arroyo WITH PASSWORD 'arroyo' SUPERUSER;" && \
     sudo -u postgres createdb arroyo && \
     refinery migrate -c refinery.toml -p crates/arroyo-api/migrations && \
-    CARGO_NET_GIT_FETCH_WITH_CLI=true CARGO_PROFILE_RELEASE_DEBUG=false cargo build --features ${FEATURES} --profile ${PROFILE} --bin arroyo && \
+    CARGO_NET_GIT_FETCH_WITH_CLI=true CARGO_PROFILE_RELEASE_DEBUG=false cargo build --locked --features "${FEATURES}" --profile ${PROFILE} --bin arroyo && \
     mv target/*/arroyo /arroyo
 
 
@@ -81,6 +84,22 @@ ENV INSTALL_RUSTC=true \
 
 EXPOSE 5115
 ENTRYPOINT [ "/app/arroyo" ]
+CMD ["cluster"]
+
+# Native Rust UDF deployments need the same toolchain and local plugin sources
+# used to build the API: its local-plugin path is embedded at compile time.
+FROM builder AS streamr-native
+ARG GIT_SHA
+LABEL org.opencontainers.image.source="https://github.com/jasadams/streamr" \
+      org.opencontainers.image.revision="${GIT_SHA}" \
+      org.opencontainers.image.title="Streamr native SQL engine"
+RUN cp /arroyo /app/arroyo && mkdir -p /var/lib/streamr
+ENV ARROYO__API__HTTP_PORT=5115 \
+    ARROYO__COMPILER__USE_LOCAL_UDF_CRATE=true \
+    ARROYO__COMPILER__INSTALL_RUSTC=false \
+    ARROYO__COMPILER__INSTALL_CLANG=false
+EXPOSE 5115
+ENTRYPOINT ["/app/arroyo"]
 CMD ["cluster"]
 
 FROM rust:slim-bookworm AS arroyo-full
