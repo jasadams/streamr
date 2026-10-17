@@ -307,19 +307,29 @@ impl ArrowOperator for KafkaSinkFunc {
 
     fn tables(&self) -> HashMap<String, TableConfig> {
         if self.is_committing() {
-            single_item_hash_map(
-                "i".to_string(),
-                TableConfig {
-                    table_type: TableEnum::GlobalKeyValue.into(),
-                    config: GlobalKeyedTableConfig {
-                        table_name: "i".to_string(),
-                        description: "index for transactional ids".to_string(),
-                        uses_two_phase_commit: true,
-                    }
-                    .encode_to_vec(),
-                    state_version: 0,
-                },
-            )
+            ["i", "j"]
+                .into_iter()
+                .map(|name| {
+                    (
+                        name.to_string(),
+                        TableConfig {
+                            table_type: TableEnum::GlobalKeyValue.into(),
+                            config: GlobalKeyedTableConfig {
+                                table_name: name.to_string(),
+                                description: if name == "i" {
+                                    "index for transactional ids"
+                                } else {
+                                    "pending Kafka replay journal"
+                                }
+                                .to_string(),
+                                uses_two_phase_commit: name == "i",
+                            }
+                            .encode_to_vec(),
+                            state_version: 0,
+                        },
+                    )
+                })
+                .collect()
         } else {
             HashMap::new()
         }
@@ -440,6 +450,18 @@ impl ArrowOperator for KafkaSinkFunc {
         ctx: &mut OperatorContext,
         _: &mut dyn Collector,
     ) -> DataflowResult<()> {
+        // Do not replace the checkpoint journal until its transaction has been
+        // acknowledged. The controller also permits only one pending checkpoint.
+        if let ConsistencyMode::ExactlyOnce {
+            producer_to_complete,
+            ..
+        } = &self.consistency_mode
+        {
+            recovery::require(
+                producer_to_complete.is_none(),
+                "Kafka checkpoint overlaps pending commit",
+            )?;
+        }
         self.flush(ctx).await;
         if self.is_committing() {
             let ConsistencyMode::ExactlyOnce {
@@ -466,7 +488,16 @@ impl ArrowOperator for KafkaSinkFunc {
                 records: std::mem::take(&mut self.journal),
             };
             self.journal_bytes = 0;
-            let pending_bytes = recovery::encode_pending(&pending)?;
+            let (journal, pending_bytes) =
+                recovery::encode_pending(&pending, self.recovery_max_bytes)?;
+            // The same FIFO writer receives this value before the checkpoint
+            // barrier. Its ordinary checkpoint file owns journal durability/GC;
+            // only the bounded reference enters commit RPC metadata.
+            ctx.table_manager
+                .get_global_keyed_state::<u32, Vec<u8>>("j")
+                .await?
+                .insert(ctx.task_info.task_index, journal)
+                .await;
             let topic = self.recovery_topic.as_ref().unwrap();
             recovery::send_marker(
                 self.producer.as_ref().unwrap(),
@@ -492,10 +523,6 @@ impl ArrowOperator for KafkaSinkFunc {
                 ..
             } = &mut self.consistency_mode
             {
-                recovery::require(
-                    producer_to_complete.is_none(),
-                    "Kafka checkpoint overlaps pending commit",
-                )?;
                 *producer_to_complete = self.producer.take();
             }
             self.recovery_state = Some(state);
@@ -515,13 +542,23 @@ impl ArrowOperator for KafkaSinkFunc {
             return Ok(());
         }
         let bytes = _commit_data.get("i").and_then(|m|m.get(&ctx.task_info.task_index)).ok_or_else(|| anyhow!("Missing Kafka replay metadata; legacy committing checkpoints cannot recover safely"))?;
-        let pending = recovery::decode_pending(bytes, epoch, self.recovery_max_bytes)?;
+        let journal = ctx
+            .table_manager
+            .get_global_keyed_state::<u32, Vec<u8>>("j")
+            .await?;
+        let pending = recovery::decode_commit(
+            bytes,
+            journal.get(&ctx.task_info.task_index).map(Vec::as_slice),
+            epoch,
+            self.recovery_max_bytes,
+        )?;
         let state = self
             .recovery_state
             .as_ref()
             .ok_or_else(|| anyhow!("Kafka recovery state missing"))?;
         recovery::require(
-            state.generation == pending.generation
+            state.checkpoint_epoch == epoch
+                && state.generation == pending.generation
                 && pending.transaction_index.checked_add(1) == Some(state.next_transaction_index),
             "Kafka pending transaction/state mismatch",
         )?;

@@ -1,3 +1,10 @@
+## STR-144 Kafka checkpoint replay journal — 2026-10-17
+
+- Actual native production replay failed the fixed1MiB encoded commit-RPC journal cap despite configured8MiB raw budget. User informed concrete gap before generic repair; no shared-client broker throttle or checkpoint-minimum workaround applied.
+- Fresh fetched base `e5e64cab9bff66ee21d2f39a047b18ee7e0671ac`; branch `agent/str-144-kafka-checkpoint-journal-20261017`, current AGENTS/build/team/ledger/work-plan and ticket read, in-flight CLEAR. Independent pre-code review APPROVE. Root explicitly requires deployedv2 in-flight checkpoint continuity.
+- Ordinary checkpoint GlobalKV `j` stores bounded pending JSON; only small identity/length/hash reference is committing metadata in `i`. Early overlap guard, existing marker/fencing/commit/replay protocol and raw8MiB bound retained. No application behavior or new RocksDB scans.
+- Maintained formatting PASS; focused codec tests queued/running. Actual oversized checkpoint/SIGKILL/committed continuity/fresh output/v2 restore, normal checks/strict Clippy, final independent review and tested image publication remain pending. Report `docs/str-144-kafka-journal.md`; evidence `/home/jason/qa-evidence/str144-kafka-journal-20261017/`.
+
 ## Native demo packaging — 2026-10-17
 
 - User authorized demo deployment after merging the generic UDF repair. Fresh fetched base `3ea6a673c7bb0b5e38aa154d154848c6143d16b0`; branch `agent/native-demo-image-20261017`; current AGENTS/build/team/ledger read. Unrelated checkouts preserved.

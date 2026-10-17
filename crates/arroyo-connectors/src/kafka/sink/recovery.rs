@@ -7,6 +7,7 @@ use rdkafka::error::KafkaError;
 use rdkafka::producer::{FutureRecord, Producer};
 use rdkafka::{ClientConfig, Message, Offset, TopicPartitionList};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::time::{Duration, Instant};
 
 pub fn require(condition: bool, message: &str) -> Result<()> {
@@ -19,6 +20,8 @@ pub const DEFAULT_MAX_BYTES: usize = 8 * 1024 * 1024;
 // CommitRequest uses tonic's bounded message transport. Keep a single-subtask
 // journal comfortably below its 4 MiB frame; aggregate sizing is a separate gate.
 pub const MAX_COMMIT_METADATA_BYTES: usize = 1024 * 1024;
+const REFERENCE_VERSION: u32 = 3;
+const MAX_REFERENCE_BYTES: usize = 4096;
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct ReplayRecord {
     pub timestamp: Option<i64>,
@@ -42,6 +45,16 @@ pub struct PendingCommit {
     pub epoch: u32,
     pub transaction_index: usize,
     pub records: Vec<ReplayRecord>,
+}
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct JournalReference {
+    version: u32,
+    generation: String,
+    epoch: u32,
+    transaction_index: usize,
+    journal_bytes: u64,
+    journal_sha256: [u8; 32],
 }
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -110,8 +123,14 @@ pub fn decode_pending(bytes: &[u8], epoch: u32, max: usize) -> Result<PendingCom
             && bytes.len() <= max.saturating_mul(5).saturating_add(4096),
         "Kafka replay metadata exceeds configured budget"
     );
-    let pending: PendingCommit = serde_json::from_slice(bytes)
-        .map_err(|e| anyhow!("Unsupported legacy/corrupt Kafka committing checkpoint: {e}"))?;
+    decode_journal(bytes, epoch, max)
+}
+
+fn encoded_journal_limit(max: usize) -> usize {
+    max.saturating_mul(5).saturating_add(4096)
+}
+
+fn validate_pending(pending: &PendingCommit, epoch: u32, max: usize) -> Result<()> {
     ensure!(
         pending.version == PROTOCOL_VERSION
             && pending.epoch == epoch
@@ -119,19 +138,99 @@ pub fn decode_pending(bytes: &[u8], epoch: u32, max: usize) -> Result<PendingCom
         "Kafka replay checkpoint identity/version mismatch"
     );
     let mut used = 0;
-    for r in &pending.records {
-        ensure!(r.partition >= 0, "Kafka replay partition missing");
-        used = check_budget(used, r, max)?;
+    for record in &pending.records {
+        ensure!(record.partition >= 0, "Kafka replay partition missing");
+        used = check_budget(used, record, max)?;
     }
+    Ok(())
+}
+
+fn decode_journal(bytes: &[u8], epoch: u32, max: usize) -> Result<PendingCommit> {
+    // Preserve the configured raw budget while bounding JSON byte-array expansion
+    // before deserialization. Journals live in checkpoint files, not RPC metadata.
+    ensure!(
+        bytes.len() <= encoded_journal_limit(max),
+        "Kafka replay journal exceeds configured encoded budget"
+    );
+    let pending: PendingCommit = serde_json::from_slice(bytes)
+        .map_err(|e| anyhow!("Unsupported legacy/corrupt Kafka committing checkpoint: {e}"))?;
+    validate_pending(&pending, epoch, max)?;
     Ok(pending)
 }
-pub fn encode_pending(pending: &PendingCommit) -> Result<Vec<u8>> {
-    let bytes = serde_json::to_vec(pending)?;
+
+/// All new checkpoints persist the journal in an ordinary checkpoint table and
+/// send only this small reference through controller commit RPCs.
+pub fn encode_pending(pending: &PendingCommit, max: usize) -> Result<(Vec<u8>, Vec<u8>)> {
+    validate_pending(pending, pending.epoch, max)?;
+    let journal = serde_json::to_vec(pending)?;
+    ensure!(
+        journal.len() <= encoded_journal_limit(max),
+        "Kafka replay journal exceeds configured encoded budget"
+    );
+    let reference = serde_json::to_vec(&JournalReference {
+        version: REFERENCE_VERSION,
+        generation: pending.generation.clone(),
+        epoch: pending.epoch,
+        transaction_index: pending.transaction_index,
+        journal_bytes: u64::try_from(journal.len())?,
+        journal_sha256: Sha256::digest(&journal).into(),
+    })?;
+    ensure!(
+        reference.len() <= MAX_REFERENCE_BYTES,
+        "Kafka journal reference exceeds bounded size"
+    );
+    Ok((journal, reference))
+}
+
+pub fn decode_commit(
+    bytes: &[u8],
+    journal: Option<&[u8]>,
+    epoch: u32,
+    max: usize,
+) -> Result<PendingCommit> {
     ensure!(
         bytes.len() <= MAX_COMMIT_METADATA_BYTES,
-        "Kafka encoded checkpoint replay journal exceeds 1 MiB commit metadata limit; reduce checkpoint interval/output volume"
+        "Kafka commit metadata exceeds bounded size"
     );
-    Ok(bytes)
+    #[derive(Deserialize)]
+    struct Version {
+        version: u32,
+    }
+    let version: Version = serde_json::from_slice(bytes)?;
+    if version.version == PROTOCOL_VERSION {
+        // Read deployed v2 in-flight checkpoints; new writes always use references.
+        return decode_pending(bytes, epoch, max);
+    }
+    ensure!(
+        version.version == REFERENCE_VERSION && bytes.len() <= MAX_REFERENCE_BYTES,
+        "Unsupported/oversized Kafka journal reference"
+    );
+    let reference: JournalReference = serde_json::from_slice(bytes)?;
+    ensure!(
+        reference.epoch == epoch && !reference.generation.is_empty(),
+        "Kafka journal reference identity mismatch"
+    );
+    let journal =
+        journal.ok_or_else(|| anyhow!("Selected checkpoint is missing Kafka replay journal"))?;
+    ensure!(
+        journal.len() <= encoded_journal_limit(max),
+        "Kafka replay journal exceeds configured encoded budget"
+    );
+    ensure!(
+        u64::try_from(journal.len())? == reference.journal_bytes,
+        "Kafka replay journal length mismatch"
+    );
+    ensure!(
+        <[u8; 32]>::from(Sha256::digest(journal)) == reference.journal_sha256,
+        "Kafka replay journal hash mismatch"
+    );
+    let pending = decode_journal(journal, epoch, max)?;
+    ensure!(
+        pending.generation == reference.generation
+            && pending.transaction_index == reference.transaction_index,
+        "Kafka replay journal/reference identity mismatch"
+    );
+    Ok(pending)
 }
 pub fn retry_transaction(
     mut op: impl FnMut() -> std::result::Result<(), KafkaError>,
@@ -399,7 +498,7 @@ mod tests {
         assert!(decode_pending(&[1, 2, 3], 1, 100).is_err());
     }
     #[test]
-    fn oversized_commit_metadata_is_rejected_before_checkpoint_publication() {
+    fn large_journal_uses_small_checkpoint_commit_reference() {
         let pending = PendingCommit {
             version: PROTOCOL_VERSION,
             generation: "g".into(),
@@ -410,7 +509,21 @@ mod tests {
                 ..record()
             }],
         };
-        assert!(encode_pending(&pending).is_err());
+        let (journal, reference) = encode_pending(&pending, DEFAULT_MAX_BYTES).unwrap();
+        assert!(journal.len() > MAX_COMMIT_METADATA_BYTES);
+        assert!(reference.len() < MAX_REFERENCE_BYTES);
+        assert_eq!(
+            decode_commit(&reference, Some(&journal), 1, DEFAULT_MAX_BYTES)
+                .unwrap()
+                .records,
+            pending.records
+        );
+        assert!(decode_commit(&reference, None, 1, DEFAULT_MAX_BYTES).is_err());
+        let mut corrupted = journal.clone();
+        *corrupted.last_mut().unwrap() ^= 1;
+        assert!(decode_commit(&reference, Some(&corrupted), 1, DEFAULT_MAX_BYTES).is_err());
+        assert!(decode_commit(&reference, Some(&journal), 2, DEFAULT_MAX_BYTES).is_err());
+        assert!(decode_commit(&reference, Some(&journal), 1, 100).is_err());
         assert!(
             decode_pending(
                 &vec![0; MAX_COMMIT_METADATA_BYTES + 1],
@@ -418,6 +531,56 @@ mod tests {
                 DEFAULT_MAX_BYTES
             )
             .is_err()
+        );
+    }
+    #[test]
+    fn journal_reference_rejects_wrong_length_generation_and_transaction() {
+        let pending = PendingCommit {
+            version: PROTOCOL_VERSION,
+            generation: "g".into(),
+            epoch: 9,
+            transaction_index: 4,
+            records: vec![record()],
+        };
+        let (journal, bytes) = encode_pending(&pending, 100).unwrap();
+        for field in ["journal_bytes", "generation", "transaction_index"] {
+            let mut reference: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            reference[field] = match field {
+                "generation" => "other".into(),
+                _ => 999.into(),
+            };
+            assert!(
+                decode_commit(
+                    &serde_json::to_vec(&reference).unwrap(),
+                    Some(&journal),
+                    9,
+                    100
+                )
+                .is_err()
+            );
+        }
+        assert!(encode_pending(&pending, 68).is_err());
+        assert!(
+            decode_journal(&vec![0; 5000], 9, 1)
+                .unwrap_err()
+                .to_string()
+                .contains("encoded budget")
+        );
+        assert!(decode_commit(br#"{"version":99}"#, Some(&journal), 9, 100).is_err());
+    }
+    #[test]
+    fn deployed_inline_v2_commit_requires_no_new_journal_table_value() {
+        let pending = PendingCommit {
+            version: PROTOCOL_VERSION,
+            generation: "deployed".into(),
+            epoch: 9,
+            transaction_index: 4,
+            records: vec![record()],
+        };
+        let inline = serde_json::to_vec(&pending).unwrap();
+        assert_eq!(
+            decode_commit(&inline, None, 9, 100).unwrap().records,
+            pending.records
         );
     }
 }
