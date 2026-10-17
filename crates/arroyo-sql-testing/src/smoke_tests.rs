@@ -2224,6 +2224,8 @@ async fn external_sql_checkpoint_capture_inner() {
         assert!(after_bytes.starts_with(&before_bytes) && after_rows >= before_rows);
     }
     run_until_finished(&restored, &mut control_rx).await;
+    drop(restored);
+    wait_for_capture_state_cleanup().await;
     let recovered_rows = capture_rows(
         &output_path,
         capture.expected_rows,
