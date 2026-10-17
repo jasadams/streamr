@@ -1,0 +1,52 @@
+{
+  "scope": "User-approved MVP correctness/resource/recovery; exhaustive remaining per-path performance-only checks explicitly deferred",
+  "production_source": "e2ff41e7c991b3e0f0c68bd7d2f874631a00501b",
+  "sql_test_source": "0e63174498ef3adb9848a669c4ea12e3c21110f3",
+  "production_binary_sha256": "0e6078d2fe6f2a2c4279b4de3d7a8d6b5486b369b47a23a5c26dcd2bee363a36",
+  "production_manifest_sha256": "229d2d97e4c29bc6a4021d09a1f970388a5fdb043ea65598b809abf9783baa0b",
+  "sql_binary_sha256": "b2e7d0df968fbe69babbfa0d13614d57e017b9bc211c5657a9cb476621750cc8",
+  "actual_retained_table": {
+    "actual_encoded_typed_value_bytes": 1256000000,
+    "actual_payload_bytes": 819200000,
+    "actual_retained_keys": 400000,
+    "backend_pool_bytes": 65011712,
+    "scope": "selected persisted typed owner only; other owners conservatively excluded from retained floor",
+    "tenfold_satisfied": true
+  },
+  "final_oracles": {
+    "aggregate": {
+      "rows": 1200000,
+      "sha256": "b8aacd80617fbc70f1dedd827769110618606e7cc71f3e772ec29ae579d0825f"
+    },
+    "calendar": {
+      "rows": 1200000,
+      "sha256": "a86273ae0432f5759e7206d16bd2cfbcd366e5f26e88c71093174c2c14a08cb1"
+    },
+    "session": {
+      "rows": 400000,
+      "sha256": "296beb0bc7e09eac1678141710ca6adc3475d33c79d58d362d6cadb6e6e99801"
+    },
+    "table": {
+      "rows": 1200000,
+      "sha256": "8b16c00f914e9d04f627a91ea073656bc9b1efaffd6c907a9434d5e6df87cb2b"
+    }
+  },
+  "peak_rss_bytes": 350818304,
+  "rss_limit_bytes": 805306368,
+  "independent_reviews": "large and 14 SQL cases approved",
+  "publication": "pending current-head CI; no merge/deploy/cutover",
+  "evidence": {
+    "/home/jason/qa-evidence/str126-qualification-20261017/large-final-review.json": "cc2b53a1d48d3b62f23f79f546fe6d9e5ed20195e66e933d21b54be6b1050a72",
+    "/home/jason/qa-evidence/str126-qualification-20261017/independent-large-audit.json": "a8bcfc15a8fc33a4ddaab44df465d2ebb903c3a8eb70dae7299a383eac94405c",
+    "/home/jason/qa-evidence/str126-qualification-20261017/extra-final-review.json": "0f5c4a6ba29af0c42a55139effe3e70d7b66ea2ef8724be5a26339cb51824d5b",
+    "/home/jason/qa-evidence/str126-qualification-20261017/runner-retry1/attempts/large/evidence/result.json": "025e22b62b2174c76bb947d9cf86f387ed6940b16e0ee00636c7ad9955e03f1a",
+    "/home/jason/qa-evidence/str126-qualification-20261017/runner-retry1/attempts/large/evidence/checkpoint-before-loss.json": "2df222577eac76c90240ded88d38d335b105a66a8a6e4c5edd4530d1945be962",
+    "/home/jason/qa-evidence/str126-qualification-20261017/runner-retry1/attempts/large/launch-result.json": "a1cbad6718260a159c220bb437f2538e0c9cd1bb0add59b833285b6de3e3c940",
+    "/home/jason/qa-evidence/str126-qualification-20261017/extra-correctness-retry1/result.json": "34cd7bb3d15606ecd6d7caffb0bfcbaaf1fd51c38d6771b5433a44ae88806aaf",
+    "/home/jason/qa-evidence/str126-qualification-20261017/extra-correctness-retry1/sql-pin.json": "0cf0aa02b3f65f00ce79a235398a7bcea6ad54f11588a1db9c769121f783b441",
+    "/home/jason/qa-evidence/str126-qualification-20261017/extra-runtime-retry1/qualification-exclusive.json": "24ce805cb08fafd427168e8dbbbccd34223a0770b8f5d72b103aa7acb8179e9a",
+    "/home/jason/qa-evidence/str126-qualification-20261017/extra-runtime-retry1/commands.json": "f840261296894f26df9947d7e973563dc860464b3b4181b5dc80eab805b38246",
+    "/home/jason/qa-evidence/str126-qualification-20261017/teardown-repair-source-review.json": "90cecb5cb601ede8ce3a213d8e7021d91691741a97f897ab6df47f2909662370",
+    "/home/jason/qa-evidence/str126-qualification-20261017/teardown-investigation/cli-unaffected-source-closure.json": "6bf62b3df893f2401c02dae799f1f6083c2c246b2fa964ed273fc4859e6a7ec7"
+  }
+}

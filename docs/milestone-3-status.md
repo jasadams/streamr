@@ -1,3 +1,10 @@
+## STR-103/126 MVP qualification — 2026-10-17
+
+- User explicitly deferred remaining exhaustive performance-only checks; exact MVP correctness/resources/recovery retained. Fresh base68539f93, producte2ff41e7 carries accepted140/tree-identicalc91787be; rejected141142 excluded. Productionpin0e6078d2/manifest229d2d97, immutablebad108ab/precompiledrelease. Old dirtySTR126worktree/failed512/interrupted768 evidence preserved.
+- **STR103 Done:** pilot and full400kkey/1.2Mevent graph independently PASS; actualtyped400kkeys/819200000payloadB vs62MiB pool; actualworkerSIGKILL gen1→2,CP2/source417792/exactclock/all14callbacks,byteidenticalprefixes/freshsuffixes; full1.2Mtable/scalar/calendar+400kSESSION exact. Peak334.566MiB below768,22382monitored100mssamples/maxgap.153970s/error0/threadsjoined;1srawhistorysaved. EngineFinished1908.823s; rates diagnostic underhostload.
+- SQLtest-only finalcleanup omission caused posttestSIGABRT; coreprovedDBclose/globalstaticexit race. Reviewed2line existingbarrier repair0e631744; unchangedactualCLI dependencyclosure explicitlyproved despite1conservativeinventorydifference. Maintainedfmt/check/strictClippy0 and fresh14array/join/window recovery cases independently PASS,wholeprocess0; allownedcleanup verified/canonicalEXreleased.
+- STR126 validation complete; next final report/source review, PR/current-head CI and handoff. No merge/release/cutover. Report `docs/str-126-validation.md`, receipt `docs/str-126-delivery-receipt.json`; evidence `/home/jason/qa-evidence/str126-qualification-20261017/`. Exhaustive per-path performance gaps explicitly deferred, not passed; broaderSTR27/applicationARC17 separate.
+
 ## STR-140 co-located keyed membership — 2026-10-17
 
 - User approved one experiment, including +8 encoded G bytes under unchanged caps. Fresh fetched base68539f93ecc2c7df01bb22f6b6f98eb693fcaaaf; isolated branchjason/str-140-group-liveness-20261017; current AGENTS/build/team/ledger/work-plan read, ownedclaim/inflightCLEAR; invoking checkout preserved.
