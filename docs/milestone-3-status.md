@@ -2,8 +2,8 @@
 
 - Fresh fetched base `ad0a4814d5b7c07d74dce54753f5e6e9aaa7a062`; branch `agent/str-143-udf-unsafe-export-20261017`. Read current AGENTS/build/team/ledger/work-plan; original dirty checkout preserved.
 - Actual public compiler/API scalar UDF failed: generated crate uses Rust2024, public UDF macro emits bare no_mangle. Repair only the required unsafe export annotation; preserve symbol names, FFI, SQL and application boundary. No state/resource/checkpoint or scan change.
-- Acceptance: public sync/async macro integration compile, maintained crate gates, actual existing CLI/compiler scalar UDF execution and process-loss recovery with explicit patched-plugin source binding, independent review and current-head CI.
-- Source-bound original failure and next runtime evidence: `/home/jason/qa-evidence/arc17-native-mvp-20261017/profile-runtime/`. Next: review small diff, run maintained gates and official API with patched local plugin; publication/CI pending.
+- Acceptance: maintained fmt/dev check/public sync+async integration tests/strict Clippy PASS. Actual official compiler/API scalar MERGE and worker SIGKILL recovery PASS (source2/epoch2, exact4outputs, committed76B, one physically fresh row, cleanup complete); old CLI and patched plugin sources explicitly separate. Independent source review APPROVE; final runtime audit/current-head CI pending.
+- Report `docs/str-143-udf-exports.md`; source-bound original failure, gates and smoke3 evidence `/home/jason/qa-evidence/arc17-native-mvp-20261017/profile-runtime/`. Next: final evidence review, draft PR and required current-head CI; no application parity/cutover claim.
 
 ## STR-103/126 MVP qualification — 2026-10-17
 
