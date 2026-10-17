@@ -15,6 +15,7 @@ fn roundtrip(values: Vec<ScalarValue>) {
         last_update_nanos: i64::MIN,
         generation: u64::MAX,
         next_ordinal: u64::MAX,
+        live_rows: 0,
         accumulator_state: values.clone(),
         last_emitted: Some(values),
     };
@@ -132,6 +133,7 @@ fn complex_scalar_families_and_declared_metadata_round_trip() {
                 last_update_nanos: 0,
                 generation: 0,
                 next_ordinal: 0,
+                live_rows: 0,
                 accumulator_state: vec![value.clone()],
                 last_emitted: None,
             };
@@ -177,6 +179,7 @@ fn declared_output_identity_and_empty_presence_are_explicit() {
         last_update_nanos: 0,
         generation: 0,
         next_ordinal: 0,
+        live_rows: 0,
         accumulator_state: vec![ScalarValue::Int64(Some(1))],
         last_emitted: None,
     };
@@ -216,6 +219,7 @@ fn primitive_layout_size_and_corruption_have_bounded_failure() {
         last_update_nanos: 0,
         generation: 0,
         next_ordinal: 0,
+        live_rows: 0,
         accumulator_state: vec![
             ScalarValue::Int64(Some(7)),
             ScalarValue::Utf8(Some("ok".into())),
@@ -228,7 +232,7 @@ fn primitive_layout_size_and_corruption_have_bounded_failure() {
     for n in 0..bytes.len() {
         assert!(codec.decode(&bytes[..n], 8192).is_err());
     }
-    for (offset, value) in [(8, 2), (65, 0x80), (74, 255), (78, 255), (80, 2)] {
+    for (offset, value) in [(8, 2), (73, 0x80), (82, 255), (86, 255), (88, 2)] {
         let mut invalid = bytes.clone();
         invalid[offset] = value;
         assert!(
@@ -297,6 +301,7 @@ fn caller_owned_capacity_does_not_become_a_new_admission_limit() {
         last_update_nanos: 0,
         generation: 0,
         next_ordinal: 0,
+        live_rows: 0,
         accumulator_state: vec![ScalarValue::Utf8(Some(text))],
         last_emitted: None,
     };
@@ -403,6 +408,7 @@ fn complex_fixture(values: Vec<ScalarValue>) -> (GroupCodec, Vec<u8>, usize) {
         last_update_nanos: 0,
         generation: 0,
         next_ordinal: 0,
+        live_rows: 0,
         accumulator_state: values,
         last_emitted: None,
     };
@@ -536,6 +542,7 @@ fn calendar_reference_codec_is_schema_bound_initialized_and_fixed_size() {
         last_update_nanos: -1,
         generation: 4,
         next_ordinal: 9,
+        live_rows: 0,
         accumulator_state: vec![ScalarValue::Int64(Some(3))],
         last_emitted: None,
     };
@@ -579,6 +586,7 @@ fn calendar_reference_codec_rejects_malformed_and_honors_tighter_value_boundary(
         last_update_nanos: 0,
         generation: 0,
         next_ordinal: 0,
+        live_rows: 0,
         accumulator_state: vec![],
         last_emitted: None,
     };
@@ -604,12 +612,44 @@ fn calendar_reference_codec_rejects_malformed_and_honors_tighter_value_boundary(
         last_update_nanos: 0,
         generation: 0,
         next_ordinal: 0,
-        accumulator_state: vec![ScalarValue::Binary(Some(vec![7; 32665]))],
+        live_rows: 0,
+        accumulator_state: vec![ScalarValue::Binary(Some(vec![7; 32657]))],
         last_emitted: None,
     };
     assert_eq!(codec.encode(&group, 32768).unwrap().len(), 32768);
-    group.accumulator_state = vec![ScalarValue::Binary(Some(vec![7; 32666]))];
+    group.accumulator_state = vec![ScalarValue::Binary(Some(vec![7; 32658]))];
     assert!(codec.encode(&group, 32768).is_err());
     group.calendar_references = CalendarReferences::default();
     assert_eq!(plain.encode(&group, 32768).unwrap().len(), 32736);
+}
+
+#[test]
+fn calendar_bucket_and_contribution_membership_header_obeys_caps() {
+    let bucket = EncodedGroup {
+        calendar_references: CalendarReferences::default(),
+        last_update_nanos: 0,
+        generation: 1,
+        next_ordinal: 0,
+        live_rows: 0,
+        accumulator_state: vec![ScalarValue::Int64(Some(7))],
+        last_emitted: None,
+    };
+    assert_eq!(HEADER_BYTES, 73); // Previous fixed65-byte header plus membership8.
+    let encoded = encode_group(&bucket, 4096).unwrap();
+    assert_eq!(encoded.len(), 65 + 8 + 1 + 8);
+    assert!(encode_group(&bucket, encoded.len() - 1).is_err());
+    assert_eq!(
+        decode_group(&encoded, &[DataType::Int64], &[], 4096)
+            .unwrap()
+            .live_rows,
+        0
+    );
+    let contribution = encode_calendar_contribution(None, None, &[], 4096).unwrap();
+    assert!(encode_calendar_contribution(None, None, &[], contribution.len() - 1).is_err());
+    let mut invalid = contribution;
+    invalid[33..41].copy_from_slice(&1_u64.to_le_bytes());
+    assert!(decode_calendar_contribution(&invalid, &[], 4096).is_err());
+    let mut obsolete = encoded;
+    obsolete[7] = b'5';
+    assert!(decode_group(&obsolete, &[DataType::Int64], &[], 4096).is_err());
 }

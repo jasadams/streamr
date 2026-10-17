@@ -6,14 +6,15 @@ use sha2::{Digest, Sha256};
 #[path = "aggregate_codec_complex.rs"]
 mod complex;
 
-const MAGIC: &[u8; 8] = b"STRAGG05";
-const HEADER_BYTES: usize = 65;
+const MAGIC: &[u8; 8] = b"STRAGG06";
+const HEADER_BYTES: usize = 73;
 
 #[derive(Debug)]
 pub(crate) struct EncodedGroup {
     pub last_update_nanos: i64,
     pub generation: u64,
     pub next_ordinal: u64,
+    pub live_rows: u64,
     pub calendar_references: CalendarReferences,
     pub accumulator_state: Vec<ScalarValue>,
     pub last_emitted: Option<Vec<ScalarValue>>,
@@ -335,6 +336,7 @@ impl GroupCodec {
         output.extend_from_slice(&group.last_update_nanos.to_le_bytes());
         output.extend_from_slice(&group.generation.to_le_bytes());
         output.extend_from_slice(&group.next_ordinal.to_le_bytes());
+        output.extend_from_slice(&group.live_rows.to_le_bytes());
         output.extend_from_slice(&self.identity);
         output.extend_from_slice(&group.calendar_references.bytes);
         let bitmap_start = output.len();
@@ -380,6 +382,7 @@ impl GroupCodec {
         let last_update_nanos = i64::from_le_bytes(input.fixed()?);
         let generation = u64::from_le_bytes(input.fixed()?);
         let next_ordinal = u64::from_le_bytes(input.fixed()?);
+        let live_rows = u64::from_le_bytes(input.fixed()?);
         ensure!(
             input.take(32)? == self.identity,
             "aggregate state type changed"
@@ -399,7 +402,10 @@ impl GroupCodec {
         let containers = value_count
             .checked_mul(std::mem::size_of::<ScalarValue>())
             .context("aggregate vector size overflow")?;
-        let base = checked_add(checked_add(bytes.len(), containers)?, reference_bytes.len())?;
+        let base = checked_add(
+            checked_add(checked_add(bytes.len(), containers)?, reference_bytes.len())?,
+            std::mem::size_of::<u64>(),
+        )?;
         workspace(base, max_bytes)?;
         // First pass validates all direct lengths and counts owned payloads before allocation.
         let mut probe = Cursor { bytes: input.bytes };
@@ -464,6 +470,7 @@ impl GroupCodec {
             last_update_nanos,
             generation,
             next_ordinal,
+            live_rows,
             calendar_references,
             accumulator_state,
             last_emitted,
@@ -890,6 +897,7 @@ pub(crate) fn encode_calendar_contribution(
             last_update_nanos: 0,
             generation: 1,
             next_ordinal: 0,
+            live_rows: 0,
             accumulator_state: state,
             last_emitted: None,
         },
@@ -909,7 +917,10 @@ pub(crate) fn decode_calendar_contribution(
     types.extend_from_slice(argument_types);
     let group = decode_group(bytes, &types, &[], max_bytes)?;
     ensure!(
-        group.generation == 1 && group.next_ordinal == 0 && group.last_update_nanos == 0,
+        group.generation == 1
+            && group.next_ordinal == 0
+            && group.live_rows == 0
+            && group.last_update_nanos == 0,
         "invalid calendar contribution codec version"
     );
     let selected = match group.accumulator_state[0] {
@@ -1002,6 +1013,7 @@ mod tests {
             last_update_nanos: 1234,
             generation: 7,
             next_ordinal: 29,
+            live_rows: u64::MAX,
             accumulator_state: vec![ScalarValue::Int64(Some(12))],
             last_emitted: Some(vec![
                 ScalarValue::Utf8(Some("α".into())),
@@ -1024,6 +1036,7 @@ mod tests {
         assert_eq!(restored.last_update_nanos, original.last_update_nanos);
         assert_eq!(restored.generation, original.generation);
         assert_eq!(restored.next_ordinal, original.next_ordinal);
+        assert_eq!(restored.live_rows, original.live_rows);
         assert!(decode_group(&encoded, &[DataType::Utf8], &[], 8192).is_err());
     }
 
@@ -1040,6 +1053,7 @@ mod tests {
             last_update_nanos: -123456789,
             generation: u64::MAX,
             next_ordinal: 17,
+            live_rows: 0,
             accumulator_state: vec![
                 nested.clone(),
                 ScalarValue::Float64(Some(nan)),
@@ -1091,7 +1105,9 @@ mod tests {
             let mut trailing = encoded.clone();
             trailing.push(0);
             assert!(codec.decode(&trailing, 8192).is_err());
-            for offset in [0, 8, 33, 64, 65] {
+            // Magic, flags, both identity boundaries and the null bitmap.
+            // Membership bytes33..41 are valid arbitrary u64 data.
+            for offset in [0, 8, 41, HEADER_BYTES - 1, HEADER_BYTES] {
                 let mut corrupted = encoded.clone();
                 corrupted[offset] ^= 0xff;
                 assert!(
@@ -1123,6 +1139,7 @@ mod tests {
             last_update_nanos: 0,
             generation: 1,
             next_ordinal: 2,
+            live_rows: 0,
             accumulator_state: vec![value.clone()],
             last_emitted: Some(vec![value]),
         };
@@ -1140,6 +1157,7 @@ mod tests {
             last_update_nanos: 0,
             generation: 0,
             next_ordinal: 0,
+            live_rows: 0,
             accumulator_state: vec![],
             last_emitted: None,
         };

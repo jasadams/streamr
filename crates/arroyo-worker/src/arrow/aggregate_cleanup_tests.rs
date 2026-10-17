@@ -167,19 +167,15 @@ async fn cleanup_generations_restore_mid_page_on_both_backends() {
                         let mut decoded = operator.native_group_codec().unwrap()
                             .decode(&encoded_group, limits.value_bytes).unwrap();
                         decoded.generation = 3;
+                        decoded.live_rows = if tombstone { 0 } else { 2 };
                         let encoded_group = operator.native_group_codec().unwrap().encode(&decoded, limits.value_bytes).unwrap();
                         let group_key = native_group_key(b'G', &group).unwrap();
-                        let rows_key = native_live_rows_key(&group).unwrap();
                         scope.put(&group_key, &encoded_group).unwrap();
-                        let encoded_rows =
-                            if tombstone { 0u64 } else { 2u64 }.to_be_bytes().to_vec();
-                        scope.put(&rows_key, &encoded_rows).unwrap();
                         scope.commit().await.unwrap();
                         if tombstone {
-                            obsolete.extend([group_key, rows_key]);
+                            obsolete.push(group_key);
                         } else {
                             retained.push((group_key, encoded_group));
-                            retained.push((rows_key, encoded_rows));
                         }
                     }
                 }
@@ -227,13 +223,6 @@ async fn cleanup_generations_restore_mid_page_on_both_backends() {
                     assert!(
                         scope
                             .get(&native_group_key(b'G', &first_group).unwrap())
-                            .await
-                            .unwrap()
-                            .is_none()
-                    );
-                    assert!(
-                        scope
-                            .get(&native_live_rows_key(&first_group).unwrap())
                             .await
                             .unwrap()
                             .is_none()
