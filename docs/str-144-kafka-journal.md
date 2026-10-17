@@ -69,9 +69,62 @@ during preflight; no guard was bypassed.
 ```sh
 STREAMR_DEV_IMAGE=localhost/streamr-str127-dev:latest scripts/cargo-dev fmt --all
 STREAMR_DEV_IMAGE=localhost/streamr-str127-dev:latest scripts/cargo-dev test --locked -p arroyo-connectors --lib kafka::sink::recovery::tests
+STREAMR_DEV_IMAGE=localhost/streamr-str127-dev:latest scripts/cargo-dev check --locked -p arroyo-connectors
+STREAMR_DEV_IMAGE=localhost/streamr-str127-dev:latest scripts/preflight-clippy.sh -p arroyo-connectors
+scripts/build-pin --root /home/jason/qa-evidence/str144-kafka-journal-20261017/dev-pin --purpose 'STR-144 bounded oversized Kafka checkpoint journal and real process-loss recovery correctness' --ui-assets /home/jason/qa-evidence/str126-qualification-20261017/release-pin/source/webui/dist --image localhost/streamr-str127-dev:latest --expected-source e5e64cab9bff66ee21d2f39a047b18ee7e0671ac
+scripts/rust-build python3 /home/jason/qa-evidence/str144-kafka-journal-20261017/run-isolated.py --case /home/jason/qa-evidence/str144-kafka-journal-20261017/runtime3 --pin /home/jason/qa-evidence/str144-kafka-journal-20261017/dev-pin --legacy-pin /home/jason/qa-evidence/str126-qualification-20261017/release-pin --repo /home/jason/repos/streamr-worktrees/kafka-checkpoint-journal-20261017
 ```
 
-Formatting passed. Focused tests, normal check/strict Clippy, actual oversized
-Kafka checkpoint/process-loss proof, deployed-v2 restoration, independent final
-review, current-head CI and tested native-image publication are pending.
-Evidence: `/home/jason/qa-evidence/str144-kafka-journal-20261017/`.
+Formatting, locked connector check and strict Clippy passed. Focused recovery
+tests: 9 passed, 0 failed, including an encoded journal larger than1MiB, a small
+reference, missing/corrupt journals, identity/length/budget failures and deployed
+inline decoding. Independent core source and generic proof source reviews
+approved; all configured PR/push CI checks passed at implementation commit
+`2fce2231230a32d34a3b4fe15b77e6b5f688953b`.
+
+The maintained normal-dev pin passed with precompiled RocksDB. CLI SHA256:
+`b8f66928168e21507d6ccf95e756e4477991eb4dd55968e1514f13bbd6dd9faa`.
+Its frozen base is `e5e64cab` plus compiled diff SHA256
+`02001f5245ba611831d1929ace4e0f7db83ed98e176aba5486b6996ee949b3ce`;
+all compiled-source file hashes match the reviewed implementation commit exactly
+(`compiled-source-binding.json`). No source or test binary is mounted in the
+runtime container. The legacy qualified CLI SHA256 is
+`0e6078d2fe6f2a2c4279b4de3d7a8d6b5486b369b47a23a5c26dcd2bee363a36`.
+
+Actual public Kafka/native CLI case `runtime3` passed:
+
+- The old CLI paused before committing version-2 inline checkpoint2. The new
+  CLI restored the same persisted catalog/pipeline/job, replayed that specific
+  committing epoch and preserved the existing physical committed prefix.
+- Checkpoint3 persisted a 1,860,246-byte JSON replay journal for one620,000-byte
+  opaque string record. Its configured raw accounting was620,085 bytes, below
+  the unchanged8MiB budget. Commit RPC metadata was259 bytes. The proof reads
+  only the exact checkpoint's declared `i`/`j` files and checks generation,
+  epoch, transaction index, SHA256, length and full record values.
+- An actual worker SIGKILL at the before-commit pause forced generation2 to3.
+  The replacement restored/replayed that same checkpoint3. All four committed
+  output rows matched exactly; physical committed prefixes remained byte
+  identical and a genuinely fresh suffix was produced after recovery.
+- Owned process cleanup completed; private broker and network deletion exited0.
+  The container had a2GiB memory cap. Maximum sampled sum of owned process RSS
+  was354,775,040 bytes; this is diagnostic, not a measured peak, generic memory
+  qualification or throughput claim. This finite case does not fill the8MiB
+  raw budget or repeat the completed full engine capacity campaign.
+
+Failures retained: `runtime1` stopped before resource creation because a local
+broker repository alias was unavailable; `runtime2` correctly replayed deployed
+inline state but its log assertion expected an unquoted tracing value. Only the
+broker alias and log parser were corrected; Rust source and pinned CLI stayed
+fixed. Source binary hashing streams, avoiding a1.7GiB allocation in the test
+container. Old local sccache hash objects were reclaimed under the exclusive
+shared lock when disk crossed the build guard; no source, target executable or
+qualification evidence was deleted, and the old cleanup receipt was preserved.
+
+Evidence: `/home/jason/qa-evidence/str144-kafka-journal-20261017/`, including
+`runtime3/result.json`, `runtime3/durable-journal.json`, `runtime3/fault.json`,
+runtime logs, physical output snapshots, outer cleanup and source pin receipts.
+Final independent evidence review and documentation-head CI are in progress.
+Tested native-image publication and production rollout remain separate pending
+steps owned by the coordinating agent. Old images cannot read the new reference
+representation; this repair provides forward restoration of deployed v2 state,
+not rollback compatibility after new-format checkpoints are committed.
