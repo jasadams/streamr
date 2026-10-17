@@ -1,3 +1,10 @@
+## Native demo packaging — 2026-10-17
+
+- User authorized demo deployment after merging the generic UDF repair. Fresh fetched base `3ea6a673c7bb0b5e38aa154d154848c6143d16b0`; branch `agent/native-demo-image-20261017`; current AGENTS/build/team/ledger read. Unrelated checkouts preserved.
+- Add a generic native image target using the maintained Docker builder and a fork-only manual CI publication path. Keep Rust toolchain and local source paths needed by the existing public UDF compiler. No application behavior, engine semantics or state scans change.
+- Rust `1.96.0-bookworm` registry index independently resolved through Podman and Skopeo to `sha256:5e2214abe154fe26e39f64488952e5c991eeed1d6d6da7cc8381ae83927f0cfc`. Native build uses the existing release Docker path and its source-built RocksDB, two Cargo jobs; no local native build or repeated capacity campaign.
+- Acceptance: independent source review, workflow/script checks, CI-built source-labelled image with actual public UDF validation and saved cdylib before publication. CI build/publication and demo deployment remain pending; deployment is owned by the coordinating agent.
+
 ## STR-143 existing Rust UDF export repair — 2026-10-17
 
 - Fresh fetched base `ad0a4814d5b7c07d74dce54753f5e6e9aaa7a062`; branch `agent/str-143-udf-unsafe-export-20261017`. Read current AGENTS/build/team/ledger/work-plan; original dirty checkout preserved.
