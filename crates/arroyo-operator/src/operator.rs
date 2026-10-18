@@ -986,17 +986,36 @@ async fn operator_run_behavior(
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     let mut shutdown_after_commit = false;
+    let mut restore_commit_epoch = this
+        .operator
+        .is_committing()
+        .then_some(this.context.restore_commit_epoch)
+        .flatten();
 
     loop {
-        let operator_future: OptionFuture<_> = this.future_to_poll().into();
+        let operator_future: OptionFuture<_> = if restore_commit_epoch.is_none() {
+            this.future_to_poll()
+        } else {
+            None
+        }
+        .into();
         tokio::select! {
             Some(control_message) = control_rx.recv() => {
+                if let (Some(expected), ControlMessage::Commit { epoch, .. }) =
+                    (restore_commit_epoch, &control_message)
+                    && expected != *epoch {
+                    return Err(anyhow!("restore commit epoch mismatch: expected {expected}, received {epoch}").into());
+                }
                 if this.handle_controller_message(&control_message, shutdown_after_commit).await? {
                     break;
                 }
+                if matches!(control_message, ControlMessage::Commit { .. }) {
+                    restore_commit_epoch = None;
+                    this.context.restore_commit_epoch = None;
+                }
             }
 
-            p = sel.next(), if !shutdown_after_commit => {
+            p = sel.next(), if !shutdown_after_commit && restore_commit_epoch.is_none() => {
                 match p {
                     Some(((idx, message), s)) => {
                         let local_idx = idx;
@@ -1059,12 +1078,15 @@ async fn operator_run_behavior(
                     }
                 }
             }
-            Some(val) = operator_future => {
+            Some(val) = operator_future, if restore_commit_epoch.is_none() => {
                 this.handle_future_result(val.0, val.1, collector).await?;
             }
-            _ = interval.tick() => {
+            _ = interval.tick(), if restore_commit_epoch.is_none() => {
                 this.handle_tick(ticks, collector).await?;
                 ticks += 1;
+            }
+            else => {
+                return Err(anyhow!("operator control channel closed before restored commit").into());
             }
         }
     }

@@ -27,6 +27,34 @@ pub use arroyo_rpc::worker_types::{RunningMessage, TaskFailedEvent, WorkerContex
 
 pub mod job_metrics;
 
+/// Debug-build fault gate after durable checkpoint commit authorization and
+/// before dispatch. It leaves operator tasks free to populate the next native
+/// transaction, so recovery can prove abandonment/fencing of real broker data.
+pub(crate) async fn checkpoint_dispatch_test_pause(job_id: &str, epoch: u64, protocol: &str) {
+    #[cfg(debug_assertions)]
+    {
+        let Ok(directory) = std::env::var("STREAMR_TEST_KAFKA_DISPATCH_FAULT_DIR") else {
+            return;
+        };
+        let path = std::path::Path::new(&directory).join(format!("dispatch-{job_id}"));
+        if path.exists() {
+            warn!(
+                job_id,
+                epoch,
+                protocol,
+                coordinator_pid = std::process::id(),
+                point = "dispatch",
+                "Kafka commit dispatch fault pause"
+            );
+            while path.exists() {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+    }
+    #[cfg(not(debug_assertions))]
+    let _ = (job_id, epoch, protocol);
+}
+
 pub const CHECKPOINTS_TO_KEEP: u64 = 10;
 pub const COMPACT_EVERY: u64 = 2;
 

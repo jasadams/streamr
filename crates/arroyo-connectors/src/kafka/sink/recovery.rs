@@ -1,4 +1,4 @@
-//! Bounded checkpoint replay with an atomic Kafka commit marker.
+//! Compact prepared-transaction recovery with an atomic Kafka marker.
 use super::super::{Context, FutureProducer};
 use anyhow::{Result, anyhow, ensure};
 use rdkafka::admin::{AdminClient, AdminOptions, ResourceSpecifier};
@@ -7,27 +7,16 @@ use rdkafka::error::KafkaError;
 use rdkafka::producer::{FutureRecord, Producer};
 use rdkafka::{ClientConfig, Message, Offset, TopicPartitionList};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::time::{Duration, Instant};
+
+pub const PROTOCOL_VERSION: u32 = 4;
+pub const MAX_METADATA_BYTES: usize = 4096;
+pub const DEFAULT_QUEUE_KBYTES: usize = 8192;
+pub const MAX_DELIVERY_FUTURES: usize = 1024;
 
 pub fn require(condition: bool, message: &str) -> Result<()> {
     ensure!(condition, "{message}");
     Ok(())
-}
-
-pub const PROTOCOL_VERSION: u32 = 2;
-pub const DEFAULT_MAX_BYTES: usize = 8 * 1024 * 1024;
-// CommitRequest uses tonic's bounded message transport. Keep a single-subtask
-// journal comfortably below its 4 MiB frame; aggregate sizing is a separate gate.
-pub const MAX_COMMIT_METADATA_BYTES: usize = 1024 * 1024;
-const REFERENCE_VERSION: u32 = 3;
-const MAX_REFERENCE_BYTES: usize = 4096;
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct ReplayRecord {
-    pub timestamp: Option<i64>,
-    pub key: Option<Vec<u8>>,
-    pub payload: Vec<u8>,
-    pub partition: i32,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -44,17 +33,8 @@ pub struct PendingCommit {
     pub generation: String,
     pub epoch: u32,
     pub transaction_index: usize,
-    pub records: Vec<ReplayRecord>,
-}
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct JournalReference {
-    version: u32,
-    generation: String,
-    epoch: u32,
-    transaction_index: usize,
-    journal_bytes: u64,
-    journal_sha256: [u8; 32],
+    pub producer_id: i64,
+    pub producer_epoch: i16,
 }
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -66,11 +46,10 @@ struct Marker {
 
 pub fn decode_state(bytes: &[u8]) -> Result<RecoveryState> {
     ensure!(
-        bytes.len() <= 4096,
+        bytes.len() <= MAX_METADATA_BYTES,
         "Kafka recovery state exceeds bounded size"
     );
-    let state: RecoveryState = serde_json::from_slice(bytes)
-        .map_err(|e| anyhow!("Unsupported legacy/corrupt Kafka checkpoint: {e}"))?;
+    let state: RecoveryState = serde_json::from_slice(bytes)?;
     ensure!(
         state.version == PROTOCOL_VERSION
             && !state.generation.is_empty()
@@ -80,7 +59,27 @@ pub fn decode_state(bytes: &[u8]) -> Result<RecoveryState> {
     );
     Ok(state)
 }
-
+pub fn decode_pending(bytes: &[u8], epoch: u32) -> Result<PendingCommit> {
+    ensure!(
+        bytes.len() <= MAX_METADATA_BYTES,
+        "Kafka transaction metadata exceeds bounded size"
+    );
+    let pending: PendingCommit = serde_json::from_slice(bytes)?;
+    ensure!(
+        pending.version == PROTOCOL_VERSION
+            && pending.epoch == epoch
+            && !pending.generation.is_empty()
+            && pending.producer_id >= 0
+            && pending.producer_epoch >= 0,
+        "Invalid Kafka prepared transaction identity"
+    );
+    Ok(pending)
+}
+pub fn encode_pending(pending: &PendingCommit) -> Result<Vec<u8>> {
+    let bytes = serde_json::to_vec(pending)?;
+    decode_pending(&bytes, pending.epoch)?;
+    Ok(bytes)
+}
 pub fn validate_marker_epoch(marker_epoch: u32, checkpoint_epoch: u32) -> Result<()> {
     ensure!(
         marker_epoch <= checkpoint_epoch,
@@ -89,148 +88,45 @@ pub fn validate_marker_epoch(marker_epoch: u32, checkpoint_epoch: u32) -> Result
     Ok(())
 }
 
-pub fn check_budget(used: usize, record: &ReplayRecord, max: usize) -> Result<usize> {
-    check_record_budget(
-        used,
-        record.payload.len(),
-        record.key.as_ref().map_or(0, Vec::len),
-        max,
-    )
-}
-pub fn check_record_budget(
-    used: usize,
-    payload_bytes: usize,
-    key_bytes: usize,
-    max: usize,
-) -> Result<usize> {
-    let bytes = payload_bytes
-        .checked_add(key_bytes)
-        .and_then(|n| n.checked_add(64))
-        .ok_or_else(|| anyhow!("Kafka replay journal size overflow"))?;
-    let next = used
-        .checked_add(bytes)
-        .ok_or_else(|| anyhow!("Kafka replay journal size overflow"))?;
-    ensure!(
-        next <= max,
-        "Kafka checkpoint replay journal exceeds sink.recovery_max_bytes ({max}); reduce checkpoint interval or increase the explicit bounded budget"
-    );
-    Ok(next)
-}
-pub fn decode_pending(bytes: &[u8], epoch: u32, max: usize) -> Result<PendingCommit> {
-    // JSON byte arrays can expand by up to four times; bound before deserialization.
-    ensure!(
-        bytes.len() <= MAX_COMMIT_METADATA_BYTES
-            && bytes.len() <= max.saturating_mul(5).saturating_add(4096),
-        "Kafka replay metadata exceeds configured budget"
-    );
-    decode_journal(bytes, epoch, max)
-}
-
-fn encoded_journal_limit(max: usize) -> usize {
-    max.saturating_mul(5).saturating_add(4096)
-}
-
-fn validate_pending(pending: &PendingCommit, epoch: u32, max: usize) -> Result<()> {
-    ensure!(
-        pending.version == PROTOCOL_VERSION
-            && pending.epoch == epoch
-            && !pending.generation.is_empty(),
-        "Kafka replay checkpoint identity/version mismatch"
-    );
-    let mut used = 0;
-    for record in &pending.records {
-        ensure!(record.partition >= 0, "Kafka replay partition missing");
-        used = check_budget(used, record, max)?;
+fn native_result(error: *mut rdkafka::bindings::rd_kafka_error_t) -> Result<()> {
+    if error.is_null() {
+        return Ok(());
     }
-    Ok(())
+    // SAFETY: the native API transfers one owned error, whose string remains
+    // valid until destruction. No private native layout is accessed.
+    unsafe {
+        let message = std::ffi::CStr::from_ptr(rdkafka::bindings::rd_kafka_error_string(error))
+            .to_string_lossy()
+            .into_owned();
+        rdkafka::bindings::rd_kafka_error_destroy(error);
+        Err(anyhow!("Kafka prepared transaction API: {message}"))
+    }
 }
-
-fn decode_journal(bytes: &[u8], epoch: u32, max: usize) -> Result<PendingCommit> {
-    // Preserve the configured raw budget while bounding JSON byte-array expansion
-    // before deserialization. Journals live in checkpoint files, not RPC metadata.
-    ensure!(
-        bytes.len() <= encoded_journal_limit(max),
-        "Kafka replay journal exceeds configured encoded budget"
-    );
-    let pending: PendingCommit = serde_json::from_slice(bytes)
-        .map_err(|e| anyhow!("Unsupported legacy/corrupt Kafka committing checkpoint: {e}"))?;
-    validate_pending(&pending, epoch, max)?;
-    Ok(pending)
-}
-
-/// All new checkpoints persist the journal in an ordinary checkpoint table and
-/// send only this small reference through controller commit RPCs.
-pub fn encode_pending(pending: &PendingCommit, max: usize) -> Result<(Vec<u8>, Vec<u8>)> {
-    validate_pending(pending, pending.epoch, max)?;
-    let journal = serde_json::to_vec(pending)?;
-    ensure!(
-        journal.len() <= encoded_journal_limit(max),
-        "Kafka replay journal exceeds configured encoded budget"
-    );
-    let reference = serde_json::to_vec(&JournalReference {
-        version: REFERENCE_VERSION,
-        generation: pending.generation.clone(),
-        epoch: pending.epoch,
-        transaction_index: pending.transaction_index,
-        journal_bytes: u64::try_from(journal.len())?,
-        journal_sha256: Sha256::digest(&journal).into(),
+pub fn prepare(producer: &FutureProducer) -> Result<(i64, i16)> {
+    let mut id = -1;
+    let mut epoch = -1;
+    // SAFETY: producer owns the live native handle; output references are valid
+    // for the synchronous API call, which seals and flushes before exporting.
+    native_result(unsafe {
+        rdkafka::bindings::rd_kafka_streamr_prepare_transaction(
+            producer.client().native_ptr(),
+            &mut id,
+            &mut epoch,
+            10_000,
+        )
     })?;
-    ensure!(
-        reference.len() <= MAX_REFERENCE_BYTES,
-        "Kafka journal reference exceeds bounded size"
-    );
-    Ok((journal, reference))
+    Ok((id, epoch))
 }
-
-pub fn decode_commit(
-    bytes: &[u8],
-    journal: Option<&[u8]>,
-    epoch: u32,
-    max: usize,
-) -> Result<PendingCommit> {
-    ensure!(
-        bytes.len() <= MAX_COMMIT_METADATA_BYTES,
-        "Kafka commit metadata exceeds bounded size"
-    );
-    #[derive(Deserialize)]
-    struct Version {
-        version: u32,
-    }
-    let version: Version = serde_json::from_slice(bytes)?;
-    if version.version == PROTOCOL_VERSION {
-        // Read deployed v2 in-flight checkpoints; new writes always use references.
-        return decode_pending(bytes, epoch, max);
-    }
-    ensure!(
-        version.version == REFERENCE_VERSION && bytes.len() <= MAX_REFERENCE_BYTES,
-        "Unsupported/oversized Kafka journal reference"
-    );
-    let reference: JournalReference = serde_json::from_slice(bytes)?;
-    ensure!(
-        reference.epoch == epoch && !reference.generation.is_empty(),
-        "Kafka journal reference identity mismatch"
-    );
-    let journal =
-        journal.ok_or_else(|| anyhow!("Selected checkpoint is missing Kafka replay journal"))?;
-    ensure!(
-        journal.len() <= encoded_journal_limit(max),
-        "Kafka replay journal exceeds configured encoded budget"
-    );
-    ensure!(
-        u64::try_from(journal.len())? == reference.journal_bytes,
-        "Kafka replay journal length mismatch"
-    );
-    ensure!(
-        <[u8; 32]>::from(Sha256::digest(journal)) == reference.journal_sha256,
-        "Kafka replay journal hash mismatch"
-    );
-    let pending = decode_journal(journal, epoch, max)?;
-    ensure!(
-        pending.generation == reference.generation
-            && pending.transaction_index == reference.transaction_index,
-        "Kafka replay journal/reference identity mismatch"
-    );
-    Ok(pending)
+pub fn resume(producer: &FutureProducer, pending: &PendingCommit) -> Result<()> {
+    // SAFETY: this API accepts only a fresh uninitialized native producer and
+    // installs a commit-only identity under the native main-thread lock.
+    native_result(unsafe {
+        rdkafka::bindings::rd_kafka_streamr_resume_commit(
+            producer.client().native_ptr(),
+            pending.producer_id,
+            pending.producer_epoch,
+        )
+    })
 }
 pub fn retry_transaction(
     mut op: impl FnMut() -> std::result::Result<(), KafkaError>,
@@ -384,25 +280,6 @@ pub async fn scan_marker(
     );
     Ok(marker.epoch)
 }
-pub async fn replay(producer: &FutureProducer, topic: &str, pending: &PendingCommit) -> Result<()> {
-    producer.begin_transaction()?;
-    for r in &pending.records {
-        let mut record = FutureRecord::<Vec<u8>, Vec<u8>>::to(topic)
-            .payload(&r.payload)
-            .partition(r.partition);
-        if let Some(key) = &r.key {
-            record = record.key(key);
-        }
-        if let Some(ts) = r.timestamp {
-            record = record.timestamp(ts);
-        }
-        producer
-            .send(record, Duration::from_secs(10))
-            .await
-            .map_err(|(e, _)| anyhow!("Kafka replay delivery failed: {e}"))?;
-    }
-    Ok(())
-}
 pub async fn fault_pause(job_id: &str, epoch: u32, point: &str, nonempty: bool) {
     if !nonempty {
         return;
@@ -421,71 +298,32 @@ pub async fn fault_pause(job_id: &str, epoch: u32, point: &str, nonempty: bool) 
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn record() -> ReplayRecord {
-        ReplayRecord {
-            timestamp: Some(123),
-            key: Some(vec![0, 255]),
-            payload: vec![1, 2, 3],
-            partition: 2,
-        }
-    }
-    #[test]
-    fn budget_rejects_before_publish() {
-        assert_eq!(check_budget(0, &record(), 69).unwrap(), 69);
-        assert!(check_budget(1, &record(), 69).is_err());
-        assert!(check_budget(usize::MAX, &record(), usize::MAX).is_err());
-        assert!(check_record_budget(0, usize::MAX, 0, usize::MAX).is_err());
-    }
-    #[test]
-    fn replay_preserves_wire_record() {
-        let p = PendingCommit {
+    fn pending() -> PendingCommit {
+        PendingCommit {
             version: PROTOCOL_VERSION,
             generation: "g".into(),
             epoch: 9,
             transaction_index: 4,
-            records: vec![record()],
-        };
-        let bytes = serde_json::to_vec(&p).unwrap();
-        let decoded = decode_pending(&bytes, 9, 100).unwrap();
-        assert_eq!(decoded.records, p.records);
-        assert!(decode_pending(&bytes, 8, 100).is_err());
-        assert!(decode_pending(&bytes, 9, 68).is_err());
+            producer_id: 123,
+            producer_epoch: 2,
+        }
     }
     #[test]
-    fn state_requires_generation_and_epoch() {
-        let state = RecoveryState {
-            version: PROTOCOL_VERSION,
-            generation: "g".into(),
-            next_transaction_index: 2,
-            checkpoint_epoch: 4,
-        };
-        assert_eq!(
-            decode_state(&serde_json::to_vec(&state).unwrap())
-                .unwrap()
-                .checkpoint_epoch,
-            4
-        );
+    fn compact_transaction_metadata_validates_identity() {
+        let p = pending();
+        let bytes = encode_pending(&p).unwrap();
+        assert!(bytes.len() < 256);
+        assert_eq!(decode_pending(&bytes, 9).unwrap().producer_id, 123);
+        assert!(decode_pending(&bytes, 8).is_err());
         assert!(
-            decode_state(br#"{"version":1,"generation":"g","next_transaction_index":2}"#).is_err()
-        );
-        assert!(decode_state(b"2").is_err());
-        let empty = RecoveryState {
-            generation: String::new(),
-            ..state
-        };
-        assert!(decode_state(&serde_json::to_vec(&empty).unwrap()).is_err());
-    }
-    #[test]
-    fn terminal_transaction_error_is_not_retried() {
-        let mut calls = 0;
-        assert!(
-            retry_transaction(|| {
-                calls += 1;
-                Err(KafkaError::ClientCreation("fatal".into()))
+            encode_pending(&PendingCommit {
+                producer_id: -1,
+                ..p
             })
             .is_err()
         );
-        assert_eq!(calls, 1);
+        assert!(decode_pending(&vec![0; MAX_METADATA_BYTES + 1], 9).is_err());
+        assert!(decode_pending(br#"{"version":2,"records":[]}"#, 9).is_err());
     }
     #[test]
     fn rollback_is_rejected() {
@@ -494,93 +332,227 @@ mod tests {
         assert!(validate_marker_epoch(8, 9).is_ok());
     }
     #[test]
-    fn legacy_checkpoint_fails_closed() {
-        assert!(decode_pending(&[1, 2, 3], 1, 100).is_err());
-    }
-    #[test]
-    fn large_journal_uses_small_checkpoint_commit_reference() {
-        let pending = PendingCommit {
+    fn state_requires_generation_and_index() {
+        let state = RecoveryState {
             version: PROTOCOL_VERSION,
             generation: "g".into(),
-            epoch: 1,
-            transaction_index: 1,
-            records: vec![ReplayRecord {
-                payload: vec![255; MAX_COMMIT_METADATA_BYTES / 4],
-                ..record()
-            }],
+            next_transaction_index: 2,
+            checkpoint_epoch: 4,
         };
-        let (journal, reference) = encode_pending(&pending, DEFAULT_MAX_BYTES).unwrap();
-        assert!(journal.len() > MAX_COMMIT_METADATA_BYTES);
-        assert!(reference.len() < MAX_REFERENCE_BYTES);
-        assert_eq!(
-            decode_commit(&reference, Some(&journal), 1, DEFAULT_MAX_BYTES)
-                .unwrap()
-                .records,
-            pending.records
-        );
-        assert!(decode_commit(&reference, None, 1, DEFAULT_MAX_BYTES).is_err());
-        let mut corrupted = journal.clone();
-        *corrupted.last_mut().unwrap() ^= 1;
-        assert!(decode_commit(&reference, Some(&corrupted), 1, DEFAULT_MAX_BYTES).is_err());
-        assert!(decode_commit(&reference, Some(&journal), 2, DEFAULT_MAX_BYTES).is_err());
-        assert!(decode_commit(&reference, Some(&journal), 1, 100).is_err());
+        assert!(decode_state(&serde_json::to_vec(&state).unwrap()).is_ok());
         assert!(
-            decode_pending(
-                &vec![0; MAX_COMMIT_METADATA_BYTES + 1],
-                1,
-                DEFAULT_MAX_BYTES
+            decode_state(
+                &serde_json::to_vec(&RecoveryState {
+                    next_transaction_index: 0,
+                    ..state
+                })
+                .unwrap()
             )
             .is_err()
         );
     }
-    #[test]
-    fn journal_reference_rejects_wrong_length_generation_and_transaction() {
-        let pending = PendingCommit {
-            version: PROTOCOL_VERSION,
-            generation: "g".into(),
-            epoch: 9,
-            transaction_index: 4,
-            records: vec![record()],
-        };
-        let (journal, bytes) = encode_pending(&pending, 100).unwrap();
-        for field in ["journal_bytes", "generation", "transaction_index"] {
-            let mut reference: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-            reference[field] = match field {
-                "generation" => "other".into(),
-                _ => 999.into(),
-            };
-            assert!(
-                decode_commit(
-                    &serde_json::to_vec(&reference).unwrap(),
-                    Some(&journal),
-                    9,
-                    100
+    #[tokio::test]
+    async fn native_resume_rejects_invalid_identity_and_reuse_without_broker() {
+        let producer: FutureProducer = ClientConfig::new()
+            .set("transactional.id", "native-resume-unit")
+            .create_with_context(Context::new(None))
+            .unwrap();
+        assert!(prepare(&producer).is_err());
+        let nontransactional: FutureProducer = ClientConfig::new()
+            .create_with_context(Context::new(None))
+            .unwrap();
+        assert!(resume(&nontransactional, &pending()).is_err());
+        assert!(
+            resume(
+                &producer,
+                &PendingCommit {
+                    producer_epoch: -1,
+                    ..pending()
+                }
+            )
+            .is_err()
+        );
+        assert!(
+            resume(
+                &producer,
+                &PendingCommit {
+                    producer_id: -1,
+                    ..pending()
+                }
+            )
+            .is_err()
+        );
+        resume(&producer, &pending()).unwrap();
+        assert!(resume(&producer, &pending()).is_err());
+        assert!(producer.begin_transaction().is_err());
+        assert!(
+            producer
+                .init_transactions(Duration::from_millis(10))
+                .is_err()
+        );
+        assert!(
+            producer
+                .abort_transaction(Duration::from_millis(10))
+                .is_err()
+        );
+        let send =
+            producer.send_result(FutureRecord::<str, str>::to("test").payload("must-not-send"));
+        assert!(send.is_err());
+    }
+    #[tokio::test]
+    async fn native_prepared_resume_remains_commit_only_after_abortable_error() {
+        use rdkafka::mocking::MockCluster;
+        use rdkafka::types::{RDKafkaApiKey, RDKafkaRespErr};
+        let cluster = MockCluster::new(1).unwrap();
+        cluster.create_topic("prepared-contract", 1, 1).unwrap();
+        let mut config = ClientConfig::new();
+        config
+            .set("bootstrap.servers", cluster.bootstrap_servers())
+            .set("transactional.id", "prepared-contract-transaction");
+        let original: FutureProducer = config.create_with_context(Context::new(None)).unwrap();
+        original.init_transactions(Duration::from_secs(5)).unwrap();
+        original.begin_transaction().unwrap();
+        original
+            .send(
+                FutureRecord::<str, str>::to("prepared-contract")
+                    .payload("durable-before-prepare")
+                    .partition(0),
+                Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
+        let (producer_id, producer_epoch) = prepare(&original).unwrap();
+        assert!(
+            original
+                .send_result(
+                    FutureRecord::<str, str>::to("prepared-contract")
+                        .payload("forbidden-after-prepare")
                 )
                 .is_err()
-            );
-        }
-        assert!(encode_pending(&pending, 68).is_err());
-        assert!(
-            decode_journal(&vec![0; 5000], 9, 1)
-                .unwrap_err()
-                .to_string()
-                .contains("encoded budget")
         );
-        assert!(decode_commit(br#"{"version":99}"#, Some(&journal), 9, 100).is_err());
-    }
-    #[test]
-    fn deployed_inline_v2_commit_requires_no_new_journal_table_value() {
-        let pending = PendingCommit {
-            version: PROTOCOL_VERSION,
-            generation: "deployed".into(),
-            epoch: 9,
-            transaction_index: 4,
-            records: vec![record()],
-        };
-        let inline = serde_json::to_vec(&pending).unwrap();
+        let recovered: FutureProducer = config.create_with_context(Context::new(None)).unwrap();
+        resume(
+            &recovered,
+            &PendingCommit {
+                producer_id,
+                producer_epoch,
+                ..pending()
+            },
+        )
+        .unwrap();
+        cluster.request_errors(
+            RDKafkaApiKey::EndTxn,
+            &[RDKafkaRespErr::RD_KAFKA_RESP_ERR_UNKNOWN_PRODUCER_ID],
+        );
+        // Resume installs identity locally; native coordinator discovery can
+        // still be in progress. Exercise the same bounded retry policy used by
+        // recovery, then require the injected non-retriable broker error.
+        let mut attempts = Vec::new();
+        let result = retry_transaction(|| {
+            let result = recovered.commit_transaction(Duration::from_secs(5));
+            if let Err(error) = &result {
+                attempts.push(error.clone());
+            }
+            result
+        });
+        eprintln!("prepared commit native error attempts: {attempts:?}");
+        assert!(result.is_err(), "injected EndTxn error must be observed");
+        let error = attempts.last().expect("native commit must fail");
         assert_eq!(
-            decode_commit(&inline, None, 9, 100).unwrap().records,
-            pending.records
+            error.rdkafka_error_code(),
+            Some(rdkafka::error::RDKafkaErrorCode::UnknownProducerId),
+            "expected injected EndTxn error, got {attempts:?}"
         );
+        assert!(
+            matches!(error, KafkaError::Transaction(e) if e.txn_requires_abort()),
+            "expected abortable error after coordinator discovery, got {attempts:?}"
+        );
+        let abort = recovered
+            .abort_transaction(Duration::from_secs(5))
+            .unwrap_err();
+        assert_eq!(
+            abort.rdkafka_error_code(),
+            Some(rdkafka::error::RDKafkaErrorCode::State)
+        );
+        assert!(recovered.begin_transaction().is_err());
+        assert!(
+            recovered
+                .send_result(
+                    FutureRecord::<str, str>::to("prepared-contract")
+                        .payload("forbidden-after-error")
+                )
+                .is_err()
+        );
+    }
+    #[tokio::test]
+    async fn native_prepared_resume_waits_for_coordinator_with_existing_api_timeout() {
+        use rdkafka::mocking::MockCluster;
+        use std::time::Instant;
+
+        // Each fresh client must discover and connect its own coordinator.
+        // Mock broker latency exceeds the former six 100 ms caller retries.
+        for scenario in ["single-call", "timeout-resume", "destroy-waiting"] {
+            let cluster = MockCluster::new(1).unwrap();
+            cluster.create_topic("delayed-prepared", 1, 1).unwrap();
+            let mut config = ClientConfig::new();
+            config
+                .set("bootstrap.servers", cluster.bootstrap_servers())
+                .set("transactional.id", format!("delayed-{scenario}"));
+            let original: FutureProducer = config.create_with_context(Context::new(None)).unwrap();
+            original.init_transactions(Duration::from_secs(5)).unwrap();
+            original.begin_transaction().unwrap();
+            original
+                .send(
+                    FutureRecord::<str, str>::to("delayed-prepared")
+                        .payload("prepared-before-delay")
+                        .partition(0),
+                    Duration::from_secs(5),
+                )
+                .await
+                .unwrap();
+            let (producer_id, producer_epoch) = prepare(&original).unwrap();
+            cluster
+                .broker_round_trip_time(1, Duration::from_millis(1000))
+                .unwrap();
+            let recovered: FutureProducer = config.create_with_context(Context::new(None)).unwrap();
+            resume(
+                &recovered,
+                &PendingCommit {
+                    producer_id,
+                    producer_epoch,
+                    ..pending()
+                },
+            )
+            .unwrap();
+            let started = Instant::now();
+            if scenario == "single-call" {
+                // No application retries: native readiness must honor this call.
+                recovered
+                    .commit_transaction(Duration::from_secs(10))
+                    .unwrap();
+                assert!(started.elapsed() >= Duration::from_millis(1000));
+            } else {
+                let error = recovered
+                    .commit_transaction(Duration::from_millis(50))
+                    .unwrap_err();
+                assert_eq!(
+                    error.rdkafka_error_code(),
+                    Some(rdkafka::error::RDKafkaErrorCode::OperationTimedOut),
+                    "{scenario}: {error:?}"
+                );
+                assert!(matches!(error, KafkaError::Transaction(ref e) if e.is_retriable()));
+                assert!(recovered.begin_transaction().is_err());
+                if scenario == "timeout-resume" {
+                    recovered
+                        .commit_transaction(Duration::from_secs(10))
+                        .unwrap();
+                } else {
+                    // Pending readiness owns no extra reference or detached task.
+                    let dropping = Instant::now();
+                    drop(recovered);
+                    assert!(dropping.elapsed() < Duration::from_secs(5));
+                }
+            }
+        }
     }
 }

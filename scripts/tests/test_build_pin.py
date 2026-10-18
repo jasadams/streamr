@@ -74,6 +74,36 @@ class FreezeTests(unittest.TestCase):
                 self.assertEqual((source / name).read_text(), override.read_text())
                 self.assertTrue(pin.compiled(name))
 
+    def test_vendored_native_edit_changes_compiled_inventory_and_diff(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = root / "repo"
+            native = repo / "vendor/rdkafka-sys/librdkafka/src/rdkafka_txnmgr.c"
+            native.parent.mkdir(parents=True)
+            native.write_text("before native transaction API\n")
+            docs = repo / "docs/status.md"
+            docs.parent.mkdir()
+            docs.write_text("receipt before\n")
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+            subprocess.run(["git", "-C", str(repo), "-c", "user.name=Pin test", "-c",
+                            "user.email=pin-test@example.invalid", "commit", "-qm", "baseline"], check=True)
+            assets = root / "assets"
+            assets.mkdir()
+            (assets / "index.html").write_text("unit fixture built UI")
+            before = pin.freeze(repo, root / "before", assets)
+            native.write_text("after native transaction API\n")
+            docs.write_text("receipt after\n")
+            after = pin.freeze(repo, root / "after", assets)
+            name = str(native.relative_to(repo))
+            compiled_after = {n: h for n, h in after.items() if pin.compiled(n)}
+            self.assertIn(name, compiled_after)
+            self.assertNotEqual(before[name], compiled_after[name])
+            difference = pin.compiled_diff(repo).decode()
+            self.assertIn(name, difference)
+            self.assertIn("+after native transaction API", difference)
+            self.assertNotIn("docs/status.md", difference)
+
     def test_compiled_inventory_excludes_receipt_only_script_edits(self):
         self.assertTrue(pin.compiled("crates/arroyo-state/src/lib.rs"))
         self.assertTrue(pin.compiled("Cargo.lock"))

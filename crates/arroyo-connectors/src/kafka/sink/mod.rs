@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
 use tracing::warn;
 pub(crate) mod recovery;
-use recovery::{PendingCommit, RecoveryState, ReplayRecord};
+use recovery::{PendingCommit, RecoveryState};
 
 use rdkafka::producer::{DeliveryFuture, FutureRecord, Producer};
 use rdkafka::util::Timeout;
@@ -48,10 +48,7 @@ pub struct KafkaSinkFunc {
     pub context: Context,
     pub serializer: ArrowSerializer,
     pub recovery_topic: Option<String>,
-    pub recovery_max_bytes: usize,
     pub recovery_state: Option<RecoveryState>,
-    pub journal: Vec<ReplayRecord>,
-    pub journal_bytes: usize,
 }
 
 pub enum ConsistencyMode {
@@ -134,26 +131,37 @@ impl KafkaSinkFunc {
 
     fn producer_config(&self) -> ClientConfig {
         let mut config = ClientConfig::new();
-        config.set("bootstrap.servers", &self.bootstrap_servers);
+        config
+            .set("bootstrap.servers", &self.bootstrap_servers)
+            .set(
+                "queue.buffering.max.kbytes",
+                recovery::DEFAULT_QUEUE_KBYTES.to_string(),
+            );
         for (key, value) in &self.client_config {
             config.set(key, value);
         }
         config
     }
-    fn transaction_producer(&self, task: &TaskInfo, index: usize) -> Result<FutureProducer> {
+    fn transactional_id(&self, task: &TaskInfo, index: usize) -> String {
+        format!(
+            "streamr-v4-id-{}-{}-{}-{}-{}",
+            task.job_id,
+            task.operator_id,
+            self.topic,
+            task.task_index,
+            index % 2
+        )
+    }
+    fn transaction_client(&self, task: &TaskInfo, index: usize) -> Result<FutureProducer> {
         let mut config = self.producer_config();
-        config.set("enable.idempotence", "true").set(
-            "transactional.id",
-            format!(
-                "streamr-v2-id-{}-{}-{}-{}-{}",
-                task.job_id,
-                task.operator_id,
-                self.topic,
-                task.task_index,
-                index % 2
-            ),
-        );
+        config
+            .set("enable.idempotence", "true")
+            .set("transactional.id", self.transactional_id(task, index));
         let producer: FutureProducer = config.create_with_context(self.context.clone())?;
+        Ok(producer)
+    }
+    fn transaction_producer(&self, task: &TaskInfo, index: usize) -> Result<FutureProducer> {
+        let producer = self.transaction_client(task, index)?;
         recovery::retry_transaction(|| {
             producer.init_transactions(Timeout::After(Duration::from_secs(10)))
         })?;
@@ -161,7 +169,7 @@ impl KafkaSinkFunc {
     }
     fn marker_key(&self, task: &TaskInfo) -> String {
         format!(
-            "streamr-v2/{}/{}/{}/{}",
+            "streamr-v4/{}/{}/{}/{}",
             task.job_id, task.operator_id, self.topic, task.task_index
         )
     }
@@ -203,14 +211,8 @@ impl KafkaSinkFunc {
             .poll(Timeout::After(Duration::ZERO));
 
         // ensure all messages were delivered before finishing the checkpoint
-        let transactional = self.is_committing();
-        for (index, future) in self.write_futures.drain(..).enumerate() {
+        for future in self.write_futures.drain(..) {
             let delivery = future.await.unwrap();
-            if let Ok((partition, _)) = &delivery
-                && transactional
-            {
-                self.journal[index].partition = *partition;
-            }
             if let Err((e, _)) = delivery {
                 ctx.error_reporter
                     .report_error("Kafka producer shut down", e.to_string())
@@ -227,21 +229,22 @@ impl KafkaSinkFunc {
         v: Vec<u8>,
         ctx: &mut OperatorContext,
     ) -> Result<()> {
-        if self.is_committing() {
-            let next_bytes = recovery::check_record_budget(
-                self.journal_bytes,
-                v.len(),
-                k.as_ref().map_or(0, Vec::len),
-                self.recovery_max_bytes,
-            )?;
-            let record = ReplayRecord {
-                timestamp: ts,
-                key: k.clone(),
-                payload: v.clone(),
-                partition: -1,
-            };
-            self.journal_bytes = next_bytes;
-            self.journal.push(record);
+        // A record larger than the producer's entire byte queue cannot ever
+        // become sendable: fail rather than retrying QueueFull forever.
+        let queue_kbytes = self
+            .client_config
+            .get("queue.buffering.max.kbytes")
+            .map(|s| s.parse::<usize>())
+            .transpose()?
+            .unwrap_or(recovery::DEFAULT_QUEUE_KBYTES);
+        recovery::require(
+            v.len()
+                .checked_add(k.as_ref().map_or(0, Vec::len))
+                .is_some_and(|n| n <= queue_kbytes.saturating_mul(1024)),
+            "Kafka output record exceeds configured producer byte queue",
+        )?;
+        if self.write_futures.len() >= recovery::MAX_DELIVERY_FUTURES {
+            self.flush(ctx).await;
         }
         let mut rec = {
             let mut rec = FutureRecord::<Vec<u8>, Vec<u8>>::to(&self.topic);
@@ -307,7 +310,7 @@ impl ArrowOperator for KafkaSinkFunc {
 
     fn tables(&self) -> HashMap<String, TableConfig> {
         if self.is_committing() {
-            ["i", "j"]
+            ["i"]
                 .into_iter()
                 .map(|name| {
                     (
@@ -316,12 +319,7 @@ impl ArrowOperator for KafkaSinkFunc {
                             table_type: TableEnum::GlobalKeyValue.into(),
                             config: GlobalKeyedTableConfig {
                                 table_name: name.to_string(),
-                                description: if name == "i" {
-                                    "index for transactional ids"
-                                } else {
-                                    "pending Kafka replay journal"
-                                }
-                                .to_string(),
+                                description: "compact prepared Kafka transaction".to_string(),
                                 uses_two_phase_commit: name == "i",
                             }
                             .encode_to_vec(),
@@ -349,10 +347,7 @@ impl ArrowOperator for KafkaSinkFunc {
                 .clone()
                 .filter(|s| !s.is_empty())
                 .ok_or_else(|| anyhow!("exactly_once requires explicit sink.recovery_topic"))?;
-            recovery::require(
-                topic != self.topic && self.recovery_max_bytes > 0,
-                "Invalid Kafka recovery topic/budget",
-            )?;
+            recovery::require(topic != self.topic, "Invalid Kafka recovery topic")?;
             recovery::validate_topic(&self.producer_config(), self.context.clone(), &topic).await?;
             let saved = ctx
                 .table_manager
@@ -360,21 +355,40 @@ impl ArrowOperator for KafkaSinkFunc {
                 .await.map_err(|e| anyhow!("Cannot restore Kafka recovery state; unsupported legacy or corrupt checkpoint: {e}"))?
                 .get(&ctx.task_info.task_index)
                 .cloned();
+            recovery::require(
+                ctx.restore_commit_epoch.is_none() || saved.is_some(),
+                "Kafka selected pending checkpoint is missing transaction state",
+            )?;
             let state = if let Some(bytes) = saved {
                 let state = recovery::decode_state(&bytes)?;
-                // Fence both the checkpoint's pending transaction and subsequent abandoned work.
-                let _ =
-                    self.transaction_producer(&ctx.task_info, state.next_transaction_index - 1)?;
+                recovery::require(
+                    ctx.restore_commit_epoch
+                        .is_none_or(|epoch| epoch == state.checkpoint_epoch),
+                    "Kafka selected pending checkpoint epoch differs from transaction state",
+                )?;
+                // Preserve the selected checkpoint's pending producer identity.
+                // Only fence the alternate slot containing abandoned later work.
                 let _ = self.transaction_producer(&ctx.task_info, state.next_transaction_index)?;
-                let marker_epoch = recovery::scan_marker(
-                    &self.producer_config(),
-                    self.context.clone(),
-                    &topic,
-                    &self.marker_key(&ctx.task_info),
-                    &state.generation,
-                )
-                .await?;
-                recovery::validate_marker_epoch(marker_epoch, state.checkpoint_epoch)?;
+                tracing::info!(job_id = %ctx.task_info.job_id, epoch = state.checkpoint_epoch,
+                    generation = %state.generation, operator_id = %ctx.task_info.operator_id,
+                    subtask_index = ctx.task_info.task_index,
+                    transactional_id = %self.transactional_id(&ctx.task_info, state.next_transaction_index),
+                    transaction_index = state.next_transaction_index,
+                    "Kafka alternate transaction fenced");
+                if ctx.restore_commit_epoch.is_none() {
+                    let marker_epoch = recovery::scan_marker(
+                        &self.producer_config(),
+                        self.context.clone(),
+                        &topic,
+                        &self.marker_key(&ctx.task_info),
+                        &state.generation,
+                    )
+                    .await?;
+                    recovery::require(
+                        marker_epoch == state.checkpoint_epoch,
+                        "Kafka restored checkpoint marker differs; refusing missing commit or rollback",
+                    )?;
+                }
                 state
             } else {
                 let state = RecoveryState {
@@ -450,7 +464,7 @@ impl ArrowOperator for KafkaSinkFunc {
         ctx: &mut OperatorContext,
         _: &mut dyn Collector,
     ) -> DataflowResult<()> {
-        // Do not replace the checkpoint journal until its transaction has been
+        // Do not replace the prepared transaction until its commit has been
         // acknowledged. The controller also permits only one pending checkpoint.
         if let ConsistencyMode::ExactlyOnce {
             producer_to_complete,
@@ -480,24 +494,6 @@ impl ArrowOperator for KafkaSinkFunc {
                     .clone()
                     .ok_or_else(|| anyhow!("Kafka recovery state missing"))?
             };
-            let pending = PendingCommit {
-                version: recovery::PROTOCOL_VERSION,
-                generation: state.generation.clone(),
-                epoch: barrier.epoch,
-                transaction_index: index - 1,
-                records: std::mem::take(&mut self.journal),
-            };
-            self.journal_bytes = 0;
-            let (journal, pending_bytes) =
-                recovery::encode_pending(&pending, self.recovery_max_bytes)?;
-            // The same FIFO writer receives this value before the checkpoint
-            // barrier. Its ordinary checkpoint file owns journal durability/GC;
-            // only the bounded reference enters commit RPC metadata.
-            ctx.table_manager
-                .get_global_keyed_state::<u32, Vec<u8>>("j")
-                .await?
-                .insert(ctx.task_info.task_index, journal)
-                .await;
             let topic = self.recovery_topic.as_ref().unwrap();
             recovery::send_marker(
                 self.producer.as_ref().unwrap(),
@@ -507,6 +503,23 @@ impl ArrowOperator for KafkaSinkFunc {
                 barrier.epoch,
             )
             .await?;
+            // The delivered marker proves a registered broker transaction even
+            // when this epoch contains no application records.
+            let (producer_id, producer_epoch) = recovery::prepare(self.producer.as_ref().unwrap())?;
+            let pending = PendingCommit {
+                version: recovery::PROTOCOL_VERSION,
+                generation: state.generation.clone(),
+                epoch: barrier.epoch,
+                transaction_index: index - 1,
+                producer_id,
+                producer_epoch,
+            };
+            tracing::info!(job_id = %ctx.task_info.job_id, epoch = barrier.epoch,
+                operator_id = %ctx.task_info.operator_id,
+                transactional_id = %self.transactional_id(&ctx.task_info, pending.transaction_index),
+                transaction_index = pending.transaction_index, producer_id, producer_epoch,
+                "Kafka compact transaction prepared");
+            let pending_bytes = recovery::encode_pending(&pending)?;
             ctx.table_manager
                 .insert_committing_data("i", pending_bytes)
                 .await;
@@ -541,17 +554,11 @@ impl ArrowOperator for KafkaSinkFunc {
             warn!("received commit for nontransactional sink");
             return Ok(());
         }
-        let bytes = _commit_data.get("i").and_then(|m|m.get(&ctx.task_info.task_index)).ok_or_else(|| anyhow!("Missing Kafka replay metadata; legacy committing checkpoints cannot recover safely"))?;
-        let journal = ctx
-            .table_manager
-            .get_global_keyed_state::<u32, Vec<u8>>("j")
-            .await?;
-        let pending = recovery::decode_commit(
-            bytes,
-            journal.get(&ctx.task_info.task_index).map(Vec::as_slice),
-            epoch,
-            self.recovery_max_bytes,
-        )?;
+        let bytes = _commit_data
+            .get("i")
+            .and_then(|m| m.get(&ctx.task_info.task_index))
+            .ok_or_else(|| anyhow!("Missing compact Kafka prepared transaction metadata"))?;
+        let pending = recovery::decode_pending(bytes, epoch)?;
         let state = self
             .recovery_state
             .as_ref()
@@ -573,20 +580,25 @@ impl ArrowOperator for KafkaSinkFunc {
         } else {
             None
         };
-        recovery::fault_pause(
-            &ctx.task_info.job_id,
-            epoch,
-            "before",
-            !pending.records.is_empty(),
-        )
-        .await;
+        recovery::fault_pause(&ctx.task_info.job_id, epoch, "before", true).await;
         if let Some(producer) = committing {
             recovery::retry_transaction(|| {
                 producer.commit_transaction(Timeout::After(Duration::from_secs(10)))
             })?;
         } else {
-            let producer = self.transaction_producer(&ctx.task_info, pending.transaction_index)?;
-            let committed_epoch = recovery::scan_marker(
+            // Reattach without InitProducerId: fencing here would abort the
+            // transaction whose durable checkpoint we have been asked to commit.
+            let producer = self.transaction_client(&ctx.task_info, pending.transaction_index)?;
+            tracing::info!(job_id = %ctx.task_info.job_id, epoch,
+                operator_id = %ctx.task_info.operator_id,
+                transactional_id = %self.transactional_id(&ctx.task_info, pending.transaction_index),
+                transaction_index = pending.transaction_index, producer_id = pending.producer_id,
+                producer_epoch = pending.producer_epoch, "Kafka compact transaction resume");
+            recovery::resume(&producer, &pending)?;
+            let commit_result = recovery::retry_transaction(|| {
+                producer.commit_transaction(Timeout::After(Duration::from_secs(10)))
+            });
+            let marker_epoch = recovery::scan_marker(
                 &self.producer_config(),
                 self.context.clone(),
                 topic,
@@ -594,23 +606,19 @@ impl ArrowOperator for KafkaSinkFunc {
                 &pending.generation,
             )
             .await?;
-            recovery::validate_marker_epoch(committed_epoch, epoch)?;
-            tracing::info!(job_id = %ctx.task_info.job_id, epoch, records = pending.records.len(), action = if committed_epoch < epoch { "replay" } else { "skipped" }, "Kafka commit recovery");
-            if committed_epoch < epoch {
-                recovery::replay(&producer, &self.topic, &pending).await?;
-                recovery::send_marker(&producer, topic, &key, &pending.generation, epoch).await?;
-                recovery::retry_transaction(|| {
-                    producer.commit_transaction(Timeout::After(Duration::from_secs(10)))
-                })?;
+            recovery::validate_marker_epoch(marker_epoch, epoch)?;
+            if marker_epoch != epoch {
+                return Err(anyhow!("Kafka prepared transaction recovery failed: {}; no exact committed marker (observed {marker_epoch}, expected {epoch})",
+                    commit_result.err().map_or_else(|| "EndTxn acknowledged".to_string(), |e| e.to_string())).into());
             }
+            tracing::info!(job_id = %ctx.task_info.job_id, epoch,
+                operator_id = %ctx.task_info.operator_id,
+                transactional_id = %self.transactional_id(&ctx.task_info, pending.transaction_index),
+                transaction_index = pending.transaction_index,
+                producer_id = pending.producer_id, producer_epoch = pending.producer_epoch,
+                "Kafka prepared transaction recovered");
         }
-        recovery::fault_pause(
-            &ctx.task_info.job_id,
-            epoch,
-            "after",
-            !pending.records.is_empty(),
-        )
-        .await;
+        recovery::fault_pause(&ctx.task_info.job_id, epoch, "after", true).await;
         let checkpoint_event = ControlResp::CheckpointEvent(CheckpointEvent {
             checkpoint_epoch: epoch as u64,
             operator_idx: ctx.task_info.operator_idx,

@@ -459,17 +459,19 @@ async fn get_and_register_checkpoint_info_leader<'a>(
     )
     .await?;
 
-    let checkpoint_ref = match new_gen {
+    let (checkpoint_ref, needs_commits) = match new_gen {
         GenerationInitialization::Initialized {
             recovery: GenerationRecovery::NoCheckpoint,
             ..
-        } => None,
+        } => (None, false),
         GenerationInitialization::Initialized {
-            recovery:
-                GenerationRecovery::Ready { checkpoint_ref }
-                | GenerationRecovery::ReplayCommit { checkpoint_ref, .. },
+            recovery: GenerationRecovery::Ready { checkpoint_ref },
             ..
-        } => Some(checkpoint_ref),
+        } => (Some(checkpoint_ref), false),
+        GenerationInitialization::Initialized {
+            recovery: GenerationRecovery::ReplayCommit { checkpoint_ref, .. },
+            ..
+        } => (Some(checkpoint_ref), true),
         GenerationInitialization::StaleGeneration { .. } => {
             unreachable!(
                 "cannot end up with stale generation given that we updated the generation\
@@ -500,7 +502,7 @@ async fn get_and_register_checkpoint_info_leader<'a>(
             epoch: manifest.epoch,
             min_epoch: manifest.min_epoch,
             id: r.to_string(),
-            needs_commits: manifest.needs_commit,
+            needs_commits,
         })
     } else {
         None
@@ -759,6 +761,10 @@ impl State for Scheduling {
                 let assignments = assignments.clone();
                 let job_id = ctx.config.id.clone();
                 let restore_epoch = checkpoint_info.as_ref().map(|info| info.epoch);
+                let restore_commit_epoch = checkpoint_info
+                    .as_ref()
+                    .filter(|info| info.needs_commits)
+                    .map(|info| u32::try_from(info.epoch).expect("checkpoint epoch exceeds u32"));
                 let program = program.clone();
                 let machine_id = workers.get(&id).as_ref().unwrap().machine_id.clone();
                 let (leader_id, leader_addr) = leader_info.clone().unzip();
@@ -776,6 +782,7 @@ impl State for Scheduling {
                     match c
                         .start_execution(Request::new(StartExecutionReq {
                             restore_epoch,
+                            restore_commit_epoch,
                             start_epoch,
                             min_epoch,
                             program: Some(program.clone()),

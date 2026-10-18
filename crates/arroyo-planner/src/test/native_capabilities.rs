@@ -429,3 +429,66 @@ async fn native_session_ranking_rejects() {
     )
     .await;
 }
+
+#[test(tokio::test)]
+async fn shared_cdc_aggregate_reaches_both_kafka_sinks_after_chaining() {
+    let sql = "SET updating_ttl = NULL;
+        CREATE TABLE changes (
+            row_id BIGINT PRIMARY KEY, k TEXT NOT NULL,
+            amount BIGINT NOT NULL, payload TEXT NOT NULL
+        ) WITH (
+            connector='kafka', bootstrap_servers='localhost:9092',
+            topic='shared-cdc-input', format='debezium_json', type='source',
+            'source.offset'='earliest', 'source.read_mode'='read_committed'
+        );
+        CREATE VIEW totals AS
+            SELECT k, COUNT(*) AS n, SUM(amount) AS total,
+                   repeat(MAX(payload),16) AS payload
+            FROM changes GROUP BY k;
+        CREATE TABLE output_a (k TEXT, n BIGINT, total BIGINT, payload TEXT) WITH (
+            connector='kafka', bootstrap_servers='localhost:9092',
+            topic='shared-cdc-output-a', format='debezium_json', type='sink',
+            'sink.commit_mode'='exactly_once', 'sink.recovery_topic'='shared-cdc-commits-a'
+        );
+        CREATE TABLE output_b (k TEXT, n BIGINT, total BIGINT, payload TEXT) WITH (
+            connector='kafka', bootstrap_servers='localhost:9092',
+            topic='shared-cdc-output-b', format='debezium_json', type='sink',
+            'sink.commit_mode'='exactly_once', 'sink.recovery_topic'='shared-cdc-commits-b'
+        );
+        INSERT INTO output_a SELECT k,n,total,payload FROM totals;
+        INSERT INTO output_b SELECT k,n,total,payload FROM totals;";
+    let mut compiled = parse_and_get_program(sql, get_test_schema_provider(), SqlConfig::default())
+        .await
+        .unwrap_or_else(|error| panic!("shared CDC fanout failed to plan: {error}"));
+    compiled
+        .program
+        .optimize(&arroyo_datastream::optimizers::ChainingOptimizer {});
+    let graph = &compiled.program.graph;
+    let sources: Vec<_> = graph
+        .node_indices()
+        .filter(|index| graph[*index].operator_chain.is_source())
+        .collect();
+    let sinks: Vec<_> = graph
+        .node_indices()
+        .filter(|index| graph[*index].operator_chain.is_sink())
+        .collect();
+    assert_eq!(sources.len(), 1, "one Kafka input must remain shared");
+    assert_eq!(sinks.len(), 2, "both Kafka outputs must remain");
+    let aggregates = graph
+        .node_weights()
+        .flat_map(|node| node.operator_chain.iter())
+        .filter(|(operator, _)| operator.operator_name == OperatorName::UpdatingAggregate)
+        .count();
+    assert_eq!(aggregates, 1, "the shared view must retain one aggregate");
+    let external_inputs: Vec<_> = graph.externals(Direction::Incoming).collect();
+    assert_eq!(
+        external_inputs, sources,
+        "no disconnected projection may become a source"
+    );
+    for sink in sinks {
+        assert!(
+            petgraph::algo::has_path_connecting(graph, sources[0], sink, None),
+            "every Kafka sink must remain reachable from the shared source"
+        );
+    }
+}

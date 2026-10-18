@@ -42,7 +42,7 @@ def write(path, value):
 
 
 def compiled(name):
-    return name.startswith(("crates/", ".cargo/")) or name in {
+    return name.startswith(("crates/", ".cargo/", "vendor/")) or name in {
         "Cargo.toml", "Cargo.lock", "rust-toolchain", "rust-toolchain.toml", "build.rs"
     }
 
@@ -72,6 +72,11 @@ def inventory(root):
 
 def git(repo, *args):
     return subprocess.check_output(["git", *args], cwd=repo)
+
+
+def compiled_diff(repo):
+    return git(repo, "diff", "--binary", "HEAD", "--", "crates", ".cargo", "vendor",
+               "Cargo.toml", "Cargo.lock", "rust-toolchain", "rust-toolchain.toml", "build.rs")
 
 
 def freeze(repo, destination, ui_assets):
@@ -462,7 +467,7 @@ def main():
     source = root / "source"
     files = freeze(repo, source, args.ui_assets.resolve(strict=True) if args.ui_assets else None)
     compiled_files = {n: h for n, h in files.items() if compiled(n)}
-    diff = git(repo, "diff", "--binary", "HEAD", "--", "crates", ".cargo", "Cargo.toml", "Cargo.lock", "rust-toolchain", "rust-toolchain.toml", "build.rs")
+    diff = compiled_diff(repo)
     (root / "compiled-source.diff").write_bytes(diff)
     write(root / "source-before.json", {"source_commit": head, "files": files, "compiled_sources": compiled_files,
           "compiled_diff_sha256": hashlib.sha256(diff).hexdigest()})

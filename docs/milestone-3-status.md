@@ -1,3 +1,12 @@
+## STR-146 Kafka compact transaction recovery — 2026-10-18
+
+- All 11 selected cases pass on dev pin `fcc0760e…`: 9 acceptance-4 cases plus 2 acceptance-5 CDC cases. Frozen unpaced liveness commits 65/65 rows to both sinks; actual pre-/post-commit SIGKILL and orphan recovery preserve physical prefixes/fresh suffixes. Both coordination modes execute; worker-leader crash recovery is not claimed.
+- User-authorized compact PID/epoch recovery replaces payload replay and its obsolete option, retaining markers/2PC. Native commit-only resume waits for coordinator readiness without initializing/fencing selected identity; authoritative startup commit gating prevents data overtaking commit. Queues default to 8192 KiB and retained delivery futures to 1024. Expired/fenced recovery without exact marker refuses commit.
+- Gates 7 fmt/check/strict Clippy passed; 2 datastream and 14 native-planner tests passed. Unchanged gates-6 connector coverage: 6 functions/8 logical cases; prior operator gate 1 passed. Pin 3 has 1267 matching compiled-source hashes, 0 mismatches; independent native linkage audit passed. Final liveness sampled owned RSS 435458048 B is diagnostic, not peak.
+- Memory/RocksDB CDC preserves shared MAX/COUNT/SUM, both outputs and all 8 update/retraction phases through orderly checkpoint-stop/restore (7 same-job restores, source offsets 1–8 and all checkpoint hashes independently decoded); no CDC SIGKILL or direct CDC RocksDB birth-file proof is claimed. Auxiliary scan pool 3978000 bytes derives from maximum legal encoded row 66682; no engine guard, native queue, SQL or oracle waiver. Earlier harness/readiness/fanout/configuration failures remain documented. The inherited fanout repair has actual before-fix 0-pass/2-fail evidence.
+- Root final 11-case audit verifies the same binary and complete current cleanup; 32 proven owned anonymous volumes removed (`owned-broker-volume-removal.json`), original baseline volume with incomplete provenance preserved. Evidence: `/home/jason/qa-evidence/str146-kafka-readiness-20261018/`. Final independent source/evidence and CDC audits passed. Next: PR CI. [Contract/report](str-146-kafka-journal.md). No full application, broader capacity, production replay, deployment or release claim.
+
+
 ## STR-144 Kafka checkpoint replay journal — 2026-10-17
 
 - Actual native production replay failed the fixed1MiB encoded commit-RPC journal cap despite configured8MiB raw budget. User informed concrete gap before generic repair; no shared-client broker throttle or checkpoint-minimum workaround applied.

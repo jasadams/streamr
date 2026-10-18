@@ -1,13 +1,45 @@
-Exactly-once Kafka recovery uses a bounded checkpoint replay journal and a marker committed atomically with each sink transaction. The [public librdkafka API](https://github.com/confluentinc/librdkafka/blob/v2.3.0/src/rdkafka.h) cannot resume a transaction from another producer process.
+# Kafka exactly-once checkpoint recovery
 
-Configure `sink.recovery_topic` explicitly. Provision that topic before starting the pipeline: exactly one partition, `cleanup.policy=compact` only, sufficient replication/min ISR for the deployment, no expiration/deletion of its latest keyed records. The configured Kafka credentials need metadata/config inspection, transactional production and read-committed consumption access. Preserve the topic for as long as any checkpoint may be restored. A checkpointed UUID generation and the latest retained marker detect missing/replaced topic contents; recovery refuses ambiguous replay. Use a dedicated marker topic per logical sink. Sharing across jobs can let unrelated open transactions block the read-committed frontier. This qualification supports fixed parallelism and restoring the latest checkpoint; a marker newer than the restored checkpoint fails closed to prevent duplicate output after state rollback.
+Exactly-once requires a preexisting one-partition `sink.recovery_topic` with
+`cleanup.policy=compact` only. Preserve its latest markers for every retained
+checkpoint and use stable job/operator/topic/subtask identity with unchanged
+parallelism. Read output with `read_committed`.
 
-`sink.recovery_max_bytes` defaults to 8388608 bytes per subtask and checkpoint interval. Each record accounts for payload, key and 64 bytes of overhead. Exceeding the budget fails before publishing the offending record. The journal is deliberately bounded memory and full checkpoint metadata, not a general disk-backed sink queue. JSON byte-array encoding expands checkpoint metadata by up to roughly four times the payload budget; pending and active journals can coexist during commit. Size memory/checkpoint budgets accordingly. The encoded journal is additionally capped at 1 MiB, checked before publishing the checkpoint, to stay below the default 4 MiB commit RPC frame for the qualified one-subtask/one-sink path. JSON expansion can make this encoded limit bind before the memory budget; reduce output per checkpoint rather than producing an unrestorable checkpoint. Aggregate commit-frame sizing across more sinks/subtasks still needs qualification. Larger-than-RAM operator state does not remove this separate output-per-checkpoint bound.
+Each checkpoint flushes output and a generation/epoch marker into the same Kafka
+transaction, seals further sends, and checkpoints compact producer ID/epoch plus
+transaction slot identity. The existing checkpoint coordinator authorizes
+commit. There is no payload replay journal, journal table or output-per-epoch
+byte budget. `sink.recovery_max_bytes` is removed. Old checkpoint formats are not
+supported under the pre-release policy.
 
-Records retain original timestamp, nullable key, payload and delivered partition. Recovery fences the previous producer, waits for any broker commit already underway, then scans the marker topic through a captured high watermark. Existing markers skip replay; otherwise saved records and the marker are replayed atomically. Failure, timeout or incomplete marker scans never acknowledge commit. Partition-count changes and rescaling during recovery are outside this fixed-parallelism qualification.
+The pinned native client extension resumes a prepared transaction without
+InitProducerId or epoch fencing. Recovered handles can only complete that
+transaction. Startup fences only the alternate abandoned slot. A selected
+pending transaction remains untouched until the coordinator sends its matching
+commit; generic operator startup gating prevents data/ticks/futures overtaking
+that commit. Ready restorations verify the exact selected marker before running.
+After recovery's EndTxn attempt, an exact committed marker proves success even
+if the acknowledgement was lost. A missing or newer marker fails closed.
 
-Legacy exactly-once checkpoints contain no recoverable journal/generation. They fail closed and require a deliberate new job/checkpoint history; silently restoring/replaying them risks loss or duplicates. Do not delete checkpoint or Kafka topic history to work around failures on a production pipeline.
+Recovery must finish before Kafka expires the prepared transaction. Configure
+native `transaction.timeout.ms` for the expected checkpoint/restart duration
+within broker limits. Expired/aborted/fenced transactions without an exact
+committed marker cannot be recovered from compact metadata; Streamr refuses
+completion. The same is true after broker transaction-state or marker loss.
+Arbitrary old-checkpoint rollback, rescale and cross-sink atomic visibility are
+not promised. Sinks/subtasks commit independently.
 
-Local fault injection is opt-in through `STREAMR_TEST_KAFKA_COMMIT_FAULT_DIR`. For a job with a nonempty journal, a `before-{job_id}` or `after-{job_id}` file pauses just before Kafka commit or just after broker commit before acknowledgement. The structured `Kafka commit fault pause` log includes job_id, epoch and point. Removing the file resumes execution; terminating the isolated runtime while paused exercises recovery. Keep this test-only environment variable absent in ordinary deployments.
+Producer queues use normal librdkafka delivery backpressure. Default
+`queue.buffering.max.kbytes` is8192 per producer; explicit existing client config
+may override it. The native bound covers accounted queued message bytes, not
+whole-process RSS or all allocator/batch overhead. At most1024 delivery futures
+are retained before awaiting delivery. A record larger than the entire configured
+producer byte queue is rejected rather than waiting forever for QueueFull.
+Active and pending producer transactions, one serialized record/batch and native
+protocol buffers may coexist. Checkpoint output volume no longer accumulates
+serialized records in Streamr memory.
 
-Protocol version 2 uses two alternating transactional IDs per sink subtask, while retaining a monotonic checkpointed transaction counter. This bounds broker transaction metadata instead of allocating a new transactional ID at every checkpoint. It relies on the enforced one-pending/one-active invariant. Version 1/full-index journals and legacy checkpoints are rejected; they cannot safely migrate by guessing which producers to fence.
+The maintained dev build compiles the vendored native client extension from its
+exact source; RocksDB continues to use the matching precompiled dev archive.
+See `vendor/rdkafka-sys/STREAMR.md` for origin/checksum and changed native files.
+Current validation and limitations belong to `docs/str-146-kafka-journal.md`.

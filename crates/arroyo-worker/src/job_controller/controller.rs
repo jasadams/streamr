@@ -92,6 +92,7 @@ impl WorkerJobController {
         checkpoint_interval: Duration,
         parent_ref: Option<(CheckpointRef, CheckpointManifest)>,
         metrics: Option<JobMetrics>,
+        restore_commit_epoch: Option<u32>,
     ) -> anyhow::Result<Self> {
         info!(job_id =? worker_context.job_id,
             restore_from =? parent_ref.as_ref().map(|p| &p.0),
@@ -196,6 +197,17 @@ impl WorkerJobController {
         // to look up the checkpoint information to initialize the workers. If on the leader side
         // we end up with a different view of the checkpoint state, that indicates something has
         // gone very wrong and our best choice is to panic and have the controller clean us up.
+        let authoritative_commit_epoch = match &recovery {
+            GenerationRecovery::ReplayCommit { .. } => parent_ref
+                .as_ref()
+                .map(|(_, manifest)| u32::try_from(manifest.epoch))
+                .transpose()?,
+            _ => None,
+        };
+        anyhow::ensure!(
+            restore_commit_epoch == authoritative_commit_epoch,
+            "worker restore commit phase differs from authoritative generation recovery"
+        );
         let (parent_ref, replay_commits) = match recovery {
             GenerationRecovery::NoCheckpoint => {
                 // nothing to do -- make sure that we're not inconsistent with the controller /
