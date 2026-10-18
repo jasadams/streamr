@@ -149,6 +149,7 @@ async fn cleanup_generations_restore_mid_page_on_both_backends() {
                             members: 9,
                             encoded_args_bytes: 123,
                             scalar_bytes: 456,
+                            max_member_workspace: 789,
                         }
                         .encode()
                         .to_vec();

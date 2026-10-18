@@ -5,6 +5,8 @@ pub(crate) mod continuous_merge;
 pub(crate) mod extension;
 pub mod external;
 mod functions;
+pub mod grouped_selector;
+pub mod grouped_selector_udaf;
 pub mod like_regex;
 pub mod local_physical;
 mod local_planning;
@@ -148,6 +150,7 @@ pub fn register_functions(registry: &mut dyn FunctionRegistry) {
     datafusion_functions_json::register_all(registry).unwrap();
 
     functions::register_all(registry);
+    grouped_selector_udaf::register(registry);
 
     for p in SessionStateDefaults::default_scalar_functions() {
         let p = if p.name() == "now" {
@@ -1369,3 +1372,5 @@ impl DFField {
         self
     }
 }
+
+pub mod aggregate_capability;

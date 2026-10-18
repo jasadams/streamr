@@ -39,6 +39,20 @@ if [[ "$1" == --exec ]]; then
 fi
 container_shell='/usr/local/bin/streamr-rocksdb-cache-guard && "$@"; result=$?; sccache --stop-server >/dev/null 2>&1; exit "$result"'
 network_options=()
+# A pinned test executable and its caller-supplied fixtures must remain outside
+# regenerable Cargo caches while still running in the maintained image.
+evidence_options=()
+if [[ -n "${STREAMR_BUILD_EVIDENCE_ROOT:-}" ]]; then
+    evidence_root="$STREAMR_BUILD_EVIDENCE_ROOT"
+    if [[ "$evidence_root" != /* || "$evidence_root" == *:* || "$evidence_root" =~ [[:cntrl:]] ]] \
+        || [[ ! -d "$evidence_root" ]] \
+        || [[ "$(realpath -e -- "$evidence_root")" != "$evidence_root" ]] \
+        || [[ "$evidence_root" == / || "$evidence_root" == /app || "$evidence_root" == /app/* ]]; then
+        echo 'Evidence root must be a canonical absolute existing directory outside /app, without colon/control characters' >&2
+        exit 2
+    fi
+    evidence_options=(-v "$evidence_root:$evidence_root:z")
+fi
 container_options=()
 if [[ -n "${STREAMR_BUILD_CONTAINER_NAME:-}" ]]; then
     [[ "$STREAMR_BUILD_CONTAINER_NAME" =~ ^streamr-build-pin-[a-z0-9-]+$ ]] || { echo "Invalid owned build container name" >&2; exit 2; }
@@ -102,6 +116,7 @@ fi
 exec "$repo_dir/scripts/rust-build" podman run --rm \
     "${network_options[@]}" \
     "${container_options[@]}" \
+    "${evidence_options[@]}" \
     -w /app \
     -e CARGO_TARGET_DIR=/app/target/milestone2-runtime \
     -e "CARGO_PROFILE_DEV_INCREMENTAL=${CARGO_PROFILE_DEV_INCREMENTAL:-true}" \

@@ -7,6 +7,7 @@ use calendar_native::{
 use crate::arrow::aggregate_codec::{CalendarReferences, EncodedGroup, GroupCodec, decode_group};
 use crate::arrow::aggregate_store::{
     AggregateExpiryProgress, AggregateScope, AggregateStore, AggregateStoreLimits,
+    aggregate_decoded_foreground, aggregate_encoded_key_bound,
 };
 use crate::arrow::decode_aggregate;
 use crate::arrow::updating_cache::{Key, UpdatingCache};
@@ -31,6 +32,11 @@ use arroyo_operator::{
         OperatorConstructor, Registry,
     },
 };
+use arroyo_planner::aggregate_capability::{
+    AggregateCapability, AggregateDescriptor, aggregate_descriptor, is_extremum,
+};
+use arroyo_planner::grouped_selector::{SelectorBudget, SelectorSpec, bounded_row_size};
+use arroyo_planner::grouped_selector_udaf::{classify, selector_spec};
 use arroyo_rpc::config::AggregateStateConfig;
 use arroyo_rpc::df::ArroyoSchema;
 use arroyo_rpc::errors::DataflowResult;
@@ -40,7 +46,8 @@ use arroyo_rpc::grpc::{
 };
 use arroyo_rpc::{TIMESTAMP_FIELD, UPDATING_META_FIELD, updating_meta_fields};
 use arroyo_state::live::{
-    LiveStateBackend,
+    LiveStateBackend, Ownership, StateNamespace,
+    checkpoint::checkpoint_decoded_reservation,
     worker::{ConfiguredBackendOwner, configured_worker_resources, construct_configured_backend},
 };
 use arroyo_state::timestamp_table_config;
@@ -99,6 +106,10 @@ impl NativeCleanupProgress {
             .saturating_add(mem::size_of::<Vec<u8>>())
             .saturating_add(mem::size_of::<Option<Vec<u8>>>())
             .saturating_add(charge);
+        let required = store
+            .optional_progress_peak(0, required.saturating_sub(charge))
+            .and_then(|mandatory| mandatory.checked_add(charge))
+            .unwrap_or(usize::MAX);
         let permit = (required <= store.resources().config().decoded_value_bytes)
             .then(|| {
                 // Shared consumers may already hold part of a valid pool. Keep
@@ -184,6 +195,15 @@ struct CollectionStats {
     members: u64,
     encoded_args_bytes: u64,
     scalar_bytes: u64,
+    // Monotone maximum until empty; a delete may retain conservative headroom.
+    max_member_workspace: u64,
+}
+
+#[derive(Clone, Copy)]
+struct CollectionMemberSize {
+    encoded_args_bytes: usize,
+    scalar_bytes: usize,
+    workspace: usize,
 }
 
 impl CollectionStats {
@@ -191,19 +211,33 @@ impl CollectionStats {
         let Some(value) = value else {
             return Ok(Self::default());
         };
-        ensure!(value.len() == 24, "invalid native collection member totals");
-        Ok(Self {
+        ensure!(
+            value.len() == 32,
+            "invalid native member totals v2 (expected 32 bytes)"
+        );
+        let stats = Self {
             members: u64::from_be_bytes(value[..8].try_into()?),
             encoded_args_bytes: u64::from_be_bytes(value[8..16].try_into()?),
-            scalar_bytes: u64::from_be_bytes(value[16..].try_into()?),
-        })
+            scalar_bytes: u64::from_be_bytes(value[16..24].try_into()?),
+            max_member_workspace: u64::from_be_bytes(value[24..32].try_into()?),
+        };
+        ensure!(
+            (stats.members == 0
+                && stats.encoded_args_bytes == 0
+                && stats.scalar_bytes == 0
+                && stats.max_member_workspace == 0)
+                || (stats.members > 0 && stats.max_member_workspace > 0),
+            "invalid native member totals count/workspace"
+        );
+        Ok(stats)
     }
 
-    fn encode(self) -> [u8; 24] {
-        let mut bytes = [0; 24];
+    fn encode(self) -> [u8; 32] {
+        let mut bytes = [0; 32];
         bytes[..8].copy_from_slice(&self.members.to_be_bytes());
         bytes[8..16].copy_from_slice(&self.encoded_args_bytes.to_be_bytes());
-        bytes[16..].copy_from_slice(&self.scalar_bytes.to_be_bytes());
+        bytes[16..24].copy_from_slice(&self.scalar_bytes.to_be_bytes());
+        bytes[24..32].copy_from_slice(&self.max_member_workspace.to_be_bytes());
         bytes
     }
 }
@@ -447,10 +481,47 @@ struct Aggregator {
     /// Ordered member-key codec for the bounded native fallback index.
     index_converter: Option<Arc<RowConverter>>,
     index_columns: Vec<usize>,
-    collection: bool,
+    /// Retain and replay all admitted members rather than just an indexed winner.
+    replay_members: bool,
+    /// ARRAY_AGG has an array result and may expose an admitted prefix limit.
+    array_result: bool,
+    /// Verified builtin accumulator storage retained per replayed input row.
+    descriptor: Option<AggregateDescriptor>,
+    member_types: Vec<DataType>,
+    member_decode_base: usize,
     collection_output_limit: Option<usize>,
     collection_member_bound: usize,
     injected_timestamp: bool,
+    selector: Option<SelectorSpec>,
+}
+
+impl Aggregator {
+    fn member_workspace(
+        &self,
+        encoded: usize,
+        sort_bytes: usize,
+        peer_index: bool,
+    ) -> Result<usize> {
+        let copies = if peer_index { 4 } else { 3 };
+        let mut bytes = encoded
+            .checked_mul(copies)
+            .and_then(|n| n.checked_add(sort_bytes.checked_mul(2)?))
+            .and_then(|n| n.checked_add(self.member_decode_base))
+            .context("native member typed workspace overflow")?;
+        if let Some(descriptor) = self
+            .descriptor
+            .filter(|descriptor| matches!(descriptor.capability, AggregateCapability::Fixed { .. }))
+        {
+            let scratch = descriptor
+                .retained_bound(1, encoded)
+                .and_then(|full| full.checked_sub(descriptor.retained_bound(1, 0)?))
+                .context("native member payload scratch overflow")?;
+            bytes = bytes
+                .checked_add(scratch)
+                .context("native member workspace overflow")?;
+        }
+        Ok(bytes)
+    }
 }
 
 pub struct IncrementalAggregatingFunc {
@@ -489,10 +560,54 @@ fn native_limits(config: AggregateStateConfig) -> AggregateStoreLimits {
     }
 }
 
+// A flush retains its output, the scope's overlay/group read, and (for
+// shared selectors) one independently charged decoded candidate concurrently.
+fn native_decoded_workspace(config: AggregateStateConfig, has_selector: bool) -> Result<usize> {
+    config
+        .overlay_bytes
+        .checked_add(
+            config
+                .max_pending_output_bytes
+                .checked_mul(3)
+                .context("native aggregate output workspace overflow")?,
+        )
+        .and_then(|bytes| {
+            bytes.checked_add(
+                config
+                    .value_bytes
+                    .checked_mul(if has_selector { 6 } else { 3 })?,
+            )
+        })
+        .context("native aggregate decoded workspace overflow")
+}
+
+fn validate_selector_owner_decoded(
+    config: AggregateStateConfig,
+    resources: &arroyo_state::live::resources::ResourceConfig,
+    encoded_key: usize,
+) -> Result<usize> {
+    let foreground = aggregate_decoded_foreground(
+        native_limits(config),
+        config.max_pending_output_bytes,
+        true,
+        encoded_key,
+    )?;
+    let checkpoint = checkpoint_decoded_reservation(resources)?;
+    let required = foreground
+        .checked_add(checkpoint)
+        .context("aggregate/checkpoint workspace overflow")?;
+    ensure!(
+        required <= resources.decoded_value_bytes,
+        "native selector owner requires {required} decoded bytes for foreground and its one checkpoint writer"
+    );
+    Ok(required)
+}
+
 fn native_index_codec(
     aggregate: &AggregateFunctionExpr,
     input_exprs: &[Arc<dyn PhysicalExpr>],
     input_schema: &Schema,
+    replay_members: bool,
 ) -> Result<(Arc<RowConverter>, Vec<usize>)> {
     let name = aggregate.fun().name().to_ascii_lowercase();
     let (indices, options): (Vec<usize>, Vec<SortOptions>) = match name.as_str() {
@@ -508,28 +623,6 @@ fn native_index_codec(
                     nulls_first: false,
                 }],
             )
-        }
-        "first_value" | "last_value" => {
-            let order = aggregate.order_bys().ok_or_else(|| {
-                anyhow!("native {name} requires an explicit ORDER BY for bounded retraction")
-            })?;
-            ensure!(
-                !order.is_empty() && order.len() < input_exprs.len(),
-                "native {name} has incompatible ORDER BY input columns"
-            );
-            let first = input_exprs.len() - order.len();
-            let options = order
-                .iter()
-                .map(|item| {
-                    let mut options = item.options;
-                    if name == "last_value" {
-                        options.descending = !options.descending;
-                        options.nulls_first = !options.nulls_first;
-                    }
-                    options
-                })
-                .collect();
-            ((first..input_exprs.len()).collect(), options)
         }
         "array_agg"
             if aggregate
@@ -556,6 +649,23 @@ fn native_index_codec(
                 // SQL leaves unordered ARRAY_AGG order unspecified. Sorting by
                 // value keeps duplicates adjacent and makes restore stable.
                 (vec![0], vec![SortOptions::default()])
+            }
+        }
+        _ if replay_members => {
+            // Verified replay companions retain physical SQL order if present;
+            // otherwise their persisted write ordinal defines traversal.
+            if let Some(order) = aggregate.order_bys().filter(|order| !order.is_empty()) {
+                ensure!(
+                    order.len() <= input_exprs.len(),
+                    "native replay aggregate ORDER BY shape mismatch"
+                );
+                let first = input_exprs.len() - order.len();
+                (
+                    (first..input_exprs.len()).collect(),
+                    order.iter().map(|item| item.options).collect(),
+                )
+            } else {
+                (Vec::new(), Vec::new())
             }
         }
         _ => bail!(
@@ -675,44 +785,11 @@ fn native_collection_shape_bytes(data_type: &DataType) -> Result<usize> {
         other => bail!("native ARRAY_AGG collection value has unsupported nested type: {other}"),
     };
     let mut shape = data_type.size();
-    let array_wrapper = [
-        std::mem::size_of::<StructArray>(),
-        std::mem::size_of::<arrow_array::StringArray>(),
-        std::mem::size_of::<arrow_array::LargeStringArray>(),
-        std::mem::size_of::<arrow_array::BinaryArray>(),
-        std::mem::size_of::<arrow_array::LargeBinaryArray>(),
-        std::mem::size_of::<arrow_array::FixedSizeBinaryArray>(),
-        std::mem::size_of::<arrow_array::NullArray>(),
-        std::mem::size_of::<arrow_array::BooleanArray>(),
-        std::mem::size_of::<arrow_array::Int64Array>(),
-        std::mem::size_of::<arrow_array::Decimal256Array>(),
-    ]
-    .into_iter()
-    .max()
-    .context("native collection array wrapper is missing")?;
     for node in std::iter::once(data_type).chain(children.iter().map(|field| field.data_type())) {
-        // Arrow 55's flat row decode can hold an ArrayData, its builder and a
-        // copied child ArrayData entry, the largest admitted concrete array
-        // wrapper, up to four Buffer objects, two ArrayRefs, Arc headers and
-        // three owned buffer headers. Three rounded cache lines cover the
-        // one-row validity, values and offsets. The fixed-width payload is
-        // charged even when the parent or child is NULL.
         shape = shape
-            .checked_add(node.size())
-            .and_then(|n| n.checked_add(2 * std::mem::size_of::<arrow::array::ArrayData>()))
-            .and_then(|n| n.checked_add(std::mem::size_of::<arrow::array::ArrayDataBuilder>()))
-            .and_then(|n| n.checked_add(array_wrapper))
-            .and_then(|n| n.checked_add(4 * std::mem::size_of::<arrow::buffer::Buffer>()))
-            .and_then(|n| n.checked_add(std::mem::size_of::<ScalarValue>()))
-            .and_then(|n| n.checked_add(std::mem::size_of::<ArrayRef>() * 2))
-            .and_then(|n| n.checked_add(std::mem::size_of::<usize>() * (2 + 3 * 8)))
-            .and_then(|n| n.checked_add(3 * 64))
-            .and_then(|n| match node {
-                DataType::FixedSizeBinary(width) => usize::try_from(*width)
-                    .ok()
-                    .and_then(|width| n.checked_add(width)),
-                _ => Some(n),
-            })
+            .checked_add(arroyo_planner::grouped_selector::row_node_decode_bytes(
+                node,
+            )?)
             .context("native collection shape size overflow")?;
     }
     Ok(shape)
@@ -745,8 +822,10 @@ fn native_collection_scalar_type(data_type: &DataType) -> bool {
             | DataType::Interval(_)
             | DataType::Binary
             | DataType::LargeBinary
+            | DataType::BinaryView
             | DataType::Utf8
             | DataType::LargeUtf8
+            | DataType::Utf8View
             | DataType::FixedSizeBinary(_)
     )
 }
@@ -805,15 +884,40 @@ impl IncrementalAggregatingFunc {
                         .context("bounded collection scalar size overflow")?,
                 );
             }
+            if let Some(descriptor) = aggregate.descriptor.filter(|_| !aggregate.array_result)
+                && matches!(descriptor.capability, AggregateCapability::Fixed { .. })
+            {
+                // Streaming fixed-state replay retains only one admitted
+                // decoded member and the verified accumulator workspace.
+                let member = usize::try_from(stats.max_member_workspace)?;
+                let state = descriptor
+                    .retained_bound(1, 0)
+                    .context("native fixed replay bound overflow")?;
+                working = working
+                    .checked_add(member)
+                    .and_then(|n| n.checked_add(state))
+                    .context("native fixed replay workspace overflow")?;
+                continue;
+            }
             let scalar_slots = count
                 .checked_mul(self.aggregates[index].input_exprs.len())
                 .and_then(|n| n.checked_mul(std::mem::size_of::<ScalarValue>()))
                 .context("native collection scalar workspace overflow")?;
+            let state = aggregate
+                .descriptor
+                .map(|descriptor| {
+                    descriptor
+                        .retained_bound(count, bytes)
+                        .context("native retained accumulator bound overflow")
+                })
+                .transpose()?
+                .unwrap_or(0);
             working = working
                 .checked_add(bytes)
                 .and_then(|n| n.checked_add(scalar_bytes))
                 .and_then(|n| n.checked_add(scalar_slots))
                 .and_then(|n| n.checked_add(count.checked_mul(32)?))
+                .and_then(|n| n.checked_add(state))
                 .context("native collection workspace overflow")?;
         }
         let admitted = working
@@ -836,14 +940,14 @@ impl IncrementalAggregatingFunc {
         scope: &mut AggregateScope<'_>,
         group: &[u8],
         aggregate_index: usize,
-        encoded_args_bytes: usize,
-        scalar_bytes: usize,
+        size: CollectionMemberSize,
         retract: bool,
     ) -> Result<()> {
         let key = native_collection_totals_key(group, aggregate_index)?;
         let mut updated = CollectionStats::decode(scope.get(&key).await?)?;
-        let bytes = u64::try_from(encoded_args_bytes)?;
-        let scalar_bytes = u64::try_from(scalar_bytes)?;
+        let bytes = u64::try_from(size.encoded_args_bytes)?;
+        let scalar_bytes = u64::try_from(size.scalar_bytes)?;
+        let workspace = u64::try_from(size.workspace)?;
         if retract {
             updated.members = updated
                 .members
@@ -871,9 +975,20 @@ impl IncrementalAggregatingFunc {
                 .checked_add(scalar_bytes)
                 .context("native collection scalar byte count overflow")?;
         }
+        if retract {
+            ensure!(
+                workspace <= updated.max_member_workspace,
+                "retained member workspace exceeds admitted maximum"
+            );
+        }
+        if updated.members == 0 {
+            updated.max_member_workspace = 0;
+        } else if !retract {
+            updated.max_member_workspace = updated.max_member_workspace.max(workspace);
+        }
         let mut totals = Vec::new();
         for (index, aggregate) in self.aggregates.iter().enumerate() {
-            if aggregate.collection {
+            if aggregate.replay_members {
                 let stats = if index == aggregate_index {
                     updated
                 } else {
@@ -889,7 +1004,9 @@ impl IncrementalAggregatingFunc {
         self.native_collection_budget(scope, totals.into_iter())?;
         if updated.members == 0 {
             ensure!(
-                updated.encoded_args_bytes == 0 && updated.scalar_bytes == 0,
+                updated.encoded_args_bytes == 0
+                    && updated.scalar_bytes == 0
+                    && updated.max_member_workspace == 0,
                 "native collection empty member count has retained bytes"
             );
             scope.delete(&key)?;
@@ -962,6 +1079,9 @@ impl IncrementalAggregatingFunc {
                     .iter()
                     .map(ScalarValue::to_array)
                     .collect::<DFResult<Vec<_>>>()?;
+                if let Some(descriptor) = aggregate.descriptor {
+                    descriptor.validate_partial_state(&arrays, 0)?;
+                }
                 accumulator.merge_batch(&arrays)?;
                 position = end;
             }
@@ -992,12 +1112,18 @@ impl IncrementalAggregatingFunc {
 
     fn native_member_keys(
         &self,
-        group: &[u8],
-        generation: u64,
-        aggregate_index: usize,
-        values: &[ArrayRef],
-        ordinal: u64,
+        change: &NativeMemberChange<'_>,
+        limits: AggregateStoreLimits,
+        identity: Option<&[u8]>,
+        omit_secondary: bool,
     ) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>)> {
+        let (group, generation, aggregate_index, values, ordinal) = (
+            change.group,
+            change.generation,
+            change.aggregate_index,
+            change.values,
+            change.ordinal,
+        );
         let aggregate = &self.aggregates[aggregate_index];
         let codec = aggregate
             .index_converter
@@ -1008,19 +1134,177 @@ impl IncrementalAggregatingFunc {
             .iter()
             .map(|index| values[*index].clone())
             .collect::<Vec<_>>();
-        let sort_rows = codec.convert_columns(&sort_columns)?;
+        let prefix = native_member_prefix(group, generation, aggregate_index)?;
+        let args_limit = if identity.is_none() && !omit_secondary {
+            limits.value_bytes.min(
+                limits
+                    .key_bytes
+                    .checked_sub(prefix.len() + 12)
+                    .context("native aggregate argument index cannot fit configured key limit")?,
+            )
+        } else {
+            limits.value_bytes
+        };
+        bounded_row_size(values, args_limit)?;
+        let key_payload = limits
+            .key_bytes
+            .checked_sub(prefix.len() + 8)
+            .context("native aggregate member key cannot fit configured limit")?;
+        bounded_row_size(&sort_columns, key_payload)?;
+        let sort_rows = if sort_columns.is_empty() {
+            None
+        } else {
+            Some(codec.convert_columns(&sort_columns)?)
+        };
         let args_rows = aggregate.row_converter.convert_columns(values)?;
         ensure!(
-            sort_rows.num_rows() == 1 && args_rows.num_rows() == 1,
+            sort_rows.as_ref().is_none_or(|rows| rows.num_rows() == 1) && args_rows.num_rows() == 1,
             "native aggregate member update requires one input row"
         );
         let args = args_rows.row(0).as_ref().to_vec();
-        let mut primary = native_member_prefix(group, generation, aggregate_index)?;
-        primary.extend_from_slice(sort_rows.row(0).as_ref());
+        let mut primary = prefix;
+        if let Some(sort_rows) = sort_rows {
+            primary.extend_from_slice(sort_rows.row(0).as_ref());
+        }
         primary.extend_from_slice(&ordinal.to_be_bytes());
-        let mut secondary = native_tuple_prefix(group, generation, aggregate_index, &args)?;
-        secondary.extend_from_slice(&ordinal.to_be_bytes());
+        let secondary = if omit_secondary {
+            Vec::new()
+        } else if let Some(identity) = identity {
+            native_tuple_prefix(group, generation, aggregate_index, identity)?
+        } else {
+            let mut key = native_tuple_prefix(group, generation, aggregate_index, &args)?;
+            key.extend_from_slice(&ordinal.to_be_bytes());
+            key
+        };
         Ok((primary, secondary, args))
+    }
+
+    fn native_selector_budget(&self, scope: &AggregateScope<'_>) -> Result<SelectorBudget> {
+        Ok(SelectorBudget {
+            key_bytes: scope.limits().key_bytes,
+            value_bytes: scope.limits().value_bytes,
+            decoded_bytes: scope
+                .limits()
+                .value_bytes
+                .checked_mul(3)
+                .context("grouped selector decoded allowance overflow")?,
+        })
+    }
+
+    async fn native_selector_delta(
+        &self,
+        scope: &mut AggregateScope<'_>,
+        change: NativeMemberChange<'_>,
+        selector: &SelectorSpec,
+    ) -> Result<()> {
+        let budget = self.native_selector_budget(scope)?;
+        let prefix = native_member_prefix(change.group, change.generation, change.aggregate_index)?;
+        if self.native_append_only {
+            ensure!(
+                !change.retract,
+                "append-only grouped selector received a retraction"
+            );
+            let Some(candidate) = selector.encode(change.values, change.ordinal, budget)? else {
+                return Ok(());
+            };
+            let mut winner = scope
+                .get(&prefix)
+                .await?
+                .map(|bytes| selector.decode_candidate(&bytes, budget))
+                .transpose()?;
+            if selector.choose(&mut winner, candidate) {
+                scope.put(
+                    &prefix,
+                    &selector.encode_candidate(winner.as_ref().unwrap(), budget)?,
+                )?;
+            }
+            return Ok(());
+        }
+        let identity_key = change
+            .row_id
+            .map(|id| {
+                ensure!(
+                    id.len() == 16,
+                    "grouped selector changelog row ID must have 16 bytes"
+                );
+                native_tuple_prefix(change.group, change.generation, change.aggregate_index, id)
+            })
+            .transpose()?;
+        if change.retract {
+            let identity_key = identity_key
+                .context("grouped selector retraction requires stable changelog row ID")?;
+            // An excluded NULL has no candidate. FILTER is applied before this
+            // call; null eligibility remains owned by the shared descriptor.
+            if selector
+                .encode(change.values, change.ordinal, budget)?
+                .is_none()
+            {
+                ensure!(
+                    scope.get(&identity_key).await?.is_none(),
+                    "grouped selector retract before-image changes null eligibility"
+                );
+                return Ok(());
+            }
+            let primary = scope
+                .get(&identity_key)
+                .await?
+                .context("grouped selector retracts a missing row identity/version")?;
+            ensure!(
+                primary.starts_with(&prefix),
+                "grouped selector identity points outside member index"
+            );
+            let stored = scope
+                .get(&primary)
+                .await?
+                .context("grouped selector member index is missing")?;
+            let candidate = selector.decode_candidate(&stored, budget)?;
+            ensure!(
+                primary[prefix.len()..] == candidate.key,
+                "grouped selector member key disagrees with retained candidate"
+            );
+            let _decoded = scope
+                .resources()
+                .try_decoded_value(selector.decoded_bound(&candidate)?)?;
+            let aggregate = &self.aggregates[change.aggregate_index];
+            let declared_for = classify(aggregate.func.fun())
+                .context("selector descriptor missing")?
+                .1;
+            // Debezium before rows carry the current triggering _timestamp.
+            // Only the implicit primary clock is exempt; user values and every
+            // ordinary secondary expression must match the stored version.
+            let ignored = if declared_for {
+                &[1_usize][..]
+            } else {
+                &[][..]
+            };
+            selector.validate_before(&candidate, change.values, ignored, budget)?;
+            scope.delete(&primary)?;
+            scope.delete(&identity_key)?;
+        } else {
+            let Some(candidate) = selector.encode(change.values, change.ordinal, budget)? else {
+                if let Some(key) = identity_key {
+                    ensure!(
+                        scope.get(&key).await?.is_none(),
+                        "grouped selector appends duplicate live row identity"
+                    );
+                }
+                return Ok(());
+            };
+            let stored = selector.encode_candidate(&candidate, budget)?;
+            let mut primary = prefix;
+            primary.extend_from_slice(&candidate.key);
+            if let Some(key) = &identity_key {
+                ensure!(
+                    scope.get(key).await?.is_none(),
+                    "grouped selector appends duplicate live row identity"
+                );
+            }
+            scope.put(&primary, &stored)?;
+            if let Some(key) = identity_key {
+                scope.put(&key, &primary)?;
+            }
+        }
+        Ok(())
     }
 
     async fn native_member_delta(
@@ -1029,6 +1313,9 @@ impl IncrementalAggregatingFunc {
         change: NativeMemberChange<'_>,
     ) -> Result<()> {
         let aggregate = &self.aggregates[change.aggregate_index];
+        if let Some(selector) = &aggregate.selector {
+            return self.native_selector_delta(scope, change, selector).await;
+        }
         let name = aggregate.func.fun().name().to_ascii_lowercase();
         ensure!(
             !aggregate.injected_timestamp || !change.values[0].is_null(0),
@@ -1039,22 +1326,72 @@ impl IncrementalAggregatingFunc {
         {
             return Ok(());
         }
-        let (primary, mut secondary, args) = self.native_member_keys(
-            change.group,
-            change.generation,
-            change.aggregate_index,
-            change.values,
-            change.ordinal,
-        )?;
-        if aggregate.injected_timestamp {
+        let omit_secondary =
+            self.native_append_only && aggregate.replay_members && !aggregate.array_result;
+        ensure!(
+            !omit_secondary || !change.retract,
+            "append-only replay aggregate received a retraction"
+        );
+        let identity = if aggregate.injected_timestamp
+            || (aggregate.replay_members && !aggregate.array_result && !self.native_append_only)
+        {
             let id = change
                 .row_id
-                .context("native injected timestamp requires a changelog row ID")?;
+                .context("native indexed aggregate requires a changelog row ID")?;
             ensure!(id.len() == 16, "native changelog row ID must have 16 bytes");
-            secondary =
-                native_tuple_prefix(change.group, change.generation, change.aggregate_index, id)?;
-        }
-        let scalar_bytes = if aggregate.collection && !change.retract {
+            Some(id)
+        } else {
+            None
+        };
+        let identity_index = identity.is_some();
+        // Complete typed argument/order admission precedes either RowConverter
+        // allocation. Three argument copies (four for a peer-argument R index)
+        // and two ordering-key copies cover encoding/decode temporaries.
+        let member_workspace = if aggregate.replay_members {
+            let encoded = bounded_row_size(change.values, scope.limits().value_bytes)?;
+            ensure!(
+                change.values.len() == aggregate.member_types.len()
+                    && change
+                        .values
+                        .iter()
+                        .zip(&aggregate.member_types)
+                        .all(|(array, expected)| array.data_type() == expected),
+                "native member argument schema changed"
+            );
+            let sort = aggregate
+                .index_columns
+                .iter()
+                .map(|index| change.values[*index].clone())
+                .collect::<Vec<_>>();
+            let key_prefix =
+                native_member_prefix(change.group, change.generation, change.aggregate_index)?;
+            let sort_limit = scope
+                .limits()
+                .key_bytes
+                .checked_sub(key_prefix.len() + 8)
+                .context("native member key cannot fit configured limit")?;
+            let sort_bytes = bounded_row_size(&sort, sort_limit)?;
+            let bound = aggregate.member_workspace(
+                encoded,
+                sort_bytes,
+                !identity_index && !omit_secondary,
+            )?;
+            ensure!(
+                bound
+                    <= scope
+                        .limits()
+                        .value_bytes
+                        .checked_mul(3)
+                        .context("native member workspace overflow")?,
+                "native member typed workspace exceeds configured allowance before materialization"
+            );
+            bound
+        } else {
+            0
+        };
+        let (primary, secondary, args) =
+            self.native_member_keys(&change, scope.limits(), identity, omit_secondary)?;
+        let scalar_bytes = if aggregate.replay_members && !change.retract {
             // Bound the encoded member before reconstructing its compact Arrow
             // value for accounting. The scope already holds its decoded-value
             // reservation; even a nested member cannot expand from an
@@ -1078,11 +1415,7 @@ impl IncrementalAggregatingFunc {
                 decode_bound <= decoded_allowance,
                 "native collection exceeds configured encoded-state or pending-output budget"
             );
-            let store = self
-                .native_store
-                .as_ref()
-                .context("native collection store was not initialized")?;
-            let _decoded_permit = store.resources().try_decoded_value(decode_bound)?;
+            let _decoded_permit = scope.resources().try_decoded_value(decode_bound)?;
             let scalar_bytes = native_collection_scalar_bytes(&aggregate.row_converter, &args)?;
             ensure!(
                 scalar_bytes <= decode_bound,
@@ -1093,7 +1426,7 @@ impl IncrementalAggregatingFunc {
             0
         };
         if change.retract {
-            let (secondary_key, primary_key) = if aggregate.injected_timestamp {
+            let (secondary_key, primary_key) = if identity_index {
                 let primary_key = scope
                     .get(&secondary)
                     .await?
@@ -1118,15 +1451,18 @@ impl IncrementalAggregatingFunc {
                 .get(&primary_key)
                 .await?
                 .context("aggregate member index is missing")?;
-            if aggregate.collection {
+            if aggregate.replay_members {
                 let (retained_scalar_bytes, stored_args) = native_collection_member(&stored)?;
                 ensure!(stored_args == args, "aggregate member indexes disagree");
                 self.native_collection_change(
                     scope,
                     change.group,
                     change.aggregate_index,
-                    args.len(),
-                    retained_scalar_bytes,
+                    CollectionMemberSize {
+                        encoded_args_bytes: args.len(),
+                        scalar_bytes: retained_scalar_bytes,
+                        workspace: member_workspace,
+                    },
                     true,
                 )
                 .await?;
@@ -1135,31 +1471,34 @@ impl IncrementalAggregatingFunc {
             }
             scope.delete(&secondary_key)?;
             scope.delete(&primary_key)?;
-            if !aggregate.injected_timestamp {
+            if !identity_index {
                 scope.member_deleted(&secondary_key);
             }
         } else {
             // An append can create an earlier ordinal in a helper/replay or a
             // new generation. Conservatively invalidate before any member put.
             scope.reset_member_progress();
-            if aggregate.injected_timestamp {
+            if identity_index {
                 ensure!(
                     scope.get(&secondary).await?.is_none(),
                     "native aggregate appends a duplicate live row ID"
                 );
             }
-            if aggregate.collection {
+            if aggregate.replay_members {
                 self.native_collection_change(
                     scope,
                     change.group,
                     change.aggregate_index,
-                    args.len(),
-                    scalar_bytes,
+                    CollectionMemberSize {
+                        encoded_args_bytes: args.len(),
+                        scalar_bytes,
+                        workspace: member_workspace,
+                    },
                     false,
                 )
                 .await?;
             }
-            if aggregate.collection {
+            if aggregate.replay_members {
                 let mut stored = Vec::with_capacity(8 + args.len());
                 stored.extend_from_slice(&u64::try_from(scalar_bytes)?.to_be_bytes());
                 stored.extend_from_slice(&args);
@@ -1167,7 +1506,9 @@ impl IncrementalAggregatingFunc {
             } else {
                 scope.put(&primary, &args)?;
             }
-            scope.put(&secondary, &primary)?;
+            if !omit_secondary {
+                scope.put(&secondary, &primary)?;
+            }
         }
         Ok(())
     }
@@ -1181,8 +1522,64 @@ impl IncrementalAggregatingFunc {
     ) -> Result<ScalarValue> {
         let aggregate = &self.aggregates[aggregate_index];
         let prefix = native_member_prefix(group, generation, aggregate_index)?;
+        if let Some(selector) = &aggregate.selector {
+            let budget = self.native_selector_budget(scope)?;
+            let stored = if self.native_append_only {
+                scope
+                    .get(&prefix)
+                    .await?
+                    .map(|value| (prefix.clone(), value))
+            } else {
+                scope.first(&prefix).await?
+            };
+            let candidate = stored
+                .map(|(key, value)| -> Result<_> {
+                    let candidate = selector.decode_candidate(&value, budget)?;
+                    ensure!(
+                        self.native_append_only || key[prefix.len()..] == candidate.key,
+                        "grouped selector member key disagrees with retained candidate"
+                    );
+                    Ok(candidate)
+                })
+                .transpose()?;
+            let bound = candidate
+                .as_ref()
+                .map(|c| selector.decoded_bound(c))
+                .transpose()?
+                .unwrap_or(0);
+            let _decoded = scope
+                .resources()
+                .try_decoded_value(bound)
+                .map_err(|error| {
+                    anyhow!("selector candidate decoded reservation requested={bound}: {error}")
+                })?;
+            return Ok(selector.evaluate(candidate.as_ref(), budget)?);
+        }
+        // Verify combined retained-state allowance before constructing or
+        // feeding a growing companion accumulator. Read only known L keys.
+        let replay_stats = if aggregate.replay_members && !aggregate.array_result {
+            let mut totals = Vec::new();
+            let mut selected = CollectionStats::default();
+            for (index, member) in self.aggregates.iter().enumerate() {
+                if member.replay_members {
+                    let stats = CollectionStats::decode(
+                        scope
+                            .get(&native_collection_totals_key(group, index)?)
+                            .await?,
+                    )?;
+                    if index == aggregate_index {
+                        selected = stats;
+                    }
+                    totals.push((index, stats));
+                }
+            }
+            self.native_collection_budget(scope, totals.into_iter())?;
+            Some(selected)
+        } else {
+            None
+        };
         let mut accumulator = aggregate.func.create_accumulator()?;
-        if aggregate.collection_output_limit == Some(0) {
+        if aggregate.array_result && aggregate.collection_output_limit == Some(0) {
             let stats = CollectionStats::decode(
                 scope
                     .get(&native_collection_totals_key(group, aggregate_index)?)
@@ -1199,12 +1596,45 @@ impl IncrementalAggregatingFunc {
                 )));
             }
         }
-        let mut update = |stored: &[u8]| -> Result<()> {
-            let args = if aggregate.collection {
-                native_collection_member(stored)?.1
+        let mut visited = CollectionStats::default();
+        let mut update = |key: &[u8], stored: &[u8]| -> Result<()> {
+            let args = if aggregate.replay_members {
+                let (scalar_bytes, args) = native_collection_member(stored)?;
+                if let Some(expected) = replay_stats {
+                    visited.members = visited
+                        .members
+                        .checked_add(1)
+                        .context("native replay member count overflow")?;
+                    visited.encoded_args_bytes = visited
+                        .encoded_args_bytes
+                        .checked_add(u64::try_from(args.len())?)
+                        .context("native replay byte count overflow")?;
+                    visited.scalar_bytes = visited
+                        .scalar_bytes
+                        .checked_add(u64::try_from(scalar_bytes)?)
+                        .context("native replay scalar count overflow")?;
+                    ensure!(
+                        visited.members <= expected.members
+                            && visited.encoded_args_bytes <= expected.encoded_args_bytes
+                            && visited.scalar_bytes <= expected.scalar_bytes,
+                        "native replay member relation exceeds admitted statistics before accumulator update"
+                    );
+                }
+                args
             } else {
                 stored
             };
+            if let Some(expected) = replay_stats {
+                let sort_bytes = key
+                    .len()
+                    .checked_sub(prefix.len() + 8)
+                    .context("native replay member key lacks ordinal")?;
+                let workspace = aggregate.member_workspace(args.len(), sort_bytes, false)?;
+                ensure!(
+                    u64::try_from(workspace)? <= expected.max_member_workspace,
+                    "native replay member workspace exceeds admitted maximum before decode"
+                );
+            }
             let parser = aggregate.row_converter.parser();
             let columns = aggregate
                 .row_converter
@@ -1212,14 +1642,22 @@ impl IncrementalAggregatingFunc {
             accumulator.update_batch(&columns)?;
             Ok(())
         };
-        if aggregate.collection {
+        if aggregate.replay_members {
             scope
-                .visit_prefix(&prefix, aggregate.collection_output_limit, |_, stored| {
-                    update(stored)
+                .visit_prefix(&prefix, aggregate.collection_output_limit, |key, stored| {
+                    update(key, stored)
                 })
                 .await?;
-        } else if let Some((_, stored)) = scope.first(&prefix).await? {
-            update(&stored)?;
+        } else if let Some((key, stored)) = scope.first(&prefix).await? {
+            update(&key, &stored)?;
+        }
+        if let Some(expected) = replay_stats {
+            ensure!(
+                visited.members == expected.members
+                    && visited.encoded_args_bytes == expected.encoded_args_bytes
+                    && visited.scalar_bytes == expected.scalar_bytes,
+                "native replay member statistics disagree with retained relation"
+            );
         }
         Ok(accumulator.evaluate_mut()?)
     }
@@ -1326,7 +1764,7 @@ impl IncrementalAggregatingFunc {
             self.native_accumulators(if expired { None } else { previous.as_ref() })?;
         if expired {
             for (index, aggregate) in self.aggregates.iter().enumerate() {
-                if aggregate.collection {
+                if aggregate.replay_members {
                     scope.delete(&native_collection_totals_key(group_key, index)?)?;
                 }
             }
@@ -1446,6 +1884,21 @@ impl IncrementalAggregatingFunc {
                 continue;
             }
             let Some(values) = selected else {
+                // FILTER-excluded before rows cannot silently leave a retained
+                // selector candidate behind under the same stable identity.
+                if retract
+                    && (self.aggregates[index].selector.is_some()
+                        || (self.aggregates[index].replay_members
+                            && !self.aggregates[index].array_result))
+                {
+                    let id = row_id
+                        .context("grouped selector retraction requires stable changelog row ID")?;
+                    let identity = native_tuple_prefix(group_key, generation, index, id)?;
+                    ensure!(
+                        scope.get(&identity).await?.is_none(),
+                        "indexed aggregate retract before-image changes FILTER eligibility"
+                    );
+                }
                 continue;
             };
             match state {
@@ -1475,7 +1928,7 @@ impl IncrementalAggregatingFunc {
         }
         if next_group_rows == Some(0) {
             for (index, aggregate) in self.aggregates.iter().enumerate() {
-                if aggregate.collection {
+                if aggregate.replay_members {
                     ensure!(
                         scope
                             .get(&native_collection_totals_key(group_key, index)?)
@@ -1578,7 +2031,7 @@ impl IncrementalAggregatingFunc {
         let collections = self
             .aggregates
             .iter()
-            .filter(|aggregate| aggregate.collection)
+            .filter(|aggregate| aggregate.replay_members)
             .count();
         // Retain the conservative keyed workspace allowance so membership
         // co-location does not change admitted chunk/commit boundaries.
@@ -1708,7 +2161,7 @@ impl IncrementalAggregatingFunc {
         // co-location does not change admitted chunk/commit boundaries.
         let operations_per_expiry = 4
             + usize::from(self.native_has_group_keys())
-            + self.aggregates.iter().filter(|a| a.collection).count();
+            + self.aggregates.iter().filter(|a| a.replay_members).count();
         let rows_per_chunk = (store.limits().write_operations / operations_per_expiry)
             .min(
                 store.limits().write_bytes
@@ -1765,7 +2218,7 @@ impl IncrementalAggregatingFunc {
                     scope.put(&native_group_key(b'D', group_key)?, &[1])?;
                     scope.put(&native_cleanup_key(group_key, old_generation)?, b"M")?;
                     for (index, aggregate) in self.aggregates.iter().enumerate() {
-                        if aggregate.collection {
+                        if aggregate.replay_members {
                             scope.delete(&native_collection_totals_key(group_key, index)?)?;
                         }
                     }
@@ -2062,9 +2515,19 @@ impl IncrementalAggregatingFunc {
         );
         let mut after = None;
         loop {
-            let _output_permit = store
-                .resources()
-                .try_decoded_value(configured.max_pending_output_bytes.saturating_mul(3))?;
+            let requested = configured
+                .max_pending_output_bytes
+                .checked_mul(3)
+                .context("native output workspace overflow")?;
+            let _output_permit =
+                store
+                    .resources()
+                    .try_decoded_value(requested)
+                    .map_err(|error| {
+                        anyhow!(
+                            "aggregate output decoded reservation requested={requested}: {error}"
+                        )
+                    })?;
             let mut scope = store.begin().await?;
             let mut output_keys = Vec::new();
             let mut output_values = vec![Vec::new(); self.aggregates.len()];
@@ -2249,7 +2712,7 @@ impl IncrementalAggregatingFunc {
         let collections = self
             .aggregates
             .iter()
-            .filter(|aggregate| aggregate.collection)
+            .filter(|aggregate| aggregate.replay_members)
             .count();
         let required_operations = (2 + usize::from(self.native_has_group_keys()))
             .checked_add(
@@ -2271,13 +2734,29 @@ impl IncrementalAggregatingFunc {
         let resources = configured_worker_resources()?
             .ok_or_else(|| anyhow!("native aggregate requires worker.live-state-resources"))?;
         ensure!(
-            limits
-                .overlay_bytes
-                .saturating_add(limits.max_pending_output_bytes.saturating_mul(3))
-                .saturating_add(limits.value_bytes.saturating_mul(3))
-                <= resources.config().decoded_value_bytes,
-            "native aggregate decoded pool cannot hold output, scope, and one read together"
+            native_decoded_workspace(
+                limits,
+                self.aggregates
+                    .iter()
+                    .any(|aggregate| aggregate.selector.is_some())
+            )? <= resources.config().decoded_value_bytes,
+            "native aggregate decoded pool cannot hold output, scope, and selector read together"
         );
+        let has_selector = self
+            .aggregates
+            .iter()
+            .any(|aggregate| aggregate.selector.is_some());
+        if has_selector {
+            let namespace = StateNamespace {
+                ownership: Ownership::PartitionLocal {
+                    subtask: ctx.task_info.task_index,
+                    parallelism: ctx.task_info.parallelism,
+                },
+                table: NATIVE_AGGREGATE_TABLE.as_bytes().to_vec(),
+            };
+            let encoded_key = aggregate_encoded_key_bound(&namespace, limits.key_bytes)?;
+            validate_selector_owner_decoded(limits, resources.config(), encoded_key)?;
+        }
         let generation = match ctx.task_info.checkpoint_file_path_layout {
             arroyo_types::CheckpointFilePathLayout::Protocol { generation, .. } => generation,
             _ => 0,
@@ -2297,7 +2776,10 @@ impl IncrementalAggregatingFunc {
             .table_manager
             .register_live_table(NATIVE_AGGREGATE_TABLE, backend.clone())
             .await?;
-        let store = AggregateStore::new(backend, table, resources, native_limits(limits))?;
+        let mut store = AggregateStore::new(backend, table, resources, native_limits(limits))?;
+        if has_selector {
+            store.preserve_selector_checkpoint_headroom();
+        }
         ensure!(
             limits.write_bytes
                 >= required_operations.saturating_mul(store.max_encoded_entry_bytes()),
@@ -3309,7 +3791,7 @@ impl IncrementalAggregatingConstructor {
             bail!("SET updating_ttl = NULL requires worker.aggregate-state native backend limits");
         }
         let mut identity = Sha256::new();
-        identity.update(b"streamr.native-updating-aggregate.v1");
+        identity.update(b"streamr.native-updating-aggregate.v2-member-workspace");
         identity.update(&config.aggregate_exec);
         let mut bounds: Vec<_> = config.collection_output_limits.iter().collect();
         bounds.sort_unstable_by_key(|(index, _)| **index);
@@ -3368,6 +3850,52 @@ impl IncrementalAggregatingConstructor {
             bail!("invalid proto -- expected aggregate exec");
         };
 
+        // Physical selector expressions additionally address the canonical arrival
+        // column. The graph schema stays raw: the updating owner supplies its
+        // persisted per-group ordinal directly to the shared kernel.
+        let serialized_expression_schema = aggregate_exec
+            .input_schema
+            .as_ref()
+            .map(Schema::try_from)
+            .transpose()?
+            .map(Arc::new)
+            .unwrap_or_else(|| input_schema.schema.clone());
+        // Nonselector plans can omit the metadata-only graph suffix.
+        let expression_schema = if serialized_expression_schema
+            .index_of(arroyo_planner::grouped_selector::ORDINAL_FIELD)
+            .is_ok()
+        {
+            serialized_expression_schema
+        } else {
+            ensure!(
+                serialized_expression_schema.fields().len() <= input_schema.schema.fields().len()
+                    && serialized_expression_schema.fields()[..]
+                        == input_schema.schema.fields()
+                            [..serialized_expression_schema.fields().len()],
+                "aggregate serialized input does not preserve raw input fields"
+            );
+            input_schema.schema.clone()
+        };
+        ensure!(
+            expression_schema.fields().len() >= input_schema.schema.fields().len()
+                && expression_schema.fields()[..input_schema.schema.fields().len()]
+                    == input_schema.schema.fields()[..],
+            "aggregate physical input does not preserve raw input schema"
+        );
+        if expression_schema.fields().len() != input_schema.schema.fields().len() {
+            ensure!(
+                expression_schema.fields().len() == input_schema.schema.fields().len() + 1,
+                "aggregate physical input has unexpected extra fields"
+            );
+            let field = expression_schema.field(input_schema.schema.fields().len());
+            ensure!(
+                field.name() == arroyo_planner::grouped_selector::ORDINAL_FIELD
+                    && field.data_type() == &DataType::UInt64
+                    && !field.is_nullable(),
+                "aggregate physical input has invalid selector ordinal field"
+            );
+        }
+
         // the state schema is made up of the key fields + the state fields for each aggregator
         // (if it supports retraction) otherwise, the input data + a count
         let mut sliding_state_fields = input_schema
@@ -3407,36 +3935,52 @@ impl IncrementalAggregatingConstructor {
             })
             .collect::<DFResult<Vec<_>>>()?;
 
+        let mut constructor_workspace = 0usize;
         let aggregates: Vec<_> = aggregate_exec
             .aggr_expr
             .iter()
             .zip(aggregate_exec.aggr_expr_name.iter())
             .enumerate()
             .map(|(index, (expr, name))| -> DFResult<_> {
-                Ok((
-                    decode_aggregate(&input_schema.schema, name, expr, registry.as_ref())?,
-                    filters.get(index).cloned().flatten(),
-                ))
+                let aggregate = decode_aggregate(&expression_schema, name, expr, registry.as_ref())?;
+                let descriptor = if native_config.is_some() && classify(aggregate.fun()).is_none() {
+                    aggregate_descriptor(&aggregate, &expression_schema)?
+                } else { None };
+                // Native SUM persists upstream's retractable [sum,count] state,
+                // which differs from its ordinary single-field partial state.
+                let descriptor = if aggregate.fun().inner().as_any().is::<datafusion::functions_aggregate::sum::Sum>() && !aggregate.is_distinct() {
+                    descriptor.map(|descriptor| descriptor.with_state_layout(&aggregate.sliding_state_fields()?)).transpose()?
+                } else { descriptor };
+                if let (Some(limits), Some(descriptor)) = (native_config, descriptor) {
+                    let floor = descriptor.retained_bound(0,0).ok_or_else(||datafusion::common::DataFusionError::Execution("native accumulator constructor floor overflow".into()))?;
+                    constructor_workspace = constructor_workspace.checked_add(floor).ok_or_else(||datafusion::common::DataFusionError::Execution("native accumulator constructor workspace overflow".into()))?;
+                    if limits.value_bytes.checked_mul(3).is_none_or(|allowance|constructor_workspace>allowance) {
+                        return Err(datafusion::common::DataFusionError::Execution("native accumulator constructors exceed configured decoded-state allowance".into()));
+                    }
+                }
+                Ok((aggregate, filters.get(index).cloned().flatten(), index, descriptor))
             })
-            .map_ok(|(agg, filter)| {
+            .map_ok(|(agg, filter, _index, descriptor)| {
                 let native_state = native_config.is_some();
                 let function = agg.fun().name().to_ascii_lowercase();
-                let retract = match agg.create_sliding_accumulator() {
-                    Ok(s) => s.supports_retract_batch(),
-                    _ => false,
+                let selector = classify(agg.fun()).is_some();
+                let retract = if selector { false } else {
+                    match agg.create_sliding_accumulator() {
+                        Ok(s) => s.supports_retract_batch(),
+                        _ => false,
+                    }
                 };
 
-                // Moving MIN/MAX and FIRST/LAST need the member index on a
-                // changelog input. On a declared append-only input, ordinary
-                // DataFusion state holds only the current winner and its order
-                // tuple (if any); its state() is reconstructible without member
-                // history. Other native aggregates retain their admission gate.
-                let native_sliding = matches!(function.as_str(), "count" | "sum" | "avg");
-                let append_only_state = native_append_only
-                    && matches!(
-                        function.as_str(),
-                        "min" | "max" | "first_value" | "last_value"
-                    );
+                // Grouped selectors always use the shared candidate kernel.
+                // Other aggregates preserve their established ordinary/sliding
+                // state and configured backend admission.
+                let verified_fixed = descriptor.is_some_and(|descriptor| matches!(descriptor.capability, AggregateCapability::Fixed { .. }));
+                // Sliding extrema hide FIFO history despite scalar state; keep
+                // the existing ordered backend index for retractable MIN/MAX.
+                let native_sliding = matches!(function.as_str(), "count" | "sum" | "avg")
+                    || (verified_fixed && !is_extremum(&agg));
+                let append_only_state = native_append_only && !selector
+                    && (is_extremum(&agg) || (!retract && verified_fixed));
 
                 (
                     agg,
@@ -3448,24 +3992,36 @@ impl IncrementalAggregatingConstructor {
                         AccumulatorType::Batch
                     },
                     filter,
+                    descriptor,
                 )
             })
-            .map_ok(|(agg, t, filter)| {
-                let input_exprs =
+            .map_ok(|(agg, t, filter, descriptor)| {
+                let is_selector = classify(agg.fun()).is_some();
+                ensure!(!is_selector || native_config.is_some(),
+                    "grouped FIRST_VALUE/LAST_VALUE requires worker.aggregate-state and worker.live-state-resources limits");
+                ensure!(!is_selector || native_append_only || agg.order_bys().is_some_and(|order| !order.is_empty()),
+                    "native grouped selector requires an explicit ORDER BY for bounded retraction");
+                let input_exprs = if is_selector {
+                    let mut args = vec![agg.expressions()[0].clone()];
+                    if let Some(order) = agg.order_bys() {
+                        args.extend(order.iter().map(|sort| sort.expr.clone()));
+                    }
+                    args
+                } else {
                     aggregate_expressions(std::slice::from_ref(&agg), &AggregateMode::Single, 0)?
-                        .pop()
-                        .unwrap();
+                        .pop().unwrap()
+                };
                 let collection = native_config.is_some()
                     && agg
                         .fun()
                         .inner()
                         .as_any()
                         .is::<datafusion::functions_aggregate::array_agg::ArrayAgg>();
+                let replay_members = collection || (t == AccumulatorType::Batch && descriptor.is_some() && !is_extremum(&agg));
                 if collection {
-                    ensure!(
-                        agg.expressions().len() == 1,
-                        "native ARRAY_AGG requires one value argument"
-                    );
+                    ensure!(agg.expressions().len() == 1, "native ARRAY_AGG requires one value argument");
+                }
+                if replay_members {
                     let types = input_exprs
                         .iter()
                         .map(|expr| expr.data_type(&input_schema.schema))
@@ -3481,20 +4037,34 @@ impl IncrementalAggregatingConstructor {
                         "native ARRAY_AGG collection schema exceeds configured decoded allowance"
                     );
                 }
-                let row_converter = Arc::new(RowConverter::new(
+                if is_selector {
+                    let types = input_exprs.iter().map(|expr| expr.data_type(&input_schema.schema))
+                        .collect::<DFResult<Vec<_>>>()?;
+                    let limits = native_config.context("grouped selector limits missing")?;
+                    SelectorSpec::preflight_types(&types[0], &types[1..], SelectorBudget {
+                        key_bytes: limits.key_bytes,
+                        value_bytes: limits.value_bytes,
+                        decoded_bytes: limits.value_bytes.checked_mul(3)
+                            .context("selector decoded allowance overflow")?,
+                    })?;
+                }
+                // Shared selectors own their value codec (including nested Arrow
+                // values unsupported by Arrow row ordering). This converter is
+                // used only by the other aggregate strategies.
+                let row_converter = Arc::new(RowConverter::new(if is_selector { Vec::new() } else {
                     input_exprs
                         .iter()
                         .map(|ex| Ok(SortField::new(ex.data_type(&input_schema.schema)?)))
-                        .collect::<DFResult<_>>()?,
-                )?);
+                        .collect::<DFResult<_>>()?
+                })?);
 
                 let fields = t.state_fields(&agg)?;
                 let first_state_col = sliding_state_fields.len();
                 sliding_state_fields.extend(fields.into_iter().enumerate().map(|(part, field)| {
                     let field = (*field).clone();
                     if t == AccumulatorType::AppendOnly {
-                        // FIRST/LAST state contains repeated names such as is_set.
-                        // Names are internal; ordinals identify the persisted state.
+                        // Internal aggregate state fields can repeat names.
+                        // Ordinals identify their persisted positions.
                         field.with_name(format!("_native_state_{}", first_state_col + part))
                     } else {
                         field
@@ -3503,9 +4073,9 @@ impl IncrementalAggregatingConstructor {
                 let state_cols = (first_state_col..sliding_state_fields.len()).collect_vec();
 
                 let (index_converter, index_columns) =
-                    if t == AccumulatorType::Batch && native_config.is_some() {
+                    if t == AccumulatorType::Batch && native_config.is_some() && !is_selector {
                         let (codec, columns) =
-                            native_index_codec(&agg, &input_exprs, &input_schema.schema)?;
+                            native_index_codec(&agg, &input_exprs, &input_schema.schema, replay_members)?;
                         (Some(codec), columns)
                     } else {
                         (None, Vec::new())
@@ -3520,7 +4090,7 @@ impl IncrementalAggregatingConstructor {
                     filter,
                     index_converter,
                     index_columns,
-                    collection,
+                    (collection, replay_members, descriptor),
                 ))
             })
             // The second map_ok returns an inner Result. flatten_ok would
@@ -3594,7 +4164,7 @@ impl IncrementalAggregatingConstructor {
             .iter()
             .filter(|_| native_config.is_some())
         {
-            let (agg, _, _, _, _, _, _, _, collection) = aggregates
+            let (agg, _, _, _, _, _, _, _, (collection, _, _)) = aggregates
                 .get(*index as usize)
                 .context("bounded collection aggregate ordinal is invalid")?;
             ensure!(
@@ -3618,12 +4188,21 @@ impl IncrementalAggregatingConstructor {
                         filter,
                         index_converter,
                         index_columns,
-                        collection,
+                        (collection, replay_members, descriptor),
                     ),
                 )|
                  -> Result<Aggregator> {
+                    let member_types = input_exprs
+                        .iter()
+                        .map(|expr| expr.data_type(&input_schema.schema))
+                        .collect::<DFResult<Vec<_>>>()?;
+                    let member_decode_base = if replay_members {
+                        native_collection_decode_bound(&member_types, 0)?
+                    } else {
+                        0
+                    };
                     Ok(Aggregator {
-                        collection_member_bound: if collection {
+                        collection_member_bound: if replay_members {
                             native_collection_decode_bound(
                                 &input_exprs
                                     .iter()
@@ -3636,7 +4215,7 @@ impl IncrementalAggregatingConstructor {
                         } else {
                             0
                         },
-                        func: agg,
+                        func: agg.clone(),
                         input_exprs,
                         filter,
                         accumulator_type: t,
@@ -3644,7 +4223,11 @@ impl IncrementalAggregatingConstructor {
                         state_cols,
                         index_converter,
                         index_columns,
-                        collection,
+                        replay_members,
+                        array_result: collection,
+                        descriptor,
+                        member_types,
+                        member_decode_base,
                         collection_output_limit: config
                             .collection_output_limits
                             .get(&(index as u32))
@@ -3652,6 +4235,22 @@ impl IncrementalAggregatingConstructor {
                             .map(|limit| usize::try_from(*limit))
                             .transpose()?,
                         injected_timestamp: Some(index) == injected_timestamp_index,
+                        selector: if classify(agg.fun()).is_some() {
+                            let spec = selector_spec(&agg, &expression_schema)?;
+                            let limits =
+                                native_config.context("grouped selector state limits missing")?;
+                            spec.validate_budget(SelectorBudget {
+                                key_bytes: limits.key_bytes,
+                                value_bytes: limits.value_bytes,
+                                decoded_bytes: limits
+                                    .value_bytes
+                                    .checked_mul(3)
+                                    .context("grouped selector decoded allowance overflow")?,
+                            })?;
+                            Some(spec)
+                        } else {
+                            None
+                        },
                     })
                 },
             )
@@ -3683,6 +4282,12 @@ impl IncrementalAggregatingConstructor {
             // Previous R keys contain the timestamp argument, not the stable
             // source row ID. They cannot recover a CDC before row's old time.
             identity.update(b"\0injected-timestamp-row-id.v1");
+        }
+        if aggregates
+            .iter()
+            .any(|aggregate| aggregate.selector.is_some())
+        {
+            identity.update(b"\0shared-grouped-selector-candidate.v2");
         }
         identity.update(b"\0compact-group-calendar-references.v5");
         let native_schema_identity = identity.finalize().to_vec();
@@ -3795,10 +4400,7 @@ mod tests {
     use arroyo_types::Watermark;
     use datafusion::execution::FunctionRegistry;
     use datafusion::functions_aggregate::{
-        array_agg::array_agg_udaf,
-        count::count_udaf,
-        first_last::{first_value_udaf, last_value_udaf},
-        min_max::max_udaf,
+        array_agg::array_agg_udaf, count::count_udaf, min_max::max_udaf,
     };
     use datafusion::physical_expr::aggregate::AggregateExprBuilder;
     use datafusion::physical_expr::expressions::{Column, Literal};
@@ -3807,6 +4409,29 @@ mod tests {
         serialize_physical_aggr_expr, serialize_physical_expr,
     };
     use datafusion_proto::protobuf::{AggregateExecNode, MaybeFilter};
+
+    fn first_value_udaf() -> Arc<datafusion::logical_expr::AggregateUDF> {
+        arroyo_planner::grouped_selector_udaf::grouped_selector(
+            arroyo_planner::grouped_selector::SelectorKind::First,
+            false,
+        )
+    }
+    fn last_value_udaf() -> Arc<datafusion::logical_expr::AggregateUDF> {
+        arroyo_planner::grouped_selector_udaf::grouped_selector(
+            arroyo_planner::grouped_selector::SelectorKind::Last,
+            false,
+        )
+    }
+    fn selector_ordinal_expr() -> Arc<dyn PhysicalExpr> {
+        Arc::new(
+            datafusion::physical_expr::ScalarFunctionExpr::try_new(
+                arroyo_planner::grouped_selector_udaf::ordinal_marker(),
+                vec![],
+                input_schema().as_ref(),
+            )
+            .unwrap(),
+        )
+    }
 
     #[derive(Default)]
     struct AggregateCollector {
@@ -3856,6 +4481,7 @@ mod tests {
         let include: Arc<dyn PhysicalExpr> = Arc::new(Column::new("include", 2));
         let timestamp: Arc<dyn PhysicalExpr> = Arc::new(Column::new(TIMESTAMP_FIELD, 3));
         let mut registry = Registry::default();
+        arroyo_planner::grouped_selector_udaf::register(&mut registry);
         for function in [
             first_value_udaf(),
             last_value_udaf(),
@@ -3873,16 +4499,17 @@ mod tests {
             ("last_desc", last_value_udaf(), true, false),
             ("selected_last", last_value_udaf(), false, true),
         ] {
-            let mut builder = AggregateExprBuilder::new(function, vec![value.clone()])
-                .schema(schema.clone())
-                .alias(name)
-                .order_by(LexOrdering::new(vec![PhysicalSortExpr::new(
-                    sequence.clone(),
-                    SortOptions {
-                        descending,
-                        nulls_first: false,
-                    },
-                )]));
+            let mut builder =
+                AggregateExprBuilder::new(function, vec![value.clone(), selector_ordinal_expr()])
+                    .schema(schema.clone())
+                    .alias(name)
+                    .order_by(LexOrdering::new(vec![PhysicalSortExpr::new(
+                        sequence.clone(),
+                        SortOptions {
+                            descending,
+                            nulls_first: false,
+                        },
+                    )]));
             if name == "first_asc" {
                 builder = builder.ignore_nulls();
             }
@@ -3934,7 +4561,7 @@ mod tests {
                 ),
             ] {
                 expressions.push(Arc::new(
-                    AggregateExprBuilder::new(function, vec![argument])
+                    AggregateExprBuilder::new(function, vec![argument, selector_ordinal_expr()])
                         .schema(schema.clone())
                         .alias(name)
                         .build()
@@ -3994,11 +4621,6 @@ mod tests {
             },
             Arc::new(registry),
         )
-    }
-
-    fn operator() -> IncrementalAggregatingFunc {
-        let (config, registry) = native_config();
-        IncrementalAggregatingConstructor::build(config, registry).unwrap()
     }
 
     fn native_operator() -> IncrementalAggregatingFunc {
@@ -4218,6 +4840,13 @@ mod tests {
         let Some(PhysicalPlanType::Aggregate(aggregate)) = &mut plan.physical_plan_type else {
             panic!("expected aggregate");
         };
+        // Calendar fixtures exercise contribution identities, which may repeat
+        // across days. Their unused positions must not impose unrelated live
+        // selector row-identity semantics on those inputs.
+        for index in 0..5 {
+            aggregate.aggr_expr[index] = aggregate.aggr_expr[6].clone();
+            aggregate.filter_expr[index].expr = None;
+        }
         aggregate.aggr_expr[7] = aggregate.aggr_expr[6].clone();
         aggregate.aggr_expr_name[7] = "selected_week".into();
         aggregate.filter_expr[7] = aggregate.filter_expr[6].clone();
@@ -4256,6 +4885,14 @@ mod tests {
         config.aggregate_exec = plan.encode_to_vec();
         let schema: ArroyoSchema = config.final_schema.take().unwrap().try_into().unwrap();
         let mut fields = schema.schema.fields().to_vec();
+        for index in 0..5 {
+            fields[index] = Arc::new(
+                fields[6]
+                    .as_ref()
+                    .clone()
+                    .with_name(format!("unused_count_{index}")),
+            );
+        }
         fields[7] = Arc::new(fields[6].as_ref().clone().with_name("selected_week"));
         config.final_schema = Some(
             ArroyoSchema::from_schema_unkeyed(Arc::new(Schema::new(fields)))
@@ -7336,6 +7973,295 @@ mod tests {
         }
     }
 
+    #[test]
+    fn selector_flush_admission_accounts_for_concurrent_candidate_decode() {
+        let frame = 32 * 1024;
+        let mut config = native_test_config();
+        config.value_bytes = frame;
+        config.overlay_bytes = 64 * frame;
+        config.max_pending_output_bytes = 24 * frame;
+        assert_eq!(
+            native_decoded_workspace(config, false).unwrap(),
+            139 * frame
+        );
+        assert_eq!(native_decoded_workspace(config, true).unwrap(), 142 * frame);
+        for factor in [139, 142] {
+            let resources = WorkerStateResources::new(ResourceConfig {
+                block_cache_bytes: 1024 * 1024,
+                memtable_bytes: 1024 * 1024,
+                queued_write_bytes: 4 * 1024 * 1024,
+                decoded_value_bytes: factor * frame,
+                scan_page_bytes: 1024 * 1024,
+                max_blocking_operations: 2,
+                max_snapshots: 2,
+                max_open_databases: 1,
+                disk_reserve_bytes: 0,
+            })
+            .unwrap();
+            let output = resources
+                .try_decoded_value(3 * config.max_pending_output_bytes)
+                .unwrap();
+            let scope = resources
+                .try_decoded_value(config.overlay_bytes + 3 * frame)
+                .unwrap();
+            let candidate = resources.try_decoded_value(3 * frame);
+            assert_eq!(candidate.is_ok(), factor == 142);
+            assert_eq!(
+                native_decoded_workspace(config, true).unwrap() <= factor * frame,
+                factor == 142
+            );
+            drop(candidate);
+            drop(scope);
+            drop(output);
+            assert!(resources.try_decoded_value(factor * frame).is_ok());
+        }
+        config.value_bytes = usize::MAX;
+        assert!(native_decoded_workspace(config, true).is_err());
+    }
+
+    #[tokio::test]
+    async fn selector_real_flush_preserves_checkpoint_writer_headroom_and_reloads_both_backends() {
+        use arroyo_state::live::{lifecycle::RocksStateConfig, rocks::RocksLiveState};
+        let frame = 1024 * 1024;
+        let config = AggregateStateConfig {
+            key_bytes: 512,
+            value_bytes: frame,
+            page_bytes: 2 * frame,
+            page_entries: 64,
+            write_bytes: 64 * frame,
+            write_operations: 128,
+            overlay_bytes: 64 * frame,
+            max_pending_output_rows: 64,
+            max_pending_output_bytes: 24 * frame,
+            max_resident_bytes: 8 * frame,
+        };
+        let namespace = StateNamespace {
+            ownership: Ownership::PartitionLocal {
+                subtask: 0,
+                parallelism: 1,
+            },
+            table: NATIVE_AGGREGATE_TABLE.as_bytes().to_vec(),
+        };
+        let encoded_key = aggregate_encoded_key_bound(&namespace, config.key_bytes).unwrap();
+        let mut resource_config = ResourceConfig {
+            block_cache_bytes: frame,
+            memtable_bytes: frame,
+            queued_write_bytes: AdmittedWriteBatch::reservation_bytes(
+                config.write_bytes,
+                config.write_operations,
+            )
+            .unwrap()
+                * 2,
+            decoded_value_bytes: 142 * frame,
+            scan_page_bytes: 16 * frame,
+            max_blocking_operations: 2,
+            max_snapshots: 8,
+            max_open_databases: 2,
+            disk_reserve_bytes: 0,
+        };
+        let writer_bytes = checkpoint_decoded_reservation(&resource_config).unwrap();
+        assert_eq!(writer_bytes, 4_374_526);
+        let required = aggregate_decoded_foreground(
+            native_limits(config),
+            config.max_pending_output_bytes,
+            true,
+            encoded_key,
+        )
+        .unwrap()
+        .checked_add(writer_bytes)
+        .unwrap();
+        assert_eq!(required, 153_272_318);
+        assert!(validate_selector_owner_decoded(config, &resource_config, encoded_key).is_err());
+        resource_config.decoded_value_bytes = required - 1;
+        assert!(validate_selector_owner_decoded(config, &resource_config, encoded_key).is_err());
+        resource_config.decoded_value_bytes = required;
+        assert_eq!(
+            validate_selector_owner_decoded(config, &resource_config, encoded_key).unwrap(),
+            required
+        );
+        let mut overflow = config;
+        overflow.overlay_bytes = usize::MAX;
+        assert!(validate_selector_owner_decoded(overflow, &resource_config, encoded_key).is_err());
+        for rocks in [false, true] {
+            for decoded in [142 * frame, required] {
+                let root = std::env::temp_dir()
+                    .join(format!("selector-writer-overlap-{}", uuid::Uuid::new_v4()));
+                let resources = WorkerStateResources::new(ResourceConfig {
+                    decoded_value_bytes: decoded,
+                    ..resource_config.clone()
+                })
+                .unwrap();
+                let native = if rocks {
+                    Some(Arc::new(
+                        RocksLiveState::open(
+                            RocksStateConfig {
+                                root: root.clone(),
+                                job_id: "selector-writer-overlap".into(),
+                                operator_id: "aggregate".into(),
+                                subtask: 0,
+                                generation: 0,
+                                attempt: 0,
+                            },
+                            resources.clone(),
+                        )
+                        .await
+                        .unwrap(),
+                    ))
+                } else {
+                    None
+                };
+                let backend: Arc<dyn LiveStateBackend> = if let Some(native) = &native {
+                    native.clone()
+                } else {
+                    Arc::new(MemoryLiveState::bounded(resources.clone(), 8 * frame).unwrap())
+                };
+                let mut manager =
+                    LiveTableManager::new(backend.clone(), namespace.ownership.clone()).unwrap();
+                let table = manager.register(NATIVE_AGGREGATE_TABLE).unwrap();
+                let mut store = AggregateStore::new(
+                    backend.clone(),
+                    table,
+                    resources.clone(),
+                    native_limits(config),
+                )
+                .unwrap();
+                store.preserve_selector_checkpoint_headroom();
+                // At the exact minimum no optional expiry/member key may steal
+                // the foreground+writer allowance, even before permits are held.
+                assert!(
+                    store
+                        .try_expiry_progress(config.max_pending_output_bytes)
+                        .is_none()
+                );
+                assert!(
+                    store
+                        .try_member_progress(config.max_pending_output_bytes)
+                        .is_none()
+                );
+                let mut operator = native_operator();
+                operator.native_config = Some(config);
+                let input = batch(&[Some("a"), Some("b")], &[1, 2], &[Some(true), Some(true)]);
+                let inputs = operator.compute_inputs(&input).unwrap();
+                let mut scope = store.begin().await.unwrap();
+                for row in 0..2 {
+                    operator
+                        .native_process_event(
+                            &mut scope,
+                            &GLOBAL_KEY,
+                            &inputs,
+                            row,
+                            false,
+                            Some(&[row as u8 + 1; 16]),
+                        )
+                        .await
+                        .unwrap();
+                }
+                scope.commit().await.unwrap();
+                operator.native_store = Some(store);
+                let mut ctx = calendar_dispatch_context(&mut operator).await;
+                let mut collector = AggregateCollector::default();
+                // Deterministically reproduce the existing asynchronous export
+                // lease while executing the actual native dirty drain.
+                let writer = resources.try_decoded_value(writer_bytes).unwrap();
+                let flushed = operator.drain_native_dirty(&mut ctx, &mut collector).await;
+                if decoded == 142 * frame {
+                    let error = flushed.unwrap_err();
+                    assert!(format!("{error:#}").contains("aggregate scope decoded reservation"));
+                    assert!(collector.batches.is_empty());
+                    drop(writer);
+                    operator
+                        .drain_native_dirty(&mut ctx, &mut collector)
+                        .await
+                        .unwrap();
+                } else {
+                    flushed.unwrap();
+                    drop(writer);
+                }
+                assert_eq!(
+                    collector
+                        .batches
+                        .iter()
+                        .map(RecordBatch::num_rows)
+                        .sum::<usize>(),
+                    1
+                );
+                assert_eq!(
+                    collector.batches[0]
+                        .column(1)
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .unwrap()
+                        .value(0),
+                    "b"
+                );
+                // A new owner reconstructs G and its candidate index, then emits
+                // the exact before image and the new winner under the same lease.
+                if decoded == required {
+                    let mut fresh = native_operator();
+                    fresh.native_config = Some(config);
+                    fresh.native_store = operator.native_store.take();
+                    drop(operator);
+                    let input = batch(&[Some("c")], &[3], &[Some(true)]);
+                    let inputs = fresh.compute_inputs(&input).unwrap();
+                    let store = fresh.native_store.as_ref().unwrap();
+                    let mut scope = store.begin().await.unwrap();
+                    fresh
+                        .native_process_event(
+                            &mut scope,
+                            &GLOBAL_KEY,
+                            &inputs,
+                            0,
+                            false,
+                            Some(&[3; 16]),
+                        )
+                        .await
+                        .unwrap();
+                    scope.commit().await.unwrap();
+                    let mut fresh_ctx = calendar_dispatch_context(&mut fresh).await;
+                    let mut next = AggregateCollector::default();
+                    let writer = resources.try_decoded_value(writer_bytes).unwrap();
+                    fresh
+                        .drain_native_dirty(&mut fresh_ctx, &mut next)
+                        .await
+                        .unwrap();
+                    drop(writer);
+                    let selected = next
+                        .batches
+                        .iter()
+                        .flat_map(|batch| {
+                            let values = batch
+                                .column(1)
+                                .as_any()
+                                .downcast_ref::<StringArray>()
+                                .unwrap();
+                            (0..values.len())
+                                .map(|row| values.value(row).to_owned())
+                                .collect::<Vec<_>>()
+                        })
+                        .collect::<Vec<_>>();
+                    assert_eq!(selected, ["b", "c"]);
+                    drop(fresh);
+                    drop(fresh_ctx);
+                } else {
+                    drop(operator);
+                }
+                drop(ctx);
+                drop(collector);
+                drop(manager);
+                drop(backend);
+                assert!(resources.try_decoded_value(decoded).is_ok());
+                if let Some(native) = native {
+                    Arc::try_unwrap(native)
+                        .unwrap_or_else(|_| panic!("retained overlap backend"))
+                        .close_and_remove()
+                        .await
+                        .unwrap();
+                    std::fs::remove_dir_all(root).unwrap();
+                }
+            }
+        }
+    }
+
     fn native_test_config() -> AggregateStateConfig {
         AggregateStateConfig {
             key_bytes: 256,
@@ -7371,12 +8297,20 @@ mod tests {
         limits: AggregateStoreLimits,
         queued_write_bytes: usize,
     ) -> AggregateStore {
+        native_test_store_with_resource_budgets(limits, queued_write_bytes, 4 * 1024 * 1024)
+    }
+
+    fn native_test_store_with_resource_budgets(
+        limits: AggregateStoreLimits,
+        queued_write_bytes: usize,
+        decoded_value_bytes: usize,
+    ) -> AggregateStore {
         let resources = WorkerStateResources::new(ResourceConfig {
             block_cache_bytes: 1024 * 1024,
             memtable_bytes: 1024 * 1024,
             queued_write_bytes,
-            decoded_value_bytes: 4 * 1024 * 1024,
-            scan_page_bytes: 1024 * 1024,
+            decoded_value_bytes,
+            scan_page_bytes: (1024_usize * 1024).max(limits.page_bytes.checked_mul(8).unwrap()),
             max_blocking_operations: 2,
             max_snapshots: 2,
             max_open_databases: 1,
@@ -8887,7 +9821,7 @@ mod tests {
                 for (row, value) in values.iter().enumerate() {
                     for ordinal in 184_u64..192 {
                         let (_, key, _) = operator
-                            .native_member_keys(
+                            .inspect_member_keys(
                                 &group.to_be_bytes(),
                                 0,
                                 0,
@@ -9418,7 +10352,7 @@ mod tests {
                 .await
                 .unwrap_err()
                 .to_string()
-                .contains("native collection exceeds")
+                .contains("configured key allowance before materialization")
         );
         drop(scope);
         let scope = store.begin().await.unwrap();
@@ -9447,6 +10381,7 @@ mod tests {
                             members: 1_000,
                             encoded_args_bytes: 0,
                             scalar_bytes: 0,
+                            max_member_workspace: 1,
                         }
                     )),
                 )
@@ -9482,6 +10417,14 @@ mod tests {
                             encoded_args_bytes: u64::try_from(stored_args.as_ref().len() * 12)
                                 .unwrap(),
                             scalar_bytes: u64::try_from(scalar_bytes * 12).unwrap(),
+                            max_member_workspace: u64::try_from(
+                                native_collection_decode_bound(
+                                    std::slice::from_ref(value.data_type()),
+                                    stored_args.as_ref().len()
+                                )
+                                .unwrap()
+                            )
+                            .unwrap(),
                         }
                     )),
                 )
@@ -9573,7 +10516,7 @@ mod tests {
         let inputs = operator.compute_inputs(&input).unwrap();
         let timestamp_values = inputs[8].selected_values(Some(0)).unwrap().unwrap();
         let (primary, secondary, args) = operator
-            .native_member_keys(&GLOBAL_KEY, 0, 8, &timestamp_values, 0)
+            .inspect_member_keys(&GLOBAL_KEY, 0, 8, &timestamp_values, 0)
             .unwrap();
         let mut scope = store.begin().await.unwrap();
         scope.put(&primary, &args).unwrap();
@@ -9673,6 +10616,28 @@ mod tests {
         );
     }
 
+    async fn native_test_evaluate(
+        operator: &IncrementalAggregatingFunc,
+        scope: &AggregateScope<'_>,
+        group: &EncodedGroup,
+    ) -> Vec<ScalarValue> {
+        let mut states = operator.native_accumulators(Some(group)).unwrap();
+        let mut values = Vec::new();
+        for (index, state) in states.iter_mut().enumerate() {
+            values.push(
+                if operator.aggregates[index].accumulator_type == AccumulatorType::Batch {
+                    operator
+                        .native_fallback_value(scope, &GLOBAL_KEY, group.generation, index)
+                        .await
+                        .unwrap()
+                } else {
+                    state.evaluate().unwrap()
+                },
+            );
+        }
+        values
+    }
+
     #[tokio::test]
     async fn append_only_native_state_keeps_winners_without_member_history() {
         let store = native_test_store();
@@ -9684,7 +10649,7 @@ mod tests {
         for aggregate in &operator.aggregates {
             if matches!(
                 aggregate.func.fun().name().to_ascii_lowercase().as_str(),
-                "min" | "max" | "first_value" | "last_value"
+                "min" | "max"
             ) {
                 assert_eq!(aggregate.accumulator_type, AccumulatorType::AppendOnly);
             }
@@ -9721,7 +10686,22 @@ mod tests {
             }
         }
         let scope = store.begin().await.unwrap();
-        assert!(scope.first(b"M").await.unwrap().is_none());
+        let mut members = 0;
+        scope
+            .visit_prefix(b"M", None, |_, _| {
+                members += 1;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            members,
+            operator
+                .aggregates
+                .iter()
+                .filter(|aggregate| aggregate.selector.is_some())
+                .count()
+        );
         assert!(scope.first(b"R").await.unwrap().is_none());
         let encoded = scope
             .get(&native_group_key(b'G', &GLOBAL_KEY).unwrap())
@@ -9738,12 +10718,7 @@ mod tests {
             .unwrap()
             .decode(&encoded, scope.limits().value_bytes)
             .unwrap();
-        let mut states = fresh.native_accumulators(Some(&group)).unwrap();
-        let actual = states
-            .iter_mut()
-            .map(IncrementalState::evaluate)
-            .collect::<DFResult<Vec<_>>>()
-            .unwrap();
+        let actual = native_test_evaluate(&fresh, &scope, &group).await;
         let smallest = (0..100).min_by_key(|&rank| order[rank]).unwrap();
         let largest = (0..100).max_by_key(|&rank| order[rank]).unwrap();
         let selected = (0..100)
@@ -9794,15 +10769,9 @@ mod tests {
             .unwrap()
             .decode(&bytes, scope.limits().value_bytes)
             .unwrap();
-        let mut states = fresh.native_accumulators(Some(&group)).unwrap();
-        let actual = states
-            .iter_mut()
-            .map(IncrementalState::evaluate)
-            .collect::<DFResult<Vec<_>>>()
-            .unwrap();
+        let actual = native_test_evaluate(&fresh, &scope, &group).await;
         // Both non-null rows share the earliest eligible ORDER BY key.
-        assert!(matches!(&actual[0], ScalarValue::Utf8(Some(value))
-            if value == "C" || value == "D"));
+        assert_eq!(actual[0], ScalarValue::Utf8(Some("C".into())));
         assert_eq!(actual[1], ScalarValue::Utf8(None));
         assert_eq!(actual[4], ScalarValue::Utf8(None));
         assert_eq!(actual[5], ScalarValue::Int64(Some(5)));
@@ -9825,7 +10794,7 @@ mod tests {
         for index in 9..13 {
             assert_eq!(
                 operator.aggregates[index].accumulator_type,
-                AccumulatorType::AppendOnly
+                AccumulatorType::Batch
             );
         }
         let first_chunk = batch(
@@ -9853,25 +10822,11 @@ mod tests {
             .unwrap()
             .decode(&checkpoint_bytes, scope.limits().value_bytes)
             .unwrap();
-        let mut checkpoint_state = operator
-            .native_accumulators(Some(&checkpoint_group))
-            .unwrap();
-        assert_eq!(
-            checkpoint_state[9].evaluate().unwrap(),
-            ScalarValue::Int64(Some(100))
-        );
-        assert_eq!(
-            checkpoint_state[10].evaluate().unwrap(),
-            ScalarValue::Int64(Some(50))
-        );
-        assert_eq!(
-            checkpoint_state[11].evaluate().unwrap(),
-            ScalarValue::Utf8(None)
-        );
-        assert_eq!(
-            checkpoint_state[12].evaluate().unwrap(),
-            ScalarValue::Utf8(None)
-        );
+        let checkpoint_state = native_test_evaluate(&operator, &scope, &checkpoint_group).await;
+        assert_eq!(checkpoint_state[9], ScalarValue::Int64(Some(100)));
+        assert_eq!(checkpoint_state[10], ScalarValue::Int64(Some(50)));
+        assert_eq!(checkpoint_state[11], ScalarValue::Utf8(None));
+        assert_eq!(checkpoint_state[12], ScalarValue::Utf8(None));
         drop(scope);
 
         // Construct another operator and continue from the serialized group.
@@ -9901,7 +10856,7 @@ mod tests {
             scope.commit().await.unwrap();
         }
         let scope = store.begin().await.unwrap();
-        assert!(scope.first(b"M").await.unwrap().is_none());
+        assert!(scope.first(b"M").await.unwrap().is_some());
         assert!(scope.first(b"R").await.unwrap().is_none());
         let group = decode_group(
             &scope
@@ -9914,14 +10869,11 @@ mod tests {
             scope.limits().value_bytes,
         )
         .unwrap();
-        let mut states = fresh.native_accumulators(Some(&group)).unwrap();
-        assert_eq!(states[9].evaluate().unwrap(), ScalarValue::Int64(Some(100)));
-        assert_eq!(states[10].evaluate().unwrap(), ScalarValue::Int64(Some(20)));
-        assert_eq!(
-            states[11].evaluate().unwrap(),
-            ScalarValue::Utf8(Some("end".into()))
-        );
-        assert_eq!(states[12].evaluate().unwrap(), ScalarValue::Utf8(None));
+        let states = native_test_evaluate(&fresh, &scope, &group).await;
+        assert_eq!(states[9], ScalarValue::Int64(Some(100)));
+        assert_eq!(states[10], ScalarValue::Int64(Some(20)));
+        assert_eq!(states[11], ScalarValue::Utf8(Some("end".into())));
+        assert_eq!(states[12], ScalarValue::Utf8(None));
     }
 
     #[test]
@@ -10115,6 +11067,944 @@ mod tests {
         scope.commit().await.unwrap();
     }
 
+    fn event_time_selector_operator(append_only: bool) -> IncrementalAggregatingFunc {
+        let (mut config, registry) = native_config();
+        use datafusion_proto::protobuf::{PhysicalSortExprNode, physical_expr_node::ExprType};
+        let mut plan = PhysicalPlanNode::decode(config.aggregate_exec.as_slice()).unwrap();
+        let Some(PhysicalPlanType::Aggregate(aggregate)) = &mut plan.physical_plan_type else {
+            panic!("aggregate")
+        };
+        for (index, node) in aggregate.aggr_expr.iter_mut().take(5).enumerate() {
+            let Some(ExprType::AggregateExpr(expression)) = &mut node.expr_type else {
+                panic!("expression")
+            };
+            let kind = if index == 0 || index == 2 {
+                arroyo_planner::grouped_selector::SelectorKind::First
+            } else {
+                arroyo_planner::grouped_selector::SelectorKind::Last
+            };
+            expression.aggregate_function = Some(datafusion_proto::protobuf::physical_aggregate_expr_node::AggregateFunction::UserDefinedAggrFunction(
+                arroyo_planner::grouped_selector_udaf::grouped_selector(kind, true).name().to_string()));
+            let clock: Arc<dyn PhysicalExpr> = Arc::new(Column::new(TIMESTAMP_FIELD, 3));
+            expression.ordering_req.insert(
+                0,
+                PhysicalSortExprNode {
+                    expr: Some(Box::new(
+                        serialize_physical_expr(&clock, &DefaultPhysicalExtensionCodec {}).unwrap(),
+                    )),
+                    asc: true,
+                    nulls_first: false,
+                },
+            );
+        }
+        config.aggregate_exec = plan.encode_to_vec();
+        if !append_only {
+            let mut schema = SchemaBuilder::from(input_schema().as_ref().clone());
+            schema.push(Field::new(
+                UPDATING_META_FIELD,
+                DataType::Struct(updating_meta_fields()),
+                false,
+            ));
+            config.input_schema = Some(
+                ArroyoSchema::from_schema_unkeyed(Arc::new(schema.finish()))
+                    .unwrap()
+                    .into(),
+            );
+        }
+        let mut operator = IncrementalAggregatingConstructor::build_with_native_config(
+            config,
+            registry,
+            Some(native_test_config()),
+        )
+        .unwrap();
+        operator.retain_indefinitely = true;
+        operator
+    }
+
+    #[tokio::test]
+    async fn shared_selector_rejects_stale_before_version_without_losing_candidate() {
+        let store = native_test_store();
+        let operator = event_time_selector_operator(false);
+        let original = batch_at(&[Some("kept")], &[20], &[20]);
+        let mut scope = store.begin_point().await.unwrap();
+        operator
+            .native_process_event(
+                &mut scope,
+                &GLOBAL_KEY,
+                &operator.compute_inputs(&original).unwrap(),
+                0,
+                false,
+                Some(&[7; 16]),
+            )
+            .await
+            .unwrap();
+        scope.commit().await.unwrap();
+        for stale in [
+            batch_at(&[Some("stale")], &[20], &[99]),
+            batch_at(&[Some("kept")], &[19], &[99]),
+            batch(&[Some("kept")], &[20], &[Some(false)]),
+        ] {
+            let mut scope = store.begin().await.unwrap();
+            let error = operator
+                .native_process_event(
+                    &mut scope,
+                    &GLOBAL_KEY,
+                    &operator.compute_inputs(&stale).unwrap(),
+                    0,
+                    true,
+                    Some(&[7; 16]),
+                )
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("before-image"), "{error}");
+            drop(scope);
+            let scope = store.begin().await.unwrap();
+            assert_eq!(
+                operator
+                    .native_fallback_value(&scope, &GLOBAL_KEY, 0, 1)
+                    .await
+                    .unwrap(),
+                ScalarValue::Utf8(Some("kept".into()))
+            );
+        }
+        // A legitimate before image may carry the new triggering clock while
+        // its actual value and explicit secondary key retain the prior version.
+        let before = batch_at(&[Some("kept")], &[20], &[99]);
+        let mut scope = store.begin().await.unwrap();
+        operator
+            .native_process_event(
+                &mut scope,
+                &GLOBAL_KEY,
+                &operator.compute_inputs(&before).unwrap(),
+                0,
+                true,
+                Some(&[7; 16]),
+            )
+            .await
+            .unwrap();
+        scope.commit().await.unwrap();
+        let scope = store.begin().await.unwrap();
+        assert_eq!(
+            operator
+                .native_fallback_value(&scope, &GLOBAL_KEY, 0, 1)
+                .await
+                .unwrap(),
+            ScalarValue::Utf8(None)
+        );
+    }
+
+    impl IncrementalAggregatingFunc {
+        // Inspect production member keys without mutating state; retain the exact
+        // codec/bounds path used by changes rather than reproducing key encoding.
+        fn inspect_member_keys(
+            &self,
+            group: &[u8],
+            generation: u64,
+            aggregate_index: usize,
+            values: &[ArrayRef],
+            ordinal: u64,
+        ) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>)> {
+            let template = native_test_store();
+            let limits = self.native_store.as_ref().unwrap_or(&template).limits();
+            self.native_member_keys(
+                &NativeMemberChange {
+                    group,
+                    generation,
+                    aggregate_index,
+                    values,
+                    retract: false,
+                    ordinal,
+                    row_id: None,
+                },
+                limits,
+                None,
+                false,
+            )
+        }
+    }
+
+    fn native_mixed_companion_operator() -> IncrementalAggregatingFunc {
+        native_companion_operator(false)
+    }
+
+    fn native_companion_operator(hll: bool) -> IncrementalAggregatingFunc {
+        let (mut config, mut registry) = native_config();
+        let codec = DefaultPhysicalExtensionCodec {};
+        let mut plan = PhysicalPlanNode::decode(config.aggregate_exec.as_slice()).unwrap();
+        let Some(PhysicalPlanType::Aggregate(aggregate)) = &mut plan.physical_plan_type else {
+            panic!("aggregate");
+        };
+        let mut final_fields = ArroyoSchema::try_from(config.final_schema.take().unwrap())
+            .unwrap()
+            .schema
+            .fields()
+            .to_vec();
+        if hll {
+            for index in 1..5 {
+                aggregate.aggr_expr[index] = aggregate.aggr_expr[6].clone();
+                aggregate.aggr_expr_name[index] = format!("unused_count_{index}");
+                aggregate.filter_expr[index].expr = None;
+                final_fields[index] = Arc::new(
+                    final_fields[6]
+                        .as_ref()
+                        .clone()
+                        .with_name(format!("unused_count_{index}")),
+                );
+            }
+        }
+        let functions = [
+            if hll {
+                datafusion::functions_aggregate::approx_distinct::approx_distinct_udaf()
+            } else {
+                datafusion::functions_aggregate::median::median_udaf()
+            },
+            datafusion::functions_aggregate::stddev::stddev_udaf(),
+        ];
+        for (offset, function) in functions.into_iter().enumerate() {
+            Arc::get_mut(&mut registry)
+                .unwrap()
+                .register_udaf(function.clone())
+                .unwrap();
+            let argument: Arc<dyn PhysicalExpr> = if offset == 0 && hll {
+                Arc::new(Column::new("value", 0))
+            } else if offset == 0 {
+                Arc::new(datafusion::physical_expr::expressions::CastExpr::new(
+                    Arc::new(Column::new("sequence", 1)),
+                    DataType::Float64,
+                    None,
+                ))
+            } else {
+                Arc::new(Literal::new(ScalarValue::Float64(Some(1.0))))
+            };
+            let expression = Arc::new(
+                AggregateExprBuilder::new(function, vec![argument])
+                    .schema(input_schema())
+                    .alias(if offset == 0 {
+                        "median_priority"
+                    } else {
+                        "constant_stddev"
+                    })
+                    .build()
+                    .unwrap(),
+            );
+            let index = 8 + offset;
+            aggregate.aggr_expr.insert(
+                index,
+                serialize_physical_aggr_expr(expression.clone(), &codec).unwrap(),
+            );
+            aggregate
+                .aggr_expr_name
+                .insert(index, expression.name().into());
+            aggregate.filter_expr.insert(
+                index,
+                datafusion_proto::protobuf::MaybeFilter {
+                    expr: (offset == 0).then(|| {
+                        serialize_physical_expr(
+                            &(Arc::new(Column::new("include", 2)) as Arc<dyn PhysicalExpr>),
+                            &codec,
+                        )
+                        .unwrap()
+                    }),
+                },
+            );
+            final_fields.insert(index, expression.field());
+        }
+        config.aggregate_exec = plan.encode_to_vec();
+        config.final_schema = Some(
+            ArroyoSchema::from_schema_unkeyed(Arc::new(Schema::new(final_fields)))
+                .unwrap()
+                .into(),
+        );
+        let mut input = SchemaBuilder::from(input_schema().as_ref().clone());
+        input.push(Field::new(
+            UPDATING_META_FIELD,
+            DataType::Struct(updating_meta_fields()),
+            false,
+        ));
+        config.input_schema = Some(
+            ArroyoSchema::from_schema_unkeyed(Arc::new(input.finish()))
+                .unwrap()
+                .into(),
+        );
+        let mut limits = native_test_config();
+        if hll {
+            let proto = PhysicalPlanNode::decode(config.aggregate_exec.as_slice()).unwrap();
+            let Some(PhysicalPlanType::Aggregate(plan)) = proto.physical_plan_type else {
+                panic!("aggregate")
+            };
+            let floor = plan
+                .aggr_expr
+                .iter()
+                .zip(&plan.aggr_expr_name)
+                .map(|(expr, name)| {
+                    let aggregate =
+                        decode_aggregate(&input_schema(), name, expr, registry.as_ref()).unwrap();
+                    aggregate_descriptor(&aggregate, &input_schema())
+                        .unwrap()
+                        .map_or(0, |descriptor| descriptor.retained_bound(0, 0).unwrap())
+                })
+                .sum::<usize>();
+            // Retain the audited constructor floor plus the existing one-row
+            // fixture allowance, rounded to a finite test frame size.
+            limits.value_bytes = (floor + native_test_config().value_bytes).next_power_of_two();
+            limits.page_bytes = limits.value_bytes.checked_mul(2).unwrap();
+            limits.write_bytes = limits.value_bytes.checked_mul(8).unwrap();
+            limits.overlay_bytes = limits.write_bytes;
+            limits.max_pending_output_bytes = limits.value_bytes.checked_mul(24).unwrap();
+        }
+        let operator = IncrementalAggregatingConstructor::build_with_native_config(
+            config,
+            registry,
+            Some(limits),
+        )
+        .unwrap();
+        if hll {
+            // Both fixed-replay fixtures use at most100B per selected value.
+            // Check the full shared replay formula, rather than assuming the
+            // constructor-floor margin also covers the member temporaries.
+            let largest = "s".repeat(100);
+            let values = vec![Arc::new(StringArray::from(vec![largest.as_str()])) as ArrayRef];
+            let encoded = bounded_row_size(&values, limits.value_bytes).unwrap();
+            let aggregate = &operator.aggregates[8];
+            let working = aggregate
+                .descriptor
+                .unwrap()
+                .retained_bound(1, 0)
+                .unwrap()
+                .checked_add(aggregate.member_workspace(encoded, 0, false).unwrap())
+                .unwrap();
+            assert!(working <= limits.value_bytes);
+            assert!(working.checked_mul(8).unwrap() <= limits.max_pending_output_bytes / 3);
+        }
+        operator
+    }
+
+    fn native_companion_store(operator: &IncrementalAggregatingFunc) -> AggregateStore {
+        let config = operator.native_config.unwrap();
+        let limits = AggregateStoreLimits {
+            key_bytes: config.key_bytes,
+            value_bytes: config.value_bytes,
+            page_bytes: config.page_bytes,
+            page_entries: config.page_entries,
+            write_bytes: config.write_bytes,
+            write_operations: config.write_operations,
+            overlay_bytes: config.overlay_bytes,
+        };
+        let decoded = config
+            .overlay_bytes
+            .checked_add(config.max_pending_output_bytes.checked_mul(3).unwrap())
+            .unwrap()
+            .checked_add(config.value_bytes.checked_mul(3).unwrap())
+            .unwrap();
+        native_test_store_with_resource_budgets(
+            limits,
+            config.value_bytes.checked_mul(64).unwrap(),
+            decoded,
+        )
+    }
+
+    #[tokio::test]
+    async fn mixed_selectors_replay_median_and_fixed_stddev_with_filter_identity_and_reload() {
+        let store = native_test_store();
+        let operator = native_mixed_companion_operator();
+        assert!(operator.aggregates[8].replay_members && !operator.aggregates[8].array_result);
+        assert_eq!(
+            operator.aggregates[9].accumulator_type,
+            AccumulatorType::Sliding
+        );
+        let input = batch(
+            &[Some("a"), Some("b"), Some("c"), Some("d"), Some("excluded")],
+            &[1, 5, 9, 9, 1000],
+            &[Some(true), Some(true), Some(true), Some(true), Some(false)],
+        );
+        let inputs = operator.compute_inputs(&input).unwrap();
+        for row in 0..input.num_rows() {
+            let mut scope = store.begin().await.unwrap();
+            operator
+                .native_process_event(
+                    &mut scope,
+                    &GLOBAL_KEY,
+                    &inputs,
+                    row,
+                    false,
+                    Some(&[row as u8; 16]),
+                )
+                .await
+                .unwrap();
+            scope.commit().await.unwrap();
+        }
+        let fresh = native_mixed_companion_operator();
+        let scope = store.begin().await.unwrap();
+        assert_eq!(
+            fresh
+                .native_fallback_value(&scope, &GLOBAL_KEY, 0, 8)
+                .await
+                .unwrap(),
+            ScalarValue::Float64(Some(7.0))
+        );
+        let group = fresh
+            .native_group_codec()
+            .unwrap()
+            .decode(
+                &scope
+                    .get(&native_group_key(b'G', &GLOBAL_KEY).unwrap())
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                scope.limits().value_bytes,
+            )
+            .unwrap();
+        let mut states = fresh.native_accumulators(Some(&group)).unwrap();
+        assert_eq!(
+            states[9].evaluate().unwrap(),
+            ScalarValue::Float64(Some(0.0))
+        );
+        drop(scope);
+        for (row, expected) in [(3, 5.0), (2, 3.0)] {
+            let mut scope = store.begin().await.unwrap();
+            fresh
+                .native_process_event(
+                    &mut scope,
+                    &GLOBAL_KEY,
+                    &inputs,
+                    row,
+                    true,
+                    Some(&[row as u8; 16]),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                fresh
+                    .native_fallback_value(&scope, &GLOBAL_KEY, 0, 8)
+                    .await
+                    .unwrap(),
+                ScalarValue::Float64(Some(expected))
+            );
+            scope.commit().await.unwrap();
+        }
+        let scope = store.begin().await.unwrap();
+        let stats = CollectionStats::decode(
+            scope
+                .get(&native_collection_totals_key(&GLOBAL_KEY, 8).unwrap())
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(stats.members, 2);
+    }
+
+    #[tokio::test]
+    async fn mixed_replay_companion_rejects_over_budget_before_committing_member() {
+        let store = native_test_store();
+        let operator = native_mixed_companion_operator();
+        let input = batch(&[Some("same")], &[1], &[Some(true)]);
+        let inputs = operator.compute_inputs(&input).unwrap();
+        let key = native_collection_totals_key(&GLOBAL_KEY, 8).unwrap();
+        let mut accepted = 0;
+        let mut rejected = false;
+        for identity in 0..1000_u64 {
+            let mut id = [0_u8; 16];
+            id[..8].copy_from_slice(&identity.to_be_bytes());
+            let mut scope = store.begin().await.unwrap();
+            match operator
+                .native_process_event(&mut scope, &GLOBAL_KEY, &inputs, 0, false, Some(&id))
+                .await
+            {
+                Ok(()) => {
+                    scope.commit().await.unwrap();
+                    accepted += 1;
+                }
+                Err(error) => {
+                    assert!(
+                        error
+                            .to_string()
+                            .contains("native collection exceeds configured"),
+                        "{error}"
+                    );
+                    drop(scope);
+                    rejected = true;
+                    break;
+                }
+            }
+        }
+        assert!(
+            rejected && accepted > 1,
+            "finite admitted relation must reject before unbounded accumulator replay"
+        );
+        let scope = store.begin().await.unwrap();
+        assert_eq!(
+            CollectionStats::decode(scope.get(&key).await.unwrap())
+                .unwrap()
+                .members,
+            accepted
+        );
+        assert_eq!(
+            operator
+                .native_fallback_value(&scope, &GLOBAL_KEY, 0, 8)
+                .await
+                .unwrap(),
+            ScalarValue::Float64(Some(1.0))
+        );
+    }
+
+    #[tokio::test]
+    async fn replay_companion_rejects_underreported_stats_before_accumulator_update() {
+        let store = native_test_store();
+        let operator = native_mixed_companion_operator();
+        let input = batch(&[Some("kept")], &[7], &[Some(true)]);
+        let mut scope = store.begin().await.unwrap();
+        operator
+            .native_process_event(
+                &mut scope,
+                &GLOBAL_KEY,
+                &operator.compute_inputs(&input).unwrap(),
+                0,
+                false,
+                Some(&[1; 16]),
+            )
+            .await
+            .unwrap();
+        scope.commit().await.unwrap();
+        let mut scope = store.begin().await.unwrap();
+        scope
+            .put(
+                &native_collection_totals_key(&GLOBAL_KEY, 8).unwrap(),
+                &CollectionStats::default().encode(),
+            )
+            .unwrap();
+        let error = operator
+            .native_fallback_value(&scope, &GLOBAL_KEY, 0, 8)
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("before accumulator update"),
+            "{error}"
+        );
+        drop(scope);
+        let scope = store.begin().await.unwrap();
+        assert_eq!(
+            operator
+                .native_fallback_value(&scope, &GLOBAL_KEY, 0, 8)
+                .await
+                .unwrap(),
+            ScalarValue::Float64(Some(7.0))
+        );
+    }
+
+    #[test]
+    fn member_workspace_statistics_reject_old_and_inconsistent_frames() {
+        assert!(CollectionStats::decode(Some(vec![0; 24])).is_err());
+        for stats in [
+            CollectionStats {
+                members: 1,
+                ..CollectionStats::default()
+            },
+            CollectionStats {
+                max_member_workspace: 1,
+                ..CollectionStats::default()
+            },
+        ] {
+            assert!(CollectionStats::decode(Some(stats.encode().to_vec())).is_err());
+        }
+        let stats = CollectionStats {
+            members: 2,
+            encoded_args_bytes: 17,
+            scalar_bytes: 23,
+            max_member_workspace: 47,
+        };
+        let restored = CollectionStats::decode(Some(stats.encode().to_vec())).unwrap();
+        assert_eq!(restored.max_member_workspace, 47);
+        assert_eq!(restored.members, 2);
+    }
+
+    #[tokio::test]
+    async fn fixed_replay_restored_maximum_includes_hll_payload_scratch_and_resets_when_empty() {
+        let operator = native_companion_operator(true);
+        let store = native_companion_store(&operator);
+        let large = "x".repeat(100);
+        let input = batch(
+            &[Some("small"), Some(&large), Some("medium-length")],
+            &[1, 2, 3],
+            &[Some(true), Some(true), Some(true)],
+        );
+        let inputs = operator.compute_inputs(&input).unwrap();
+        let key = native_collection_totals_key(&GLOBAL_KEY, 8).unwrap();
+        for row in 0..3 {
+            let mut scope = store.begin().await.unwrap();
+            operator
+                .native_process_event(
+                    &mut scope,
+                    &GLOBAL_KEY,
+                    &inputs,
+                    row,
+                    false,
+                    Some(&[row as u8; 16]),
+                )
+                .await
+                .unwrap();
+            scope.commit().await.unwrap();
+        }
+        let mut scope = store.begin().await.unwrap();
+        let before_nonlargest = CollectionStats::decode(scope.get(&key).await.unwrap()).unwrap();
+        operator
+            .native_process_event(&mut scope, &GLOBAL_KEY, &inputs, 2, true, Some(&[2; 16]))
+            .await
+            .unwrap();
+        assert_eq!(
+            CollectionStats::decode(scope.get(&key).await.unwrap())
+                .unwrap()
+                .max_member_workspace,
+            before_nonlargest.max_member_workspace
+        );
+        scope.commit().await.unwrap();
+        let original = {
+            let scope = store.begin().await.unwrap();
+            CollectionStats::decode(scope.get(&key).await.unwrap()).unwrap()
+        };
+        // A corrupted maximum that admits row decoding but excludes HLL's to_string scratch
+        // must fail before decoding/updating, and leave the committed relation intact.
+        let mut scope = store.begin().await.unwrap();
+        let mut corrupt = original;
+        corrupt.max_member_workspace -= 1;
+        let selected = inputs[8].selected_values(Some(1)).unwrap().unwrap();
+        let encoded = bounded_row_size(&selected, scope.limits().value_bytes).unwrap();
+        let decode_without_hll_scratch = encoded * 3 + operator.aggregates[8].member_decode_base;
+        assert!(corrupt.max_member_workspace >= decode_without_hll_scratch as u64);
+        scope.put(&key, &corrupt.encode()).unwrap();
+        let error = operator
+            .native_fallback_value(&scope, &GLOBAL_KEY, 0, 8)
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("workspace exceeds admitted maximum before decode"),
+            "{error}"
+        );
+        drop(scope);
+        // Removing the largest member retains a conservative maximum across fresh owners.
+        let fresh = native_companion_operator(true);
+        let mut scope = store.begin().await.unwrap();
+        fresh
+            .native_process_event(&mut scope, &GLOBAL_KEY, &inputs, 1, true, Some(&[1; 16]))
+            .await
+            .unwrap();
+        scope.commit().await.unwrap();
+        let scope = store.begin().await.unwrap();
+        let remaining = CollectionStats::decode(scope.get(&key).await.unwrap()).unwrap();
+        assert_eq!(remaining.members, 1);
+        assert_eq!(
+            remaining.max_member_workspace,
+            original.max_member_workspace
+        );
+        assert_eq!(
+            fresh
+                .native_fallback_value(&scope, &GLOBAL_KEY, 0, 8)
+                .await
+                .unwrap(),
+            ScalarValue::UInt64(Some(1))
+        );
+        drop(scope);
+        let mut scope = store.begin().await.unwrap();
+        fresh
+            .native_process_event(&mut scope, &GLOBAL_KEY, &inputs, 0, true, Some(&[0; 16]))
+            .await
+            .unwrap();
+        scope.commit().await.unwrap();
+        let scope = store.begin().await.unwrap();
+        assert!(scope.get(&key).await.unwrap().is_none());
+        drop(scope);
+        let mut scope = store.begin().await.unwrap();
+        fresh
+            .native_process_event(&mut scope, &GLOBAL_KEY, &inputs, 0, false, Some(&[9; 16]))
+            .await
+            .unwrap();
+        scope.commit().await.unwrap();
+        let scope = store.begin().await.unwrap();
+        let reset = CollectionStats::decode(scope.get(&key).await.unwrap()).unwrap();
+        assert!(reset.max_member_workspace < original.max_member_workspace);
+    }
+
+    #[tokio::test]
+    async fn fixed_replay_streams_history_larger_than_single_materialization_allowance() {
+        let operator = native_companion_operator(true);
+        let store = native_companion_store(&operator);
+        let value = "s".repeat(100);
+        let input = batch(&[Some(&value)], &[1], &[Some(true)]);
+        let inputs = operator.compute_inputs(&input).unwrap();
+        // The materialization budget is one value_bytes allowance. Exceed it
+        // with actual selected payload, independently of row-codec overhead.
+        let members = (store.limits().value_bytes / value.len() + 1) as u64;
+        for identity in 0..members {
+            let mut id = [0; 16];
+            id[..8].copy_from_slice(&identity.to_be_bytes());
+            let mut scope = store.begin().await.unwrap();
+            operator
+                .native_process_event(&mut scope, &GLOBAL_KEY, &inputs, 0, false, Some(&id))
+                .await
+                .unwrap();
+            scope.commit().await.unwrap();
+        }
+        let scope = store.begin().await.unwrap();
+        let stats = CollectionStats::decode(
+            scope
+                .get(&native_collection_totals_key(&GLOBAL_KEY, 8).unwrap())
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(stats.members, members);
+        assert!(
+            members.checked_mul(value.len() as u64).unwrap() > scope.limits().value_bytes as u64
+        );
+        assert!(stats.encoded_args_bytes > scope.limits().value_bytes as u64);
+        assert!(stats.members > scope.limits().page_entries as u64);
+        let fresh = native_companion_operator(true);
+        assert_eq!(
+            fresh
+                .native_fallback_value(&scope, &GLOBAL_KEY, 0, 8)
+                .await
+                .unwrap(),
+            ScalarValue::UInt64(Some(1))
+        );
+    }
+
+    #[tokio::test]
+    async fn actual_sql_grouped_selector_descriptor_constructs_against_physical_input_schema() {
+        use arroyo_datastream::logical::OperatorName;
+        use arroyo_planner::{ArroyoSchemaProvider, SqlConfig, parse_and_get_program};
+        for declared in [false, true] {
+            let watermark = if declared {
+                ", WATERMARK FOR event_time AS event_time - INTERVAL '5' SECOND"
+            } else {
+                ""
+            };
+            let sql = format!(
+                "CREATE TABLE events (row_id BIGINT PRIMARY KEY, k TEXT, value TEXT, priority BIGINT, event_time TIMESTAMP NOT NULL{watermark}) WITH (connector='single_file',path='/tmp/grouped-selector-descriptor.jsonl',format='debezium_json',type='source'); SELECT k,FIRST_VALUE(value ORDER BY priority) AS first,LAST_VALUE(value ORDER BY priority DESC) AS last, MEDIAN(CAST(priority AS DOUBLE)) AS median_priority, STDDEV(1.0) AS constant_stddev FROM events GROUP BY k"
+            );
+            let compiled =
+                parse_and_get_program(&sql, ArroyoSchemaProvider::new(), SqlConfig::default())
+                    .await
+                    .unwrap();
+            let config = compiled
+                .program
+                .graph
+                .node_weights()
+                .flat_map(|node| node.operator_chain.iter())
+                .find(|(operator, _)| operator.operator_name == OperatorName::UpdatingAggregate)
+                .map(|(operator, _)| {
+                    UpdatingAggregateOperator::decode(operator.operator_config.as_slice()).unwrap()
+                })
+                .unwrap();
+            let raw: ArroyoSchema = config.input_schema.clone().unwrap().try_into().unwrap();
+            assert!(
+                raw.schema
+                    .index_of(arroyo_planner::grouped_selector::ORDINAL_FIELD)
+                    .is_err()
+            );
+            for malformed in [
+                "ordinal",
+                "ordinal-name",
+                "ordinal-type",
+                "marker-args",
+                "clock",
+                "schema",
+            ] {
+                if malformed == "clock" && !declared {
+                    continue;
+                }
+                let mut bad = config.clone();
+                let mut plan = PhysicalPlanNode::decode(bad.aggregate_exec.as_slice()).unwrap();
+                let Some(PhysicalPlanType::Aggregate(aggregate)) = &mut plan.physical_plan_type
+                else {
+                    panic!("aggregate");
+                };
+                if malformed == "schema" {
+                    aggregate.input_schema.as_mut().unwrap().columns.pop();
+                } else if malformed == "ordinal-type" {
+                    let schema = aggregate.input_schema.as_mut().unwrap();
+                    let wrong_type = schema.columns[0].arrow_type.clone();
+                    schema.columns.last_mut().unwrap().arrow_type = wrong_type;
+                } else {
+                    let Some(
+                        datafusion_proto::protobuf::physical_expr_node::ExprType::AggregateExpr(
+                            expression,
+                        ),
+                    ) = &mut aggregate.aggr_expr[0].expr_type
+                    else {
+                        panic!("selector");
+                    };
+                    if malformed == "marker-args" {
+                        expression.expr[1].expr_type = Some(
+                            datafusion_proto::protobuf::physical_expr_node::ExprType::ScalarUdf(
+                                datafusion_proto::protobuf::PhysicalScalarUdfNode {
+                                    name: arroyo_planner::grouped_selector::ORDINAL_MARKER.into(),
+                                    args: vec![expression.expr[0].clone()],
+                                    fun_definition: None,
+                                    return_type: None,
+                                    nullable: false,
+                                },
+                            ),
+                        );
+                    } else if malformed == "ordinal" || malformed == "ordinal-name" {
+                        let Some(datafusion_proto::protobuf::physical_expr_node::ExprType::Column(
+                            column,
+                        )) = &mut expression.expr[1].expr_type
+                        else {
+                            panic!("ordinal");
+                        };
+                        if malformed == "ordinal" {
+                            column.index = u32::MAX;
+                        } else {
+                            column.name = "forged_ordinal".into();
+                        }
+                    } else {
+                        expression.ordering_req[0].asc = false;
+                    }
+                }
+                bad.aggregate_exec = plan.encode_to_vec();
+                assert!(
+                    IncrementalAggregatingConstructor::build_with_native_config(
+                        bad,
+                        Arc::new(arroyo_planner::physical::new_registry()),
+                        Some(native_test_config())
+                    )
+                    .is_err(),
+                    "malformed {malformed} descriptor must return a structured error"
+                );
+            }
+            let operator = IncrementalAggregatingConstructor::build_with_native_config(
+                config,
+                Arc::new(arroyo_planner::physical::new_registry()),
+                Some(native_test_config()),
+            )
+            .unwrap();
+            assert_eq!(
+                operator
+                    .aggregates
+                    .iter()
+                    .filter(|aggregate| aggregate.selector.is_some())
+                    .count(),
+                2
+            );
+        }
+    }
+
+    #[test]
+    fn shared_selector_requires_existing_state_limits() {
+        let (config, registry) = native_config();
+        let error =
+            IncrementalAggregatingConstructor::build_with_native_config(config, registry, None)
+                .err()
+                .expect("grouped selector must not fall back to the old implementation");
+        assert!(
+            error.to_string().contains("worker.aggregate-state"),
+            "{error}"
+        );
+    }
+
+    // Runtime index regression; the SQL capture matrix separately proves FOR
+    // binding and physical roundtrips. Distinct IDs deliberately share args.
+    #[tokio::test]
+    async fn event_time_selectors_keep_exact_write_identity_after_reload() {
+        for append_only in [false, true] {
+            let store = native_test_store();
+            let operator = event_time_selector_operator(append_only);
+            assert_eq!(
+                operator.aggregates[1].accumulator_type,
+                AccumulatorType::Batch
+            );
+            let rows = batch(
+                &[Some("A"), Some("B"), Some("A")],
+                &[20; 3],
+                &[Some(true); 3],
+            );
+            let inputs = operator.compute_inputs(&rows).unwrap();
+            let mut scope = store.begin_point().await.unwrap();
+            for row in 0..3 {
+                let id = [row as u8 + 1; 16];
+                operator
+                    .native_process_event(
+                        &mut scope,
+                        &GLOBAL_KEY,
+                        &inputs,
+                        row,
+                        false,
+                        (!append_only).then_some(id.as_slice()),
+                    )
+                    .await
+                    .unwrap();
+            }
+            scope.commit().await.unwrap();
+            let fresh = event_time_selector_operator(append_only);
+            let scope = store.begin().await.unwrap();
+            for (index, expected) in [(0, "A"), (1, "A"), (2, "A"), (3, "A")] {
+                assert_eq!(
+                    fresh
+                        .native_fallback_value(&scope, &GLOBAL_KEY, 0, index)
+                        .await
+                        .unwrap(),
+                    ScalarValue::Utf8(Some(expected.into()))
+                );
+            }
+            drop(scope);
+            if append_only {
+                continue;
+            }
+            // Remove the newest equal-valued peer first. Deleting the
+            // earliest matching args would leave A winning LAST instead of B.
+            for (row, id) in [(2, [3; 16]), (0, [1; 16])] {
+                let mut scope = store.begin().await.unwrap();
+                fresh
+                    .native_process_event(&mut scope, &GLOBAL_KEY, &inputs, row, true, Some(&id))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    fresh
+                        .native_fallback_value(&scope, &GLOBAL_KEY, 0, 1)
+                        .await
+                        .unwrap(),
+                    ScalarValue::Utf8(Some("B".into()))
+                );
+                scope.commit().await.unwrap();
+            }
+            let scope = store.begin().await.unwrap();
+            assert_eq!(
+                fresh
+                    .native_fallback_value(&scope, &GLOBAL_KEY, 0, 0)
+                    .await
+                    .unwrap(),
+                ScalarValue::Utf8(Some("B".into()))
+            );
+            drop(scope);
+            // New write wins the tie; deleting it restores B's original ordinal.
+            let replacement = batch(&[Some("C")], &[20], &[Some(true)]);
+            let replacement_inputs = fresh.compute_inputs(&replacement).unwrap();
+            for retract in [false, true] {
+                let mut scope = store.begin().await.unwrap();
+                fresh
+                    .native_process_event(
+                        &mut scope,
+                        &GLOBAL_KEY,
+                        &replacement_inputs,
+                        0,
+                        retract,
+                        Some(&[4; 16]),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    fresh
+                        .native_fallback_value(&scope, &GLOBAL_KEY, 0, 1)
+                        .await
+                        .unwrap(),
+                    ScalarValue::Utf8(Some(if retract { "B" } else { "C" }.into()))
+                );
+                scope.commit().await.unwrap();
+            }
+        }
+    }
+
     #[tokio::test]
     async fn injected_event_time_max_retracts_original_member_by_row_id_after_reload() {
         let store = native_test_store();
@@ -10181,7 +12071,7 @@ mod tests {
                 .await
                 .unwrap_err()
                 .to_string()
-                .contains("duplicate live row ID")
+                .contains("grouped selector appends duplicate live row identity")
         );
         drop(scope);
     }
@@ -11296,328 +13186,10 @@ mod tests {
         }
     }
 
-    fn assert_values(
-        operator: &mut IncrementalAggregatingFunc,
-        expected: &[Option<&str>],
-        all: i64,
-        selected: i64,
-    ) {
-        let actual = operator.evaluate(&GLOBAL_KEY).unwrap();
-        for (value, expected) in actual.iter().zip(expected) {
-            assert_eq!(value, &ScalarValue::Utf8(expected.map(str::to_string)));
-        }
-        assert_eq!(actual[5], ScalarValue::Int64(Some(all)));
-        assert_eq!(actual[6], ScalarValue::Int64(Some(selected)));
-    }
-
-    fn retract(
-        operator: &mut IncrementalAggregatingFunc,
-        batch: &RecordBatch,
-        index: Option<usize>,
-    ) {
-        let inputs = operator.compute_inputs(batch).unwrap();
-        operator.retract_batch(&GLOBAL_KEY, &inputs, index).unwrap();
-    }
-
     fn checkpoint_rows(schema: &ArroyoSchema, columns: Vec<ArrayRef>) -> RecordBatch {
         let mut fields = schema.schema.fields().to_vec();
         fields.push(Arc::new(Field::new("generation", DataType::UInt64, false)));
         RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap()
-    }
-
-    #[test]
-    fn native_ordered_values_across_batches_and_retractions() {
-        let mut operator = operator();
-        operator
-            .global_aggregate(&batch(
-                &[Some("u"), Some("v")],
-                &[1, 2],
-                &[Some(true), Some(true)],
-            ))
-            .unwrap();
-        assert_values(
-            &mut operator,
-            &[Some("u"), Some("v"), Some("v"), Some("u"), Some("v")],
-            2,
-            2,
-        );
-        operator
-            .global_aggregate(&batch(
-                &[Some("early"), Some("late")],
-                &[0, 3],
-                &[Some(false), None],
-            ))
-            .unwrap();
-        assert_values(
-            &mut operator,
-            &[
-                Some("early"),
-                Some("late"),
-                Some("late"),
-                Some("early"),
-                Some("v"),
-            ],
-            4,
-            2,
-        );
-        // Removing an excluded row must leave the independently filtered values
-        // and count unchanged while retracting the unfiltered companion.
-        retract(
-            &mut operator,
-            &batch(&[Some("late")], &[3], &[None]),
-            Some(0),
-        );
-        assert_values(
-            &mut operator,
-            &[
-                Some("early"),
-                Some("v"),
-                Some("v"),
-                Some("early"),
-                Some("v"),
-            ],
-            3,
-            2,
-        );
-        retract(
-            &mut operator,
-            &batch(&[Some("v")], &[2], &[Some(true)]),
-            None,
-        );
-        assert_values(
-            &mut operator,
-            &[
-                Some("early"),
-                Some("u"),
-                Some("u"),
-                Some("early"),
-                Some("u"),
-            ],
-            2,
-            1,
-        );
-    }
-
-    #[test]
-    fn native_ordered_repeated_values_keep_distinct_sequences() {
-        let mut operator = operator();
-        operator
-            .global_aggregate(&batch(
-                &[Some("same"), Some("middle"), Some("same")],
-                &[1, 2, 3],
-                &[Some(true); 3],
-            ))
-            .unwrap();
-        retract(
-            &mut operator,
-            &batch(&[Some("same")], &[3], &[Some(true)]),
-            Some(0),
-        );
-        assert_values(
-            &mut operator,
-            &[
-                Some("same"),
-                Some("middle"),
-                Some("middle"),
-                Some("same"),
-                Some("middle"),
-            ],
-            2,
-            2,
-        );
-    }
-
-    #[test]
-    fn native_ordered_equal_keys_retain_remaining_duplicate() {
-        let mut operator = operator();
-        operator
-            .global_aggregate(&batch(
-                &[Some("tied"), Some("tied"), Some("later")],
-                &[1, 1, 2],
-                &[Some(true), Some(true), Some(false)],
-            ))
-            .unwrap();
-        retract(
-            &mut operator,
-            &batch(&[Some("tied")], &[1], &[Some(true)]),
-            Some(0),
-        );
-        assert_values(
-            &mut operator,
-            &[
-                Some("tied"),
-                Some("later"),
-                Some("later"),
-                Some("tied"),
-                Some("tied"),
-            ],
-            2,
-            1,
-        );
-    }
-
-    #[test]
-    fn native_filter_null_values_and_row_updates() {
-        let mut operator = operator();
-        operator
-            .global_aggregate(&batch(
-                &[Some("u"), None, Some("")],
-                &[1, 2, 3],
-                &[Some(true), Some(true), Some(false)],
-            ))
-            .unwrap();
-        assert_values(
-            &mut operator,
-            &[Some("u"), Some(""), Some(""), Some("u"), None],
-            3,
-            2,
-        );
-        let next = batch(
-            &[Some("null-filter"), Some("selected")],
-            &[4, 5],
-            &[None, Some(true)],
-        );
-        let inputs = operator.compute_inputs(&next).unwrap();
-        operator
-            .update_batch(&GLOBAL_KEY, &inputs, Some(0))
-            .unwrap();
-        operator
-            .update_batch(&GLOBAL_KEY, &inputs, Some(1))
-            .unwrap();
-        assert_values(
-            &mut operator,
-            &[
-                Some("u"),
-                Some("selected"),
-                Some("selected"),
-                Some("u"),
-                Some("selected"),
-            ],
-            5,
-            3,
-        );
-    }
-
-    #[test]
-    fn native_ordered_checkpoint_rows_reload_into_fresh_operator() {
-        let mut original = operator();
-        original
-            .global_aggregate(&batch(
-                &[Some("u"), Some("v"), Some("w")],
-                &[1, 2, 3],
-                &[Some(true), Some(false), Some(true)],
-            ))
-            .unwrap();
-        let sliding = checkpoint_rows(
-            &original.sliding_state_schema.clone(),
-            original.checkpoint_sliding().unwrap().unwrap(),
-        );
-        let fallback = checkpoint_rows(
-            &original.batch_state_schema.clone(),
-            original.checkpoint_batch().unwrap().unwrap(),
-        );
-        drop(original);
-        let mut fresh = operator();
-        // Production checkpoint serializers and restore methods; this is a
-        // fresh operator row-codec reload, not a remote TableManager checkpoint.
-        fresh.restore_sliding_batch(&sliding).unwrap();
-        fresh.restore_batch(&fallback).unwrap();
-        assert_values(
-            &mut fresh,
-            &[Some("u"), Some("w"), Some("w"), Some("u"), Some("w")],
-            3,
-            2,
-        );
-        retract(
-            &mut fresh,
-            &batch(&[Some("w")], &[3], &[Some(true)]),
-            Some(0),
-        );
-        fresh
-            .global_aggregate(&batch(&[Some("later")], &[4], &[Some(true)]))
-            .unwrap();
-        assert_values(
-            &mut fresh,
-            &[
-                Some("u"),
-                Some("later"),
-                Some("later"),
-                Some("u"),
-                Some("later"),
-            ],
-            3,
-            2,
-        );
-    }
-
-    #[test]
-    fn native_ordered_legacy_checkpoint_rows_reject_before_input() {
-        let mut original = operator();
-        original
-            .global_aggregate(&batch(&[Some("u")], &[1], &[Some(true)]))
-            .unwrap();
-        let mut columns = original.checkpoint_batch().unwrap().unwrap();
-        let index = original
-            .batch_state_schema
-            .schema
-            .index_of("args_row")
-            .unwrap();
-        let rows = columns[index]
-            .as_any()
-            .downcast_ref::<BinaryArray>()
-            .unwrap();
-        let mut legacy = BinaryBuilder::new();
-        // Keep earlier rows current so a late legacy row tests atomic validation.
-        for (index, row) in rows.iter().enumerate() {
-            let row = row.unwrap();
-            legacy.append_value(if index + 1 == rows.len() {
-                row.strip_prefix(ORDERED_ARGS_V1).unwrap()
-            } else {
-                row
-            });
-        }
-        columns[index] = Arc::new(legacy.finish());
-        let checkpoint = checkpoint_rows(&original.batch_state_schema, columns);
-        let mut fresh = operator();
-        let error = fresh.restore_batch(&checkpoint).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("legacy or unsupported ordered aggregate checkpoint")
-        );
-        assert!(error.to_string().contains("source replay"));
-        assert!(fresh.accumulators.iter_mut().next().is_none());
-    }
-    #[test]
-    fn native_filtered_legacy_checkpoint_rejects_before_input() {
-        let mut original = operator();
-        original
-            .global_aggregate(&batch(&[Some("u")], &[1], &[Some(true)]))
-            .unwrap();
-        let columns = original.checkpoint_sliding().unwrap().unwrap();
-        let mut checkpoint = checkpoint_rows(&original.sliding_state_schema, columns);
-        let fields: Vec<_> = checkpoint
-            .schema()
-            .fields()
-            .iter()
-            .map(|field| {
-                let mut metadata = field.metadata().clone();
-                metadata.remove(INPUT_SEMANTICS_KEY);
-                Arc::new((**field).clone().with_metadata(metadata))
-            })
-            .collect();
-        checkpoint =
-            RecordBatch::try_new(Arc::new(Schema::new(fields)), checkpoint.columns().to_vec())
-                .unwrap();
-        let mut fresh = operator();
-        let error = fresh.restore_sliding_batch(&checkpoint).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("ordered/filtered aggregate checkpoint")
-        );
-        assert!(error.to_string().contains("source replay"));
-        assert!(fresh.accumulators.iter_mut().next().is_none());
     }
 
     #[test]

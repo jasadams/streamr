@@ -3417,13 +3417,13 @@ dependencies = [
 [[package]]
 name = "datafusion-functions-aggregate-common"
 version = "48.0.1"
-source = "git+https://github.com/ArroyoSystems/arrow-datafusion?branch=48.0.1%2Farroyo#916b45f5c28d94765ae4a6393c5e126b2ea55e1c"
 dependencies = [
  "ahash 0.8.7",
  "arrow",
  "datafusion-common",
  "datafusion-expr-common",
  "datafusion-physical-expr-common",
+ "rand 0.9.1",
 ]
 
 [[package]]

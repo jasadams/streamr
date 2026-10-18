@@ -100,7 +100,7 @@ failed. Recheck connector health before resuming ticket recording.
 
 Observed against the preserved SQL executable above on 2026-10-08:
 
-- `test-native-aggregate-ordering.py --total-order`: first native memory/batch-1
+- Historical `test-native-aggregate-ordering.py --total-order`: first native memory/batch-1
   controller checkpoint capture has three rows, while the driver requires two.
 - `test-native-unordered-first-last.py`: four memory cases pass, then RocksDB
   batch-1/controller recovery has three rows, while the driver requires two.
@@ -128,6 +128,19 @@ passed on the basis of final values alone. No product or assertion change was
 made during this batch. A follow-up harness repair should validate every CDC
 transition and checkpoint boundary without assuming input wins the first tick;
 changing engine emission scheduling would be a separate semantic change.
+
+The native/legacy ordering differential and its alternate execution invocation
+were retired by STR-60's single grouped-selector implementation. This section
+preserves evidence from the recorded 2026-10-08 executable; it is not a current
+workflow or current tie contract. The original diagnostic remains available at
+[fetched base 14353046](https://github.com/jasadams/streamr/blob/14353046e5085325b66563981be61c96ecfed7b7/scripts/test-native-aggregate-ordering.py).
+Current focused validation prepares independent retained scenarios with
+[`native_grouped_selectors.py`](../scripts/native_grouped_selectors.py) and
+[`native_window_selectors.py`](../scripts/native_window_selectors.py), then runs
+[`test-native-result-manifest.py`](../scripts/test-native-result-manifest.py).
+The current manifests require matching initial/recovered checkpoint flush
+boundaries and exact typed per-key CDC or append-output sequences. Prepared
+fixtures alone do not establish execution or recovery success.
 
 ## Evidence and process cleanup for this incident
 

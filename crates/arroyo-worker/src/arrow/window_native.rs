@@ -13,7 +13,7 @@ use arrow::{
 };
 use arrow_array::{
     Array, ListArray, PrimitiveArray, RecordBatch, StringArray, StructArray, UInt32Array,
-    types::TimestampNanosecondType,
+    UInt64Array, types::TimestampNanosecondType,
 };
 use arrow_schema::{DataType, SchemaRef};
 use arroyo_operator::{
@@ -21,6 +21,11 @@ use arroyo_operator::{
     operator::Registry,
 };
 use arroyo_planner::{
+    aggregate_capability::{
+        AggregateDescriptor, aggregate_descriptor, is_extremum, logical_payload_bytes,
+    },
+    grouped_selector::{ORDINAL_FIELD, SelectorBudget},
+    grouped_selector_udaf::{bind_window_budget, classify},
     physical::{ArroyoPhysicalExtensionCodec, DecodingContext},
     schemas::add_timestamp_field_arrow,
 };
@@ -51,7 +56,69 @@ use std::{
 };
 use tokio::sync::mpsc::{Receiver, channel};
 
+pub(super) fn has_grouped_selector(plan: &dyn ExecutionPlan) -> bool {
+    plan.as_any()
+        .downcast_ref::<AggregateExec>()
+        .is_some_and(|aggregate| {
+            aggregate
+                .aggr_expr()
+                .iter()
+                .any(|expression| classify(expression.fun()).is_some())
+        })
+        || plan
+            .children()
+            .iter()
+            .any(|child| has_grouped_selector(child.as_ref()))
+}
+
 const TABLE: &str = "w";
+
+fn partial_payload_bound(
+    base: usize,
+    columns: &[(usize, AggregateDescriptor)],
+    batch: &RecordBatch,
+    indices: &UInt32Array,
+) -> Result<usize> {
+    columns
+        .iter()
+        .try_fold(base, |total, (column, descriptor)| {
+            let payload =
+                indices
+                    .values()
+                    .iter()
+                    .try_fold(0usize, |sum, index| -> Result<usize> {
+                        sum.checked_add(logical_payload_bytes(
+                            batch.column(*column),
+                            *index as usize,
+                        )?)
+                        .context("native window partial payload size overflow")
+                    })?;
+            let with_payload = descriptor
+                .retained_bound(1, payload)
+                .context("native window partial aggregate size overflow")?;
+            let without_payload = descriptor
+                .retained_bound(1, 0)
+                .context("native window partial aggregate size overflow")?;
+            total
+                .checked_add(
+                    with_payload
+                        .checked_sub(without_payload)
+                        .context("native window partial aggregate size underflow")?,
+                )
+                .context("native window partial aggregate size overflow")
+        })
+}
+
+fn partial_chunk_rows(per_row: usize, limit: usize) -> Result<usize> {
+    if per_row == 0 {
+        return Ok(64);
+    }
+    ensure!(
+        per_row <= limit,
+        "native window one partial aggregate row exceeds configured partial limit"
+    );
+    Ok((limit / per_row).min(64))
+}
 
 fn is_terminal_watermark(watermark: std::time::SystemTime) -> bool {
     to_nanos(watermark) == u64::MAX as u128
@@ -271,6 +338,10 @@ pub(crate) struct NativeWindow {
     collection_columns: Vec<(usize, bool)>,
     collection_ordering_pairs: Vec<(usize, usize)>,
     collection_output: bool,
+    replay_columns: Vec<(usize, AggregateDescriptor)>,
+    partial_state_per_row: usize,
+    fixed_state_bytes: usize,
+    partial_payload_columns: Vec<(usize, AggregateDescriptor)>,
     limits: WindowStateConfig,
     identity: Vec<u8>,
     store: Option<WindowStore>,
@@ -301,7 +372,16 @@ impl NativeWindow {
             !hopping || (width >= slide && width.as_nanos().is_multiple_of(slide.as_nanos())),
             "native HOP width must be an integer multiple of slide"
         );
-        let partial = StatelessPhysicalExecutor::new(partial_bytes, registry.as_ref())?;
+        let budget = SelectorBudget {
+            key_bytes: limits.key_bytes,
+            value_bytes: limits.partial_bytes,
+            decoded_bytes: limits
+                .partial_bytes
+                .checked_mul(3)
+                .context("window selector budget overflow")?,
+        };
+        let mut partial = StatelessPhysicalExecutor::new(partial_bytes, registry.as_ref())?;
+        partial.plan = bind_window_budget(partial.plan, budget)?;
         let physical_partial_schema = partial.plan.schema();
         ensure!(
             physical_partial_schema.fields().len() + 1 == partial_schema.schema.fields().len(),
@@ -320,16 +400,43 @@ impl NativeWindow {
         let mut collection_columns = Vec::new();
         let mut collection_ordering_pairs = Vec::new();
         let mut collection_output = false;
+        let mut replay_columns = Vec::new();
+        let mut partial_state_per_row = 0usize;
+        let mut fixed_state_bytes = 0usize;
+        let mut partial_payload_columns = Vec::new();
         let mut variable_other_output = false;
         let mut state_column = key_count;
         for aggregate in partial_aggregate.aggr_expr() {
-            let name = aggregate.fun().name().to_ascii_lowercase();
-            let ordered_first_last = matches!(name.as_str(), "first_value" | "last_value")
-                && aggregate.order_bys().is_some_and(|order| !order.is_empty())
-                && !aggregate.is_distinct();
-            let unordered_scalar = matches!(name.as_str(), "count" | "sum" | "avg" | "min" | "max")
-                && aggregate.order_bys().is_none()
-                && !aggregate.is_distinct();
+            let grouped_selector = classify(aggregate.fun()).is_some() && !aggregate.is_distinct();
+            let descriptor = aggregate_descriptor(aggregate, &partial_aggregate.input().schema())?;
+            let capability = descriptor.map(|descriptor| descriptor.capability);
+            if let Some(descriptor) = descriptor {
+                let per_group = descriptor
+                    .retained_bound(1, 0)
+                    .context("native window partial aggregate size overflow")?;
+                partial_state_per_row = partial_state_per_row
+                    .checked_add(per_group)
+                    .context("native window partial companion total overflow")?;
+                if descriptor.payload_multiplier > 0 {
+                    let args = aggregate.expressions();
+                    let column = args[0]
+                        .as_any()
+                        .downcast_ref::<datafusion::physical_expr::expressions::Column>()
+                        .context("native window companion projection schema mismatch")?;
+                    partial_payload_columns.push((column.index(), descriptor));
+                }
+                if descriptor.state_list_column.is_some() || descriptor.hll_registers {
+                    replay_columns.push((state_column, descriptor));
+                } else {
+                    fixed_state_bytes = fixed_state_bytes
+                        .checked_add(
+                            descriptor
+                                .retained_bound(0, 0)
+                                .context("native window fixed aggregate size overflow")?,
+                        )
+                        .context("native window fixed companion total overflow")?;
+                }
+            }
             let function = aggregate.fun().inner().as_any();
             let array_agg = function.is::<datafusion::functions_aggregate::array_agg::ArrayAgg>();
             let distinct_count = aggregate.is_distinct()
@@ -337,8 +444,9 @@ impl NativeWindow {
             let ordered_array = array_agg
                 && !aggregate.is_distinct()
                 && aggregate.order_bys().is_some_and(|order| !order.is_empty());
-            let collection =
-                ((array_agg || distinct_count) && aggregate.order_bys().is_none()) || ordered_array;
+            let collection = ((array_agg || (distinct_count && descriptor.is_none()))
+                && aggregate.order_bys().is_none())
+                || ordered_array;
             if collection {
                 let args = aggregate.expressions();
                 ensure!(
@@ -419,8 +527,8 @@ impl NativeWindow {
                 .checked_add(state_fields.len())
                 .context("native window partial state column overflow")?;
             ensure!(
-                unordered_scalar || ordered_first_last || collection,
-                "native window state supports scalar aggregates, ordered FIRST_VALUE/LAST_VALUE, and bounded flat ARRAY_AGG or COUNT(DISTINCT)"
+                capability.is_some() || is_extremum(aggregate) || grouped_selector || collection,
+                "native window state supports scalar aggregates, shared grouped FIRST_VALUE/LAST_VALUE, and bounded flat ARRAY_AGG or COUNT(DISTINCT)"
             );
         }
         ensure!(
@@ -455,12 +563,13 @@ impl NativeWindow {
             &runtime,
             &finish_codec,
         )?;
+        let finish = bind_window_budget(finish, budget)?;
         let projection = projection_bytes
             .map(|bytes| StatelessPhysicalExecutor::new(bytes, registry.as_ref()))
             .transpose()?;
         let finish_timestamp_schema = add_timestamp_field_arrow((*finish.schema()).clone());
         let mut identity = Sha256::new();
-        identity.update(b"streamr.native-window-partial.v1");
+        identity.update(b"streamr.native-window-partial.v2");
         identity.update(width.as_nanos().to_be_bytes());
         identity.update(slide.as_nanos().to_be_bytes());
         identity.update([u8::from(hopping)]);
@@ -493,6 +602,10 @@ impl NativeWindow {
             collection_columns,
             collection_ordering_pairs,
             collection_output,
+            replay_columns,
+            partial_state_per_row,
+            fixed_state_bytes,
+            partial_payload_columns,
             limits,
             identity: identity.finalize().to_vec(),
             store: None,
@@ -504,7 +617,7 @@ impl NativeWindow {
             TABLE.into(),
             TableConfig {
                 table_type: TableEnum::DiskKeyedMap.into(),
-                state_version: 1,
+                state_version: 2,
                 config: DiskKeyedTableConfig {
                     table_name: TABLE.into(),
                     encoding_version: 1,
@@ -585,6 +698,23 @@ impl NativeWindow {
         {
             return Ok(());
         }
+        // Preserve source order across bin sorting, partial chunks and HOP merges.
+        let physical_input = self
+            .partial
+            .plan
+            .as_any()
+            .downcast_ref::<AggregateExec>()
+            .map(|aggregate| aggregate.input().schema());
+        let batch = if let Some(schema) =
+            physical_input.filter(|schema| schema.index_of(ORDINAL_FIELD).is_ok())
+        {
+            let arrivals = self.store()?.allocate_arrivals(batch.num_rows()).await?;
+            let mut columns = batch.columns().to_vec();
+            columns.push(Arc::new(UInt64Array::from_iter_values(arrivals)));
+            RecordBatch::try_new(schema, columns)?
+        } else {
+            batch
+        };
         let bins = self
             .binning
             .evaluate(&batch)?
@@ -620,12 +750,42 @@ impl NativeWindow {
                 let mut offset = start;
                 let mut partial_chunks = 0usize;
                 while offset < end {
-                    let stop = (offset + 64).min(end);
+                    // A chunk can contain a different group per source row.
+                    // Bound each group's fixed metadata/initial Vec before DF
+                    // constructs any partial accumulator (not merely its output).
+                    let chunk_rows =
+                        partial_chunk_rows(self.partial_state_per_row, self.limits.partial_bytes)?;
+                    let chunk_rows = if self.partial_payload_columns.is_empty() {
+                        chunk_rows
+                    } else {
+                        chunk_rows.min(1)
+                    };
+                    let stop = (offset + chunk_rows).min(end);
+                    let retained = self
+                        .partial_state_per_row
+                        .checked_mul(stop - offset)
+                        .context("native window partial retained state overflow")?;
+
                     let chunk_indices = UInt32Array::from(
                         (offset..stop)
                             .map(|index| Ok::<_, anyhow::Error>(indices.value(index)))
                             .collect::<Result<Vec<_>>>()?,
                     );
+                    // Projected argument values are already evaluated once.
+                    // Check their selected logical bytes before take can copy
+                    // any source string/binary value into a partial chunk.
+                    let retained = partial_payload_bound(
+                        retained,
+                        &self.partial_payload_columns,
+                        &batch,
+                        &chunk_indices,
+                    )?;
+                    ensure!(
+                        retained <= self.limits.partial_bytes,
+                        "native window partial aggregate payload exceeds configured partial limit"
+                    );
+                    let _partial_state = self.store()?.reserve_retained_aggregate(retained)?;
+                    self.store()?.check_reader_capacity()?;
                     let columns = batch
                         .columns()
                         .iter()
@@ -690,18 +850,22 @@ impl NativeWindow {
             };
             // Collection preflight scans the same snapshot. Scalar/ordered
             // groups carry this decoded first partial into the paged producer.
-            let first_for_producer = if self.collection_columns.is_empty() {
-                Some(first)
-            } else {
-                drop(first);
-                None
-            };
+            let first_for_producer =
+                if self.collection_columns.is_empty() && self.replay_columns.is_empty() {
+                    Some(first)
+                } else {
+                    drop(first);
+                    None
+                };
             // ARRAY_AGG and DISTINCT retain cardinality-growing final state.
             // Count collection output values in this same snapshot before
             // invoking DataFusion; this pass retains only one decoded partial.
             // Count only value lists; paired ordering state is validated separately.
             // Measure the value bound without imposing an execution pool.
-            if !self.collection_columns.is_empty() {
+            let mut replay_rows = vec![0usize; self.replay_columns.len()];
+            let mut retained = self.fixed_state_bytes;
+            let mut replay_payload = vec![0usize; self.replay_columns.len()];
+            if !self.collection_columns.is_empty() || !self.replay_columns.is_empty() {
                 let mut after = None;
                 let mut size = CollectionSize::default();
                 while let Some(partial) = snapshot
@@ -719,6 +883,51 @@ impl NativeWindow {
                         &self.collection_ordering_pairs,
                     )?;
                     size.add_partial(&partial.batch, &self.collection_columns)?;
+                    retained = self.fixed_state_bytes;
+                    for (((column, descriptor), rows), payload) in self
+                        .replay_columns
+                        .iter()
+                        .zip(&mut replay_rows)
+                        .zip(&mut replay_payload)
+                    {
+                        let arrays =
+                            &partial.batch.columns()[*column..*column + descriptor.state_fields];
+                        descriptor.validate_partial_state(arrays, 0)?;
+                        if let Some(list_column) = descriptor.state_list_column {
+                            let list = arrays[list_column]
+                                .as_any()
+                                .downcast_ref::<ListArray>()
+                                .context("native window replay companion state must be List")?;
+                            ensure!(
+                                list.len() == 1,
+                                "native window replay partial must have one row"
+                            );
+                            if !list.is_null(0) {
+                                *rows = rows
+                                    .checked_add(list.value_length(0) as usize)
+                                    .context("native window retained row count overflow")?;
+                                if descriptor.payload_multiplier > 0 {
+                                    let values = list.value(0);
+                                    for row in 0..values.len() {
+                                        *payload = payload
+                                            .checked_add(logical_payload_bytes(&values, row)?)
+                                            .context("native window retained payload overflow")?;
+                                    }
+                                }
+                            }
+                        }
+                        retained = retained
+                            .checked_add(
+                                descriptor
+                                    .retained_bound(*rows, *payload)
+                                    .context("native window retained aggregate size overflow")?,
+                            )
+                            .context("native window companion total overflow")?;
+                    }
+                    ensure!(
+                        retained <= self.limits.partial_bytes,
+                        "native window retained aggregate state exceeds configured partial limit"
+                    );
                     // Refuse as soon as the bounded scan proves admission
                     // impossible. Do not walk the rest of a hot group before
                     // discovering a limit that has already been exceeded.
@@ -730,7 +939,13 @@ impl NativeWindow {
                     after = Some(partial.key.clone());
                 }
             }
+            ensure!(
+                retained <= self.limits.partial_bytes,
+                "native window retained aggregate state exceeds configured partial limit"
+            );
+            let _retained_permit = self.store()?.reserve_retained_aggregate(retained)?;
             let _input_queue_permit = self.store()?.reserve_final_input_queue()?;
+            self.store()?.check_reader_capacity()?;
             let (sender, receiver) = channel(1);
             *self.finish_receiver.write().unwrap() = Some(receiver);
             self.finish.reset()?;
@@ -903,12 +1118,23 @@ mod tests {
     };
 
     fn store_for_schema(schema: SchemaRef) -> (WindowStore, WorkerStateResources) {
+        store_for_schema_limit(schema, 8192)
+    }
+
+    fn store_for_schema_limit(
+        schema: SchemaRef,
+        value_bytes: usize,
+    ) -> (WindowStore, WorkerStateResources) {
+        let write_bytes = 65536.max(value_bytes * 8);
+        let write_reservation =
+            arroyo_state::live::write::AdmittedWriteBatch::reservation_bytes(write_bytes, 16)
+                .unwrap();
         let resources = WorkerStateResources::new(ResourceConfig {
             block_cache_bytes: 1024 * 1024,
             memtable_bytes: 1024 * 1024,
-            queued_write_bytes: 1024 * 1024,
+            queued_write_bytes: (1024 * 1024).max(write_reservation),
             decoded_value_bytes: 4 * 1024 * 1024,
-            scan_page_bytes: 1024 * 1024,
+            scan_page_bytes: (1024 * 1024).max(value_bytes * 16),
             max_blocking_operations: 2,
             max_snapshots: 8,
             max_open_databases: 1,
@@ -932,10 +1158,10 @@ mod tests {
             schema,
             WindowStoreLimits {
                 key_bytes: 128,
-                value_bytes: 8192,
-                page_bytes: 32768,
+                value_bytes,
+                page_bytes: 32768.max(value_bytes * 2),
                 page_entries: 1,
-                write_bytes: 65536,
+                write_bytes,
                 write_operations: 16,
                 max_resident_bytes: 8 * 1024 * 1024,
             },
@@ -1157,6 +1383,10 @@ mod tests {
                 collection_columns: columns.to_vec(),
                 collection_ordering_pairs: pairs.to_vec(),
                 collection_output: true,
+                replay_columns: vec![],
+                partial_state_per_row: 0,
+                fixed_state_bytes: 0,
+                partial_payload_columns: vec![],
                 limits: WindowStateConfig {
                     key_bytes: 128,
                     partial_bytes: 8192,
@@ -1298,6 +1528,453 @@ mod tests {
             ),
         ] {
             assert!(validate_ordered_partial_pairs(&batch, &[(0, 1)]).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn planned_count_distinct_byte_types_share_grouped_selector_window_runtime() {
+        use arroyo_rpc::grpc::api::TumblingWindowAggregateOperator;
+        use datafusion_proto::physical_plan::{
+            DefaultPhysicalExtensionCodec, from_proto::parse_physical_expr,
+        };
+        use datafusion_proto::protobuf::PhysicalExprNode;
+        for target in ["Utf8View", "LargeUtf8", "Binary"] {
+            let sql = format!(
+                "CREATE TABLE input_rows (event_time TIMESTAMP NOT NULL,value TEXT, \
+                WATERMARK FOR event_time AS event_time - INTERVAL '1 second') \
+                WITH(connector='single_file',path='/tmp/str60-count-distinct.jsonl',format='json',type='source'); \
+                SELECT TUMBLE(INTERVAL '1 second') AS window,FIRST_VALUE(value) AS first, \
+                COUNT(DISTINCT arrow_cast(value,'{target}')) AS n FROM input_rows GROUP BY window"
+            );
+            let compiled = arroyo_planner::parse_and_get_program(
+                &sql,
+                arroyo_planner::ArroyoSchemaProvider::new(),
+                arroyo_planner::SqlConfig {
+                    default_parallelism: 1,
+                },
+            )
+            .await
+            .unwrap();
+            let operator = compiled
+                .program
+                .graph
+                .node_weights()
+                .flat_map(|node| node.operator_chain.iter())
+                .map(|(operator, _)| operator)
+                .find(|operator| {
+                    operator.operator_name
+                        == arroyo_datastream::logical::OperatorName::TumblingWindowAggregate
+                })
+                .unwrap();
+            let declared =
+                TumblingWindowAggregateOperator::decode(operator.operator_config.as_slice())
+                    .unwrap();
+            let input: ArroyoSchema = declared.input_schema.clone().unwrap().try_into().unwrap();
+            let partial_schema: ArroyoSchema =
+                declared.partial_schema.clone().unwrap().try_into().unwrap();
+            let registry = Arc::new(arroyo_planner::physical::new_registry());
+            let binning = parse_physical_expr(
+                &PhysicalExprNode::decode(declared.binning_function.as_slice()).unwrap(),
+                registry.as_ref(),
+                &input.schema,
+                &DefaultPhysicalExtensionCodec {},
+            )
+            .unwrap();
+            // CountView's verified constructor floor requires real headroom;
+            // derive backend page/write allowances from this explicit value cap.
+            let value_bytes = 128 * 1024;
+            let mut native = NativeWindow::new(
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+                false,
+                binning,
+                &declared.binning_function,
+                &declared.partial_aggregation_plan,
+                &declared.final_aggregation_plan,
+                declared.final_projection.as_deref(),
+                &partial_schema,
+                registry,
+                WindowStateConfig {
+                    key_bytes: 128,
+                    partial_bytes: value_bytes,
+                    page_bytes: value_bytes * 2,
+                    page_entries: 1,
+                    write_bytes: value_bytes * 8,
+                    write_operations: 16,
+                    max_resident_bytes: 8 * 1024 * 1024,
+                },
+            )
+            .unwrap_or_else(|error| panic!("{target} constructor: {error:#}"));
+            assert_eq!(
+                native.collection_columns.len(),
+                0,
+                "descriptor-covered COUNT DISTINCT entered legacy ARRAY checks"
+            );
+            let columns = input
+                .schema
+                .fields()
+                .iter()
+                .map(|field| -> Arc<dyn Array> {
+                    match field.data_type() {
+                        DataType::Utf8 => Arc::new(StringArray::from(vec!["b", "a", "b"])),
+                        DataType::LargeUtf8 => {
+                            Arc::new(arrow_array::LargeStringArray::from(vec!["b", "a", "b"]))
+                        }
+                        DataType::Utf8View => {
+                            Arc::new(arrow_array::StringViewArray::from(vec!["b", "a", "b"]))
+                        }
+                        DataType::Binary => Arc::new(arrow_array::BinaryArray::from(vec![
+                            b"b".as_slice(),
+                            b"a".as_slice(),
+                            b"b".as_slice(),
+                        ])),
+                        DataType::Timestamp(arrow_schema::TimeUnit::Nanosecond, _) => {
+                            Arc::new(arrow_array::TimestampNanosecondArray::from(vec![
+                                30, 10, 20,
+                            ]))
+                        }
+                        other => panic!("unexpected {target} projected input type {other:?}"),
+                    }
+                })
+                .collect();
+            let batch = RecordBatch::try_new(input.schema.clone(), columns).unwrap();
+            let (store, resources) =
+                store_for_schema_limit(native.partial_schema.clone(), value_bytes);
+            native.store = Some(store);
+            let (control, _rx) = channel(16);
+            let mut ctx = OperatorContext::new(
+                Arc::new(arroyo_types::get_test_task_info()),
+                None,
+                control,
+                1,
+                vec![Arc::new(input)],
+                None,
+                HashMap::new(),
+            )
+            .await;
+            native
+                .process_batch(batch, &mut ctx)
+                .await
+                .unwrap_or_else(|error| panic!("{target} input: {error:#}"));
+            let snapshot = native.store().unwrap().snapshot().await.unwrap();
+            let mut output = RecordedCollector::default();
+            native
+                .emit_interval(&snapshot, 0, 1_000_000_000, &mut output)
+                .await
+                .unwrap_or_else(|error| panic!("{target} output: {error:#}"));
+            assert_eq!(output.0.len(), 1, "{target}");
+            let batch = &output.0[0];
+            // NativeWindow emits the physical GROUP BY columns followed by
+            // aggregate expressions; SELECT aliases belong to the downstream
+            // projection. This fixture invokes the serialized window stage.
+            assert_eq!(batch.num_columns(), 4);
+            let first = 1;
+            let count = 2;
+            assert_eq!(
+                batch
+                    .column(first)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap()
+                    .value(0),
+                "a",
+                "{target}"
+            );
+            assert_eq!(
+                batch
+                    .column(count)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .value(0),
+                2,
+                "{target}"
+            );
+            drop(
+                resources
+                    .try_decoded_value(resources.config().decoded_value_bytes)
+                    .unwrap(),
+            );
+        }
+    }
+
+    #[test]
+    fn variable_partial_preflight_checks_selected_logical_bytes_before_take() {
+        use datafusion::physical_expr::{aggregate::AggregateExprBuilder, expressions::col};
+        let limit = 128 * 1024;
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Utf8View,
+            true,
+        )]));
+        let aggregate = AggregateExprBuilder::new(
+            datafusion::functions_aggregate::approx_distinct::approx_distinct_udaf(),
+            vec![col("value", &schema).unwrap()],
+        )
+        .schema(schema.clone())
+        .alias("hll")
+        .build()
+        .unwrap();
+        let descriptor = aggregate_descriptor(&aggregate, &schema).unwrap().unwrap();
+        let huge = "x".repeat(2 * limit);
+        let values = Arc::new(arrow_array::StringViewArray::from(vec![
+            Some(huge.as_str()),
+            Some("tiny"),
+        ])) as arrow_array::ArrayRef;
+        let batch = RecordBatch::try_new(schema, vec![values]).unwrap();
+        assert!(batch.get_array_memory_size() > limit);
+        let base = descriptor.retained_bound(1, 0).unwrap();
+        let selected = partial_payload_bound(
+            base,
+            &[(0, descriptor)],
+            &batch,
+            &UInt32Array::from(vec![1]),
+        )
+        .unwrap();
+        assert_eq!(selected, base + 4);
+        assert!(
+            selected <= limit,
+            "small selected value was charged for unused backing"
+        );
+        let oversized = partial_payload_bound(
+            base,
+            &[(0, descriptor)],
+            &batch,
+            &UInt32Array::from(vec![0]),
+        )
+        .unwrap();
+        assert!(
+            oversized > limit,
+            "oversized selected payload passed pre-take admission"
+        );
+        // The actual production path performs this same check before invoking
+        // take or starting the partial DF executor. No SQL argument is evaluated.
+    }
+
+    async fn median_fixture() -> (NativeWindow, WorkerStateResources, OperatorContext) {
+        use arroyo_planner::physical::{ArroyoMemExec, new_registry};
+        use datafusion::{
+            functions_aggregate::median::median_udaf,
+            physical_expr::{aggregate::AggregateExprBuilder, expressions::col},
+            physical_plan::aggregates::{AggregateMode, PhysicalGroupBy},
+        };
+        let raw = partial().schema();
+        let aggregates = (0..2)
+            .map(|index| {
+                Arc::new(
+                    AggregateExprBuilder::new(median_udaf(), vec![col("count", &raw).unwrap()])
+                        .schema(raw.clone())
+                        .alias(format!("median_{index}"))
+                        .build()
+                        .unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let partial_plan: Arc<dyn ExecutionPlan> = Arc::new(
+            AggregateExec::try_new(
+                AggregateMode::Partial,
+                PhysicalGroupBy::new_single(vec![]),
+                aggregates.clone(),
+                vec![None; 2],
+                Arc::new(ArroyoMemExec::new("input".into(), raw.clone())),
+                raw.clone(),
+            )
+            .unwrap(),
+        );
+        let state_schema = partial_plan.schema();
+        let finish: Arc<dyn ExecutionPlan> = Arc::new(
+            AggregateExec::try_new(
+                AggregateMode::Final,
+                PhysicalGroupBy::new_single(vec![]),
+                aggregates,
+                vec![None; 2],
+                Arc::new(ArroyoMemExec::new("input".into(), state_schema.clone())),
+                raw.clone(),
+            )
+            .unwrap(),
+        );
+        let codec = ArroyoPhysicalExtensionCodec {
+            context: DecodingContext::Planning,
+        };
+        let partial_bytes = PhysicalPlanNode::try_from_physical_plan(partial_plan, &codec)
+            .unwrap()
+            .encode_to_vec();
+        let finish_bytes = PhysicalPlanNode::try_from_physical_plan(finish, &codec)
+            .unwrap()
+            .encode_to_vec();
+        let schema =
+            ArroyoSchema::from_schema_unkeyed(add_timestamp_field_arrow((*state_schema).clone()))
+                .unwrap();
+        let mut operator = NativeWindow::new(
+            Duration::from_nanos(10),
+            Duration::from_nanos(10),
+            false,
+            Arc::new(datafusion::physical_expr::expressions::Literal::new(
+                ScalarValue::TimestampNanosecond(Some(0), None),
+            )),
+            &[],
+            &partial_bytes,
+            &finish_bytes,
+            None,
+            &schema,
+            Arc::new(new_registry()),
+            WindowStateConfig {
+                key_bytes: 128,
+                partial_bytes: 8192,
+                page_bytes: 32768,
+                page_entries: 1,
+                write_bytes: 65536,
+                write_operations: 16,
+                max_resident_bytes: 8 * 1024 * 1024,
+            },
+        )
+        .unwrap();
+        let (store, resources) = store_for_schema(state_schema);
+        operator.store = Some(store);
+        let (control, _rx) = channel(16);
+        let ctx = OperatorContext::new(
+            Arc::new(arroyo_types::get_test_task_info()),
+            None,
+            control,
+            1,
+            vec![Arc::new(
+                ArroyoSchema::from_schema_unkeyed(add_timestamp_field_arrow((*raw).clone()))
+                    .unwrap(),
+            )],
+            None,
+            HashMap::new(),
+        )
+        .await;
+        (operator, resources, ctx)
+    }
+
+    #[tokio::test]
+    async fn median_partial_preflight_shares_bounds_and_caps_each_chunk_before_materialization() {
+        let (mut operator, resources, mut ctx) = median_fixture().await;
+        let one = operator.partial_state_per_row;
+        assert_eq!(
+            one,
+            operator
+                .replay_columns
+                .iter()
+                .map(|(_, descriptor)| descriptor.retained_bound(1, 0).unwrap())
+                .sum::<usize>()
+        );
+        operator.limits.partial_bytes = one - 1;
+        let error = operator
+            .process_batch(partial(), &mut ctx)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("one partial aggregate row"));
+        assert_eq!(
+            operator.store().unwrap().earliest_time().await.unwrap(),
+            None
+        );
+        // Exactly one conservative group allowance fits: 65 rows must become
+        // 65 finite one-row partials rather than a 64-row unbounded accumulator.
+        operator.limits.partial_bytes = one;
+        let rows = RecordBatch::try_new(
+            partial().schema(),
+            vec![Arc::new(Int64Array::from(vec![1; 65]))],
+        )
+        .unwrap();
+        operator.process_batch(rows, &mut ctx).await.unwrap();
+        let snapshot = operator.store().unwrap().snapshot().await.unwrap();
+        let mut after = None;
+        let mut pages = 0;
+        while let Some(partial) = snapshot
+            .next_partial_range(&[], 0, 10, false, after.as_deref())
+            .await
+            .unwrap()
+        {
+            pages += 1;
+            assert!(pages <= 65);
+            for column in partial.batch.columns() {
+                assert_eq!(
+                    column
+                        .as_any()
+                        .downcast_ref::<ListArray>()
+                        .unwrap()
+                        .value_length(0),
+                    1
+                );
+            }
+            after = Some(partial.key);
+        }
+        assert_eq!(pages, 65);
+        drop(
+            resources
+                .try_decoded_value(resources.config().decoded_value_bytes)
+                .unwrap(),
+        );
+    }
+
+    #[tokio::test]
+    async fn median_final_preflight_refusal_and_cancellation_release_state_without_retirement() {
+        let (mut operator, resources, mut ctx) = median_fixture().await;
+        for _ in 0..9 {
+            operator.process_batch(partial(), &mut ctx).await.unwrap();
+        }
+        let snapshot = operator.store().unwrap().snapshot().await.unwrap();
+        let mut collector = RecordedCollector::default();
+        operator.limits.partial_bytes = operator
+            .replay_columns
+            .iter()
+            .map(|(_, descriptor)| descriptor.retained_bound(9, 0).unwrap())
+            .sum::<usize>()
+            - 1;
+        let error = operator
+            .emit_interval(&snapshot, 0, 10, &mut collector)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("retained aggregate state"));
+        assert!(collector.0.is_empty());
+        assert_eq!(
+            operator.store().unwrap().earliest_time().await.unwrap(),
+            Some(0)
+        );
+        assert_eq!(operator.store().unwrap().progress().await.unwrap(), None);
+        drop(
+            resources
+                .try_decoded_value(resources.config().decoded_value_bytes)
+                .unwrap(),
+        );
+        operator.limits.partial_bytes = 8192;
+        let (started_tx, mut started_rx) = tokio::sync::oneshot::channel();
+        let (_release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let mut blocked = BlockedCollector {
+            started: Some(started_tx),
+            release: release_rx,
+        };
+        let mut pending = Box::pin(operator.emit_interval(&snapshot, 0, 10, &mut blocked));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::select! { result = &mut pending => panic!("unexpected completion {result:?}"), started = &mut started_rx => { started.unwrap(); } }
+        }).await.unwrap();
+        drop(pending);
+        assert_eq!(
+            operator.store().unwrap().earliest_time().await.unwrap(),
+            Some(0)
+        );
+        assert_eq!(operator.store().unwrap().progress().await.unwrap(), None);
+        drop(
+            resources
+                .try_decoded_value(resources.config().decoded_value_bytes)
+                .unwrap(),
+        );
+        operator
+            .emit_interval(&snapshot, 0, 10, &mut collector)
+            .await
+            .unwrap();
+        assert_eq!(collector.0.len(), 1);
+        for column in &collector.0[0].columns()[..2] {
+            assert_eq!(
+                column
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .value(0),
+                1
+            );
         }
     }
 
@@ -1666,6 +2343,10 @@ mod tests {
                 },
                 collection_ordering_pairs: vec![],
                 collection_output: collection,
+                replay_columns: vec![],
+                partial_state_per_row: 0,
+                fixed_state_bytes: 0,
+                partial_payload_columns: vec![],
                 limits: WindowStateConfig {
                     key_bytes: 128,
                     partial_bytes: 8192,
