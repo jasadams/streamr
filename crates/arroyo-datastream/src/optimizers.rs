@@ -175,4 +175,69 @@ mod tests {
             assert_eq!(graph.edge_count(), 2);
         }
     }
+
+    #[test]
+    fn chaining_removal_preserves_empty_and_single_output() {
+        for output in [None, Some("output")] {
+            let mut graph = DiGraph::new();
+            let removed = graph.add_node("removed");
+            let sink = graph.add_node("sink");
+            let parent = graph.add_node("parent");
+            graph.add_edge(parent, removed, "input");
+            if let Some(weight) = output {
+                graph.add_edge(removed, sink, weight);
+            }
+            remove_in_place(&mut graph, removed);
+            let edges = graph
+                .edge_references()
+                .map(|edge| (graph[edge.source()], graph[edge.target()], *edge.weight()))
+                .collect::<Vec<_>>();
+            let expected = output
+                .into_iter()
+                .map(|weight| ("parent", "sink", weight))
+                .collect::<Vec<_>>();
+            assert_eq!(edges, expected);
+        }
+    }
+
+    #[test]
+    fn chaining_removal_preserves_fanout_parallel_edges_and_swapped_indices() {
+        for parent_is_last in [false, true] {
+            let mut graph = DiGraph::new();
+            let first = graph.add_node(if parent_is_last { "other" } else { "parent" });
+            let removed = graph.add_node("removed");
+            let left = graph.add_node("left");
+            let right = graph.add_node("right");
+            let last = graph.add_node(if parent_is_last { "parent" } else { "other" });
+            let (parent, other) = if parent_is_last {
+                (last, first)
+            } else {
+                (first, last)
+            };
+            graph.add_edge(parent, removed, "input");
+            graph.add_edge(removed, left, "left-first");
+            graph.add_edge(removed, right, "right");
+            graph.add_edge(other, left, "unrelated");
+            graph.add_edge(removed, left, "left-second");
+
+            remove_in_place(&mut graph, removed);
+
+            let mut edges = graph
+                .edge_references()
+                .map(|edge| (graph[edge.source()], graph[edge.target()], *edge.weight()))
+                .collect::<Vec<_>>();
+            edges.sort_unstable();
+            assert_eq!(
+                edges,
+                vec![
+                    ("other", "left", "unrelated"),
+                    ("parent", "left", "left-first"),
+                    ("parent", "left", "left-second"),
+                    ("parent", "right", "right"),
+                ],
+                "parent_is_last={parent_is_last}"
+            );
+            assert!(!graph.node_weights().any(|node| *node == "removed"));
+        }
+    }
 }

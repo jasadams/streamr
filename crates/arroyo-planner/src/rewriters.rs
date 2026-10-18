@@ -843,6 +843,63 @@ pub(crate) fn depends_on_event_clock(expr: &Expr, schema: &datafusion::common::D
     .expect("infallible expression visitor")
 }
 
+#[derive(Default)]
+struct EventClockLineage {
+    aggregate: bool,
+    trigger_sources: usize,
+    overwritten: bool,
+}
+
+impl EventClockLineage {
+    fn visit(&mut self, plan: &LogicalPlan) -> DFResult<()> {
+        if let LogicalPlan::Extension(extension) = plan {
+            if let Some(updating) = extension
+                .node
+                .as_any()
+                .downcast_ref::<crate::extension::updating_aggregate::UpdatingAggregateExtension>(
+            ) && updating.emit_per_event
+            {
+                let LogicalPlan::Aggregate(aggregate) = &updating.aggregate else {
+                    return plan_err!("per-event aggregate clock has no native aggregate plan");
+                };
+                // This private route emits an original trigger timestamp for
+                // each accepted input. Skip only its own aggregate node; its
+                // input must still prove one source and an unmodified clock.
+                return self.visit(&aggregate.input);
+            }
+            if extension.node.as_any().is::<TableSourceExtension>() {
+                self.trigger_sources += 1;
+            }
+            self.aggregate |= extension
+                .node
+                .as_any()
+                .is::<crate::extension::aggregate::AggregateExtension>();
+        }
+        if let LogicalPlan::Projection(projection) = plan {
+            let source_projection = matches!(projection.input.as_ref(), LogicalPlan::Extension(extension)
+                if extension.node.as_any().is::<TableSourceExtension>()
+                    || extension.node.as_any().is::<DebeziumUnrollingExtension>());
+            if !source_projection {
+                for (index, expression) in projection.expr.iter().enumerate() {
+                    if projection.schema.field(index).name() != TIMESTAMP_FIELD {
+                        continue;
+                    }
+                    let mut expression = expression;
+                    while let Expr::Alias(alias) = expression {
+                        expression = alias.expr.as_ref();
+                    }
+                    self.overwritten |= !matches!(expression, Expr::Column(column) if column.name == TIMESTAMP_FIELD);
+                }
+            }
+        }
+        self.aggregate |= matches!(plan, LogicalPlan::Aggregate(_));
+        for input in plan.inputs() {
+            self.visit(input)?;
+        }
+        Ok(())
+    }
+}
+
 impl TreeNodeRewriter for EventClockRewriter<'_> {
     type Node = Expr;
 
@@ -854,50 +911,24 @@ impl TreeNodeRewriter for EventClockRewriter<'_> {
             return Ok(Transformed::no(node));
         }
 
-        let mut aggregate = false;
-        let mut trigger_sources = 0;
-        let mut overwritten = false;
-        self.input.exists(|plan| {
-            if let LogicalPlan::Extension(extension) = plan {
-                if extension.node.as_any().is::<TableSourceExtension>() {
-                    trigger_sources += 1;
-                }
-                aggregate |= extension.node.as_any().is::<crate::extension::aggregate::AggregateExtension>();
-            }
-            if let LogicalPlan::Projection(projection) = plan {
-                let source_projection = matches!(projection.input.as_ref(), LogicalPlan::Extension(extension)
-                    if extension.node.as_any().is::<TableSourceExtension>()
-                        || extension.node.as_any().is::<DebeziumUnrollingExtension>());
-                if !source_projection {
-                    for (index, expression) in projection.expr.iter().enumerate() {
-                        if projection.schema.field(index).name() != TIMESTAMP_FIELD { continue; }
-                        let mut expression = expression;
-                        while let Expr::Alias(alias) = expression {
-                            expression = alias.expr.as_ref();
-                        }
-                        overwritten |= !matches!(expression, Expr::Column(column) if column.name == TIMESTAMP_FIELD);
-                    }
-                }
-            }
-            aggregate |= matches!(plan, LogicalPlan::Aggregate(_));
-            Ok(false)
-        })?;
-        if trigger_sources == 0 {
+        let mut lineage = EventClockLineage::default();
+        lineage.visit(self.input)?;
+        if lineage.trigger_sources == 0 {
             return plan_err!(
                 "EVENT_TIMESTAMP()/EVENT_DATE() requires a current triggering event source"
             );
         }
-        if trigger_sources != 1 {
+        if lineage.trigger_sources != 1 {
             return plan_err!(
                 "EVENT_TIMESTAMP()/EVENT_DATE() has ambiguous triggering sources; a single triggering source is required"
             );
         }
-        if aggregate {
+        if lineage.aggregate {
             return plan_err!(
                 "EVENT_TIMESTAMP()/EVENT_DATE() requires current-trigger clock metadata across maintained aggregates (STR-62); aggregate output time is not an event clock"
             );
         }
-        if overwritten {
+        if lineage.overwritten {
             return plan_err!(
                 "event clock triggering timestamp was replaced by a projection; alias the retained or calculated timestamp to a different output name"
             );

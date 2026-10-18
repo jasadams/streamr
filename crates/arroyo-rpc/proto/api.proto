@@ -132,6 +132,9 @@ message UpdatingAggregateOperator {
   // Planner-proven exclusive prefix consumption, indexed by aggregate ordinal.
   map<uint32, uint64> collection_output_limits = 10;
   repeated CalendarAggregateDescriptor calendar_aggregates = 11;
+  // Planner-proven append COUNT/MAX input consumed as one accepted snapshot
+  // per original row by MERGE. Ordinary aggregate changelog emission is unchanged.
+  bool emit_per_event = 12;
 }
 
 // A maintained inclusive UTC calendar FILTER, indexed by aggregate ordinal.

@@ -66,6 +66,142 @@ fn merge(action: &str) -> String {
     )
 }
 
+fn aggregate_merge(settings: &str, aggregate: &str) -> String {
+    format!(
+        "{settings} {DECLARATIONS}
+         CREATE VIEW counts AS SELECT counter, {aggregate} AS quantity FROM events GROUP BY counter;
+         CREATE VIEW applied AS MERGE INTO inventory AS target USING counts AS source
+         ON target.counter = source.counter
+         WHEN MATCHED THEN UPDATE SET quantity = source.quantity
+         WHEN NOT MATCHED THEN INSERT (counter,quantity) VALUES (source.counter,source.quantity)
+         RETURNING source AS source, old AS old, new AS new, action AS action;
+         SELECT new.quantity FROM applied;"
+    )
+}
+
+#[test(tokio::test)]
+async fn maintained_merge_uses_separate_native_snapshot_producer() {
+    let compiled = plan(&aggregate_merge("SET updating_ttl = NULL;", "COUNT(*)")).await;
+    let aggregates = compiled
+        .program
+        .graph
+        .node_weights()
+        .flat_map(|node| node.operator_chain.iter())
+        .filter(|(operator, _)| operator.operator_name == OperatorName::UpdatingAggregate)
+        .map(|(operator, _)| {
+            arroyo_rpc::grpc::api::UpdatingAggregateOperator::decode(
+                operator.operator_config.as_slice(),
+            )
+            .unwrap()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(aggregates.len(), 1);
+    assert!(aggregates[0].emit_per_event);
+    let output: arrow_schema::Schema =
+        serde_json::from_str(&aggregates[0].final_schema.as_ref().unwrap().arrow_schema).unwrap();
+    assert!(output.index_of(arroyo_rpc::UPDATING_META_FIELD).is_err());
+    assert_eq!(state_operators(&compiled).len(), 1);
+}
+
+#[test(tokio::test)]
+async fn maintained_merge_does_not_upgrade_an_ordinary_view_consumer() {
+    let mut sql = aggregate_merge("SET updating_ttl = NULL;", "COUNT(*)");
+    sql.push_str("SELECT counter,quantity FROM counts;");
+    let compiled = plan(&sql).await;
+    let mut modes = compiled
+        .program
+        .graph
+        .node_weights()
+        .flat_map(|node| node.operator_chain.iter())
+        .filter(|(operator, _)| operator.operator_name == OperatorName::UpdatingAggregate)
+        .map(|(operator, _)| {
+            arroyo_rpc::grpc::api::UpdatingAggregateOperator::decode(
+                operator.operator_config.as_slice(),
+            )
+            .unwrap()
+            .emit_per_event
+        })
+        .collect::<Vec<_>>();
+    modes.sort_unstable();
+    assert_eq!(modes, [false, true]);
+}
+
+#[test(tokio::test)]
+async fn maintained_merge_event_clock_uses_the_accepted_trigger() {
+    let mut sql = aggregate_merge("SET updating_ttl = NULL;", "COUNT(*)");
+    sql.push_str("SELECT EVENT_TIMESTAMP() AS trigger_time FROM applied;");
+    plan(&sql).await;
+}
+
+#[test(tokio::test)]
+async fn maintained_merge_event_clock_rejects_an_overwritten_input_clock() {
+    let mut sql = aggregate_merge("SET updating_ttl = NULL;", "COUNT(*)").replace(
+        "CREATE VIEW counts AS SELECT counter, COUNT(*) AS quantity FROM events GROUP BY counter;",
+        "CREATE VIEW replaced AS SELECT counter, CAST('2020-01-01' AS TIMESTAMP) AS _timestamp FROM events;
+         CREATE VIEW counts AS SELECT counter, COUNT(*) AS quantity FROM replaced GROUP BY counter;",
+    );
+    sql.push_str("SELECT EVENT_TIMESTAMP() FROM applied;");
+    reject(&sql, "triggering timestamp was replaced by a projection").await;
+}
+
+#[test(tokio::test)]
+async fn maintained_merge_rejects_unresolved_retention_and_other_aggregates() {
+    reject(
+        &aggregate_merge("", "COUNT(*)"),
+        "requires SET updating_ttl = NULL",
+    )
+    .await;
+    reject(
+        &aggregate_merge("SET updating_ttl = NULL;", "SUM(counter)"),
+        "COUNT/MAX only",
+    )
+    .await;
+    reject(
+        &aggregate_merge("SET updating_ttl = NULL;", "COUNT(DISTINCT counter)"),
+        "non-distinct COUNT/MAX",
+    )
+    .await;
+}
+
+#[test(tokio::test)]
+async fn maintained_merge_rejects_unsupported_event_lineage_and_ordering() {
+    let base = aggregate_merge("SET updating_ttl = NULL;", "COUNT(*)");
+    let view =
+        "CREATE VIEW counts AS SELECT counter, COUNT(*) AS quantity FROM events GROUP BY counter;";
+    let cases = [
+        ("join", base.replace(view, "CREATE VIEW counts AS SELECT a.counter, COUNT(*) AS quantity FROM events a JOIN events b ON a.counter=b.counter GROUP BY a.counter;")),
+        ("nested", base.replace(view, "CREATE VIEW inner_counts AS SELECT counter, COUNT(*) AS n FROM events GROUP BY counter; CREATE VIEW counts AS SELECT counter, COUNT(*) AS quantity FROM inner_counts GROUP BY counter;")),
+        ("updating", base.replace("CREATE TABLE events WITH (connector = 'impulse', event_rate = '1');", "CREATE TABLE events (counter BIGINT PRIMARY KEY) WITH (connector='kafka',bootstrap_servers='localhost:9092',topic='changes',type='source',format='debezium_json');")),
+        ("ordered", aggregate_merge("SET updating_ttl = NULL;", "FIRST_VALUE(counter ORDER BY counter)")),
+    ];
+    for (case, sql) in cases {
+        let result = parse_and_get_program(
+            &sql,
+            ArroyoSchemaProvider::new(),
+            SqlConfig {
+                default_parallelism: 1,
+            },
+        )
+        .await;
+        let error = result.expect_err(case);
+        println!("STR64 unsupported {case}: {error}");
+    }
+}
+
+#[test(tokio::test)]
+async fn maintained_merge_rejects_calendar_results_before_worker_construction() {
+    let declarations = "CREATE TABLE events (counter BIGINT NOT NULL, event_time TIMESTAMP NOT NULL,
+        WATERMARK FOR event_time AS event_time - INTERVAL '1' DAY)
+        WITH (connector='single_file',path='/tmp/str64-rejected-calendar.jsonl',format='json',type='source');
+        CREATE STATE TABLE inventory (counter BIGINT PRIMARY KEY, quantity BIGINT) PARTITION BY counter;";
+    let sql = aggregate_merge(
+        "SET updating_ttl = NULL;",
+        "COUNT(*) FILTER (WHERE CAST(event_time AS DATE) = EVENT_DATE())",
+    )
+    .replace(DECLARATIONS, declarations);
+    reject(&sql, "no calendar aggregates").await;
+}
+
 #[test(tokio::test)]
 async fn named_merge_has_one_captured_effectful_producer() {
     let query = merge(
@@ -141,9 +277,29 @@ async fn captured_merge_is_one_producer_across_two_consumers() {
          SELECT source.counter FROM applied;
          SELECT action FROM applied"
     );
-    let configs = state_operators(&plan(&query).await);
+    let mut compiled = plan(&query).await;
+    compiled
+        .program
+        .optimize(&arroyo_datastream::optimizers::ChainingOptimizer {});
+    let configs = state_operators(&compiled);
     assert_eq!(configs.len(), 1);
     assert_eq!(configs[0].captured_result_name.as_deref(), Some("applied"));
+    let graph = &compiled.program.graph;
+    let roots = graph
+        .externals(petgraph::Direction::Incoming)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        roots.len(),
+        1,
+        "captured consumers must stay attached to their source"
+    );
+    assert!(graph[roots[0]].operator_chain.is_source());
+    let mut reachable = petgraph::visit::Dfs::new(graph, roots[0]);
+    let mut count = 0;
+    while reachable.next(graph).is_some() {
+        count += 1;
+    }
+    assert_eq!(count, graph.node_count());
 }
 
 #[test(tokio::test)]

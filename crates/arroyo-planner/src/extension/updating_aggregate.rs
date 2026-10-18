@@ -30,6 +30,7 @@ pub(crate) struct UpdatingAggregateExtension {
     pub(crate) timestamp_qualifier: Option<TableReference>,
     pub(crate) ttl: Option<Duration>,
     pub(crate) calendar_aggregates: Vec<crate::plan::CalendarAggregate>,
+    pub(crate) emit_per_event: bool,
 }
 
 impl UpdatingAggregateExtension {
@@ -54,6 +55,7 @@ impl UpdatingAggregateExtension {
             timestamp_qualifier,
             ttl,
             calendar_aggregates,
+            emit_per_event: false,
         })
     }
 }
@@ -84,13 +86,18 @@ impl UserDefinedLogicalNodeCore for UpdatingAggregateExtension {
         _exprs: Vec<datafusion::prelude::Expr>,
         inputs: Vec<LogicalPlan>,
     ) -> Result<Self> {
-        Self::new(
+        let mut next = Self::new(
             inputs[0].clone(),
             self.key_fields.clone(),
             self.timestamp_qualifier.clone(),
             self.ttl,
             self.calendar_aggregates.clone(),
-        )
+        )?;
+        if self.emit_per_event {
+            next.emit_per_event = true;
+            next.final_calculation = next.aggregate.clone();
+        }
+        Ok(next)
     }
 }
 
@@ -216,6 +223,7 @@ impl ArroyoExtension for UpdatingAggregateExtension {
             })
             .collect::<Result<Vec<_>>>()?;
         let config = UpdatingAggregateOperator {
+            emit_per_event: self.emit_per_event,
             calendar_aggregates,
             collection_output_limits,
             name: "UpdatingAggregate".to_string(),

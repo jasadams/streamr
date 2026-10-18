@@ -10,7 +10,7 @@ use arroyo_datastream::logical::{
 use arroyo_rpc::df::{ArroyoSchema, ArroyoSchemaRef};
 use arroyo_rpc::grpc::api::{
     FusedStateTableOperator, FusedStateTableStep, ProjectionOperator, StateTableCaptureOperator,
-    StateTableDefinition, StateTableOperator, ValuePlanOperator,
+    StateTableDefinition, StateTableOperator, UpdatingAggregateOperator, ValuePlanOperator,
 };
 use datafusion::common::{DataFusionError, Result};
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
@@ -617,6 +617,32 @@ fn is_valid_input_boundary(
     admission: &dyn ScalarPlanAdmission,
 ) -> Result<bool> {
     let operator = single_operator(graph, boundary)?;
+    if operator.operator_name == OperatorName::UpdatingAggregate {
+        let aggregate = UpdatingAggregateOperator::decode(operator.operator_config.as_slice())
+            .map_err(|error| reject(format!("invalid aggregate input boundary: {error}")))?;
+        if !aggregate.emit_per_event {
+            return Ok(false);
+        }
+        let incoming = graph.edges_directed(boundary, Incoming).collect::<Vec<_>>();
+        if graph[boundary].parallelism != 1
+            || incoming.len() != 1
+            || incoming[0]
+                .weight()
+                .schema
+                .schema
+                .index_of(arroyo_rpc::UPDATING_META_FIELD)
+                .is_ok()
+            || aggregate.retain_indefinitely != Some(true)
+        {
+            return Err(reject(
+                "aggregate event-result boundary requires singleton append input and indefinite retention",
+            ));
+        }
+        // The logical route validates one append source and COUNT/MAX. The
+        // aggregate remains a separate owner; only its accepted rows enter
+        // this fused region, in their original input order.
+        return Ok(true);
+    }
     let mut current = match operator.operator_name {
         OperatorName::ConnectorSource => boundary,
         OperatorName::ExpressionWatermark => only_parent(graph, boundary)?.0,

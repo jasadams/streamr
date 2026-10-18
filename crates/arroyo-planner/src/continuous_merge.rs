@@ -1,4 +1,6 @@
 //! Native, event-driven retained table planning. No storage or runtime SQL lives here.
+#[path = "merge_event_source.rs"]
+mod event_source;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -312,10 +314,10 @@ pub(crate) fn plan_named_merge(
     // never a separately regenerated source query or a relookup of old/new.
     let source_sql = format!("SELECT * FROM {source}");
     let source_statement = parse_sql(&source_sql)?.remove(0);
-    let input = rewrite_plan(
+    let input = event_source::resolve(rewrite_plan(
         produce_optimized_plan(&source_statement, provider)?,
         provider,
-    )?;
+    )?)?;
     if input
         .schema()
         .has_column_with_unqualified_name(arroyo_rpc::UPDATING_META_FIELD)

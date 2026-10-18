@@ -471,6 +471,7 @@ pub struct IncrementalAggregatingFunc {
     retain_indefinitely: bool,
     native_schema_identity: Vec<u8>,
     native_append_only: bool,
+    emit_per_event: bool,
     calendars: Vec<CalendarAggregate>,
 }
 
@@ -1520,12 +1521,176 @@ impl IncrementalAggregatingFunc {
             .native_group_codec()?
             .encode(&next, scope.limits().value_bytes)?;
         scope.put(&storage_key, &encoded)?;
-        scope.put(&native_group_key(b'D', group_key)?, &[1])?;
+        if !self.emit_per_event {
+            scope.put(&native_group_key(b'D', group_key)?, &[1])?;
+        }
         if !self.retain_indefinitely {
             scope.put(
                 &native_expiry_key(now.saturating_add(ttl_nanos), group_key)?,
                 &[1],
             )?;
+        }
+        Ok(())
+    }
+
+    async fn native_accepted_values(
+        &self,
+        scope: &AggregateScope<'_>,
+        group_key: &[u8],
+        group: &EncodedGroup,
+    ) -> Result<Vec<ScalarValue>> {
+        let mut accumulators = self.native_accumulators(Some(group))?;
+        let mut values = Vec::with_capacity(self.aggregates.len());
+        for (index, state) in accumulators.iter_mut().enumerate() {
+            values.push(match state {
+                IncrementalState::Sliding { accumulator, .. } => accumulator.evaluate()?,
+                IncrementalState::Batch { .. } => {
+                    self.native_fallback_value(scope, group_key, group.generation, index)
+                        .await?
+                }
+            });
+        }
+        Ok(values)
+    }
+
+    /// Preserve every accepted append prefix without dirty-key enumeration or
+    /// ordinary changelog replacement/equality suppression. Aggregate and
+    /// target remain independent owners and recover from an aligned checkpoint.
+    async fn process_native_event_batch(
+        &self,
+        batch: &RecordBatch,
+        ctx: &mut OperatorContext,
+        collector: &mut dyn Collector,
+    ) -> DataflowResult<()> {
+        let store = self
+            .native_store
+            .as_ref()
+            .context("native aggregate store is not initialized")?;
+        if batch.column_by_name(UPDATING_META_FIELD).is_some() {
+            return Err(anyhow!("per-event aggregate MERGE received a changelog").into());
+        }
+        let input_schema = &ctx.in_schemas[0];
+        let keys = self.key_converter.convert_columns(
+            &input_schema
+                .sort_columns(batch, false)
+                .into_iter()
+                .map(|column| column.values)
+                .collect::<Vec<_>>(),
+        )?;
+        let inputs = self.compute_inputs(batch)?;
+        let configured = self
+            .native_config
+            .context("per-event aggregate requires native limits")?;
+        let limits = store.limits();
+        // Retain ordinary append processing's conservative three-operation
+        // allowance. Output has an independent admitted bound below.
+        let operations = 3;
+        let chunk_rows = (limits.write_operations / operations)
+            .min(configured.max_pending_output_rows)
+            .min(limits.write_bytes / store.max_encoded_entry_bytes().saturating_mul(operations))
+            .min(
+                limits.overlay_bytes
+                    / limits
+                        .key_bytes
+                        .saturating_add(limits.value_bytes)
+                        .saturating_mul(operations),
+            );
+        if chunk_rows == 0 {
+            return Err(anyhow!("per-event aggregate budget cannot admit one event").into());
+        }
+        let mut start = 0;
+        while start < batch.num_rows() {
+            // Covers owned row batches, their concatenation and evaluation
+            // scratch; released only after downstream collection finishes.
+            let _output = store
+                .resources()
+                .try_decoded_value(configured.max_pending_output_bytes.saturating_mul(3))
+                .map_err(anyhow::Error::from)?;
+            let mut end = batch.num_rows().min(start.saturating_add(chunk_rows));
+            loop {
+                let mut scope = store.begin_point().await?;
+                let mut output = Vec::new();
+                let mut output_bytes = 0usize;
+                let mut shorter = None;
+                for row in start..end {
+                    let key = keys.row(row);
+                    self.native_process_calendar_event_with_progress(
+                        &mut scope,
+                        NativeCalendarEvent {
+                            group_key: key.as_ref(),
+                            inputs: &inputs,
+                            row,
+                            retract: false,
+                            row_id: None,
+                            calendar_inputs: &[],
+                        },
+                        &mut None,
+                    )
+                    .await?;
+                    let bytes = scope
+                        .get(&native_group_key(b'G', key.as_ref())?)
+                        .await?
+                        .context("per-event aggregate lost its accepted group")?;
+                    let group = self
+                        .native_group_codec()?
+                        .decode(&bytes, limits.value_bytes)?;
+                    let mut values = self
+                        .native_accepted_values(&scope, key.as_ref(), &group)
+                        .await?;
+                    // The injected MAX remains native state, but it is not this
+                    // event's clock. User-declared MAX columns remain untouched.
+                    *values
+                        .last_mut()
+                        .context("per-event aggregate has no timestamp")? =
+                        ScalarValue::try_from_array(
+                            batch.column(input_schema.timestamp_index),
+                            row,
+                        )?;
+                    let mut columns = self.key_converter.convert_rows([key])?;
+                    columns.extend(
+                        values
+                            .into_iter()
+                            .map(|value| value.to_array())
+                            .collect::<DFResult<Vec<_>>>()?,
+                    );
+                    let accepted =
+                        RecordBatch::try_new(self.schema_without_metadata.clone(), columns)?;
+                    let next_bytes = output_bytes
+                        .checked_add(accepted.get_array_memory_size())
+                        .context("per-event aggregate output size overflow")?;
+                    if next_bytes > configured.max_pending_output_bytes / 3 {
+                        if output.is_empty() {
+                            return Err(anyhow!("one per-event aggregate result exceeds configured pending-output budget").into());
+                        }
+                        shorter = Some(row);
+                        break;
+                    }
+                    output_bytes = next_bytes;
+                    output.push(accepted);
+                }
+                if let Some(next_end) = shorter {
+                    // No writes have committed. Reprepare the fitting prefix in
+                    // a fresh scope, excluding the event that crossed the bound.
+                    // Input expressions are computed once and COUNT/MAX replay
+                    // has no external effects or processing-time SQL evaluation.
+                    end = next_end;
+                    continue;
+                }
+                // Every fallible row evaluation and output allocation precedes the
+                // live commit. A delivery error fails this attempt; never retry it.
+                let output =
+                    arrow::compute::concat_batches(&self.schema_without_metadata, &output)?;
+                if output.get_array_memory_size() > configured.max_pending_output_bytes {
+                    return Err(anyhow!(
+                        "per-event aggregate output exceeds configured pending-output budget"
+                    )
+                    .into());
+                }
+                scope.commit().await?;
+                collector.collect(output).await?;
+                start = end;
+                break;
+            }
         }
         Ok(())
     }
@@ -1983,6 +2148,9 @@ impl IncrementalAggregatingFunc {
         ctx: &mut OperatorContext,
         collector: &mut dyn Collector,
     ) -> DataflowResult<()> {
+        if self.emit_per_event {
+            return Ok(());
+        }
         self.prune_calendar_buckets().await?;
         // Existing dirty groups are emitted before expiration, matching the
         // legacy flush order (updates first, then TTL retractions).
@@ -2084,24 +2252,9 @@ impl IncrementalAggregatingFunc {
                     let mut group = self
                         .native_group_codec()?
                         .decode(&bytes, scope.limits().value_bytes)?;
-                    let mut accumulators = self.native_accumulators(Some(&group))?;
-                    let mut next = Vec::with_capacity(self.aggregates.len());
-                    for (index, state) in accumulators.iter_mut().enumerate() {
-                        next.push(match state {
-                            IncrementalState::Sliding { accumulator, .. } => {
-                                accumulator.evaluate()?
-                            }
-                            IncrementalState::Batch { .. } => {
-                                self.native_fallback_value(
-                                    &scope,
-                                    &group_key,
-                                    group.generation,
-                                    index,
-                                )
-                                .await?
-                            }
-                        });
-                    }
+                    let next = self
+                        .native_accepted_values(&scope, &group_key, &group)
+                        .await?;
                     let append = !self.native_has_group_keys() || group.live_rows > 0;
                     let unchanged = append
                         && group.last_emitted.as_ref().is_some_and(|old| {
@@ -3072,8 +3225,13 @@ impl ArrowOperator for IncrementalAggregatingFunc {
         &mut self,
         batch: RecordBatch,
         ctx: &mut OperatorContext,
-        _: &mut dyn Collector,
+        collector: &mut dyn Collector,
     ) -> DataflowResult<()> {
+        if self.emit_per_event {
+            return self
+                .process_native_event_batch(&batch, ctx, collector)
+                .await;
+        }
         if self.native_config.is_some() {
             self.process_native_batch(&batch, ctx).await?;
             return Ok(());
@@ -3186,7 +3344,7 @@ impl ArrowOperator for IncrementalAggregatingFunc {
     }
 
     fn tick_interval(&self) -> Option<Duration> {
-        Some(self.flush_interval)
+        (!self.emit_per_event).then_some(self.flush_interval)
     }
 
     async fn handle_tick(
@@ -3305,6 +3463,14 @@ impl IncrementalAggregatingConstructor {
         registry: Arc<Registry>,
         native_config: Option<AggregateStateConfig>,
     ) -> Result<IncrementalAggregatingFunc> {
+        let emit_per_event = config.emit_per_event;
+        ensure!(
+            !emit_per_event
+                || (native_config.is_some()
+                    && config.retain_indefinitely == Some(true)
+                    && config.calendar_aggregates.is_empty()),
+            "per-event aggregate MERGE requires native state, indefinite retention and no calendar aggregates"
+        );
         if config.retain_indefinitely == Some(true) && native_config.is_none() {
             bail!("SET updating_ttl = NULL requires worker.aggregate-state native backend limits");
         }
@@ -3319,6 +3485,9 @@ impl IncrementalAggregatingConstructor {
         }
 
         identity.update(&config.metadata_expr);
+        if emit_per_event {
+            identity.update(b"\0event-results.v1");
+        }
         identity.update(config.ttl_micros.to_be_bytes());
         identity.update([u8::from(config.retain_indefinitely == Some(true))]);
         if let Some(schema) = &config.input_schema {
@@ -3352,7 +3521,14 @@ impl IncrementalAggregatingConstructor {
             native_config.is_some() && input_schema.schema.index_of(UPDATING_META_FIELD).is_err();
         let final_schema: ArroyoSchema = config.final_schema.unwrap().try_into()?;
         let mut schema_without_metadata = SchemaBuilder::from((*final_schema.schema).clone());
-        schema_without_metadata.remove(final_schema.schema.index_of(UPDATING_META_FIELD).unwrap());
+        if emit_per_event {
+            ensure!(
+                native_append_only && final_schema.schema.index_of(UPDATING_META_FIELD).is_err(),
+                "per-event aggregate MERGE requires append input and accepted snapshot output"
+            );
+        } else {
+            schema_without_metadata.remove(final_schema.schema.index_of(UPDATING_META_FIELD)?);
+        }
 
         let metadata_expr = parse_physical_expr(
             &PhysicalExprNode::decode(&mut config.metadata_expr.as_slice())?,
@@ -3533,6 +3709,35 @@ impl IncrementalAggregatingConstructor {
             .collect::<Result<_>>()?;
 
         let state_schema = Schema::new(sliding_state_fields);
+
+        if emit_per_event {
+            ensure!(
+                !key_fields.is_empty()
+                    && final_schema.schema.fields().len() == key_fields.len() + aggregates.len()
+                    && final_schema.timestamp_index + 1 == final_schema.schema.fields().len()
+                    && aggregates.iter().all(|(agg, kind, _, _, _, _, _, _, _)| {
+                        matches!(agg.fun().name(), "count" | "max")
+                            && *kind != AccumulatorType::Batch
+                            && !agg.is_distinct()
+                            && agg.order_bys().is_none()
+                    }),
+                "per-event aggregate MERGE requires keyed native COUNT/MAX snapshots"
+            );
+            let (clock, _, _, _, arguments, filter, _, _, _) = aggregates
+                .last()
+                .context("per-event aggregate has no injected timestamp")?;
+            ensure!(
+                clock.name() == TIMESTAMP_FIELD
+                    && clock.fun().inner().as_any().is::<Max>()
+                    && arguments.len() == 1
+                    && arguments[0]
+                        .as_any()
+                        .downcast_ref::<Column>()
+                        .is_some_and(|column| column.index() == input_schema.timestamp_index)
+                    && filter.is_none(),
+                "per-event aggregate timestamp does not match input clock ordinal"
+            );
+        }
 
         let versioned_inputs = aggregates.iter().any(|(agg, _, _, _, _, filter, _, _, _)| {
             filter.is_some() || agg.order_bys().is_some()
@@ -3756,6 +3961,7 @@ impl IncrementalAggregatingConstructor {
             retain_indefinitely: config.retain_indefinitely == Some(true),
             native_schema_identity,
             native_append_only,
+            emit_per_event,
             calendars,
         };
         operator.native_codec = Some(GroupCodec::with_calendar_layout(
@@ -3991,6 +4197,7 @@ mod tests {
                 retain_indefinitely: None,
                 collection_output_limits: Default::default(),
                 calendar_aggregates: Vec::new(),
+                emit_per_event: false,
             },
             Arc::new(registry),
         )
@@ -4038,6 +4245,261 @@ mod tests {
         operator.retain_indefinitely = true;
         assert!(operator.native_append_only);
         operator
+    }
+
+    fn native_event_config() -> (UpdatingAggregateOperator, Arc<Registry>) {
+        let (mut config, registry) = native_config();
+        let mut physical = PhysicalPlanNode::decode(config.aggregate_exec.as_slice()).unwrap();
+        let Some(PhysicalPlanType::Aggregate(aggregate)) = &mut physical.physical_plan_type else {
+            panic!("aggregate fixture")
+        };
+        let selected = [5, 7, 8]; // COUNT, MAX(value), planner-owned MAX(_timestamp).
+        aggregate.aggr_expr = selected
+            .iter()
+            .map(|&i| aggregate.aggr_expr[i].clone())
+            .collect();
+        aggregate.aggr_expr_name = selected
+            .iter()
+            .map(|&i| aggregate.aggr_expr_name[i].clone())
+            .collect();
+        aggregate.filter_expr = selected
+            .iter()
+            .map(|&i| aggregate.filter_expr[i].clone())
+            .collect();
+        config.aggregate_exec = physical.encode_to_vec();
+        config.input_schema = Some(
+            ArroyoSchema::from_schema_keys(input_schema(), vec![0])
+                .unwrap()
+                .into(),
+        );
+        let old: ArroyoSchema = config.final_schema.take().unwrap().try_into().unwrap();
+        let mut fields = vec![input_schema().field(0).clone()];
+        fields.extend(selected.iter().map(|&i| old.schema.field(i).clone()));
+        config.final_schema = Some(
+            ArroyoSchema::from_schema_unkeyed(Arc::new(Schema::new(fields)))
+                .unwrap()
+                .into(),
+        );
+        config.retain_indefinitely = Some(true);
+        config.emit_per_event = true;
+        (config, registry)
+    }
+
+    async fn native_event_context(config: &UpdatingAggregateOperator) -> OperatorContext {
+        let input: ArroyoSchema = config.input_schema.clone().unwrap().try_into().unwrap();
+        let (control, _rx) = tokio::sync::mpsc::channel(16);
+        OperatorContext::new(
+            Arc::new(arroyo_types::get_test_task_info()),
+            None,
+            control,
+            1,
+            vec![Arc::new(input)],
+            None,
+            HashMap::new(),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn per_event_native_caps_rows_and_retains_every_prefix_and_trigger_time() {
+        let (config, registry) = native_event_config();
+        let mut context = native_event_context(&config).await;
+        let mut limits = native_test_config();
+        limits.max_pending_output_rows = 2;
+        let mut operator = IncrementalAggregatingConstructor::build_with_native_config(
+            config,
+            registry,
+            Some(limits),
+        )
+        .unwrap();
+        operator.native_store = Some(native_test_store());
+        let rows = batch(
+            &[Some("k"); 8],
+            &[10, 20, 5, 6, 7, 8, 9, 11],
+            &[Some(true); 8],
+        );
+        let mut collector = AggregateCollector::default();
+        operator
+            .process_batch(rows, &mut context, &mut collector)
+            .await
+            .unwrap();
+        assert_eq!(
+            collector
+                .batches
+                .iter()
+                .map(RecordBatch::num_rows)
+                .collect::<Vec<_>>(),
+            [2, 2, 2, 2]
+        );
+        let actual = collector
+            .batches
+            .iter()
+            .flat_map(|batch| {
+                (0..batch.num_rows()).map(move |row| {
+                    (
+                        ScalarValue::try_from_array(batch.column(1), row).unwrap(),
+                        ScalarValue::try_from_array(batch.column(3), row).unwrap(),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            actual,
+            [10, 20, 5, 6, 7, 8, 9, 11]
+                .into_iter()
+                .enumerate()
+                .map(|(row, time)| (
+                    ScalarValue::Int64(Some(row as i64 + 1)),
+                    ScalarValue::TimestampNanosecond(Some(time), None),
+                ))
+                .collect::<Vec<_>>()
+        );
+        let store = operator.native_store.as_ref().unwrap();
+        let resources = store.resources().clone();
+        let scope = store.begin().await.unwrap();
+        assert!(
+            scope.first(b"D").await.unwrap().is_none(),
+            "event snapshots must not leave ordinary dirty output behind"
+        );
+        drop(scope);
+        operator
+            .handle_tick(1, &mut context, &mut collector)
+            .await
+            .unwrap();
+        operator
+            .on_close(
+                &Some(SignalMessage::EndOfData),
+                &mut context,
+                &mut collector,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            collector.batches.len(),
+            4,
+            "control messages cannot duplicate event snapshots"
+        );
+        assert!(
+            resources
+                .try_decoded_value(resources.config().decoded_value_bytes)
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn per_event_native_preserves_delivery_error_domain_and_releases_permits() {
+        use arroyo_rpc::errors::{DataflowError, ErrorDomain, RetryHint};
+        struct RefusingCollector;
+        #[async_trait::async_trait]
+        impl Collector for RefusingCollector {
+            async fn collect(&mut self, _: RecordBatch) -> DataflowResult<()> {
+                Err(DataflowError::ConnectorError {
+                    domain: ErrorDomain::User,
+                    retry: RetryHint::NoRetry,
+                    error: "declared delivery refusal".into(),
+                    source: None,
+                })
+            }
+            async fn broadcast_watermark(
+                &mut self,
+                _: arroyo_types::Watermark,
+            ) -> DataflowResult<()> {
+                Ok(())
+            }
+        }
+        let (config, registry) = native_event_config();
+        let mut context = native_event_context(&config).await;
+        let mut operator = IncrementalAggregatingConstructor::build_with_native_config(
+            config,
+            registry,
+            Some(native_test_config()),
+        )
+        .unwrap();
+        operator.native_store = Some(native_test_store());
+        let input = batch(&[Some("k")], &[10], &[Some(true)]);
+        let error = operator
+            .process_batch(input, &mut context, &mut RefusingCollector)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                DataflowError::ConnectorError {
+                    domain: ErrorDomain::User,
+                    retry: RetryHint::NoRetry,
+                    ..
+                }
+            ),
+            "delivery failure classification changed: {error:?}"
+        );
+        let resources = operator.native_store.as_ref().unwrap().resources();
+        assert!(
+            resources
+                .try_decoded_value(resources.config().decoded_value_bytes)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn per_event_native_rejects_unsupported_wire_combinations() {
+        for unsupported in [
+            "finite",
+            "changelog",
+            "metadata",
+            "legacy",
+            "calendar",
+            "clock",
+        ] {
+            let (mut config, registry) = native_event_config();
+            let mut native = Some(native_test_config());
+            match unsupported {
+                "finite" => config.retain_indefinitely = None,
+                "legacy" => native = None,
+                "calendar" => config.calendar_aggregates.push(Default::default()),
+                "clock" => {
+                    let mut physical =
+                        PhysicalPlanNode::decode(config.aggregate_exec.as_slice()).unwrap();
+                    let Some(PhysicalPlanType::Aggregate(aggregate)) =
+                        &mut physical.physical_plan_type
+                    else {
+                        unreachable!()
+                    };
+                    aggregate.aggr_expr[2] = aggregate.aggr_expr[1].clone();
+                    config.aggregate_exec = physical.encode_to_vec();
+                }
+                "changelog" | "metadata" => {
+                    let slot = if unsupported == "changelog" {
+                        &mut config.input_schema
+                    } else {
+                        &mut config.final_schema
+                    };
+                    let old: ArroyoSchema = slot.take().unwrap().try_into().unwrap();
+                    let mut fields = SchemaBuilder::from(old.schema.as_ref().clone());
+                    fields.push(Field::new(
+                        UPDATING_META_FIELD,
+                        DataType::Struct(updating_meta_fields()),
+                        false,
+                    ));
+                    *slot = Some(
+                        ArroyoSchema::new(
+                            Arc::new(fields.finish()),
+                            old.timestamp_index,
+                            old.storage_keys().cloned(),
+                            old.routing_keys().cloned(),
+                        )
+                        .into(),
+                    );
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                IncrementalAggregatingConstructor::build_with_native_config(
+                    config, registry, native
+                )
+                .is_err(),
+                "admitted {unsupported}"
+            );
+        }
     }
 
     fn native_array_operator(
@@ -4195,6 +4657,7 @@ mod tests {
             retain_indefinitely: Some(true),
             collection_output_limits: limit.map(|limit| (0, limit)).into_iter().collect(),
             calendar_aggregates: Vec::new(),
+            emit_per_event: false,
         };
         IncrementalAggregatingConstructor::build_with_native_config(
             config,

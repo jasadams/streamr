@@ -2620,3 +2620,6 @@ mod smoke_state_table_lifecycle;
 
 #[path = "smoke_sql_json.rs"]
 mod smoke_sql_json;
+
+#[path = "smoke_str64.rs"]
+mod smoke_str64;
