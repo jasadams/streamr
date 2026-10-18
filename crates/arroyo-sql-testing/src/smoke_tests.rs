@@ -1367,6 +1367,40 @@ impl CaptureIdle {
         }))
     }
 
+    fn resumed(&self, target: Option<&str>, minimum_rows: Option<&str>) -> Result<Option<Self>> {
+        let (Some(target), Some(minimum_rows)) = (target, minimum_rows) else {
+            anyhow::ensure!(
+                target.is_none() && minimum_rows.is_none(),
+                "resumed idle target and minimum rows must be configured together"
+            );
+            return Ok(None);
+        };
+        anyhow::ensure!(
+            !target.is_empty()
+                && target.bytes().all(|byte| byte.is_ascii_digit())
+                && !minimum_rows.is_empty()
+                && minimum_rows.bytes().all(|byte| byte.is_ascii_digit()),
+            "resumed idle target and minimum rows must be unsigned decimal integers"
+        );
+        let source_row_target: i32 = target.parse()?;
+        let min_pre_rows: usize = minimum_rows.parse()?;
+        anyhow::ensure!(
+            source_row_target > self.source_row_target,
+            "resumed idle target must advance beyond the first hold"
+        );
+        anyhow::ensure!(
+            min_pre_rows > self.min_pre_rows,
+            "resumed idle minimum rows must advance beyond the first hold"
+        );
+        Ok(Some(Self {
+            source_row_target,
+            duration: self.duration,
+            min_pre_rows,
+            max_output_bytes: self.max_output_bytes,
+            pre_match: None,
+        }))
+    }
+
     /// Single-file sources read the first available row without a NoOp.
     fn additional_noops(&self, already_read: i32) -> i32 {
         assert!(already_read > 0 && already_read <= self.source_row_target);
@@ -1470,8 +1504,8 @@ async fn capture_idle_output(
     max_bytes: usize,
     pre_match: Option<&CaptureIdlePreMatch>,
 ) -> (usize, Vec<u8>) {
-    // Four snapshots across the two phases must fit inside the outer 4x
-    // runtime timeout alongside the two bounded idle holds.
+    // Each snapshot is bounded by a quarter runtime timeout. An optional
+    // resumed hold uses the same bound and the existing outer capture timeout.
     let deadline = tokio::time::Instant::now() + test_runtime_timeout() / 4;
     loop {
         match File::open(output_path).await {
@@ -1731,6 +1765,35 @@ fn idle_capture_requires_one_row_batches_and_bounded_complete_configuration() {
 }
 
 #[test]
+fn resumed_idle_requires_paired_forward_bounded_targets() {
+    let first = CaptureIdle {
+        source_row_target: 2,
+        duration: Duration::from_secs(3),
+        min_pre_rows: 2,
+        max_output_bytes: 262144,
+        pre_match: None,
+    };
+    assert_eq!(first.resumed(None, None).unwrap(), None);
+    let resumed = first.resumed(Some("3"), Some("4")).unwrap().unwrap();
+    assert_eq!(resumed.source_row_target, 3);
+    assert_eq!(resumed.min_pre_rows, 4);
+    assert_eq!(resumed.additional_noops(first.source_row_target), 1);
+    assert_eq!(resumed.duration, first.duration);
+    assert_eq!(resumed.max_output_bytes, first.max_output_bytes);
+    for (target, rows) in [
+        (Some("3"), None),
+        (None, Some("4")),
+        (Some("2"), Some("4")),
+        (Some("3"), Some("2")),
+        (Some("-1"), Some("4")),
+        (Some("2147483648"), Some("4")),
+        (Some("3"), Some("")),
+    ] {
+        assert!(first.resumed(target, rows).is_err());
+    }
+}
+
+#[test]
 fn idle_control_counts_account_for_automatic_first_and_restored_suffix_rows() {
     let idle = CaptureIdle {
         source_row_target: 9,
@@ -1838,6 +1901,21 @@ async fn wait_for_capture_state_cleanup() {
 async fn external_sql_checkpoint_capture_inner() {
     let capture = CaptureCounts::from_env().expect("invalid external SQL capture configuration");
     let idle = CaptureIdle::from_env(&capture).expect("invalid external SQL idle configuration");
+    let resumed_target = env::var("STREAMR_CAPTURE_IDLE_RESUME_SOURCE_ROW_TARGET").ok();
+    let resumed_rows = env::var("STREAMR_CAPTURE_IDLE_RESUME_MIN_PRE_ROWS").ok();
+    assert!(
+        idle.is_some() || (resumed_target.is_none() && resumed_rows.is_none()),
+        "resumed idle capture requires a first idle hold"
+    );
+    let resumed_idle = idle.as_ref().and_then(|idle| {
+        idle.resumed(resumed_target.as_deref(), resumed_rows.as_deref())
+            .expect("invalid resumed idle capture configuration")
+    });
+    let idle_stages: Vec<_> = idle
+        .iter()
+        .map(|idle| ("", idle))
+        .chain(resumed_idle.iter().map(|idle| ("-resumed", idle)))
+        .collect();
     let schedule = smoke_schedule_tests::CaptureSchedule::from_env()
         .expect("invalid external SQL initial schedule");
     assert!(
@@ -1955,7 +2033,12 @@ async fn external_sql_checkpoint_capture_inner() {
     let initial_path = output_path.with_extension("initial.jsonl");
     let mut stale_paths = vec![output_path.clone(), initial_path.clone()];
     if idle.is_some() {
-        for phase in ["initial", "recovered"] {
+        for phase in [
+            "initial",
+            "recovered",
+            "initial-resumed",
+            "recovered-resumed",
+        ] {
             for boundary in ["before", "after"] {
                 stale_paths
                     .push(output_path.with_extension(format!("idle-{phase}-{boundary}.jsonl")));
@@ -1982,21 +2065,23 @@ async fn external_sql_checkpoint_capture_inner() {
             .run(&running, &mut control_rx, &output_path, initial_started)
             .await;
     }
-    if let Some(idle) = &idle {
-        advance_idle_target(&running, idle.additional_noops(1)).await;
+    let mut initial_source_rows = 1;
+    for (suffix, idle) in &idle_stages {
+        let phase = format!("initial{suffix}");
+        advance_idle_target(&running, idle.additional_noops(initial_source_rows)).await;
         let (before_rows, before_bytes) = capture_idle_output(
             &output_path,
-            "initial",
+            &phase,
             "before",
             idle.min_pre_rows,
             idle.max_output_bytes,
             idle.pre_match.as_ref(),
         )
         .await;
-        hold_capture_idle(&mut control_rx, "initial", idle).await;
+        hold_capture_idle(&mut control_rx, &phase, idle).await;
         let (after_rows, after_bytes) = capture_idle_output(
             &output_path,
-            "initial",
+            &phase,
             "after",
             before_rows,
             idle.max_output_bytes,
@@ -2004,6 +2089,7 @@ async fn external_sql_checkpoint_capture_inner() {
         )
         .await;
         assert!(after_bytes.starts_with(&before_bytes) && after_rows >= before_rows);
+        initial_source_rows = idle.source_row_target;
     }
     run_until_finished(&running, &mut control_rx).await;
     wait_for_capture_state_cleanup().await;
@@ -2194,27 +2280,25 @@ async fn external_sql_checkpoint_capture_inner() {
         .unwrap()
         .start()
         .await;
-    if let Some(idle) = &idle {
+    let mut restored_source_rows = capture.input_rows_before_checkpoint + 1;
+    for (suffix, idle) in &idle_stages {
+        let phase = format!("recovered{suffix}");
         // Restore reads the first suffix row without a NoOp. The configured
         // target is an absolute source row count across the checkpoint.
-        advance_idle_target(
-            &restored,
-            idle.additional_noops(capture.input_rows_before_checkpoint + 1),
-        )
-        .await;
+        advance_idle_target(&restored, idle.additional_noops(restored_source_rows)).await;
         let (before_rows, before_bytes) = capture_idle_output(
             &output_path,
-            "recovered",
+            &phase,
             "before",
             idle.min_pre_rows,
             idle.max_output_bytes,
             idle.pre_match.as_ref(),
         )
         .await;
-        hold_capture_idle(&mut control_rx, "recovered", idle).await;
+        hold_capture_idle(&mut control_rx, &phase, idle).await;
         let (after_rows, after_bytes) = capture_idle_output(
             &output_path,
-            "recovered",
+            &phase,
             "after",
             before_rows,
             idle.max_output_bytes,
@@ -2222,6 +2306,7 @@ async fn external_sql_checkpoint_capture_inner() {
         )
         .await;
         assert!(after_bytes.starts_with(&before_bytes) && after_rows >= before_rows);
+        restored_source_rows = idle.source_row_target;
     }
     run_until_finished(&restored, &mut control_rx).await;
     drop(restored);
