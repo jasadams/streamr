@@ -24,12 +24,13 @@ fn remove_in_place<N, E>(graph: &mut DiGraph<N, E>, node: NodeIndex) {
     let incoming = incoming.id();
     graph.remove_edge(incoming);
 
-    let outgoing: Vec<_> = graph
+    // DiGraph swap-removes edge indices. Re-read the current outgoing edge
+    // after every mutation so rewiring cannot invalidate another saved ID.
+    while let Some((edge, target)) = graph
         .edges_directed(node, Outgoing)
-        .map(|e| (e.id(), e.target().id()))
-        .collect();
-
-    for (edge, target) in outgoing {
+        .next()
+        .map(|edge| (edge.id(), edge.target().id()))
+    {
         let weight = graph.remove_edge(edge).unwrap();
         graph.add_edge(parent, target, weight);
     }
@@ -101,5 +102,77 @@ impl Optimizer for ChainingOptimizer {
         }
 
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn removing_chained_fanout_preserves_every_successor_and_edge_weight() {
+        for reverse in [false, true] {
+            let mut graph = DiGraph::new();
+            let parent = graph.add_node("parent");
+            let removed = graph.add_node("removed");
+            let a = graph.add_node("a");
+            let b = graph.add_node("b");
+            graph.add_edge(parent, removed, "incoming");
+            let outgoing = if reverse {
+                [(b, "to-b"), (a, "to-a")]
+            } else {
+                [(a, "to-a"), (b, "to-b")]
+            };
+            for (target, weight) in outgoing {
+                graph.add_edge(removed, target, weight);
+            }
+
+            remove_in_place(&mut graph, removed);
+
+            let mut actual: Vec<_> = graph
+                .edge_references()
+                .map(|edge| (graph[edge.source()], graph[edge.target()], *edge.weight()))
+                .collect();
+            actual.sort_unstable();
+            assert_eq!(
+                actual,
+                vec![("parent", "a", "to-a"), ("parent", "b", "to-b")],
+                "fanout must survive either insertion order (reverse={reverse})"
+            );
+            assert_eq!(graph.node_count(), 3);
+            assert_eq!(graph.edge_count(), 2);
+        }
+    }
+
+    #[test]
+    fn removing_chained_fanout_preserves_parallel_edge_weight_multiset() {
+        for weights in [["first", "second"], ["second", "first"]] {
+            let mut graph = DiGraph::new();
+            let parent = graph.add_node("parent");
+            let removed = graph.add_node("removed");
+            let target = graph.add_node("target");
+            graph.add_edge(parent, removed, "incoming");
+            for weight in weights {
+                graph.add_edge(removed, target, weight);
+            }
+
+            remove_in_place(&mut graph, removed);
+
+            let mut actual: Vec<_> = graph
+                .edge_references()
+                .map(|edge| (graph[edge.source()], graph[edge.target()], *edge.weight()))
+                .collect();
+            actual.sort_unstable();
+            assert_eq!(
+                actual,
+                vec![
+                    ("parent", "target", "first"),
+                    ("parent", "target", "second")
+                ],
+                "parallel edges retain independent weights"
+            );
+            assert_eq!(graph.node_count(), 2);
+            assert_eq!(graph.edge_count(), 2);
+        }
     }
 }

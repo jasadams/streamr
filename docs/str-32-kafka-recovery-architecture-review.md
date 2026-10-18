@@ -1,5 +1,8 @@
 # STR-32 Kafka recovery architecture review
 
+Historical source-bound review. STR-146 explicitly replaces payload replay with
+compact prepared transaction recovery; see [current design/status](str-146-kafka-journal.md).
+
 Independent read-only review, 2026-10-11. Reviewed engine base `682bea0d0955be2e021fe475b25228f3dacf7d5f`. No engine implementation, configuration, restart, build or fault run was performed for this review. Concurrent user-authorized queue/helper removals are separate work and do not change the Kafka files reviewed here.
 
 ## Verdict

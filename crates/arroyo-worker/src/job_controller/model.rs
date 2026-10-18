@@ -574,6 +574,12 @@ impl RunningJobModel {
                 .await?
                 {
                     CommitAuthorization::Authorized { .. } => {
+                        super::checkpoint_dispatch_test_pause(
+                            &self.job_id,
+                            *self.epoch,
+                            "worker_leader",
+                        )
+                        .await;
                         // commit to workers
                         for worker in self.workers.values_mut() {
                             worker
@@ -709,6 +715,9 @@ impl RunningJobModel {
                     );
 
                     self.start_or_get_span(JobCheckpointEventType::Committing);
+
+                    super::checkpoint_dispatch_test_pause(&self.job_id, *self.epoch, "controller")
+                        .await;
 
                     // TODO: this should be done in parallel, but we're being conservative for now
                     //  about changing existing behaviorÏ

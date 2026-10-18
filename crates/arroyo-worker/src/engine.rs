@@ -253,6 +253,18 @@ pub struct Program {
 }
 
 impl Program {
+    pub fn set_restore_commit_epoch(&self, epoch: Option<u32>) {
+        for node in self.graph.write().unwrap().node_weights_mut() {
+            if let SubtaskOrQueueNode::SubtaskNode(node) = node
+                && let OperatorNode::Chained(chain) = &mut node.node
+            {
+                for (_, context) in chain.iter_mut() {
+                    context.restore_commit_epoch = epoch;
+                }
+            }
+        }
+    }
+
     pub fn total_nodes(&self) -> usize {
         self.graph.read().unwrap().node_count()
     }

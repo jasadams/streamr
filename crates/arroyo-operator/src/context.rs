@@ -515,6 +515,8 @@ pub async fn send_checkpoint_event(
 }
 
 pub struct OperatorContext {
+    /// Selected checkpoint still awaits coordinator-authorized external commits.
+    pub restore_commit_epoch: Option<u32>,
     pub task_info: Arc<TaskInfo>,
     pub control_tx: Sender<ControlResp>,
     pub watermarks: WatermarkHolder,
@@ -758,6 +760,7 @@ impl OperatorContext {
                 .expect("should be able to create TableManager");
 
         Self {
+            restore_commit_epoch: None,
             task_info: task_info.clone(),
             control_tx: control_tx.clone(),
             watermarks: WatermarkHolder::new(vec![
@@ -925,6 +928,175 @@ mod tests {
             vec![Arc::new(Int64Array::from(vec![1, 2, 3, 4]))],
         )
         .unwrap()
+    }
+
+    type GateTestFuture =
+        std::pin::Pin<Box<dyn std::future::Future<Output = Box<dyn std::any::Any + Send>> + Send>>;
+
+    struct RestoreGateSink {
+        fail_commit: bool,
+        observed: tokio::sync::mpsc::UnboundedSender<&'static str>,
+    }
+    #[async_trait]
+    impl crate::operator::ArrowOperator for RestoreGateSink {
+        fn name(&self) -> String {
+            "restore-gate-test".into()
+        }
+        fn is_committing(&self) -> bool {
+            true
+        }
+        async fn process_batch(
+            &mut self,
+            _: RecordBatch,
+            _: &mut OperatorContext,
+            _: &mut dyn Collector,
+        ) -> DataflowResult<()> {
+            self.observed.send("batch").unwrap();
+            Ok(())
+        }
+        async fn handle_commit(
+            &mut self,
+            _: u32,
+            _: &HashMap<String, HashMap<u32, Vec<u8>>>,
+            _: &mut OperatorContext,
+        ) -> DataflowResult<()> {
+            self.observed.send("commit").unwrap();
+            if self.fail_commit {
+                return Err(anyhow::anyhow!("injected restored commit failure").into());
+            }
+            Ok(())
+        }
+        fn future_to_poll(&mut self) -> Option<GateTestFuture> {
+            self.observed.send("getter").unwrap();
+            None
+        }
+        async fn handle_tick(
+            &mut self,
+            _: u64,
+            _: &mut OperatorContext,
+            _: &mut dyn Collector,
+        ) -> DataflowResult<()> {
+            self.observed.send("tick").unwrap();
+            Ok(())
+        }
+    }
+    #[tokio::test]
+    async fn restore_commit_gate_blocks_data_and_ticks_until_authorized_commit() {
+        use crate::operator::{ChainedOperator, OperatorNode};
+        for (received, fail_commit) in [
+            (Some(7), false),
+            (Some(8), false),
+            (Some(7), true),
+            (Some(0), false),
+            (None, false),
+        ] {
+            let success = received == Some(7) && !fail_commit;
+            let (control, mut events) = tokio::sync::mpsc::channel(32);
+            let (commands, command_rx) = tokio::sync::mpsc::channel(8);
+            let (observed, mut callbacks) = tokio::sync::mpsc::unbounded_channel();
+            let task = Arc::new(TaskInfo {
+                job_id: format!(
+                    "restore-gate-{}-{received:?}-{fail_commit}",
+                    std::process::id()
+                ),
+                operator_idx: 95,
+                operator_name: "restore-gate-test".into(),
+                operator_id: "sink".into(),
+                task_index: 0,
+                parallelism: 1,
+                key_range: 0..=u64::MAX,
+                checkpoint_file_path_layout: Default::default(),
+            });
+            let mut context =
+                OperatorContext::new(task, None, control.clone(), 1, vec![], None, HashMap::new())
+                    .await;
+            context.restore_commit_epoch = Some(7);
+            let node = Box::new(OperatorNode::Chained(ChainedOperator::new(
+                Box::new(RestoreGateSink {
+                    observed,
+                    fail_commit,
+                }),
+                context,
+            )));
+            let (input, receiver) = batch_bounded(8);
+            input.send(ArrowMessage::Data(queue_batch())).await.unwrap();
+            let run = tokio::spawn(node.start(
+                control,
+                command_rx,
+                vec![receiver],
+                vec![],
+                None,
+                Arc::new(tokio::sync::Barrier::new(1)),
+            ));
+            assert!(matches!(
+                events.recv().await,
+                Some(ControlResp::TaskStarted { .. })
+            ));
+            assert!(
+                tokio::time::timeout(Duration::from_millis(20), callbacks.recv())
+                    .await
+                    .is_err()
+            );
+            let Some(epoch) = received else {
+                run.abort();
+                assert!(run.await.err().expect("cancelled task").is_cancelled());
+                assert!(callbacks.try_recv().is_err());
+                continue;
+            };
+            if epoch == 0 {
+                drop(commands);
+                tokio::time::timeout(Duration::from_secs(2), run)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let mut closed_failure = false;
+                while let Ok(event) = events.try_recv() {
+                    if let ControlResp::TaskFailed { error, .. } = event {
+                        closed_failure |= error
+                            .message
+                            .contains("control channel closed before restored commit");
+                    }
+                }
+                assert!(closed_failure);
+                assert!(callbacks.try_recv().is_err());
+                continue;
+            }
+            commands
+                .send(ControlMessage::Commit {
+                    epoch,
+                    commit_data: HashMap::new(),
+                })
+                .await
+                .unwrap();
+            if success {
+                assert_eq!(callbacks.recv().await, Some("commit"));
+                loop {
+                    if callbacks.recv().await == Some("batch") {
+                        break;
+                    }
+                }
+                input
+                    .send(ArrowMessage::Signal(SignalMessage::EndOfData))
+                    .await
+                    .unwrap();
+            }
+            tokio::time::timeout(Duration::from_secs(2), run)
+                .await
+                .unwrap()
+                .unwrap();
+            let mut failed = false;
+            while let Ok(event) = events.try_recv() {
+                failed |= matches!(event, ControlResp::TaskFailed { .. });
+            }
+            assert_eq!(failed, !success);
+            if !success {
+                while let Ok(callback) = callbacks.try_recv() {
+                    assert_ne!(callback, "batch");
+                    assert_ne!(callback, "tick");
+                    assert_ne!(callback, "getter");
+                }
+            }
+        }
     }
 
     struct BufferedFinishSource {

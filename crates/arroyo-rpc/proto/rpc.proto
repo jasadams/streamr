@@ -559,6 +559,8 @@ message StartExecutionReq {
   uint64 checkpoint_interval_micros = 9;
   // for leader mode, this gives the path to load the restore checkpoint manifest from
   optional string checkpoint_manifest_ref = 10;
+  // Authoritative selected restore phase, not the manifest's historical 2PC flag.
+  optional uint32 restore_commit_epoch = 11;
 }
 
 message StartExecutionResp {

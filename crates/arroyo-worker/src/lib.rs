@@ -277,6 +277,7 @@ impl WorkerState {
         shutdown: &ShutdownGuard,
         checkpoint_interval: Duration,
         parent: Option<(CheckpointRef, CheckpointManifest)>,
+        restore_commit_epoch: Option<u32>,
     ) -> anyhow::Result<bool> {
         // runs only on the leader
 
@@ -313,6 +314,7 @@ impl WorkerState {
             checkpoint_interval,
             parent,
             metrics,
+            restore_commit_epoch,
         )
         .await
         {
@@ -417,6 +419,7 @@ impl WorkerState {
                     &shutdown_guard,
                     Duration::from_micros(req.checkpoint_interval_micros),
                     parent.clone(),
+                    req.restore_commit_epoch,
                 )
                 .await?
             {
@@ -454,6 +457,13 @@ impl WorkerState {
             )
             .await?;
 
+            if let Some(epoch) = req.restore_commit_epoch {
+                anyhow::ensure!(
+                    req.restore_epoch == Some(u64::from(epoch)),
+                    "restore commit epoch differs from selected checkpoint"
+                );
+            }
+            program.set_restore_commit_epoch(req.restore_commit_epoch);
             let engine = Engine::new(
                 program,
                 self.worker_context.clone(),
