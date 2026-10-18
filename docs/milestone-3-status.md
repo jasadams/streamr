@@ -34,7 +34,9 @@
   live pre-EOF zero, unchanged silence and exact fresh-worker checkpoint CDC.
 - Shared-target stale metadata check failure is preserved; queued timestamp
   refresh resolved it with identical source hashes and caches retained.
-  Next: final evidence approval, PR directly against main and current-head CI.
+  Final source/evidence review approved with zero findings.
+  [PR #75](https://github.com/jasadams/streamr/pull/75) targets main directly.
+  Next: current-head CI, then merge-sweeper owns merge and Done transition.
   Full Kafka/process-loss/capacity qualification is not claimed by this repair.
 - Instructions: `AGENTS.md`, `.claude/build-test.md`, this ledger and feature
   plan; evidence `/home/jason/qa-evidence/str29-native-delivery-20261018/`.

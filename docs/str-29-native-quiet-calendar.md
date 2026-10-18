@@ -47,8 +47,10 @@ bound on physical backend traversal. This change makes no production performance
 improvement claim.
 
 The activated existing B recalculation scans remain bounded by the known group,
-generation and aggregate family, with retained horizon lower bound and exclusive
-reference-day-plus-one upper bound. Lifetime and correction metadata remain.
+generation and aggregate family. Their logical continuation starts after
+first-retained-day-minus-one (the native seek is inclusive and the merge rejects
+keys at or below the continuation), with exclusive reference-day-plus-one upper
+bound. Lifetime and correction metadata remain.
 
 ## Validation
 
@@ -104,3 +106,7 @@ Its current test executable SHA256 is
 `integrated-cache-refresh/validated-files.json` binds code to gates and
 `runtime-integrated/` preserves four successful captures and resource receipts.
 Original and integrated pinned executables remain outside Cargo caches.
+
+[PR #75](https://github.com/jasadams/streamr/pull/75) targets main directly.
+Independent source/evidence review approved with zero findings. Current-head CI
+is pending; merge-sweeper owns the merge and Done transition.
