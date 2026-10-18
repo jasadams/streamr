@@ -3095,11 +3095,24 @@ impl ArrowOperator for IncrementalAggregatingFunc {
     async fn handle_watermark(
         &mut self,
         watermark: arroyo_types::Watermark,
-        _ctx: &mut OperatorContext,
-        _collector: &mut dyn Collector,
+        ctx: &mut OperatorContext,
+        collector: &mut dyn Collector,
     ) -> DataflowResult<Option<arroyo_types::Watermark>> {
         if self.native_config.is_some() {
             self.calendar_watermark(watermark).await?;
+            if !self.calendars.is_empty()
+                && let arroyo_types::Watermark::EventTime(time) = watermark
+                && time != arroyo_types::from_nanos(u64::MAX as u128)
+            {
+                // Emit accepted data first. Every due owner commits G/H/U/D
+                // atomically, drops its snapshot and drains normal CDC before
+                // the next owner or downstream watermark can advance.
+                self.flush_native(ctx, collector).await?;
+                while self.dispatch_calendar_due().await? {
+                    self.drain_native_dirty(ctx, collector).await?;
+                    tokio::task::yield_now().await;
+                }
+            }
         }
         Ok(Some(watermark))
     }
@@ -3768,6 +3781,7 @@ mod tests {
         table::LiveTableManager,
         write::AdmittedWriteBatch,
     };
+    use arroyo_types::Watermark;
     use datafusion::execution::FunctionRegistry;
     use datafusion::functions_aggregate::{
         array_agg::array_agg_udaf,
@@ -4403,6 +4417,607 @@ mod tests {
             .into_iter()
             .map(|index| state[index].evaluate().unwrap())
             .collect()
+    }
+
+    async fn calendar_dispatch_context(
+        operator: &mut IncrementalAggregatingFunc,
+    ) -> OperatorContext {
+        // State-only fixtures carry a NULL placeholder; production CDC output
+        // requires the typed metadata expression used by the native D drain.
+        let metadata = StructArray::new(
+            updating_meta_fields(),
+            vec![
+                Arc::new(BooleanArray::from(vec![false])),
+                ScalarValue::FixedSizeBinary(16, Some(vec![1; 16]))
+                    .to_array()
+                    .unwrap(),
+            ],
+            None,
+        );
+        operator.metadata_expr = Arc::new(Literal::new(ScalarValue::Struct(Arc::new(metadata))));
+        let mut ctx = native_input_context(input_schema()).await;
+        let mut output = SchemaBuilder::from(operator.schema_without_metadata.as_ref().clone());
+        output.push(Field::new(
+            UPDATING_META_FIELD,
+            DataType::Struct(updating_meta_fields()),
+            false,
+        ));
+        ctx.out_schema = Some(Arc::new(
+            ArroyoSchema::from_schema_unkeyed(Arc::new(output.finish())).unwrap(),
+        ));
+        ctx
+    }
+
+    fn calendar_dispatch_watermark(day: i64) -> Watermark {
+        Watermark::EventTime(
+            arroyo_types::event_time::from_signed_nanos(day * 86_400_000_000_000).unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn calendar_dispatch_finite_watermark_emits_exact_quiet_cdc_and_holds_idle_eof() {
+        for day in [200, -2] {
+            let mut operator = native_calendar_operator();
+            calendar_test_event(&mut operator, day, day, Some(true), false, &[1; 16]).await;
+            let mut ctx = calendar_dispatch_context(&mut operator).await;
+            let mut collector = AggregateCollector::default();
+            for watermark in [
+                Watermark::Idle,
+                Watermark::EventTime(arroyo_types::from_nanos(u64::MAX as u128)),
+            ] {
+                operator
+                    .handle_watermark(watermark, &mut ctx, &mut collector)
+                    .await
+                    .unwrap();
+            }
+            assert!(collector.batches.is_empty());
+            assert_eq!(
+                calendar_test_values(&operator).await,
+                vec![ScalarValue::Int64(Some(1)); 3]
+            );
+            let scope = operator
+                .native_store
+                .as_ref()
+                .unwrap()
+                .begin()
+                .await
+                .unwrap();
+            assert!(scope.get(b"W").await.unwrap().is_none());
+            drop(scope);
+            operator
+                .handle_watermark(
+                    calendar_dispatch_watermark(i64::from(day) + 1),
+                    &mut ctx,
+                    &mut collector,
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                collector.batches.len(),
+                2,
+                "accepted refresh precedes quiet replacement"
+            );
+            let refresh = IncrementalAggregatingFunc::get_retracts(&collector.batches[0]).unwrap();
+            assert_eq!(refresh.values().iter().collect::<Vec<_>>(), vec![false]);
+            let replacement = &collector.batches[1];
+            let retracts = IncrementalAggregatingFunc::get_retracts(replacement).unwrap();
+            assert_eq!(
+                retracts.values().iter().collect::<Vec<_>>(),
+                vec![true, false]
+            );
+            for (row, recent) in [(0, 1), (1, 0)] {
+                assert_eq!(
+                    ScalarValue::try_from_array(replacement.column(5), row).unwrap(),
+                    ScalarValue::Int64(Some(1))
+                );
+                assert_eq!(
+                    ScalarValue::try_from_array(replacement.column(6), row).unwrap(),
+                    ScalarValue::Int64(Some(recent))
+                );
+                assert_eq!(
+                    ScalarValue::try_from_array(replacement.column(7), row).unwrap(),
+                    ScalarValue::Int64(Some(1))
+                );
+                assert_eq!(
+                    ScalarValue::try_from_array(replacement.column(8), row).unwrap(),
+                    ScalarValue::TimestampNanosecond(Some(1), None)
+                );
+            }
+            let emitted = collector.batches.len();
+            for watermark in [
+                calendar_dispatch_watermark(i64::from(day)),
+                calendar_dispatch_watermark(i64::from(day) + 1),
+                Watermark::Idle,
+                Watermark::EventTime(arroyo_types::from_nanos(u64::MAX as u128)),
+            ] {
+                operator
+                    .handle_watermark(watermark, &mut ctx, &mut collector)
+                    .await
+                    .unwrap();
+            }
+            assert_eq!(collector.batches.len(), emitted);
+            assert_eq!(
+                calendar_test_values(&operator).await,
+                vec![
+                    ScalarValue::Int64(Some(1)),
+                    ScalarValue::Int64(Some(0)),
+                    ScalarValue::Int64(Some(1))
+                ]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn calendar_dispatch_cancelled_scope_and_stale_generation_preserve_pending_owner() {
+        let mut operator = native_calendar_operator();
+        calendar_test_event(&mut operator, 200, 200, Some(true), false, &[1; 16]).await;
+        operator
+            .calendar_watermark(calendar_dispatch_watermark(201))
+            .await
+            .unwrap();
+        let store = operator.native_store.as_ref().unwrap();
+        {
+            let mut scope = store.begin().await.unwrap();
+            operator
+                .recalculate_calendar_group(&mut scope, &GLOBAL_KEY, 201)
+                .await
+                .unwrap();
+            // Dropping the uncommitted scope is cancellation before publication.
+        }
+        assert_eq!(
+            calendar_test_values(&operator).await,
+            vec![ScalarValue::Int64(Some(1)); 3]
+        );
+        {
+            let mut scope = store.begin().await.unwrap();
+            scope
+                .put(
+                    &calendar_native::calendar_due_key(199 * 86_400_000_000_000, &GLOBAL_KEY)
+                        .unwrap(),
+                    &999_u64.to_be_bytes(),
+                )
+                .unwrap();
+            scope.commit().await.unwrap();
+        }
+        assert!(
+            operator.dispatch_calendar_due().await.unwrap(),
+            "retire stale entry only"
+        );
+        assert_eq!(
+            calendar_test_values(&operator).await,
+            vec![ScalarValue::Int64(Some(1)); 3]
+        );
+        assert!(operator.dispatch_calendar_due().await.unwrap());
+        assert!(!operator.dispatch_calendar_due().await.unwrap());
+        assert_eq!(
+            calendar_test_values(&operator).await,
+            vec![
+                ScalarValue::Int64(Some(1)),
+                ScalarValue::Int64(Some(0)),
+                ScalarValue::Int64(Some(1))
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn calendar_dispatch_one_entry_pages_many_keys_and_deleted_retaining_owner() {
+        use arroyo_state::live::{lifecycle::RocksStateConfig, rocks::RocksLiveState};
+        for rocks in [false, true] {
+            let root = std::env::temp_dir()
+                .join(format!("calendar-dispatch-churn-{}", uuid::Uuid::new_v4()));
+            let template = native_test_store();
+            let resources = template.resources().clone();
+            let limits = AggregateStoreLimits {
+                page_entries: 1,
+                ..template.limits()
+            };
+            drop(template);
+            let native = if rocks {
+                Some(Arc::new(
+                    RocksLiveState::open(
+                        RocksStateConfig {
+                            root: root.clone(),
+                            job_id: "calendar-dispatch-churn".into(),
+                            operator_id: "aggregate".into(),
+                            subtask: 0,
+                            generation: 0,
+                            attempt: 0,
+                        },
+                        resources.clone(),
+                    )
+                    .await
+                    .unwrap(),
+                ))
+            } else {
+                None
+            };
+            let backend: Arc<dyn LiveStateBackend> = if let Some(native) = &native {
+                native.clone()
+            } else {
+                Arc::new(MemoryLiveState::bounded(resources.clone(), 8 * 1024 * 1024).unwrap())
+            };
+            let mut manager = LiveTableManager::new(
+                backend.clone(),
+                Ownership::PartitionLocal {
+                    subtask: 0,
+                    parallelism: 1,
+                },
+            )
+            .unwrap();
+            let table = manager.register(NATIVE_AGGREGATE_TABLE).unwrap();
+            let mut operator = native_calendar_operator();
+            let mut fields = operator.schema_without_metadata.fields().to_vec();
+            fields.insert(0, Arc::new(Field::new("group_key", DataType::Utf8, false)));
+            operator.schema_without_metadata = Arc::new(Schema::new(fields));
+            operator.key_converter =
+                RowConverter::new(vec![SortField::new(DataType::Utf8)]).unwrap();
+            let names: Vec<_> = (0..24).map(|index| format!("key{index:02}")).collect();
+            let rows = operator
+                .key_converter
+                .convert_columns(&[Arc::new(StringArray::from(names))])
+                .unwrap();
+            let groups: Vec<_> = rows.iter().map(|row| row.as_ref().to_vec()).collect();
+            operator.native_store = Some(
+                AggregateStore::new(backend.clone(), table, resources.clone(), limits).unwrap(),
+            );
+            for (index, group) in groups.iter().enumerate() {
+                calendar_test_event_for_group(
+                    &mut operator,
+                    group,
+                    Some(200),
+                    200,
+                    Some(true),
+                    false,
+                    &[index as u8; 16],
+                )
+                .await
+                .unwrap();
+            }
+            calendar_test_event_for_group(
+                &mut operator,
+                &groups[0],
+                Some(200),
+                200,
+                Some(true),
+                true,
+                &[0; 16],
+            )
+            .await
+            .unwrap();
+            let mut ctx = calendar_dispatch_context(&mut operator).await;
+            let mut collector = AggregateCollector::default();
+            operator
+                .handle_watermark(calendar_dispatch_watermark(201), &mut ctx, &mut collector)
+                .await
+                .unwrap();
+            let scope = operator
+                .native_store
+                .as_ref()
+                .unwrap()
+                .begin()
+                .await
+                .unwrap();
+            assert!(
+                scope
+                    .get(&native_group_key(b'G', &groups[0]).unwrap())
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                scope
+                    .get(
+                        &calendar_native::calendar_due_key(201 * 86_400_000_000_000, &groups[0])
+                            .unwrap()
+                    )
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            for group in &groups[1..] {
+                assert!(
+                    scope
+                        .get(
+                            &calendar_native::calendar_due_key(202 * 86_400_000_000_000, group)
+                                .unwrap()
+                        )
+                        .await
+                        .unwrap()
+                        .is_some()
+                );
+            }
+            drop(scope);
+            for group in &groups[1..] {
+                assert_eq!(
+                    calendar_test_values_for_group(&operator, group).await,
+                    vec![
+                        ScalarValue::Int64(Some(1)),
+                        ScalarValue::Int64(Some(0)),
+                        ScalarValue::Int64(Some(1))
+                    ]
+                );
+            }
+            let emitted: usize = collector.batches.iter().map(RecordBatch::num_rows).sum();
+            assert_eq!(emitted, 23 * 3);
+            operator
+                .handle_watermark(calendar_dispatch_watermark(201), &mut ctx, &mut collector)
+                .await
+                .unwrap();
+            assert_eq!(
+                collector
+                    .batches
+                    .iter()
+                    .map(RecordBatch::num_rows)
+                    .sum::<usize>(),
+                emitted
+            );
+            // Recreate the retired opaque key after progress; stale owner state
+            // must not leak into its lifetime or next due boundary.
+            calendar_test_event_for_group(
+                &mut operator,
+                &groups[0],
+                Some(201),
+                201,
+                Some(true),
+                false,
+                &[0; 16],
+            )
+            .await
+            .unwrap();
+            operator
+                .handle_watermark(calendar_dispatch_watermark(202), &mut ctx, &mut collector)
+                .await
+                .unwrap();
+            assert_eq!(
+                calendar_test_values_for_group(&operator, &groups[0]).await,
+                vec![
+                    ScalarValue::Int64(Some(1)),
+                    ScalarValue::Int64(Some(0)),
+                    ScalarValue::Int64(Some(1))
+                ]
+            );
+            assert_eq!(
+                collector
+                    .batches
+                    .iter()
+                    .map(RecordBatch::num_rows)
+                    .sum::<usize>(),
+                emitted + 3
+            );
+            drop(operator);
+            drop(manager);
+            drop(backend);
+            if let Some(native) = native {
+                Arc::try_unwrap(native)
+                    .unwrap_or_else(|_| panic!("retained calendar Rocks backend"))
+                    .close_and_remove()
+                    .await
+                    .unwrap();
+                std::fs::remove_dir_all(root).unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn calendar_dispatch_checkpoint_restores_pending_owner_and_output_on_both_backends() {
+        use arroyo_rpc::grpc::rpc::DiskKeyedTableConfig;
+        use arroyo_state::live::{checkpoint, lifecycle::RocksStateConfig, rocks::RocksLiveState};
+        for (rocks, pending_output) in [(false, false), (false, true), (true, false), (true, true)]
+        {
+            let root = std::env::temp_dir().join(format!("calendar-due-{}", uuid::Uuid::new_v4()));
+            let remote = root.join("checkpoint");
+            std::fs::create_dir_all(&remote).unwrap();
+            // The production exporter requests pages up to 1 MiB; Rocks
+            // admits their copies/cursors independently of aggregate pages.
+            let resources = WorkerStateResources::new(ResourceConfig {
+                max_open_databases: 2,
+                scan_page_bytes: 16 * 1024 * 1024,
+                queued_write_bytes: 16 * 1024 * 1024,
+                decoded_value_bytes: 32 * 1024 * 1024,
+                ..native_test_store().resources().config().clone()
+            })
+            .unwrap();
+            let mut native = Vec::new();
+            let mut backends: Vec<Arc<dyn LiveStateBackend>> = Vec::new();
+            for generation in [0, 1] {
+                if rocks {
+                    let backend = Arc::new(
+                        RocksLiveState::open(
+                            RocksStateConfig {
+                                root: root.join("live"),
+                                job_id: "calendar-due".into(),
+                                operator_id: "aggregate".into(),
+                                subtask: 0,
+                                generation,
+                                attempt: 0,
+                            },
+                            resources.clone(),
+                        )
+                        .await
+                        .unwrap(),
+                    );
+                    backends.push(backend.clone());
+                    native.push(backend);
+                } else {
+                    backends.push(Arc::new(
+                        MemoryLiveState::bounded(resources.clone(), 8 * 1024 * 1024).unwrap(),
+                    ));
+                }
+            }
+            let ownership = Ownership::PartitionLocal {
+                subtask: 0,
+                parallelism: 1,
+            };
+            let mut manager =
+                LiveTableManager::new(backends[0].clone(), ownership.clone()).unwrap();
+            let table = manager.register(NATIVE_AGGREGATE_TABLE).unwrap();
+            let namespace = table.namespace().clone();
+            let limits = native_test_store().limits();
+            let store =
+                AggregateStore::new(backends[0].clone(), table, resources.clone(), limits).unwrap();
+            let mut operator = native_calendar_operator();
+            operator.native_store = Some(store);
+            calendar_test_event(&mut operator, 200, 200, Some(true), false, &[1; 16]).await;
+            // Checkpoint a real admitted frontier while its quiet H/U owner
+            // still awaits recalculation; W/V and pending work restore together.
+            operator
+                .calendar_watermark(Watermark::EventTime(
+                    arroyo_types::event_time::from_signed_nanos(201 * 86_400_000_000_000).unwrap(),
+                ))
+                .await
+                .unwrap();
+            let mut ctx = calendar_dispatch_context(&mut operator).await;
+            let mut initial = AggregateCollector::default();
+            operator
+                .drain_native_dirty(&mut ctx, &mut initial)
+                .await
+                .unwrap();
+            assert_eq!(
+                initial
+                    .batches
+                    .iter()
+                    .map(RecordBatch::num_rows)
+                    .sum::<usize>(),
+                1
+            );
+            operator
+                .calendar_watermark(calendar_dispatch_watermark(201))
+                .await
+                .unwrap();
+            if pending_output {
+                // Checkpoint after atomic G/H/U/D commit but before sink ACK.
+                assert!(operator.dispatch_calendar_due().await.unwrap());
+            }
+            let snapshot = backends[0].snapshot().await.unwrap();
+            let storage =
+                arroyo_state::get_storage_provider(&arroyo_state::StorageProviderFor::Controller {
+                    storage_url: Some(format!("file://{}", remote.display())),
+                })
+                .await
+                .unwrap();
+            let config = DiskKeyedTableConfig {
+                table_name: NATIVE_AGGREGATE_TABLE.into(),
+                encoding_version: 1,
+                schema_identity: operator.native_schema_identity.clone(),
+            };
+            let receipt = checkpoint::export(
+                &snapshot,
+                &namespace,
+                &config,
+                &storage,
+                "checkpoint-1/aggregate",
+                1,
+                0,
+                0,
+            )
+            .await
+            .unwrap();
+            checkpoint::restore(
+                backends[1].as_ref(),
+                &namespace,
+                &config,
+                &receipt,
+                &storage,
+            )
+            .await
+            .unwrap();
+            let mut restored_manager =
+                LiveTableManager::new(backends[1].clone(), ownership).unwrap();
+            let restored_table = restored_manager.register(NATIVE_AGGREGATE_TABLE).unwrap();
+            let restored_store = AggregateStore::new(
+                backends[1].clone(),
+                restored_table,
+                resources.clone(),
+                limits,
+            )
+            .unwrap();
+            let mut fresh = native_calendar_operator();
+            fresh.native_store = Some(restored_store);
+            let mut ctx = calendar_dispatch_context(&mut fresh).await;
+            let scope = fresh.native_store.as_ref().unwrap().begin().await.unwrap();
+            let frontier = crate::arrow::aggregate_codec::CalendarProgress::decode(
+                &scope.get(b"W").await.unwrap().unwrap(),
+            )
+            .unwrap();
+            assert_eq!(frontier.watermark_nanos, 201 * 86_400_000_000_000);
+            assert!(scope.get(b"V").await.unwrap().is_some());
+            let due_day = if pending_output { 202 } else { 201 };
+            assert!(
+                scope
+                    .get(
+                        &calendar_native::calendar_due_key(
+                            due_day * 86_400_000_000_000,
+                            &GLOBAL_KEY
+                        )
+                        .unwrap()
+                    )
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+            drop(scope);
+            let mut output = AggregateCollector::default();
+            // A restored, regressing incoming notification must use W's date.
+            fresh
+                .handle_watermark(calendar_dispatch_watermark(200), &mut ctx, &mut output)
+                .await
+                .unwrap();
+            assert_eq!(output.batches.len(), 1);
+            let batch = &output.batches[0];
+            assert_eq!(
+                IncrementalAggregatingFunc::get_retracts(batch)
+                    .unwrap()
+                    .values()
+                    .iter()
+                    .collect::<Vec<_>>(),
+                vec![true, false]
+            );
+            for (row, recent) in [(0, 1), (1, 0)] {
+                assert_eq!(
+                    ScalarValue::try_from_array(batch.column(5), row).unwrap(),
+                    ScalarValue::Int64(Some(1))
+                );
+                assert_eq!(
+                    ScalarValue::try_from_array(batch.column(6), row).unwrap(),
+                    ScalarValue::Int64(Some(recent))
+                );
+                assert_eq!(
+                    ScalarValue::try_from_array(batch.column(7), row).unwrap(),
+                    ScalarValue::Int64(Some(1))
+                );
+                assert_eq!(
+                    ScalarValue::try_from_array(batch.column(8), row).unwrap(),
+                    ScalarValue::TimestampNanosecond(Some(1), None)
+                );
+            }
+            assert_eq!(
+                calendar_test_values(&fresh).await,
+                vec![
+                    ScalarValue::Int64(Some(1)),
+                    ScalarValue::Int64(Some(0)),
+                    ScalarValue::Int64(Some(1))
+                ]
+            );
+            fresh
+                .handle_watermark(calendar_dispatch_watermark(201), &mut ctx, &mut output)
+                .await
+                .unwrap();
+            assert_eq!(output.batches.len(), 1);
+            drop(snapshot);
+            drop(operator);
+            drop(fresh);
+            drop(manager);
+            drop(restored_manager);
+            drop(backends);
+            for backend in native {
+                Arc::try_unwrap(backend)
+                    .unwrap_or_else(|_| panic!("retained Rocks backend"))
+                    .close_and_remove()
+                    .await
+                    .unwrap();
+            }
+            std::fs::remove_dir_all(root).unwrap();
+        }
     }
 
     mod calendar_progress_tests {

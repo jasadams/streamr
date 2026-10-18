@@ -765,13 +765,87 @@ impl IncrementalAggregatingFunc {
         Ok(())
     }
 
+    /// Commit one due owner, using only persisted real event-time progress.
+    /// Restart at H after each commit: the old deadline is atomically removed
+    /// or replaced beyond W, so cancellation/recovery needs no volatile cursor.
+    pub(super) async fn dispatch_calendar_due(&self) -> Result<bool> {
+        if self.calendars.is_empty() {
+            return Ok(false);
+        }
+        let store = self
+            .native_store
+            .as_ref()
+            .context("calendar aggregate store missing")?;
+        let mut scope = store.begin().await?;
+        let Some(progress) = self.calendar_progress(&scope).await? else {
+            return Ok(false);
+        };
+        // Inclusive deadlines through W; all future owners are outside the
+        // native scan, rather than read then discarded by the Rust caller.
+        let end = progress.watermark_nanos.checked_add(1).map(|next| {
+            let mut key = vec![b'H'];
+            key.extend_from_slice(&((next as u64) ^ (1 << 63)).to_be_bytes());
+            key
+        });
+        let Some((due, generation_bytes)) =
+            scope.first_from_bounded(b"H", None, end.as_deref()).await?
+        else {
+            return Ok(false);
+        };
+        ensure!(
+            due.len() >= 13 && generation_bytes.len() == 8,
+            "invalid calendar due entry"
+        );
+        let deadline = (u64::from_be_bytes(due[1..9].try_into()?) ^ (1 << 63)) as i64;
+        ensure!(
+            deadline <= progress.watermark_nanos,
+            "calendar due entry exceeds watermark bound"
+        );
+        let group_len = usize::try_from(u32::from_be_bytes(due[9..13].try_into()?))?;
+        ensure!(
+            group_len == due.len() - 13,
+            "invalid calendar due group key"
+        );
+        let group_key = &due[13..];
+        let generation = u64::from_be_bytes(generation_bytes.as_slice().try_into()?);
+        let owns_boundary = scope
+            .get(&native_generation_prefix(b'U', group_key, generation)?)
+            .await?
+            .is_some_and(|value| value == deadline.to_be_bytes());
+        let current = scope
+            .get(&native_group_key(b'G', group_key)?)
+            .await?
+            .map(|bytes| {
+                self.native_group_codec()?
+                    .decode(&bytes, scope.limits().value_bytes)
+            })
+            .transpose()?;
+        if owns_boundary && current.is_some_and(|group| group.generation == generation) {
+            // G contains the calendar references: old H delete, new H/U,
+            // updated G and D are five mutations, independent of key count.
+            const WRITES: usize = 5;
+            let limits = store.limits();
+            ensure!(
+                WRITES <= limits.write_operations
+                    && WRITES <= limits.write_bytes / store.max_encoded_entry_bytes()
+                    && WRITES <= limits.overlay_bytes / (limits.key_bytes + limits.value_bytes),
+                "calendar dispatch cannot admit one owner"
+            );
+            let reference = i32::try_from(progress.watermark_nanos.div_euclid(86_400_000_000_000))?;
+            self.recalculate_calendar_group(&mut scope, group_key, reference)
+                .await?;
+        } else {
+            // A stale H entry cannot mutate a replacement generation. Its U
+            // pointer remains the responsibility of existing owner cleanup.
+            scope.delete(&due)?;
+        }
+        scope.commit().await?;
+        Ok(true)
+    }
+
     /// STR-29's quiet-key traversal invokes this with the real progress UTC day.
     /// This callback never evaluates row-context functions using invented rows.
     /// The caller commits this owner's scope and drains D through normal output.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "STR-29 owns quiet-key scheduler integration")
-    )]
     pub(crate) async fn recalculate_calendar_group(
         &self,
         scope: &mut AggregateScope<'_>,

@@ -16,6 +16,23 @@
 - Actual isolated public Kafka case runtime3 PASS: true deployedv2 inline COMMITTING CP2 restored/replayed on same catalog/job; CP3 journal1,860,246B/ref259B/raw620,085B, exact selected-file/hash/identity/records; actual workerSIGKILL gen2→3 restores/replays CP3, exact4committed rows/physicalprefix/freshsuffix; owned cleanup complete. Sampled summedRSS354,775,040B diagnostic under2GiB container cap; no generic peak/performance/full8MiB qualification claim.
 - Runtime1 localimage-alias preflight and runtime2 quoted-log parser failure retained; no Rust/pinned-binary change. Final evidence review/docs-head CI and tested image publication/deployment pending. Report `docs/str-144-kafka-journal.md`; evidence `/home/jason/qa-evidence/str144-kafka-journal-20261017/`.
 
+## Active STR-29 native quiet-key delivery repair — 2026-10-18
+
+- User reopened STR-29 after confirming production scheduler absence. Worker
+  Codex `/root`; branch `jason/str-29-delivery-audit-20261018`, fetched base
+  `14353046e5085325b66563981be61c96ecfed7b7`; no elapsed-time limit.
+- Root cause: PR #30 merged its dependency branch after #23 had already merged
+  main. Its scheduler never reached main; W/V pruning alone leaves quiet G
+  accumulators stale. Old branch and evidence preserved.
+- Acceptance: real native SQL keyA lifetime1/today1 -> lifetime1/today0 when keyB
+  advances finite watermark; silence unchanged, exact CDC, bounded due work,
+  fresh memory/RocksDB recovery. No custom timer graph, application UDF or pool.
+- Next: integrate existing H/U deadline dispatch with current native aggregate
+  path, focused regressions and real SQL capture, independent review, green PR
+  against main. Checks pending; no runtime pass claimed.
+- Instructions: `AGENTS.md`, `.claude/build-test.md`, this ledger and feature
+  plan; evidence `/home/jason/qa-evidence/str29-native-delivery-20261018/`.
+
 ## Native demo packaging — 2026-10-17
 
 - User authorized demo deployment after merging the generic UDF repair. Fresh fetched base `3ea6a673c7bb0b5e38aa154d154848c6143d16b0`; branch `agent/native-demo-image-20261017`; current AGENTS/build/team/ledger read. Unrelated checkouts preserved.
