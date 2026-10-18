@@ -27,9 +27,15 @@
 - Acceptance: real native SQL keyA lifetime1/today1 -> lifetime1/today0 when keyB
   advances finite watermark; silence unchanged, exact CDC, bounded due work,
   fresh memory/RocksDB recovery. No custom timer graph, application UDF or pool.
-- Next: integrate existing H/U deadline dispatch with current native aggregate
-  path, focused regressions and real SQL capture, independent review, green PR
-  against main. Checks pending; no runtime pass claimed.
+- Production H/U dispatch and bounded transient continuation are integrated
+  onto main `8f937aa9`. Current-source fmt, strict lint and locked check pass;
+  calendar29 pass/1 existing ignored, idle-control6 and capture3 pass, Python12
+  pass. Four actual native SQL cases pass (memory/RocksDB x controller/leader):
+  live pre-EOF zero, unchanged silence and exact fresh-worker checkpoint CDC.
+- Shared-target stale metadata check failure is preserved; queued timestamp
+  refresh resolved it with identical source hashes and caches retained.
+  Next: final evidence approval, PR directly against main and current-head CI.
+  Full Kafka/process-loss/capacity qualification is not claimed by this repair.
 - Instructions: `AGENTS.md`, `.claude/build-test.md`, this ledger and feature
   plan; evidence `/home/jason/qa-evidence/str29-native-delivery-20261018/`.
 

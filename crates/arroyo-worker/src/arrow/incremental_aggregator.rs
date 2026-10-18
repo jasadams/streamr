@@ -3108,7 +3108,18 @@ impl ArrowOperator for IncrementalAggregatingFunc {
                 // atomically, drops its snapshot and drains normal CDC before
                 // the next owner or downstream watermark can advance.
                 self.flush_native(ctx, collector).await?;
-                while self.dispatch_calendar_due().await? {
+                let store = self
+                    .native_store
+                    .as_ref()
+                    .context("calendar aggregate store missing")?;
+                let output_bytes = self
+                    .native_config
+                    .context("native aggregate limits missing")?
+                    .max_pending_output_bytes;
+                // Reuse TTL's optional backend-state key reservation, including
+                // the existing D-output peak. Tight configurations stay cold.
+                let mut continuation = store.try_expiry_progress(output_bytes);
+                while self.dispatch_calendar_due(continuation.as_mut()).await? {
                     self.drain_native_dirty(ctx, collector).await?;
                     tokio::task::yield_now().await;
                 }
@@ -4580,15 +4591,15 @@ mod tests {
             scope.commit().await.unwrap();
         }
         assert!(
-            operator.dispatch_calendar_due().await.unwrap(),
+            operator.dispatch_calendar_due(None).await.unwrap(),
             "retire stale entry only"
         );
         assert_eq!(
             calendar_test_values(&operator).await,
             vec![ScalarValue::Int64(Some(1)); 3]
         );
-        assert!(operator.dispatch_calendar_due().await.unwrap());
-        assert!(!operator.dispatch_calendar_due().await.unwrap());
+        assert!(operator.dispatch_calendar_due(None).await.unwrap());
+        assert!(!operator.dispatch_calendar_due(None).await.unwrap());
         assert_eq!(
             calendar_test_values(&operator).await,
             vec![
@@ -4597,6 +4608,103 @@ mod tests {
                 ScalarValue::Int64(Some(1))
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn calendar_dispatch_equal_deadlines_cursor_matches_cold_and_restarts_for_new_keys() {
+        for warm in [false, true] {
+            let mut operator = native_calendar_operator();
+            operator.native_store = Some(native_test_store_with_limits(AggregateStoreLimits {
+                page_entries: 1,
+                ..native_test_store().limits()
+            }));
+            let groups: Vec<_> = (1_u8..=24).map(|key| vec![key]).collect();
+            for (index, group) in groups.iter().enumerate() {
+                calendar_test_event_for_group(
+                    &mut operator,
+                    group,
+                    Some(200),
+                    200,
+                    Some(true),
+                    false,
+                    &[index as u8; 16],
+                )
+                .await
+                .unwrap();
+            }
+            operator
+                .calendar_watermark(calendar_dispatch_watermark(201))
+                .await
+                .unwrap();
+            let store = operator.native_store.as_ref().unwrap();
+            let mut continuation = if warm {
+                Some(
+                    store
+                        .try_expiry_progress(
+                            operator.native_config.unwrap().max_pending_output_bytes,
+                        )
+                        .unwrap(),
+                )
+            } else {
+                None
+            };
+            for group in &groups {
+                assert!(
+                    operator
+                        .dispatch_calendar_due(continuation.as_mut())
+                        .await
+                        .unwrap()
+                );
+                if let Some(progress) = &continuation {
+                    assert_eq!(
+                        progress.after.as_ref().unwrap(),
+                        &calendar_native::calendar_due_key(201 * 86_400_000_000_000, group)
+                            .unwrap()
+                    );
+                }
+                assert_eq!(
+                    calendar_test_values_for_group(&operator, group).await,
+                    vec![
+                        ScalarValue::Int64(Some(1)),
+                        ScalarValue::Int64(Some(0)),
+                        ScalarValue::Int64(Some(1))
+                    ]
+                );
+            }
+            assert!(
+                !operator
+                    .dispatch_calendar_due(continuation.as_mut())
+                    .await
+                    .unwrap()
+            );
+            drop(continuation);
+            // A newly inserted smaller key must be visible to the next cold
+            // handler even when its day/deadline matches the just-drained set.
+            calendar_test_event_for_group(
+                &mut operator,
+                &[0],
+                Some(201),
+                201,
+                Some(true),
+                false,
+                &[99; 16],
+            )
+            .await
+            .unwrap();
+            operator
+                .calendar_watermark(calendar_dispatch_watermark(202))
+                .await
+                .unwrap();
+            assert!(operator.dispatch_calendar_due(None).await.unwrap());
+            assert_eq!(
+                calendar_test_values_for_group(&operator, &[0]).await,
+                vec![
+                    ScalarValue::Int64(Some(1)),
+                    ScalarValue::Int64(Some(0)),
+                    ScalarValue::Int64(Some(1))
+                ]
+            );
+        }
     }
 
     #[tokio::test]
@@ -4886,7 +4994,7 @@ mod tests {
                 .unwrap();
             if pending_output {
                 // Checkpoint after atomic G/H/U/D commit but before sink ACK.
-                assert!(operator.dispatch_calendar_due().await.unwrap());
+                assert!(operator.dispatch_calendar_due(None).await.unwrap());
             }
             let snapshot = backends[0].snapshot().await.unwrap();
             let storage =

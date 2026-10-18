@@ -766,9 +766,12 @@ impl IncrementalAggregatingFunc {
     }
 
     /// Commit one due owner, using only persisted real event-time progress.
-    /// Restart at H after each commit: the old deadline is atomically removed
-    /// or replaced beyond W, so cancellation/recovery needs no volatile cursor.
-    pub(super) async fn dispatch_calendar_due(&self) -> Result<bool> {
+    /// An optional admitted logical lower bound belongs only to this serial
+    /// watermark handler. The next handler/cancellation/recovery starts cold.
+    pub(super) async fn dispatch_calendar_due(
+        &self,
+        continuation: Option<&mut AggregateExpiryProgress>,
+    ) -> Result<bool> {
         if self.calendars.is_empty() {
             return Ok(false);
         }
@@ -787,8 +790,15 @@ impl IncrementalAggregatingFunc {
             key.extend_from_slice(&((next as u64) ^ (1 << 63)).to_be_bytes());
             key
         });
-        let Some((due, generation_bytes)) =
-            scope.first_from_bounded(b"H", None, end.as_deref()).await?
+        let Some((due, generation_bytes)) = scope
+            .first_from_bounded(
+                b"H",
+                continuation
+                    .as_ref()
+                    .and_then(|progress| progress.after.as_deref()),
+                end.as_deref(),
+            )
+            .await?
         else {
             return Ok(false);
         };
@@ -840,6 +850,12 @@ impl IncrementalAggregatingFunc {
             scope.delete(&due)?;
         }
         scope.commit().await?;
+        // Publish only the successfully committed exclusive logical key. The
+        // owner is serial, D drain only deletes H, and replacement deadlines
+        // are beyond W: no new earlier due insertion can interleave here.
+        if let Some(continuation) = continuation {
+            continuation.after = Some(due.into_boxed_slice().into_vec());
+        }
         Ok(true)
     }
 
