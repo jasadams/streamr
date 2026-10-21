@@ -626,19 +626,53 @@ fn is_valid_input_boundary(
         let incoming = graph.edges_directed(boundary, Incoming).collect::<Vec<_>>();
         if graph[boundary].parallelism != 1
             || incoming.len() != 1
-            || incoming[0]
-                .weight()
-                .schema
-                .schema
-                .index_of(arroyo_rpc::UPDATING_META_FIELD)
-                .is_ok()
             || aggregate.retain_indefinitely != Some(true)
         {
             return Err(reject(
-                "aggregate event-result boundary requires singleton append input and indefinite retention",
+                "aggregate event-result boundary requires singleton input and indefinite retention",
             ));
         }
-        // The logical route validates one append source and COUNT/MAX. The
+        if incoming[0]
+            .weight()
+            .schema
+            .schema
+            .index_of(arroyo_rpc::UPDATING_META_FIELD)
+            .is_ok()
+        {
+            let mut current = incoming[0].source();
+            let mut seen = BTreeSet::new();
+            loop {
+                if !seen.insert(current.index()) || graph[current].parallelism != 1 {
+                    return Err(reject(
+                        "per-event correction lineage requires acyclic singleton tasks",
+                    ));
+                }
+                let operation = single_operator(graph, current)?;
+                let parents = graph.edges_directed(current, Incoming).collect::<Vec<_>>();
+                if operation.operator_name == OperatorName::ConnectorSource {
+                    if !parents.is_empty() {
+                        return Err(reject("per-event correction source is not a root"));
+                    }
+                    break;
+                }
+                if !matches!(
+                    operation.operator_name,
+                    OperatorName::ArrowValue
+                        | OperatorName::ArrowKey
+                        | OperatorName::Projection
+                        | OperatorName::ExpressionWatermark
+                ) || parents.len() != 1
+                {
+                    return Err(reject(
+                        "per-event correction requires a direct batch-preserving source lineage",
+                    ));
+                }
+                // One destination invokes the collector's identity path even
+                // for the aggregate key edge. No keyed reorder is permitted.
+                current = parents[0].source();
+            }
+        }
+        // The logical route validates one direct source and COUNT/MAX. The
         // aggregate remains a separate owner; only its accepted rows enter
         // this fused region, in their original input order.
         return Ok(true);

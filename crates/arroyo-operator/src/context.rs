@@ -568,6 +568,15 @@ fn repartition<'a>(
     keys: Option<&'a Vec<usize>>,
     qs: usize,
 ) -> impl Iterator<Item = (usize, RecordBatch)> + 'a {
+    // One destination is an identity operation: keep the original order and
+    // complete logical input batch without sorting equal destination IDs.
+    if qs == 1 {
+        return (record.num_rows() != 0)
+            .then(|| (0, record.clone()))
+            .into_iter()
+            .collect::<Vec<_>>()
+            .into_iter();
+    }
     let mut buf = vec![0; record.num_rows()];
 
     if let Some(keys) = keys {
@@ -804,6 +813,23 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+
+    #[test]
+    fn single_destination_preserves_one_batch_order_and_backing_ownership() {
+        let input = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("id", DataType::UInt64, false)])),
+            vec![Arc::new(UInt64Array::from(vec![8, 1, 7, 1, 3, 0, 3, 9]))],
+        )
+        .unwrap();
+        for keys in [None, Some(vec![0])] {
+            let output = repartition(&input, keys.as_ref(), 1).collect::<Vec<_>>();
+            assert_eq!(output.len(), 1);
+            assert_eq!(output[0].0, 0);
+            assert_eq!(output[0].1, input);
+            assert!(Arc::ptr_eq(output[0].1.column(0), input.column(0)));
+            assert!(Arc::ptr_eq(&output[0].1.schema(), &input.schema()));
+        }
+    }
 
     #[test]
     fn test_watermark_holder() {

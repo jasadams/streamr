@@ -5,6 +5,7 @@ use crate::physical::ArroyoPhysicalExtensionCodec;
 use arroyo_datastream::logical::{LogicalEdge, LogicalEdgeType, LogicalNode, OperatorName};
 use arroyo_rpc::config::config;
 use arroyo_rpc::{df::ArroyoSchema, grpc::api::UpdatingAggregateOperator};
+use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion::common::{DFSchemaRef, Result, TableReference, ToDFSchema, plan_err};
 use datafusion::logical_expr::expr::ScalarFunction;
 use datafusion::logical_expr::{
@@ -120,6 +121,55 @@ impl ArroyoExtension for UpdatingAggregateExtension {
         }
 
         let input_schema = input_schemas[0].clone();
+        if self.emit_per_event
+            && input_schema
+                .schema
+                .index_of(arroyo_rpc::UPDATING_META_FIELD)
+                .is_ok()
+        {
+            // Extension boundaries become separate memory readers in physical
+            // plans. Check EVERY segment down to the source, not just the last.
+            self.aggregate.apply(|node| {
+                if let LogicalPlan::Extension(extension) = node {
+                    let input = if let Some(watermark) = extension
+                        .node
+                        .as_any()
+                        .downcast_ref::<super::watermark_node::WatermarkNode>(
+                    ) {
+                        if !watermark.preserve_source_envelope {
+                            return plan_err!(
+                                "per-event correction watermark drops source envelope"
+                            );
+                        }
+                        Some(&watermark.input)
+                    } else if let Some(remote) = extension
+                        .node
+                        .as_any()
+                        .downcast_ref::<super::remote_table::RemoteTableExtension>(
+                    ) {
+                        Some(&remote.input)
+                    } else {
+                        extension
+                            .node
+                            .as_any()
+                            .downcast_ref::<super::key_calculation::KeyCalculationExtension>()
+                            .map(|key| &key.input)
+                    };
+                    if let Some(input) = input {
+                        crate::physical::validate_complete_source_batch(
+                            planner.sync_plan(input)?.as_ref(),
+                        )?;
+                    }
+                }
+                Ok(TreeNodeRecursion::Continue)
+            })?;
+            let LogicalPlan::Aggregate(aggregate) = &self.aggregate else {
+                return plan_err!("per-event correction requires aggregate input");
+            };
+            crate::physical::validate_complete_source_batch(
+                planner.sync_plan(&aggregate.input)?.as_ref(),
+            )?;
+        }
         let input_dfschema = input_schema.schema.clone().to_dfschema()?;
 
         let aggregate_exec = PhysicalPlanNode::try_from_physical_plan(

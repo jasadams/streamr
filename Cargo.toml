@@ -131,7 +131,7 @@ datafusion-proto = {git = 'https://github.com/ArroyoSystems/arrow-datafusion', b
 datafusion-functions = {git = 'https://github.com/ArroyoSystems/arrow-datafusion', branch = '48.0.1/arroyo'}
 datafusion-functions-window = {git = 'https://github.com/ArroyoSystems/arrow-datafusion', branch = '48.0.1/arroyo'}
 
-sqlparser = { git = "https://github.com/jasadams/sqlparser-rs", rev = "02d020901b65d048e97feae48083fcac38d343ca" }
+sqlparser = { git = "https://github.com/jasadams/sqlparser-rs", rev = "41e07aa42c01ba8e9e625311f5e15202e0d5bf58" }
 
 cornucopia_async = { git = "https://github.com/ArroyoSystems/cornucopia", branch = "sqlite" }
 cornucopia = { git = "https://github.com/ArroyoSystems/cornucopia", branch = "sqlite" }
@@ -143,4 +143,4 @@ jiter = {git = "https://github.com/ArroyoSystems/jiter", branch = "disable_pytho
 # that git source to the SQL/JSON fork too, keeping a single sqlparser
 # instance across the whole dependency graph.
 [patch."https://github.com/ArroyoSystems/sqlparser-rs"]
-sqlparser = { git = "https://github.com/jasadams/sqlparser-rs", rev = "02d020901b65d048e97feae48083fcac38d343ca" }
+sqlparser = { git = "https://github.com/jasadams/sqlparser-rs", rev = "41e07aa42c01ba8e9e625311f5e15202e0d5bf58" }

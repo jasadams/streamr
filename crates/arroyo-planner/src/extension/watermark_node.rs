@@ -23,6 +23,7 @@ pub struct WatermarkNode {
     pub watermark_expression: Expr,
     pub schema: DFSchemaRef,
     timestamp_index: usize,
+    pub(crate) preserve_source_envelope: bool,
 }
 
 multifield_partial_ord!(
@@ -30,7 +31,8 @@ multifield_partial_ord!(
     input,
     qualifier,
     watermark_expression,
-    timestamp_index
+    timestamp_index,
+    preserve_source_envelope
 );
 
 impl UserDefinedLogicalNodeCore for WatermarkNode {
@@ -73,13 +75,14 @@ impl UserDefinedLogicalNodeCore for WatermarkNode {
             watermark_expression: exprs.into_iter().next().unwrap(),
             schema: self.schema.clone(),
             timestamp_index,
+            preserve_source_envelope: self.preserve_source_envelope,
         })
     }
 }
 
 impl ArroyoExtension for WatermarkNode {
     fn node_name(&self) -> Option<NamedNode> {
-        Some(NamedNode::Watermark(self.qualifier.clone()))
+        (!self.preserve_source_envelope).then(|| NamedNode::Watermark(self.qualifier.clone()))
     }
 
     fn plan_node(
@@ -96,6 +99,7 @@ impl ArroyoExtension for WatermarkNode {
             format!("watermark_{index}"),
             OperatorName::ExpressionWatermark,
             ExpressionWatermarkConfig {
+                preserve_source_envelope: self.preserve_source_envelope,
                 period_micros: 1_000_000,
                 idle_time_micros: None,
                 expression: expression.encode_to_vec(),
@@ -129,9 +133,18 @@ impl WatermarkNode {
         qualifier: TableReference,
         watermark_expression: Expr,
     ) -> Result<Self> {
+        Self::with_source_envelope(input, qualifier, watermark_expression, false)
+    }
+
+    pub(crate) fn with_source_envelope(
+        input: LogicalPlan,
+        qualifier: TableReference,
+        watermark_expression: Expr,
+        preserve_source_envelope: bool,
+    ) -> Result<Self> {
         let fields = crate::fields_with_qualifiers(input.schema())
             .into_iter()
-            .filter(|field| field.field.name() != SOURCE_ENVELOPE_FIELD)
+            .filter(|field| preserve_source_envelope || field.field.name() != SOURCE_ENVELOPE_FIELD)
             .collect::<Vec<_>>();
         let schema = add_timestamp_field(
             Arc::new(crate::schema_from_df_fields_with_metadata(
@@ -149,6 +162,7 @@ impl WatermarkNode {
             watermark_expression,
             schema,
             timestamp_index,
+            preserve_source_envelope,
         })
     }
     pub(crate) fn arroyo_schema(&self) -> ArroyoSchema {

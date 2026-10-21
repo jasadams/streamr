@@ -496,7 +496,7 @@ fn assert_time(value: &Value, expected: Option<i32>) {
 }
 
 // Observe actual connector batches without changing operator execution or clocks.
-fn observe_source_batches(program: &Program) -> Arc<std::sync::Mutex<Vec<usize>>> {
+pub(super) fn observe_source_batches(program: &Program) -> Arc<std::sync::Mutex<Vec<usize>>> {
     observe_operator(program, "expression_watermark_generator", None)
 }
 
@@ -647,7 +647,7 @@ impl Collector for FailingCollector<'_> {
     }
 }
 
-async fn fail_after_live_commit(
+pub(super) async fn fail_after_live_commit(
     job: &str,
     logical: &Arc<LogicalProgram>,
     udfs: &[LocalUdf],

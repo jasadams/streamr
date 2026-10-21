@@ -171,7 +171,6 @@ async fn maintained_merge_rejects_unsupported_event_lineage_and_ordering() {
     let cases = [
         ("join", base.replace(view, "CREATE VIEW counts AS SELECT a.counter, COUNT(*) AS quantity FROM events a JOIN events b ON a.counter=b.counter GROUP BY a.counter;")),
         ("nested", base.replace(view, "CREATE VIEW inner_counts AS SELECT counter, COUNT(*) AS n FROM events GROUP BY counter; CREATE VIEW counts AS SELECT counter, COUNT(*) AS quantity FROM inner_counts GROUP BY counter;")),
-        ("updating", base.replace("CREATE TABLE events WITH (connector = 'impulse', event_rate = '1');", "CREATE TABLE events (counter BIGINT PRIMARY KEY) WITH (connector='kafka',bootstrap_servers='localhost:9092',topic='changes',type='source',format='debezium_json');")),
         ("ordered", aggregate_merge("SET updating_ttl = NULL;", "FIRST_VALUE(counter ORDER BY counter)")),
     ];
     for (case, sql) in cases {
@@ -838,4 +837,235 @@ async fn related_tables_reject_mismatched_ownership_fields() {
          ON applied.source.counter = limits.tenant"
     );
     reject(&query, "compatible partition ownership").await;
+}
+
+#[test(tokio::test)]
+async fn maintained_merge_correction_preserves_private_operation_marker() {
+    let sql = aggregate_merge("SET updating_ttl = NULL;", "COUNT(*)").replace(
+        "CREATE TABLE events WITH (connector = 'impulse', event_rate = '1');",
+        "CREATE TABLE events (counter BIGINT PRIMARY KEY) WITH (connector='kafka',bootstrap_servers='localhost:9092',topic='changes',type='source',format='debezium_json');",
+    );
+    let compiled = plan(&sql).await;
+    for node in compiled.program.graph.node_weights() {
+        assert_eq!(node.parallelism, 1);
+        for (operator, _) in node.operator_chain.iter() {
+            if operator.operator_name == OperatorName::UpdatingAggregate {
+                let config = arroyo_rpc::grpc::api::UpdatingAggregateOperator::decode(
+                    operator.operator_config.as_slice(),
+                )
+                .unwrap();
+                assert!(config.emit_per_event);
+                let input: arroyo_rpc::df::ArroyoSchema =
+                    config.input_schema.unwrap().try_into().unwrap();
+                assert!(
+                    input
+                        .schema
+                        .index_of(arroyo_rpc::SOURCE_ENVELOPE_FIELD)
+                        .is_ok()
+                );
+                assert!(
+                    input
+                        .schema
+                        .index_of(arroyo_rpc::UPDATING_META_FIELD)
+                        .is_ok()
+                );
+                let output: arroyo_rpc::df::ArroyoSchema =
+                    config.final_schema.unwrap().try_into().unwrap();
+                assert!(
+                    output
+                        .schema
+                        .index_of(arroyo_rpc::SOURCE_ENVELOPE_FIELD)
+                        .is_err()
+                );
+                assert!(
+                    output
+                        .schema
+                        .index_of(arroyo_rpc::UPDATING_META_FIELD)
+                        .is_err()
+                );
+            }
+            if operator.operator_name == OperatorName::ExpressionWatermark {
+                let config = arroyo_rpc::grpc::api::ExpressionWatermarkConfig::decode(
+                    operator.operator_config.as_slice(),
+                )
+                .unwrap();
+                assert!(config.preserve_source_envelope);
+                assert!(config.source_envelope_index.is_some());
+            }
+        }
+    }
+}
+
+#[test(tokio::test)]
+async fn maintained_merge_correction_keeps_declared_clock_through_alias_projection() {
+    let sql = aggregate_merge("SET updating_ttl = NULL;", "COUNT(*)")
+        .replace(
+            "CREATE TABLE events WITH (connector = 'impulse', event_rate = '1');",
+            "CREATE TABLE events (counter BIGINT PRIMARY KEY, event_time TIMESTAMP NOT NULL,
+             WATERMARK FOR event_time AS event_time - INTERVAL '1' DAY)
+             WITH (connector='single_file',path='/tmp/str64-qualified-correction.jsonl',
+             type='source',format='debezium_json');
+             CREATE VIEW projected AS SELECT e.counter,e.event_time FROM events AS e
+             WHERE e.counter > 0;",
+        )
+        .replace(
+            "AS quantity FROM events GROUP BY",
+            "AS quantity FROM projected GROUP BY",
+        );
+    let sql = format!("{sql} SELECT EVENT_TIMESTAMP() AS original_trigger FROM applied;");
+    let compiled = plan(&sql).await;
+    assert_eq!(state_operators(&compiled).len(), 1);
+}
+
+fn correction_boundary_query(format: &str, peak_type: &str, views: &str) -> String {
+    format!("SET updating_ttl = NULL;
+        CREATE TABLE changes (row_id BIGINT PRIMARY KEY,k TEXT NOT NULL,
+            value BIGINT NOT NULL,active BOOLEAN NOT NULL,event_time TIMESTAMP NOT NULL,
+            WATERMARK FOR event_time AS event_time - INTERVAL '1' DAY)
+            WITH (connector='single_file',path='/tmp/str64-boundary.jsonl',format='{format}',type='source');
+        CREATE STATE TABLE totals (k TEXT PRIMARY KEY,total BIGINT,peak {peak_type},last_seen TIMESTAMP) PARTITION BY k;
+        {views}
+        CREATE VIEW applied AS MERGE INTO totals AS previous USING accepted AS incoming
+        ON previous.k=incoming.k
+        WHEN MATCHED THEN UPDATE SET total=incoming.total,peak=incoming.peak,last_seen=incoming.last_seen
+        WHEN NOT MATCHED THEN INSERT(k,total,peak,last_seen) VALUES(incoming.k,incoming.total,incoming.peak,incoming.last_seen)
+        RETURNING source AS source,old AS old,new AS new,action AS action;
+        SELECT new.total,new.peak FROM applied;")
+}
+const BOUNDARY_AGGREGATE: &str = "CREATE VIEW accepted AS SELECT k,COUNT(*) AS total,MAX(value) AS peak,MAX(event_time) AS last_seen FROM changes GROUP BY k;";
+fn distinct_predicate(sql: String) -> String {
+    sql.replace("WHEN MATCHED THEN", "WHEN MATCHED AND (previous.total IS DISTINCT FROM incoming.total OR previous.peak IS DISTINCT FROM incoming.peak OR previous.last_seen IS DISTINCT FROM incoming.last_seen) THEN")
+}
+
+#[test(tokio::test)]
+async fn str64_correction_boundary_probe_append_distinct_or_control() {
+    plan(&distinct_predicate(correction_boundary_query(
+        "json",
+        "BIGINT",
+        BOUNDARY_AGGREGATE,
+    )))
+    .await;
+}
+#[test(tokio::test)]
+async fn str64_correction_boundary_probe_cdc_distinct_or() {
+    plan(&distinct_predicate(correction_boundary_query(
+        "debezium_json",
+        "BIGINT",
+        BOUNDARY_AGGREGATE,
+    )))
+    .await;
+}
+#[test(tokio::test)]
+async fn str64_correction_boundary_probe_named_volatile_projection() {
+    let sql=correction_boundary_query("debezium_json","TEXT", "CREATE VIEW sampled AS SELECT k,uuid() AS candidate,event_time FROM changes;
+        CREATE VIEW accepted AS SELECT k,COUNT(*) AS total,MAX(candidate) AS peak,MAX(event_time) AS last_seen FROM sampled GROUP BY k;");
+    reject(
+        &sql,
+        "per-event correction requires repeatable source expressions",
+    )
+    .await;
+}
+#[test(tokio::test)]
+async fn str64_correction_boundary_probe_volatile_where() {
+    let views = BOUNDARY_AGGREGATE.replace(
+        "FROM changes GROUP BY",
+        "FROM changes WHERE random() > 0.5 GROUP BY",
+    );
+    reject(
+        &correction_boundary_query("debezium_json", "BIGINT", &views),
+        "per-event correction requires repeatable source expressions",
+    )
+    .await;
+}
+#[test(tokio::test)]
+async fn str64_correction_boundary_probe_volatile_argument() {
+    let views = BOUNDARY_AGGREGATE.replace("MAX(value)", "MAX(uuid())");
+    reject(
+        &correction_boundary_query("debezium_json", "TEXT", &views),
+        "per-event correction requires repeatable source expressions",
+    )
+    .await;
+}
+#[test(tokio::test)]
+async fn str64_correction_boundary_probe_volatile_aggregate_filter() {
+    let views = BOUNDARY_AGGREGATE.replace("COUNT(*)", "COUNT(*) FILTER (WHERE random() > 0.5)");
+    reject(
+        &correction_boundary_query("debezium_json", "BIGINT", &views),
+        "per-event correction requires repeatable source expressions",
+    )
+    .await;
+}
+#[test(tokio::test)]
+async fn str64_correction_boundary_probe_trigger_where() {
+    let views = BOUNDARY_AGGREGATE.replace(
+        "FROM changes GROUP BY",
+        "FROM changes WHERE EVENT_TIMESTAMP() > TIMESTAMP '1970-01-01 00:00:07' GROUP BY",
+    );
+    reject(
+        &correction_boundary_query("debezium_json", "BIGINT", &views),
+        "per-event correction requires repeatable source expressions",
+    )
+    .await;
+}
+#[test(tokio::test)]
+async fn str64_correction_boundary_probe_trigger_alias_where() {
+    let views = format!(
+        "CREATE VIEW clocked AS SELECT k,value,event_time,EVENT_TIMESTAMP() AS sampled_clock FROM changes; {}",
+        BOUNDARY_AGGREGATE.replace(
+            "FROM changes GROUP BY",
+            "FROM clocked WHERE sampled_clock > TIMESTAMP '1970-01-01 00:00:07' GROUP BY"
+        )
+    );
+    reject(
+        &correction_boundary_query("debezium_json", "BIGINT", &views),
+        "per-event correction requires repeatable source expressions",
+    )
+    .await;
+}
+#[test(tokio::test)]
+async fn str64_correction_boundary_probe_overwritten_clock_literal() {
+    let views = format!(
+        "CREATE VIEW clocked AS SELECT k,value,event_time,TIMESTAMP '1970-01-01 00:00:55' AS _timestamp FROM changes; {}",
+        BOUNDARY_AGGREGATE.replace("FROM changes GROUP BY", "FROM clocked GROUP BY")
+    );
+    reject(
+        &correction_boundary_query("debezium_json", "BIGINT", &views),
+        "per-event correction must preserve the source trigger timestamp",
+    )
+    .await;
+}
+#[test(tokio::test)]
+async fn str64_correction_boundary_probe_overwritten_clock_payload() {
+    let views = format!(
+        "CREATE VIEW clocked AS SELECT k,value,event_time,event_time AS _timestamp FROM changes; {}",
+        BOUNDARY_AGGREGATE.replace("FROM changes GROUP BY", "FROM clocked GROUP BY")
+    );
+    reject(
+        &correction_boundary_query("debezium_json", "BIGINT", &views),
+        "per-event correction must preserve the source trigger timestamp",
+    )
+    .await;
+}
+#[test(tokio::test)]
+async fn str64_correction_boundary_probe_append_volatile_control() {
+    let views = BOUNDARY_AGGREGATE.replace("MAX(value)", "MAX(uuid())");
+    plan(&correction_boundary_query("json", "TEXT", &views)).await;
+}
+#[test(tokio::test)]
+async fn str64_correction_boundary_probe_postaggregate_clock_uuid_control() {
+    let sql=correction_boundary_query("debezium_json","BIGINT",BOUNDARY_AGGREGATE).replace("SELECT new.total,new.peak FROM applied;", "SELECT new.total,new.peak,uuid() AS capture_id,EVENT_TIMESTAMP() AS original_trigger FROM applied;");
+    plan(&sql).await;
+}
+#[test(tokio::test)]
+async fn str64_correction_boundary_probe_declared_payload_time_control() {
+    let views = BOUNDARY_AGGREGATE.replace(
+        "FROM changes GROUP BY",
+        "FROM changes WHERE event_time > TIMESTAMP '1970-01-01 00:00:07' GROUP BY",
+    );
+    plan(&correction_boundary_query(
+        "debezium_json",
+        "BIGINT",
+        &views,
+    ))
+    .await;
 }

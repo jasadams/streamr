@@ -1,0 +1,3 @@
+{"before":null,"after":{"row_id":1,"k":"a","value":10,"active":true,"event_time":"1970-01-01T00:00:10Z"},"op":"c"}
+{"before":null,"after":{"row_id":2,"k":"a","value":20,"active":true,"event_time":"1970-01-01T00:00:20Z"},"op":"c"}
+{"before":{"row_id":2,"k":"a","value":20,"active":true,"event_time":"1970-01-01T00:00:20Z"},"after":{"row_id":2,"k":"a","value":5,"active":true,"event_time":"1970-01-01T00:00:05Z"},"op":"u"}

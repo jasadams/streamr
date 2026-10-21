@@ -364,9 +364,8 @@ pub(crate) fn plan_named_merge(
             .as_ref()
             .map(|sql| expression(sql, &expression_schema, provider))
             .transpose()?;
-        if predicate
-            .as_ref()
-            .is_some_and(|e| e.get_type(&expression_schema).ok() != Some(DataType::Boolean))
+        if let Some(predicate) = &predicate
+            && predicate.get_type(&expression_schema)? != DataType::Boolean
         {
             return plan_err!("MERGE WHEN predicate must be boolean");
         }

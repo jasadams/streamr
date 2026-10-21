@@ -2623,3 +2623,9 @@ mod smoke_sql_json;
 
 #[path = "smoke_str64.rs"]
 mod smoke_str64;
+
+#[path = "smoke_str64_corrections.rs"]
+mod smoke_str64_corrections;
+
+#[path = "smoke_str64_branches.rs"]
+mod smoke_str64_branches;

@@ -46,6 +46,7 @@ pub struct WatermarkGenerator {
     expression: Arc<dyn PhysicalExpr>,
     timestamp_index: usize,
     source_envelope_index: Option<usize>,
+    preserve_source_envelope: bool,
 }
 
 impl WatermarkGenerator {
@@ -65,6 +66,7 @@ impl WatermarkGenerator {
             expression,
             timestamp_index,
             source_envelope_index,
+            preserve_source_envelope: false,
         }
     }
 }
@@ -116,7 +118,9 @@ impl WatermarkGenerator {
             .as_any()
             .downcast_ref::<TimestampNanosecondArray>()
             .unwrap();
-        let output = if let Some(marker) = self.source_envelope_index {
+        let output = if let Some(marker) = self.source_envelope_index
+            && !self.preserve_source_envelope
+        {
             admitted.project(
                 &(0..admitted.num_columns())
                     .filter(|i| *i != marker)
@@ -229,13 +233,18 @@ impl OperatorConstructor for WatermarkGeneratorConstructor {
             &DefaultPhysicalExtensionCodec {},
         )?;
 
-        let generator = WatermarkGenerator::expression(
+        anyhow::ensure!(
+            !config.preserve_source_envelope || config.source_envelope_index.is_some(),
+            "preserved source envelopes require a source marker"
+        );
+        let mut generator = WatermarkGenerator::expression(
             Duration::from_micros(config.period_micros),
             config.idle_time_micros.map(Duration::from_micros),
             expression,
             input_schema.timestamp_index,
             config.source_envelope_index.map(|i| i as usize),
         );
+        generator.preserve_source_envelope = config.preserve_source_envelope;
         Ok(ConstructedOperator::from_operator(Box::new(generator)))
     }
 }
@@ -409,6 +418,90 @@ fn signed_timestamp(nanos: i64) -> DataflowResult<SystemTime> {
 #[cfg(test)]
 mod signed_timestamp_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn direct_correction_preserves_marker_only_when_configured() {
+        #[derive(Default)]
+        struct Captures(Vec<RecordBatch>);
+        #[async_trait]
+        impl Collector for Captures {
+            async fn collect(&mut self, batch: RecordBatch) -> DataflowResult<()> {
+                self.0.push(batch);
+                Ok(())
+            }
+            async fn broadcast_watermark(&mut self, _: Watermark) -> DataflowResult<()> {
+                Ok(())
+            }
+        }
+        let schema = Arc::new(arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new(
+                arroyo_rpc::TIMESTAMP_FIELD,
+                arrow_schema::DataType::Timestamp(arrow_schema::TimeUnit::Nanosecond, None),
+                false,
+            ),
+            arrow_schema::Field::new(
+                arroyo_rpc::SOURCE_ENVELOPE_FIELD,
+                arrow_schema::DataType::UInt64,
+                false,
+            ),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(TimestampNanosecondArray::from(vec![20, 5])),
+                Arc::new(UInt64Array::from(vec![0, 0])),
+            ],
+        )
+        .unwrap();
+        for preserve in [false, true] {
+            let mut generator = WatermarkGenerator::expression(
+                Duration::from_secs(1),
+                None,
+                Arc::new(datafusion::physical_expr::expressions::Column::new(
+                    arroyo_rpc::TIMESTAMP_FIELD,
+                    0,
+                )),
+                0,
+                Some(1),
+            );
+            generator.preserve_source_envelope = preserve;
+            let mut captures = Captures::default();
+            generator
+                .admit_batch(batch.clone(), 0, &mut captures)
+                .await
+                .unwrap();
+            assert_eq!(captures.0.len(), 1);
+            assert_eq!(captures.0[0].num_rows(), 2);
+            assert_eq!(
+                captures.0[0]
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<TimestampNanosecondArray>()
+                    .unwrap()
+                    .values()
+                    .as_ref(),
+                &[5, 5]
+            );
+            assert_eq!(
+                captures.0[0]
+                    .column_by_name(arroyo_rpc::SOURCE_ENVELOPE_FIELD)
+                    .is_some(),
+                preserve
+            );
+            if preserve {
+                assert_eq!(
+                    captures.0[0]
+                        .column(1)
+                        .as_any()
+                        .downcast_ref::<UInt64Array>()
+                        .unwrap()
+                        .values()
+                        .as_ref(),
+                    &[0, 0]
+                );
+            }
+        }
+    }
 
     #[test]
     fn admission_preserves_update_envelopes_and_does_not_pair_equal_keys() {

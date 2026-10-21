@@ -132,8 +132,8 @@ message UpdatingAggregateOperator {
   // Planner-proven exclusive prefix consumption, indexed by aggregate ordinal.
   map<uint32, uint64> collection_output_limits = 10;
   repeated CalendarAggregateDescriptor calendar_aggregates = 11;
-  // Planner-proven append COUNT/MAX input consumed as one accepted snapshot
-  // per original row by MERGE. Ordinary aggregate changelog emission is unchanged.
+  // Planner-proven COUNT/MAX input consumed as final accepted snapshots
+  // per complete original operation by MERGE. Ordinary aggregate changelog emission is unchanged.
   bool emit_per_event = 12;
 }
 
@@ -266,6 +266,7 @@ message SessionWindow {
 }
 
 message ExpressionWatermarkConfig {
+  bool preserve_source_envelope = 6;
   optional uint32 source_envelope_index = 5;
   uint64 period_micros = 1;
   optional uint64 idle_time_micros = 2;

@@ -38,7 +38,9 @@ use arroyo_rpc::grpc::{
     api::UpdatingAggregateOperator,
     rpc::{DiskKeyedTableConfig, TableConfig, TableEnum},
 };
-use arroyo_rpc::{TIMESTAMP_FIELD, UPDATING_META_FIELD, updating_meta_fields};
+use arroyo_rpc::{
+    SOURCE_ENVELOPE_FIELD, TIMESTAMP_FIELD, UPDATING_META_FIELD, updating_meta_fields,
+};
 use arroyo_state::live::{
     LiveStateBackend,
     worker::{ConfiguredBackendOwner, configured_worker_resources, construct_configured_backend},
@@ -1219,7 +1221,7 @@ impl IncrementalAggregatingFunc {
                     update(stored)
                 })
                 .await?;
-        } else if let Some((_, stored)) = scope.first(&prefix).await? {
+        } else if let Some((_, stored)) = scope.first_tagged(&prefix, "accepted_M").await? {
             update(&stored)?;
         }
         Ok(accumulator.evaluate_mut()?)
@@ -1490,8 +1492,8 @@ impl IncrementalAggregatingFunc {
                     let mut secondary = native_generation_prefix(b'R', group_key, generation)?;
                     secondary.extend_from_slice(&u32::try_from(index)?.to_be_bytes());
                     ensure!(
-                        scope.first(&primary).await?.is_none()
-                            && scope.first(&secondary).await?.is_none(),
+                        scope.first_tagged(&primary, "empty_M").await?.is_none()
+                            && scope.first_tagged(&secondary, "empty_R").await?.is_none(),
                         "native aggregate retracts a nonmatching keyed row"
                     );
                 }
@@ -1566,8 +1568,15 @@ impl IncrementalAggregatingFunc {
             .native_store
             .as_ref()
             .context("native aggregate store is not initialized")?;
+        if !self.native_append_only {
+            return self
+                .process_native_correction_batch(batch, ctx, collector)
+                .await;
+        }
         if batch.column_by_name(UPDATING_META_FIELD).is_some() {
-            return Err(anyhow!("per-event aggregate MERGE received a changelog").into());
+            return Err(
+                anyhow!("per-event aggregate MERGE received an unexpected changelog").into(),
+            );
         }
         let input_schema = &ctx.in_schemas[0];
         let keys = self.key_converter.convert_columns(
@@ -1690,6 +1699,163 @@ impl IncrementalAggregatingFunc {
                 collector.collect(output).await?;
                 start = end;
                 break;
+            }
+        }
+        Ok(())
+    }
+
+    /// A callback contains complete surviving source operations. The planner
+    /// proves that no physical/transport step can split or combine callbacks.
+    /// Marker ordinals restart for every callback; they are never durable IDs.
+    async fn process_native_correction_batch(
+        &self,
+        batch: &RecordBatch,
+        ctx: &mut OperatorContext,
+        collector: &mut dyn Collector,
+    ) -> DataflowResult<()> {
+        let (retracts, ids) = native_changelog_columns(batch)?;
+        let ranges = native_event_ranges(batch, retracts, ctx.in_schemas[0].timestamp_index)?;
+        let store = self
+            .native_store
+            .as_ref()
+            .context("native aggregate store is not initialized")?;
+        let configured = self
+            .native_config
+            .context("per-event aggregate requires native limits")?;
+        let input_schema = &ctx.in_schemas[0];
+        let keys = self.key_converter.convert_columns(
+            &input_schema
+                .sort_columns(batch, false)
+                .into_iter()
+                .map(|column| column.values)
+                .collect::<Vec<_>>(),
+        )?;
+        let inputs = self.compute_inputs(batch)?;
+        let fallback = self
+            .aggregates
+            .iter()
+            .filter(|aggregate| aggregate.accumulator_type == AccumulatorType::Batch)
+            .count();
+        // Admission covers the WHOLE operation, including both keys of a move.
+        // It never falls back to admitting just the before image.
+        let operations_per_image = 3usize
+            .checked_add(fallback.saturating_mul(2))
+            .context("per-event operation count overflow")?;
+        for range in ranges {
+            let operations = operations_per_image
+                .checked_mul(range.len())
+                .context("per-event operation count overflow")?;
+            let limits = store.limits();
+            if operations > limits.write_operations
+                || operations.saturating_mul(store.max_encoded_entry_bytes()) > limits.write_bytes
+                || operations.saturating_mul(limits.key_bytes.saturating_add(limits.value_bytes))
+                    > limits.overlay_bytes
+            {
+                return Err(anyhow!(
+                    "per-event aggregate budget cannot admit one complete source operation"
+                )
+                .into());
+            }
+            let mut output_diagnostic =
+                crate::arrow::aggregate_store::scan_diagnostics::OutputProbe::new();
+            let _output = store
+                .resources()
+                .try_decoded_value(configured.max_pending_output_bytes.saturating_mul(3))
+                .map_err(anyhow::Error::from)?;
+            let mut scope = store.begin().await?;
+            output_diagnostic.bind(scope.diagnostic_scope_id());
+            let mut affected = Vec::<usize>::new();
+            for row in range.clone() {
+                let key = keys.row(row);
+                if !affected
+                    .iter()
+                    .any(|known| keys.row(*known).as_ref() == key.as_ref())
+                {
+                    affected.push(row);
+                }
+                self.native_process_calendar_event_with_progress(
+                    &mut scope,
+                    NativeCalendarEvent {
+                        group_key: key.as_ref(),
+                        inputs: &inputs,
+                        row,
+                        retract: retracts.value(row),
+                        row_id: Some(ids.value(row)),
+                        calendar_inputs: &[],
+                    },
+                    &mut None,
+                )
+                .await?;
+            }
+            let trigger = range.end - 1;
+            let mut output = Vec::new();
+            let mut output_bytes = 0usize;
+            for row in affected {
+                let key = keys.row(row);
+                let storage_key = native_group_key(b'G', key.as_ref())?;
+                let encoded = scope
+                    .get(&storage_key)
+                    .await?
+                    .context("per-event aggregate lost its accepted group")?;
+                let group = self
+                    .native_group_codec()?
+                    .decode(&encoded, limits.value_bytes)?;
+                if group.live_rows == 0 {
+                    // Exact native retractions have already verified that all
+                    // member/identity entries are gone. No dirty/TTL state is
+                    // created on this route, so remove the empty group too.
+                    scope.delete(&storage_key)?;
+                    continue;
+                }
+                if output.len() >= configured.max_pending_output_rows {
+                    return Err(anyhow!("one per-event aggregate operation exceeds configured pending-output row budget").into());
+                }
+                let mut values = self
+                    .native_accepted_values(&scope, key.as_ref(), &group)
+                    .await?;
+                *values
+                    .last_mut()
+                    .context("per-event aggregate has no timestamp")? =
+                    ScalarValue::try_from_array(
+                        batch.column(input_schema.timestamp_index),
+                        trigger,
+                    )?;
+                let mut columns = self.key_converter.convert_rows([key])?;
+                columns.extend(
+                    values
+                        .into_iter()
+                        .map(|value| value.to_array())
+                        .collect::<DFResult<Vec<_>>>()?,
+                );
+                let accepted = RecordBatch::try_new(self.schema_without_metadata.clone(), columns)?;
+                output_bytes = output_bytes
+                    .checked_add(accepted.get_array_memory_size())
+                    .context("per-event aggregate output size overflow")?;
+                if output_bytes > configured.max_pending_output_bytes / 3 {
+                    return Err(anyhow!(
+                        "one per-event aggregate operation exceeds configured pending-output budget"
+                    )
+                    .into());
+                }
+                output.push(accepted);
+            }
+            let accepted = arrow::compute::concat_batches(&self.schema_without_metadata, &output)?;
+            if accepted.get_array_memory_size() > configured.max_pending_output_bytes {
+                return Err(anyhow!(
+                    "per-event aggregate output exceeds configured pending-output budget"
+                )
+                .into());
+            }
+            scope.commit().await?;
+            if accepted.num_rows() != 0 {
+                output_diagnostic.event("collector_begin");
+                let delivered = collector.collect(accepted).await;
+                output_diagnostic.event(if delivered.is_ok() {
+                    "collector_complete"
+                } else {
+                    "collector_error"
+                });
+                delivered?;
             }
         }
         Ok(())
@@ -3400,6 +3566,56 @@ fn set_retract_metadata(metadata: ArrayRef, is_retract: Arc<BooleanArray>) -> Ar
     Arc::new(StructArray::new(updating_meta_fields(), arrays, None))
 }
 
+/// Validate the complete callback before writing any operation. Gaps arise
+/// naturally from source filters; a marker may never recur after another run.
+fn native_event_ranges(
+    batch: &RecordBatch,
+    retracts: &BooleanArray,
+    timestamp: usize,
+) -> Result<Vec<std::ops::Range<usize>>> {
+    let marker = batch
+        .column_by_name(SOURCE_ENVELOPE_FIELD)
+        .context("per-event correction requires source envelope")?
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .context("source envelope must be UInt64")?;
+    ensure!(marker.null_count() == 0, "source envelope contains NULL");
+    ensure!(
+        batch.column(timestamp).null_count() == 0,
+        "source envelope trigger clock contains NULL"
+    );
+    let mut ranges = Vec::new();
+    let mut start = 0;
+    let mut previous = None;
+    while start < batch.num_rows() {
+        let operation = marker.value(start);
+        ensure!(
+            previous.is_none_or(|last| operation > last),
+            "source envelope operations are not strictly ordered"
+        );
+        let mut end = start + 1;
+        while end < batch.num_rows() && marker.value(end) == operation {
+            end += 1;
+        }
+        ensure!(end - start <= 2, "source envelope exceeds two images");
+        if end - start == 2 {
+            ensure!(
+                retracts.value(start) && !retracts.value(start + 1),
+                "source envelope pair must retract then append"
+            );
+            ensure!(
+                ScalarValue::try_from_array(batch.column(timestamp), start)?
+                    == ScalarValue::try_from_array(batch.column(timestamp), start + 1)?,
+                "source envelope images have different trigger clocks"
+            );
+        }
+        ranges.push(start..end);
+        previous = Some(operation);
+        start = end;
+    }
+    Ok(ranges)
+}
+
 fn native_changelog_columns(batch: &RecordBatch) -> Result<(&BooleanArray, &FixedSizeBinaryArray)> {
     let metadata = batch
         .column_by_name(UPDATING_META_FIELD)
@@ -3523,8 +3739,15 @@ impl IncrementalAggregatingConstructor {
         let mut schema_without_metadata = SchemaBuilder::from((*final_schema.schema).clone());
         if emit_per_event {
             ensure!(
-                native_append_only && final_schema.schema.index_of(UPDATING_META_FIELD).is_err(),
-                "per-event aggregate MERGE requires append input and accepted snapshot output"
+                native_config.is_some()
+                    && final_schema.schema.index_of(UPDATING_META_FIELD).is_err()
+                    && (native_append_only
+                        || input_schema
+                            .schema
+                            .field_with_name(SOURCE_ENVELOPE_FIELD)
+                            .is_ok_and(|field| field.data_type() == &DataType::UInt64
+                                && !field.is_nullable())),
+                "per-event aggregate MERGE requires append or complete source-envelope input and accepted snapshot output"
             );
         } else {
             schema_without_metadata.remove(final_schema.schema.index_of(UPDATING_META_FIELD)?);
@@ -3717,7 +3940,7 @@ impl IncrementalAggregatingConstructor {
                     && final_schema.timestamp_index + 1 == final_schema.schema.fields().len()
                     && aggregates.iter().all(|(agg, kind, _, _, _, _, _, _, _)| {
                         matches!(agg.fun().name(), "count" | "max")
-                            && *kind != AccumulatorType::Batch
+                            && (*kind != AccumulatorType::Batch || !native_append_only)
                             && !agg.is_distinct()
                             && agg.order_bys().is_none()
                     }),
@@ -3754,6 +3977,7 @@ impl IncrementalAggregatingConstructor {
             let event_column = args
                 .first()
                 .and_then(|arg| arg.as_any().downcast_ref::<Column>());
+            let metadata_suffix = usize::from(!emit_per_event);
             ensure!(
                 *kind == AccumulatorType::Batch
                     && agg.fun().inner().as_any().is::<Max>()
@@ -3776,8 +4000,9 @@ impl IncrementalAggregatingConstructor {
                     && !agg.is_distinct()
                     && !agg.ignore_nulls()
                     && final_schema.schema.fields().len()
-                        == key_fields.len() + aggregates.len() + 1
-                    && final_schema.timestamp_index + 1 == final_schema.schema.fields().len() - 1
+                        == key_fields.len() + aggregates.len() + metadata_suffix
+                    && final_schema.timestamp_index + 1 + metadata_suffix
+                        == final_schema.schema.fields().len()
                     && final_schema
                         .schema
                         .field(final_schema.timestamp_index)
@@ -4298,6 +4523,314 @@ mod tests {
             HashMap::new(),
         )
         .await
+    }
+
+    fn native_correction_config() -> (UpdatingAggregateOperator, Arc<Registry>) {
+        let (mut config, registry) = native_event_config();
+        let input: ArroyoSchema = config.input_schema.take().unwrap().try_into().unwrap();
+        let mut fields = SchemaBuilder::from(input.schema.as_ref().clone());
+        fields.push(Field::new(
+            UPDATING_META_FIELD,
+            DataType::Struct(updating_meta_fields()),
+            false,
+        ));
+        fields.push(Field::new(SOURCE_ENVELOPE_FIELD, DataType::UInt64, false));
+        config.input_schema = Some(
+            ArroyoSchema::new(
+                Arc::new(fields.finish()),
+                input.timestamp_index,
+                input.storage_keys().cloned(),
+                input.routing_keys().cloned(),
+            )
+            .into(),
+        );
+        (config, registry)
+    }
+
+    fn correction_batch(
+        groups: &[Option<&str>],
+        values: &[i64],
+        times: &[i64],
+        retracts: &[bool],
+        ids: &[[u8; 16]],
+        markers: &[u64],
+    ) -> RecordBatch {
+        let input = native_test_changelog_with_ids(&batch_at(groups, values, times), retracts, ids);
+        let mut fields = input.schema().fields().to_vec();
+        fields.push(Arc::new(Field::new(
+            SOURCE_ENVELOPE_FIELD,
+            DataType::UInt64,
+            false,
+        )));
+        let mut columns = input.columns().to_vec();
+        columns.push(Arc::new(UInt64Array::from(markers.to_vec())));
+        RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap()
+    }
+
+    async fn correction_inventory(store: &AggregateStore) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let scope = store.begin().await.unwrap();
+        let mut entries = Vec::new();
+        for prefix in [b"G", b"M", b"R"] {
+            let mut after: Option<Vec<u8>> = None;
+            while let Some(entry) = scope.first_from(prefix, after.as_deref()).await.unwrap() {
+                after = Some(entry.0.clone());
+                entries.push(entry);
+            }
+        }
+        entries
+    }
+
+    #[test]
+    fn per_event_correction_serialized_constructor_validates_injected_clock() {
+        let (config, registry) = native_correction_config();
+        let decoded = UpdatingAggregateOperator::decode(config.encode_to_vec().as_slice()).unwrap();
+        assert!(
+            IncrementalAggregatingConstructor::build_with_native_config(
+                decoded,
+                registry,
+                Some(native_test_config())
+            )
+            .is_ok()
+        );
+        let (mut config, registry) = native_correction_config();
+        let mut physical = PhysicalPlanNode::decode(config.aggregate_exec.as_slice()).unwrap();
+        let Some(PhysicalPlanType::Aggregate(aggregate)) = &mut physical.physical_plan_type else {
+            unreachable!()
+        };
+        aggregate.aggr_expr[2] = aggregate.aggr_expr[1].clone();
+        config.aggregate_exec = physical.encode_to_vec();
+        let decoded = UpdatingAggregateOperator::decode(config.encode_to_vec().as_slice()).unwrap();
+        let error = IncrementalAggregatingConstructor::build_with_native_config(
+            decoded,
+            registry,
+            Some(native_test_config()),
+        )
+        .err()
+        .expect("forged clock must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("timestamp does not match input clock ordinal"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn per_event_correction_validates_complete_local_marker_runs() {
+        let pair = correction_batch(
+            &[Some("a"); 2],
+            &[20, 5],
+            &[5, 5],
+            &[true, false],
+            &[[2; 16]; 2],
+            &[0, 0],
+        );
+        assert_eq!(
+            native_event_ranges(&pair, native_changelog_columns(&pair).unwrap().0, 3).unwrap(),
+            std::iter::once(0..2).collect::<Vec<_>>()
+        );
+        // Marker zero may be reused by the next complete callback.
+        assert_eq!(
+            native_event_ranges(&pair, native_changelog_columns(&pair).unwrap().0, 3).unwrap(),
+            std::iter::once(0..2).collect::<Vec<_>>()
+        );
+        for (markers, flags, times) in [
+            (vec![0, 0, 0], vec![true, false, false], vec![5, 5, 5]),
+            (vec![1, 0], vec![false, false], vec![5, 5]),
+            (vec![0, 0], vec![false, true], vec![5, 5]),
+            (vec![0, 0], vec![true, false], vec![20, 5]),
+            (vec![0, 1, 0], vec![false, false, false], vec![5, 5, 5]),
+        ] {
+            let len = markers.len();
+            let input = correction_batch(
+                &vec![Some("a"); len],
+                &vec![5; len],
+                &times,
+                &flags,
+                &vec![[2; 16]; len],
+                &markers,
+            );
+            assert!(
+                native_event_ranges(&input, native_changelog_columns(&input).unwrap().0, 3)
+                    .is_err()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn per_event_correction_is_atomic_and_removes_absent_group_state() {
+        let (config, registry) = native_correction_config();
+        let mut context = native_event_context(&config).await;
+        let mut operator = IncrementalAggregatingConstructor::build_with_native_config(
+            config,
+            registry,
+            Some(native_test_config()),
+        )
+        .unwrap();
+        operator.native_store = Some(native_test_store());
+        operator
+            .process_batch(
+                correction_batch(&[Some("z")], &[99], &[99], &[false], &[[9; 16]], &[0]),
+                &mut context,
+                &mut AggregateCollector::default(),
+            )
+            .await
+            .unwrap();
+        let unrelated = correction_inventory(operator.native_store.as_ref().unwrap()).await;
+        assert!(!unrelated.is_empty());
+        let mut collector = AggregateCollector::default();
+        for input in [
+            correction_batch(
+                &[Some("a"); 2],
+                &[10, 20],
+                &[10, 20],
+                &[false, false],
+                &[[1; 16], [2; 16]],
+                &[0, 1],
+            ),
+            correction_batch(
+                &[Some("a"); 2],
+                &[20, 5],
+                &[5, 5],
+                &[true, false],
+                &[[2; 16]; 2],
+                &[0, 0],
+            ),
+            correction_batch(&[Some("a")], &[10], &[10], &[true], &[[1; 16]], &[0]),
+            correction_batch(&[Some("a")], &[5], &[5], &[true], &[[2; 16]], &[0]),
+        ] {
+            operator
+                .process_batch(input, &mut context, &mut collector)
+                .await
+                .unwrap();
+        }
+        let actual = collector
+            .batches
+            .iter()
+            .map(|batch| {
+                (0..4)
+                    .map(|column| ScalarValue::try_from_array(batch.column(column), 0).unwrap())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            actual,
+            vec![
+                vec![
+                    ScalarValue::Utf8(Some("a".into())),
+                    ScalarValue::Int64(Some(1)),
+                    ScalarValue::Utf8(Some("a".into())),
+                    ScalarValue::TimestampNanosecond(Some(10), None)
+                ],
+                vec![
+                    ScalarValue::Utf8(Some("a".into())),
+                    ScalarValue::Int64(Some(2)),
+                    ScalarValue::Utf8(Some("a".into())),
+                    ScalarValue::TimestampNanosecond(Some(20), None)
+                ],
+                vec![
+                    ScalarValue::Utf8(Some("a".into())),
+                    ScalarValue::Int64(Some(2)),
+                    ScalarValue::Utf8(Some("a".into())),
+                    ScalarValue::TimestampNanosecond(Some(5), None)
+                ],
+                vec![
+                    ScalarValue::Utf8(Some("a".into())),
+                    ScalarValue::Int64(Some(1)),
+                    ScalarValue::Utf8(Some("a".into())),
+                    ScalarValue::TimestampNanosecond(Some(10), None)
+                ],
+            ]
+        );
+        assert_eq!(
+            correction_inventory(operator.native_store.as_ref().unwrap()).await,
+            unrelated,
+            "cleanup must remove only the absent group and every one of its members"
+        );
+        let scope = operator
+            .native_store
+            .as_ref()
+            .unwrap()
+            .begin()
+            .await
+            .unwrap();
+        for prefix in [b"D", b"C"] {
+            assert!(
+                scope.first(prefix).await.unwrap().is_none(),
+                "empty group leaked namespace {prefix:?}"
+            );
+        }
+        drop(scope);
+        operator
+            .process_batch(
+                correction_batch(&[Some("a")], &[7], &[7], &[false], &[[2; 16]], &[0]),
+                &mut context,
+                &mut collector,
+            )
+            .await
+            .unwrap();
+        assert_eq!(collector.batches.len(), 5);
+        assert_eq!(
+            ScalarValue::try_from_array(collector.batches[4].column(1), 0).unwrap(),
+            ScalarValue::Int64(Some(1))
+        );
+    }
+
+    #[tokio::test]
+    async fn per_event_correction_refuses_two_key_output_without_partial_commit() {
+        let (config, registry) = native_correction_config();
+        let mut context = native_event_context(&config).await;
+        let mut limits = native_test_config();
+        limits.max_pending_output_rows = 1;
+        let mut operator = IncrementalAggregatingConstructor::build_with_native_config(
+            config,
+            registry,
+            Some(limits),
+        )
+        .unwrap();
+        operator.native_store = Some(native_test_store());
+        let mut collector = AggregateCollector::default();
+        operator
+            .process_batch(
+                correction_batch(
+                    &[Some("a"), Some("a"), Some("b")],
+                    &[10, 20, 30],
+                    &[10, 20, 30],
+                    &[false, false, false],
+                    &[[1; 16], [2; 16], [3; 16]],
+                    &[0, 1, 2],
+                ),
+                &mut context,
+                &mut collector,
+            )
+            .await
+            .unwrap();
+        let before = correction_inventory(operator.native_store.as_ref().unwrap()).await;
+        let error = operator
+            .process_batch(
+                correction_batch(
+                    &[Some("a"), Some("b")],
+                    &[20, 5],
+                    &[5, 5],
+                    &[true, false],
+                    &[[2; 16]; 2],
+                    &[0, 0],
+                ),
+                &mut context,
+                &mut collector,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("pending-output row budget"),
+            "{error}"
+        );
+        assert_eq!(collector.batches.len(), 3);
+        assert_eq!(
+            correction_inventory(operator.native_store.as_ref().unwrap()).await,
+            before,
+            "refused operation must not change either group's G/M/R entries"
+        );
     }
 
     #[tokio::test]

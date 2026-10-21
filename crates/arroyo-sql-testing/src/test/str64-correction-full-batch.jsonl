@@ -1,0 +1,10 @@
+{"before": null, "after": {"row_id": 1, "k": "a", "value": 10, "active": true, "event_time": "1970-01-01T00:00:10Z"}, "op": "c"}
+{"before": null, "after": {"row_id": 2, "k": "a", "value": 20, "active": true, "event_time": "1970-01-01T00:00:20Z"}, "op": "c"}
+{"before": {"row_id": 2, "k": "a", "value": 20, "active": true, "event_time": "1970-01-01T00:00:20Z"}, "after": {"row_id": 2, "k": "a", "value": 5, "active": true, "event_time": "1970-01-01T00:00:05Z"}, "op": "u"}
+{"before": null, "after": {"row_id": 10, "k": "f0", "value": 31, "active": true, "event_time": "1970-01-01T00:00:31Z"}, "op": "c"}
+{"before": null, "after": {"row_id": 11, "k": "f1", "value": 32, "active": true, "event_time": "1970-01-01T00:00:32Z"}, "op": "c"}
+{"before": null, "after": {"row_id": 12, "k": "f2", "value": 33, "active": true, "event_time": "1970-01-01T00:00:33Z"}, "op": "c"}
+{"before": null, "after": {"row_id": 13, "k": "f3", "value": 34, "active": true, "event_time": "1970-01-01T00:00:34Z"}, "op": "c"}
+{"before": null, "after": {"row_id": 14, "k": "f4", "value": 35, "active": true, "event_time": "1970-01-01T00:00:35Z"}, "op": "c"}
+{"before": null, "after": {"row_id": 15, "k": "f5", "value": 36, "active": true, "event_time": "1970-01-01T00:00:36Z"}, "op": "c"}
+{"before": null, "after": {"row_id": 16, "k": "f6", "value": 37, "active": true, "event_time": "1970-01-01T00:00:37Z"}, "op": "c"}

@@ -4,16 +4,18 @@ set -euo pipefail
 
 usage() {
     cat <<'EOF'
-Usage: scripts/preflight-clippy.sh [-p <crate>]... [--help]
+Usage: scripts/preflight-clippy.sh [-p <crate>]... [--manifest-path <path>] [--help]
 
 Run Clippy with the CI flags and --locked. Defaults to the whole workspace;
-repeat -p <crate> to check selected packages instead.
+repeat -p <crate> to check selected packages instead. --manifest-path selects
+a manifest visible inside the development container.
 
 Exit codes: 0 success, 1 Clippy/build failure, 2 usage error, 3 missing runner.
 EOF
 }
 
 packages=()
+manifest=()
 while (( $# )); do
     case "$1" in
         -p)
@@ -23,6 +25,15 @@ while (( $# )); do
                 exit 2
             fi
             packages+=(-p "$2")
+            shift 2
+            ;;
+        --manifest-path)
+            if (( $# < 2 )) || [[ -z "$2" || "$2" == -* ]] || (( ${#manifest[@]} )); then
+                echo 'Error: --manifest-path requires one manifest path.' >&2
+                usage >&2
+                exit 2
+            fi
+            manifest=(--manifest-path "$2")
             shift 2
             ;;
         --help)
@@ -49,7 +60,7 @@ if (( ${#packages[@]} )); then
     scope=("${packages[@]}")
 fi
 cd -- "$repo_dir"
-if "$runner" clippy --locked --no-deps --all-features --all-targets "${scope[@]}" -- -D warnings; then
+if "$runner" clippy --locked --no-deps --all-features --all-targets "${manifest[@]}" "${scope[@]}" -- -D warnings; then
     exit 0
 else
     exit 1
