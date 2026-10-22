@@ -3441,7 +3441,6 @@ dependencies = [
 [[package]]
 name = "datafusion-functions-nested"
 version = "48.0.1"
-source = "git+https://github.com/ArroyoSystems/arrow-datafusion?branch=48.0.1%2Farroyo#916b45f5c28d94765ae4a6393c5e126b2ea55e1c"
 dependencies = [
  "arrow",
  "arrow-ord",
@@ -3456,6 +3455,7 @@ dependencies = [
  "itertools 0.14.0",
  "log",
  "paste",
+ "rand 0.9.1",
 ]
 
 [[package]]
