@@ -388,6 +388,7 @@ impl SessionAggregatingWindowFunc {
 struct SessionWindowConfig {
     gap: Duration,
     input_schema_ref: ArroyoSchemaRef,
+    output_schema_ref: ArroyoSchemaRef,
     window_field: FieldRef,
     window_index: usize,
     // TODO: perform partial aggregations and checkpoint those.
@@ -735,6 +736,25 @@ impl OperatorConstructor for SessionAggregatingWindowConstructor {
             .input_schema
             .ok_or_else(|| anyhow!("missing input schema"))?
             .try_into()?;
+        arroyo_planner::physical::validate_session_result_plan(
+            final_execution_plan.as_ref(),
+            &input_schema.schema,
+        )?;
+        let output_schema: ArroyoSchema = config
+            .output_schema
+            .ok_or_else(|| anyhow!("SESSION output descriptor missing"))?
+            .try_into()?;
+        let expected = arroyo_rpc::df::session_output_schema(
+            &input_schema,
+            final_execution_plan.schema().as_ref(),
+            window_field.name(),
+            usize::try_from(config.window_index)?,
+            &output_schema,
+        )?;
+        anyhow::ensure!(
+            output_schema == expected,
+            "SESSION output descriptor differs from physical layout"
+        );
         let row_converter = if input_schema.routing_keys().is_none() {
             let array = Arc::new(BooleanArray::from(vec![false]));
             Converter::Empty(
@@ -759,6 +779,7 @@ impl OperatorConstructor for SessionAggregatingWindowConstructor {
             window_field,
             window_index: config.window_index as usize,
             input_schema_ref: Arc::new(input_schema),
+            output_schema_ref: Arc::new(output_schema),
             final_physical_exec: final_execution_plan,
             receiver,
         };
@@ -805,6 +826,12 @@ impl ArrowOperator for SessionAggregatingWindowFunc {
     }
 
     async fn on_start(&mut self, ctx: &mut OperatorContext) -> DataflowResult<()> {
+        if ctx.in_schemas.len() != 1
+            || ctx.in_schemas[0] != self.config.input_schema_ref
+            || ctx.out_schema.as_ref() != Some(&self.config.output_schema_ref)
+        {
+            return Err(anyhow!("SESSION context schemas differ from validated descriptor").into());
+        }
         if let Some(native) = self.native.as_mut() {
             native.on_start(ctx).await?;
             return Ok(());

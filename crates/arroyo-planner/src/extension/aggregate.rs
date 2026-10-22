@@ -199,6 +199,25 @@ impl AggregateExtension {
             unkeyed_aggregate_schema.clone(),
         )?;
         let aggregate_plan = planner.sync_plan(&LogicalPlan::Aggregate(unkeyed_aggregate))?;
+        let physical_input: arroyo_rpc::df::ArroyoSchema = ArroyoSchema::from_schema_keys(
+            Arc::new(input_schema.as_ref().into()),
+            self.key_fields.clone(),
+        )?;
+        crate::physical::validate_session_result_plan(
+            aggregate_plan.as_ref(),
+            &physical_input.schema,
+        )?;
+        let expected = arroyo_rpc::df::session_output_schema(
+            &physical_input,
+            aggregate_plan.schema().as_ref(),
+            window_field.name(),
+            *window_index,
+            &self.output_schema(),
+        )
+        .map_err(|error| datafusion::common::plan_datafusion_err!("{error}"))?;
+        if self.output_schema() != expected {
+            return plan_err!("SESSION declared output differs from native physical layout");
+        }
 
         let physical_plan_node = PhysicalPlanNode::try_from_physical_plan(
             aggregate_plan,
@@ -218,6 +237,7 @@ impl AggregateExtension {
             unkeyed_aggregate_schema: None,
             partial_aggregation_plan: vec![],
             final_aggregation_plan: physical_plan_node.encode_to_vec(),
+            output_schema: Some(self.output_schema().into()),
         };
 
         Ok(LogicalNode::single(

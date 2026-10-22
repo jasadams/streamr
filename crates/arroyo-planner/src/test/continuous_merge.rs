@@ -1506,3 +1506,164 @@ async fn maintained_merge_direct_array_retains_native_collection_result_and_publ
         arrow_schema::DataType::List(_)
     ));
 }
+
+fn finalized_session_merge() -> String {
+    "CREATE TABLE events(t TEXT NOT NULL,k TEXT NOT NULL,event_time TIMESTAMP NOT NULL,
+       WATERMARK FOR event_time AS event_time-INTERVAL '5 seconds')
+       WITH(connector='single_file',path='/tmp/str64-session-plan.jsonl',format='json',type='source');
+     CREATE VIEW computed AS SELECT t,k,SESSION(INTERVAL '30 minutes') AS window,COUNT(*) AS n
+       FROM events GROUP BY t,k,window;
+     CREATE STATE TABLE snapshots(t TEXT,k TEXT,n BIGINT,PRIMARY KEY(t,k)) PARTITION BY t;
+     CREATE VIEW applied AS MERGE INTO snapshots AS previous USING computed AS incoming
+       ON previous.t=incoming.t AND previous.k=incoming.k
+       WHEN MATCHED THEN UPDATE SET n=incoming.n
+       WHEN NOT MATCHED THEN INSERT(t,k,n) VALUES(incoming.t,incoming.k,incoming.n)
+       RETURNING source AS source,old AS old,new AS new,action AS action;
+     SELECT source.t,source.k,old.n AS previous_n,new.n AS n,action,
+       applied._timestamp AS finalized_at FROM applied;".into()
+}
+// Record the ordinary native producer before proving its MERGE consumer. This
+// keeps its actual admission/key/physical lowering visible when a proof fails.
+async fn record_ordinary_session_plan(sql: &str) {
+    use petgraph::visit::EdgeRef;
+    let declarations = sql.split("CREATE STATE TABLE snapshots").next().unwrap();
+    let ordinary = plan(&format!("{declarations} SELECT * FROM computed;")).await;
+    let nodes = ordinary.program.graph.node_indices().map(|index| {
+        let node = &ordinary.program.graph[index];
+        let operators = node.operator_chain.iter().map(|(operator, output)| {
+            let config = match operator.operator_name {
+                OperatorName::ExpressionWatermark => format!("{:#?}",
+                    arroyo_rpc::grpc::api::ExpressionWatermarkConfig::decode(operator.operator_config.as_slice()).unwrap()),
+                OperatorName::SessionWindowAggregate => format!("{:#?}",
+                    arroyo_rpc::grpc::api::SessionWindowAggregateOperator::decode(operator.operator_config.as_slice()).unwrap()),
+                OperatorName::ArrowValue => format!("{:#?}",
+                    arroyo_rpc::grpc::api::ValuePlanOperator::decode(operator.operator_config.as_slice()).unwrap()),
+                OperatorName::ArrowKey => format!("{:#?}",
+                    arroyo_rpc::grpc::api::KeyPlanOperator::decode(operator.operator_config.as_slice()).unwrap()),
+                _ => String::new(),
+            };
+            let physical = match operator.operator_name {
+                OperatorName::ArrowValue => Some(arroyo_rpc::grpc::api::ValuePlanOperator::decode(operator.operator_config.as_slice()).unwrap().physical_plan),
+                OperatorName::ArrowKey => Some(arroyo_rpc::grpc::api::KeyPlanOperator::decode(operator.operator_config.as_slice()).unwrap().physical_plan),
+                OperatorName::SessionWindowAggregate => Some(arroyo_rpc::grpc::api::SessionWindowAggregateOperator::decode(operator.operator_config.as_slice()).unwrap().final_aggregation_plan),
+                _ => None,
+            }.map(|bytes| format!("{:#?}", datafusion_proto::protobuf::PhysicalPlanNode::decode(bytes.as_slice()).unwrap()));
+            serde_json::json!({"id":operator.operator_id,"kind":format!("{:?}",operator.operator_name),
+                "config":config,"serialized_config":operator.operator_config,"physical_plan":physical,
+                "output":format!("{output:#?}")})
+        }).collect::<Vec<_>>();
+        serde_json::json!({"index":index.index(),"node_id":node.node_id,
+            "parallelism":node.parallelism,"operators":operators})
+    }).collect::<Vec<_>>();
+    let edges = ordinary
+        .program
+        .graph
+        .edge_references()
+        .map(|edge| {
+            serde_json::json!({
+                "source":edge.source().index(),"target":edge.target().index(),
+                "edge":format!("{:#?}", edge.weight())
+            })
+        })
+        .collect::<Vec<_>>();
+    let evidence = serde_json::json!({"sql":format!("{declarations} SELECT * FROM computed;"),"nodes":nodes,"edges":edges});
+    eprintln!(
+        "SESSION_ORDINARY_PLAN {}",
+        serde_json::to_string(&evidence).unwrap()
+    );
+    if let Ok(path) = std::env::var("STREAMR_TEST_SESSION_PLAN_EVIDENCE") {
+        let suffix = if sql.contains("GENERATED ALWAYS") {
+            "generated"
+        } else {
+            "declared"
+        };
+        std::fs::write(
+            format!("{path}-{suffix}.json"),
+            serde_json::to_vec_pretty(&evidence).unwrap(),
+        )
+        .unwrap();
+    }
+}
+
+#[test(tokio::test)]
+async fn finalized_session_merge_keeps_native_append_producer_and_shared_result_cut() {
+    let sql = finalized_session_merge();
+    record_ordinary_session_plan(&sql).await;
+    let compiled = plan(&sql).await;
+    let operators = compiled
+        .program
+        .graph
+        .node_weights()
+        .flat_map(|node| node.operator_chain.iter())
+        .map(|(operator, _)| operator)
+        .collect::<Vec<_>>();
+    for (kind, count) in [
+        (OperatorName::ConnectorSource, 1),
+        (OperatorName::SessionWindowAggregate, 1),
+        (OperatorName::FusedStateTable, 1),
+        (OperatorName::UpdatingAggregate, 0),
+    ] {
+        assert_eq!(
+            operators
+                .iter()
+                .filter(|operator| operator.operator_name == kind)
+                .count(),
+            count
+        );
+    }
+    let native = operators
+        .iter()
+        .find(|op| op.operator_name == OperatorName::SessionWindowAggregate)
+        .unwrap();
+    let native = arroyo_rpc::grpc::api::SessionWindowAggregateOperator::decode(
+        native.operator_config.as_slice(),
+    )
+    .unwrap();
+    let output: arroyo_rpc::df::ArroyoSchema = native.output_schema.unwrap().try_into().unwrap();
+    assert_eq!(output.schema.field(0).name(), "t");
+    assert_eq!(output.schema.field(1).name(), "k");
+    assert_eq!(output.timestamp_index, output.schema.fields().len() - 1);
+    assert_eq!(
+        output.schema.field(output.timestamp_index).data_type(),
+        &arrow_schema::DataType::Timestamp(arrow_schema::TimeUnit::Nanosecond, None)
+    );
+    assert!(
+        output
+            .schema
+            .index_of(arroyo_rpc::UPDATING_META_FIELD)
+            .is_err()
+    );
+    assert_eq!(state_operators(&compiled).len(), 1);
+}
+#[test(tokio::test)]
+async fn finalized_session_merge_rejects_replaced_result_clock_and_prior_state_access() {
+    let sql = finalized_session_merge();
+    let replaced=sql.replace("USING computed AS incoming", "USING replaced AS incoming")
+        .replace("CREATE STATE TABLE snapshots", "CREATE VIEW replaced AS SELECT t,k,n,TIMESTAMP '2000-01-01 00:00:00' AS _timestamp FROM computed; CREATE STATE TABLE snapshots");
+    reject(&replaced, "preserve the native producer clock").await;
+    let prior=sql.replace("CREATE VIEW computed AS", "CREATE STATE TABLE retained(t TEXT,k TEXT,n BIGINT,PRIMARY KEY(t,k)) PARTITION BY t; CREATE VIEW looked AS SELECT events.* FROM events LEFT JOIN retained ON events.t=retained.t AND events.k=retained.k; CREATE VIEW computed AS")
+        .replace("FROM events GROUP BY", "FROM looked GROUP BY");
+    reject(&prior, "finalized").await;
+}
+
+#[test(tokio::test)]
+async fn finalized_session_merge_preserves_exact_canonical_generated_source_clock() {
+    let sql = finalized_session_merge().replace(
+        "event_time TIMESTAMP NOT NULL,\n       WATERMARK FOR event_time AS event_time-INTERVAL '5 seconds'",
+        "event_time TEXT NOT NULL,event_ts TIMESTAMP GENERATED ALWAYS AS (CAST(event_time AS TIMESTAMP)) STORED,\n       WATERMARK FOR event_ts AS CAST(event_time AS TIMESTAMP)-INTERVAL '5 seconds'",
+    );
+    assert!(sql.contains("GENERATED ALWAYS"));
+    record_ordinary_session_plan(&sql).await;
+    let compiled = plan(&sql).await;
+    assert_eq!(
+        compiled
+            .program
+            .graph
+            .node_weights()
+            .flat_map(|node| node.operator_chain.iter())
+            .filter(|(operator, _)| operator.operator_name == OperatorName::SessionWindowAggregate)
+            .count(),
+        1
+    );
+    assert_eq!(state_operators(&compiled).len(), 1);
+}

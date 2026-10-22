@@ -333,8 +333,12 @@ async fn native_program_for_sql(sql: &str) -> Result<(Program, Vec<TaskAssignmen
                 OperatorName::ArrowValue => {
                     let mut cfg =
                         api::ValuePlanOperator::decode(operator.operator_config.as_slice())?;
-                    if let Some(boundary) = &mut cfg.accepted_result {
-                        boundary.root_operator += 1000;
+                    if let Some(boundary) = &mut cfg.accepted_result
+                        && let Some(api::accepted_result_boundary::Producer::ResponseRootOperator(
+                            root,
+                        )) = &mut boundary.producer
+                    {
+                        *root += 1000;
                     }
                     operator.operator_config = cfg.encode_to_vec();
                 }

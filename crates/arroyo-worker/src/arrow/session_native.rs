@@ -250,6 +250,7 @@ fn validate_aggregates(
 pub(crate) struct NativeSession {
     gap: i64,
     input_schema: Arc<ArroyoSchema>,
+    output_schema: Arc<ArroyoSchema>,
     window_field: FieldRef,
     window_index: usize,
     finish: Arc<dyn ExecutionPlan>,
@@ -299,7 +300,28 @@ impl NativeSession {
         let reader_schema =
             retained_input_schema(&finish).context("native SESSION retained reader missing")?;
         let finish = normalize_collection_plan(finish, &reader_schema)?;
+        arroyo_planner::physical::validate_session_result_plan(
+            finish.as_ref(),
+            &input_schema.schema,
+        )?;
         validate_aggregates(finish.as_ref(), &reader_schema)?;
+        let output_schema: ArroyoSchema = config
+            .output_schema
+            .clone()
+            .context("native SESSION output descriptor missing")?
+            .try_into()?;
+        let expected = arroyo_rpc::df::session_output_schema(
+            &input_schema,
+            finish.schema().as_ref(),
+            &config.window_field_name,
+            usize::try_from(config.window_index)?,
+            &output_schema,
+        )?;
+        ensure!(
+            output_schema == expected,
+            "native SESSION output descriptor differs from physical layout"
+        );
+
         let mut incremental = None;
         if let Some(resources) = configured_worker_resources()? {
             // Construction-only admission: classification/template creation may
@@ -346,6 +368,7 @@ impl NativeSession {
         Ok(Self {
             gap,
             input_schema: Arc::new(input_schema),
+            output_schema: Arc::new(output_schema),
             window_field: Arc::new(Field::new(
                 &config.window_field_name,
                 window_arrow_struct(),
@@ -381,6 +404,12 @@ impl NativeSession {
     }
 
     pub async fn on_start(&mut self, ctx: &mut OperatorContext) -> Result<()> {
+        ensure!(
+            ctx.in_schemas.len() == 1
+                && ctx.in_schemas[0] == self.input_schema
+                && ctx.out_schema.as_ref() == Some(&self.output_schema),
+            "native SESSION context schemas differ from validated descriptor"
+        );
         ensure!(
             ctx.task_info.parallelism == 1 && ctx.task_info.task_index == 0,
             "native SESSION requires one serial owner for its keyed state"
@@ -1520,6 +1549,9 @@ mod tests {
         let mut operator = NativeSession {
             gap: 10,
             input_schema: input_schema.clone(),
+            output_schema: Arc::new(
+                ArroyoSchema::from_schema_unkeyed(output_schema.clone()).unwrap(),
+            ),
             window_field: window,
             window_index: 0,
             finish,
@@ -1817,6 +1849,9 @@ mod tests {
             let mut operator = NativeSession {
                 gap: 10,
                 input_schema: input_schema.clone(),
+                output_schema: Arc::new(
+                    ArroyoSchema::from_schema_unkeyed(output_schema.clone()).unwrap(),
+                ),
                 window_field: window,
                 window_index: 0,
                 finish,
@@ -2206,32 +2241,11 @@ mod tests {
                     .collect(),
             )
             .unwrap();
-            let mut fields = input
-                .schema
-                .fields()
-                .iter()
-                .take(count)
-                .map(|f| f.as_ref().clone())
-                .collect::<Vec<_>>();
-            fields.insert(
-                operator.window_index,
-                operator.window_field.as_ref().clone(),
-            );
-            fields.extend(
-                operator
-                    .finish
-                    .schema()
-                    .fields()
-                    .iter()
-                    .map(|f| f.as_ref().clone()),
-            );
-            fields.push(Field::new(
-                arroyo_rpc::TIMESTAMP_FIELD,
-                DataType::Timestamp(arrow_schema::TimeUnit::Nanosecond, None),
-                false,
-            ));
-            let output =
-                Arc::new(ArroyoSchema::from_schema_unkeyed(Arc::new(Schema::new(fields))).unwrap());
+            // Use the actual serialized public descriptor, including key
+            // aliases and Arroyo key metadata, just as Engine construction does.
+            let output = operator.output_schema.clone();
+            let declared: ArroyoSchema = config.output_schema.clone().unwrap().try_into().unwrap();
+            assert_eq!(output.as_ref(), &declared);
             let (control_tx, _control_rx) = channel(32);
             let mut ctx = OperatorContext::new(
                 Arc::new(arroyo_types::get_test_task_info()),
@@ -2532,5 +2546,105 @@ mod tests {
             restored_backend.close().await.unwrap();
             closing_backend.close().await.unwrap();
         }
+    }
+    #[tokio::test]
+    async fn session_finalized_serialized_descriptor_and_context_are_required() {
+        let sql = "CREATE TABLE events(k TEXT NOT NULL,event_time TIMESTAMP NOT NULL,
+          WATERMARK FOR event_time AS event_time-INTERVAL '5 seconds')
+          WITH(connector='single_file',path='/tmp/session-descriptor.jsonl',format='json',type='source');
+          SELECT k,SESSION(INTERVAL '30 minutes') AS window,COUNT(*) AS n FROM events GROUP BY k,window";
+        let compiled = arroyo_planner::parse_and_get_program(
+            sql,
+            arroyo_planner::ArroyoSchemaProvider::new(),
+            arroyo_planner::SqlConfig {
+                default_parallelism: 1,
+            },
+        )
+        .await
+        .unwrap();
+        let operator = compiled
+            .program
+            .graph
+            .node_weights()
+            .flat_map(|node| node.operator_chain.iter())
+            .map(|(operator, _)| operator)
+            .find(|operator| {
+                operator.operator_name
+                    == arroyo_datastream::logical::OperatorName::SessionWindowAggregate
+            })
+            .unwrap();
+        let valid =
+            api::SessionWindowAggregateOperator::decode(operator.operator_config.as_slice())
+                .unwrap();
+        let limits = WindowStateConfig {
+            key_bytes: 512,
+            partial_bytes: 32768,
+            page_bytes: 131072,
+            page_entries: 1,
+            write_bytes: 524288,
+            write_operations: 64,
+            max_resident_bytes: 8 * 1024 * 1024,
+        };
+        let registry = Arc::new(arroyo_planner::physical::new_registry());
+        let mut owner = NativeSession::new(&valid, registry.clone(), limits).unwrap();
+        assert_eq!(owner.output_schema.schema.field(0).name(), "k");
+        for corruption in ["missing", "clock", "window", "key"] {
+            let mut invalid = valid.clone();
+            match corruption {
+                "missing" => invalid.output_schema = None,
+                "clock" => invalid.output_schema.as_mut().unwrap().timestamp_index = u32::MAX,
+                "window" => invalid.window_index = u64::MAX,
+                "key" => {
+                    let old: ArroyoSchema =
+                        invalid.output_schema.take().unwrap().try_into().unwrap();
+                    let mut fields = old.schema.fields().to_vec();
+                    fields[0] = Arc::new(Field::new("k", DataType::Int64, false));
+                    invalid.output_schema = Some(
+                        ArroyoSchema::new(
+                            Arc::new(Schema::new(fields)),
+                            old.timestamp_index,
+                            old.storage_keys().cloned(),
+                            old.routing_keys().cloned(),
+                        )
+                        .into(),
+                    );
+                }
+                _ => unreachable!(),
+            }
+            let invalid =
+                api::SessionWindowAggregateOperator::decode(invalid.encode_to_vec().as_slice())
+                    .unwrap();
+            assert!(
+                NativeSession::new(&invalid, registry.clone(), limits).is_err(),
+                "{corruption}"
+            );
+            use arroyo_operator::operator::OperatorConstructor;
+            assert!(
+                super::super::session_aggregating_window::SessionAggregatingWindowConstructor
+                    .with_config(invalid, registry.clone())
+                    .is_err(),
+                "outer {corruption}"
+            );
+        }
+        let (control, _rx) = tokio::sync::mpsc::channel(16);
+        let mut context = OperatorContext::new(
+            Arc::new(arroyo_types::get_test_task_info()),
+            None,
+            control,
+            1,
+            vec![owner.input_schema.clone()],
+            None,
+            HashMap::new(),
+        )
+        .await;
+        let error = owner.on_start(&mut context).await.unwrap_err();
+        assert!(
+            error.to_string().contains("context schemas differ"),
+            "{error}"
+        );
+        assert!(
+            owner.store.is_none(),
+            "forged context must fail before backend construction"
+        );
     }
 }

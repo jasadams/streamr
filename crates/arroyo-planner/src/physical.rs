@@ -59,6 +59,72 @@ use std::fmt::Debug;
 use tokio::sync::mpsc::{Receiver, UnboundedReceiver};
 use tokio_stream::wrappers::{ReceiverStream, UnboundedReceiverStream};
 
+/// Prove a native SESSION final aggregate reads only its registered input.
+/// Used with planning and the native bounded/unbounded execution codecs.
+pub fn validate_session_result_plan(plan: &dyn ExecutionPlan, input: &SchemaRef) -> Result<()> {
+    fn visit(
+        plan: &dyn ExecutionPlan,
+        input: &SchemaRef,
+        readers: &mut usize,
+        selector: bool,
+    ) -> Result<()> {
+        if plan.as_any().is::<ArroyoMemExec>()
+            || plan.as_any().is::<BoundedRecordBatchReader>()
+            || plan.as_any().is::<UnboundedRecordBatchReader>()
+        {
+            let mut expected = input.clone();
+            if selector && plan.schema().fields().len() == input.fields().len() + 1 {
+                // Existing grouped selectors consume the native retained write
+                // ordinal, appended by SESSION while replaying a retained row.
+                let mut fields = input.fields().to_vec();
+                fields.push(Arc::new(arrow_schema::Field::new(
+                    crate::grouped_selector::ORDINAL_FIELD,
+                    DataType::UInt64,
+                    false,
+                )));
+                expected = Arc::new(Schema::new_with_metadata(fields, input.metadata().clone()));
+            }
+            if !plan.children().is_empty() || plan.schema() != expected {
+                return plan_err!("SESSION final reader differs from registered input");
+            }
+            *readers += 1;
+            return Ok(());
+        }
+        let Some(aggregate) = plan
+            .as_any()
+            .downcast_ref::<datafusion::physical_plan::aggregates::AggregateExec>()
+        else {
+            return plan_err!("SESSION final plan contains non-aggregate work");
+        };
+        if !aggregate.group_expr().expr().is_empty() || plan.children().len() != 1 {
+            return plan_err!("SESSION final aggregate must be unkeyed with one input");
+        }
+        visit(plan.children()[0].as_ref(), input, readers, selector)
+    }
+    fn selector(plan: &dyn ExecutionPlan) -> bool {
+        plan.as_any()
+            .downcast_ref::<datafusion::physical_plan::aggregates::AggregateExec>()
+            .is_some_and(|aggregate| {
+                aggregate.aggr_expr().iter().any(|expression| {
+                    crate::grouped_selector_udaf::classify(expression.fun()).is_some()
+                })
+            })
+            || plan.children().iter().any(|child| selector(child.as_ref()))
+    }
+    let mut readers = 0;
+    if !plan
+        .as_any()
+        .is::<datafusion::physical_plan::aggregates::AggregateExec>()
+    {
+        return plan_err!("SESSION final plan must be a native aggregate");
+    }
+    visit(plan, input, &mut readers, selector(plan))?;
+    if readers != 1 {
+        return plan_err!("SESSION final plan must read one registered source");
+    }
+    Ok(())
+}
+
 /// Prove one complete source batch survives this private CDC segment. No
 /// repartitioner/coalescer/expander may participate, even behind scalar labels.
 pub(crate) fn validate_complete_source_batch(plan: &dyn ExecutionPlan) -> Result<()> {

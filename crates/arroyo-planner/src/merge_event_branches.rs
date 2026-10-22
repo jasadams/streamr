@@ -760,7 +760,10 @@ fn validate_graph_configs(graph: &arroyo_datastream::logical::LogicalGraph) -> R
                     }
                     config
                         .accepted_result
-                        .map(|boundary| boundary.root_operator)
+                        .and_then(|boundary| match boundary.producer {
+                            Some(arroyo_rpc::grpc::api::accepted_result_boundary::Producer::ResponseRootOperator(root)) => Some(root),
+                            _ => None,
+                        })
                 }
                 _ => None,
             };

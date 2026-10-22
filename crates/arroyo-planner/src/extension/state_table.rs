@@ -140,10 +140,7 @@ impl StateTableAccess {
                     .downcast_ref::<super::remote_table::RemoteTableExtension>()
                     && let Some(route) = remote.accepted_result
                 {
-                    source_names.push(
-                        crate::merge_event_results::accepted_source(&remote.input, route.slot)?
-                            .to_string(),
-                    );
+                    source_names.push(route.source(&remote.input)?.to_string());
                     return Ok(TreeNodeRecursion::Jump);
                 }
                 if let Some(join) = e.node.as_any().downcast_ref::<super::join::JoinExtension>()

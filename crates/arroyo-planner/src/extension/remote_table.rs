@@ -30,7 +30,7 @@ pub(crate) struct RemoteTableExtension {
     pub(crate) name: TableReference,
     pub(crate) schema: DFSchemaRef,
     pub(crate) materialize: bool,
-    pub(crate) accepted_result: Option<crate::merge_event_branches::ResponseRoute>,
+    pub(crate) accepted_result: Option<crate::merge_event_results::AcceptedResultRoute>,
     pub(crate) union_schema: bool,
 }
 
@@ -45,11 +45,18 @@ multifield_partial_ord!(
 
 impl ArroyoExtension for RemoteTableExtension {
     fn response_root_slot(&self) -> Option<u32> {
-        self.accepted_result.map(|route| route.slot)
+        match self.accepted_result {
+            Some(crate::merge_event_results::AcceptedResultRoute::Response(route)) => {
+                Some(route.slot)
+            }
+            _ => None,
+        }
     }
     fn bind_response_root(&self, operator: u32) -> Result<Option<Box<dyn ArroyoExtension>>> {
         let mut next = self.clone();
-        if let Some(route) = &mut next.accepted_result {
+        if let Some(crate::merge_event_results::AcceptedResultRoute::Response(route)) =
+            &mut next.accepted_result
+        {
             route.operator = Some(operator);
         }
         Ok(Some(Box::new(next)))
@@ -144,16 +151,18 @@ impl ArroyoExtension for RemoteTableExtension {
         let accepted_result = self
             .accepted_result
             .map(|route| {
-                crate::merge_event_results::accepted_source(&self.input, route.slot)?;
+                route.source(&self.input)?;
                 if input_schemas.len() != 1 {
                     return plan_err!("accepted native SELECT requires one result input");
                 }
                 Ok(arroyo_rpc::grpc::api::AcceptedResultBoundary {
-                    root_operator: route.operator.ok_or_else(|| {
-                        datafusion::common::plan_datafusion_err!(
-                            "accepted result root is not bound"
-                        )
-                    })?,
+                    producer: Some(match route {
+                        crate::merge_event_results::AcceptedResultRoute::Response(route) =>
+                            arroyo_rpc::grpc::api::accepted_result_boundary::Producer::ResponseRootOperator(
+                                route.operator.ok_or_else(|| datafusion::common::plan_datafusion_err!("accepted result root is not bound"))?),
+                        crate::merge_event_results::AcceptedResultRoute::FinalizedAppend =>
+                            arroyo_rpc::grpc::api::accepted_result_boundary::Producer::FinalizedAppend(true),
+                    }),
                     input_schema: Some(input_schemas[0].as_ref().clone().into()),
                     output_schema: Some(self.output_schema().into()),
                 })

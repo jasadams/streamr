@@ -218,7 +218,7 @@ async fn native_selector_packet_exact_outputs() {
                         .filter(|row| !row.is_empty())
                         .count() as u64
         );
-        assert!(output_rows > 0 && output_rows <= expected.len());
+        assert!(output_rows <= expected.len());
         (i32::try_from(input_rows).unwrap(), output_rows)
     });
     for attempt in 0..=usize::from(checkpoint.is_some()) {
@@ -250,6 +250,7 @@ async fn native_selector_packet_exact_outputs() {
                 &mut finished,
             )
             .await;
+            assert!(bytes > 0, "packet checkpoint must contain retained state");
             let tasks: usize = running.operator_controls().values().map(Vec::len).sum();
             tokio::time::timeout(test_runtime_timeout(), async {
                 while finished.len() < tasks {
@@ -276,7 +277,18 @@ async fn native_selector_packet_exact_outputs() {
             let expected_prefix =
                 normalize_packet_rows(expected[..output_rows].to_vec(), &timestamp_paths);
             for (index, output) in outputs.iter().enumerate() {
-                let captured = tokio::fs::read(output).await.unwrap();
+                let captured = match tokio::fs::read(output).await {
+                    Ok(bytes) => bytes,
+                    Err(error)
+                        if output_rows == 0 && error.kind() == std::io::ErrorKind::NotFound =>
+                    {
+                        Vec::new()
+                    }
+                    Err(error) => panic!(
+                        "cannot read checkpoint consumer {}: {error}",
+                        output.display()
+                    ),
+                };
                 tokio::fs::write(
                     evidence.join(format!("checkpoint-consumer-{index}.jsonl")),
                     &captured,
@@ -300,6 +312,30 @@ async fn native_selector_packet_exact_outputs() {
                 "input_rows":input_rows,"output_rows":output_rows,"source_batches":observed_batches,
                 "restore":"fresh local program and owners in the same process",
             })).unwrap()).await.unwrap();
+            if let Some(fault) = packet.get("fail_session_delivery") {
+                super::smoke_str64::fail_finalized_session_delivery(
+                    &job,
+                    &logical,
+                    &udfs,
+                    &outputs,
+                    output_rows,
+                    i32::try_from(fault["source_noops"].as_u64().unwrap()).unwrap(),
+                )
+                .await;
+                tokio::fs::write(
+                    evidence.join("delivery-failure-receipt.json"),
+                    serde_json::to_vec_pretty(&serde_json::json!({
+                        "producer":"SessionWindowAggregate", "completed_checkpoint":1,
+                        "prefix_rows":output_rows,"blocked_finalized_output":true,
+                        "checkpoint2_source_acknowledged":true,
+                        "blocked_owner_checkpoint2_completed":false,
+                        "task_failed":true,"whole_attempt_drained":true,
+                    }))
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            }
         } else {
             run_until_finished(&running, &mut rx).await;
             drop(abort);

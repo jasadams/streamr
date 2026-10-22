@@ -7,6 +7,20 @@ use datafusion::common::{Result, TableReference, plan_err};
 use datafusion::logical_expr::{Aggregate, Extension, LogicalPlan};
 use std::sync::Arc;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd)]
+pub(crate) enum AcceptedResultRoute {
+    Response(ResponseRoute),
+    FinalizedAppend,
+}
+impl AcceptedResultRoute {
+    pub(crate) fn source(self, plan: &LogicalPlan) -> Result<TableReference> {
+        match self {
+            Self::Response(route) => accepted_source(plan, route.slot),
+            Self::FinalizedAppend => crate::finalized_result::accepted_source(plan),
+        }
+    }
+}
+
 fn as_aggregate(plan: &LogicalPlan) -> Option<&UpdatingAggregateExtension> {
     if let LogicalPlan::Extension(extension) = plan {
         extension
@@ -298,10 +312,10 @@ pub(crate) fn resolve(input: &LogicalPlan, slot: u32) -> Result<Option<LogicalPl
             name: TableReference::bare("accepted_native_result"),
             materialize: false,
             union_schema: false,
-            accepted_result: Some(ResponseRoute {
+            accepted_result: Some(AcceptedResultRoute::Response(ResponseRoute {
                 slot,
                 operator: None,
-            }),
+            })),
         }),
     })))
 }

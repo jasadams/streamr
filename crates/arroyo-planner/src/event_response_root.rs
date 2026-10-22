@@ -74,7 +74,7 @@ pub(crate) fn find_source(plan: &LogicalPlan) -> Result<(&Projection, &TableSour
     }
     find_source(scalar_input(plan)?)
 }
-fn projection_columns(
+pub(crate) fn projection_columns(
     projection: &Projection,
     source: &TableSourceExtension,
 ) -> Result<Vec<usize>> {

@@ -19,7 +19,10 @@ message ConnectorOp {
 // Native SELECT is evaluated before the serial MERGE region. The planner
 // proves this cut's complete schemas and concrete native producer ancestry.
 message AcceptedResultBoundary {
-  uint32 root_operator = 1;
+  oneof producer {
+    uint32 response_root_operator = 1;
+    bool finalized_append = 4;
+  }
   ArroyoSchema input_schema = 2;
   ArroyoSchema output_schema = 3;
 }
@@ -79,6 +82,7 @@ message SessionWindowAggregateOperator {
   ArroyoSchema unkeyed_aggregate_schema = 6;
   bytes partial_aggregation_plan = 7;
   bytes final_aggregation_plan = 8;
+  ArroyoSchema output_schema = 9;
 }
 
 message JoinOperator {

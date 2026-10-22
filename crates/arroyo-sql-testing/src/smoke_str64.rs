@@ -685,7 +685,22 @@ impl ArrowOperator for BatchObserver {
         ctx: &mut OperatorContext,
         collector: &mut dyn Collector,
     ) -> DataflowResult<Option<arroyo_types::Watermark>> {
-        self.inner.handle_watermark(watermark, ctx, collector).await
+        if self.inner.name() == "session_window"
+            && let Some(fault) = &self.fault
+        {
+            self.inner
+                .handle_watermark(
+                    watermark,
+                    ctx,
+                    &mut FailingCollector {
+                        inner: collector,
+                        fault: fault.clone(),
+                    },
+                )
+                .await
+        } else {
+            self.inner.handle_watermark(watermark, ctx, collector).await
+        }
     }
     async fn handle_checkpoint(
         &mut self,
@@ -729,7 +744,7 @@ impl Collector for FailingCollector<'_> {
         self.fault.release.notified().await;
         Err(arroyo_rpc::errors::DataflowError::InternalOperatorError {
             error: "STR64 injected blocked delivery failure",
-            message: "after real aggregate collect, before downstream delivery".into(),
+            message: "real output before downstream delivery and producer acknowledgement".into(),
         })
     }
     async fn broadcast_watermark(
@@ -748,40 +763,107 @@ pub(super) async fn fail_after_live_commit(
     mirror: &Path,
     fail_owner: bool,
 ) {
+    fail_delivery_from_checkpoint(
+        job,
+        logical,
+        udfs,
+        output,
+        mirror,
+        DeliveryCase::Updating { fail_owner },
+    )
+    .await;
+}
+
+pub(super) async fn fail_finalized_session_delivery(
+    job: &str,
+    logical: &Arc<LogicalProgram>,
+    udfs: &[LocalUdf],
+    outputs: &[PathBuf],
+    prefix_rows: usize,
+    source_noops: i32,
+) {
+    assert_eq!(outputs.len(), 2);
+    fail_delivery_from_checkpoint(
+        job,
+        logical,
+        udfs,
+        &outputs[0],
+        &outputs[1],
+        DeliveryCase::FinalizedSession {
+            prefix_rows,
+            source_noops,
+        },
+    )
+    .await;
+}
+
+enum DeliveryCase {
+    Updating {
+        fail_owner: bool,
+    },
+    FinalizedSession {
+        prefix_rows: usize,
+        source_noops: i32,
+    },
+}
+
+async fn fail_delivery_from_checkpoint(
+    job: &str,
+    logical: &Arc<LogicalProgram>,
+    udfs: &[LocalUdf],
+    output: &Path,
+    mirror: &Path,
+    case: DeliveryCase,
+) {
+    let finalized_session = matches!(&case, DeliveryCase::FinalizedSession { .. });
+    let (blocked_name, blocked_kind, source_noops, prefix_rows) = match case {
+        DeliveryCase::Updating { fail_owner: true } => {
+            ("fused_state_table_", OperatorName::FusedStateTable, 7, 2)
+        }
+        DeliveryCase::Updating { fail_owner: false } => (
+            "UpdatingAggregatingFunc",
+            OperatorName::UpdatingAggregate,
+            7,
+            2,
+        ),
+        DeliveryCase::FinalizedSession {
+            prefix_rows,
+            source_noops,
+        } => (
+            "session_window",
+            OperatorName::SessionWindowAggregate,
+            source_noops,
+            prefix_rows,
+        ),
+    };
     let (tx, mut rx) = channel(128);
     let program = local_program(job, &logical.graph, udfs, Some(1), tx).await;
     let fault = Arc::new(DeliveryFault::default());
-    let blocked_name = if fail_owner {
-        "fused_state_table_"
-    } else {
-        "UpdatingAggregatingFunc"
-    };
-    let blocked_kind = if fail_owner {
-        OperatorName::FusedStateTable
-    } else {
-        OperatorName::UpdatingAggregate
-    };
     let _observations = observe_operator(&program, blocked_name, Some(fault.clone()));
     let failed = Engine::for_local(program, "pipe-test".into(), job.into())
         .await
         .unwrap()
         .start()
         .await;
-    // Seven NoOps admit the eight remaining accepted rows, producing a full
-    // batch8. CP2 then advances into the filtered sentinel's control wait,
-    // keeping the source and its async checkpoint writer alive through ACK.
-    advance(&failed, 7).await;
+    // Admit the declared suffix through real source controls. An unread
+    // sentinel keeps the source alive through its asynchronous CP2 ACK.
+    advance(&failed, source_noops).await;
+    if finalized_session {
+        // CP2 flushes a partial source batch, delivering the ordinary later
+        // watermark that closes SESSION. Its owner must block before snapshot.
+        enqueue_delivery_fault_checkpoint(&failed).await;
+    }
     tokio::time::timeout(test_runtime_timeout(), fault.reached.notified())
         .await
         .expect("owner never reached blocked real output");
     assert_eq!(
         read_rows(output).await.len(),
-        2,
+        prefix_rows,
         "blocked output reached primary sink"
     );
     assert_eq!(
         read_rows(mirror).await.len(),
-        2,
+        prefix_rows,
         "blocked output reached mirror sink"
     );
     let source_task_id = logical
@@ -803,25 +885,21 @@ pub(super) async fn fail_after_live_commit(
         .0
         .operator_id
         .clone();
-    let blocked_id = logical
+    let blocked_ids: Vec<_> = logical
         .graph
         .node_weights()
         .flat_map(|n| n.operator_chain.iter())
-        .find(|(op, _)| op.operator_name == blocked_kind)
-        .unwrap()
-        .0
-        .operator_id
-        .clone();
-    for source in failed.source_controls() {
-        source
-            .send(ControlMessage::Checkpoint(CheckpointBarrier {
-                epoch: 2,
-                min_epoch: 0,
-                timestamp: SystemTime::now(),
-                then_stop: false,
-            }))
-            .await
-            .unwrap();
+        .filter(|(op, _)| op.operator_name == blocked_kind)
+        .map(|(op, _)| op.operator_id.clone())
+        .collect();
+    assert_eq!(
+        blocked_ids.len(),
+        1,
+        "fault requires one unambiguous native owner"
+    );
+    let blocked_id = blocked_ids[0].clone();
+    if !finalized_session {
+        enqueue_delivery_fault_checkpoint(&failed).await;
     }
     // The source snapshot completes while real owner output remains blocked.
     // Its acknowledgement does not prove barrier enqueue at that owner.
@@ -914,11 +992,25 @@ pub(super) async fn fail_after_live_commit(
     .await
     .expect("failed attempt cancellation timed out");
     wait_for_capture_state_cleanup().await;
-    assert_eq!(read_rows(output).await.len(), 2);
-    assert_eq!(read_rows(mirror).await.len(), 2);
+    assert_eq!(read_rows(output).await.len(), prefix_rows);
+    assert_eq!(read_rows(mirror).await.len(), prefix_rows);
     println!(
         "STR64_FAULT observed_real_output_block=true observed_task_failure=true whole_attempt_drained=true checkpoint2_source_acknowledged=true blocked_owner_checkpoint2_completed=false boundary={blocked_name}"
     );
+}
+
+async fn enqueue_delivery_fault_checkpoint(engine: &RunningEngine) {
+    for source in engine.source_controls() {
+        source
+            .send(ControlMessage::Checkpoint(CheckpointBarrier {
+                epoch: 2,
+                min_epoch: 0,
+                timestamp: SystemTime::now(),
+                then_stop: false,
+            }))
+            .await
+            .unwrap();
+    }
 }
 
 #[tokio::test]

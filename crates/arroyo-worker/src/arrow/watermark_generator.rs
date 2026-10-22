@@ -230,26 +230,11 @@ impl OperatorConstructor for WatermarkGeneratorConstructor {
             );
         }
         let input_schema: ArroyoSchema = config.input_schema.unwrap().try_into()?;
-        anyhow::ensure!(
-            input_schema.timestamp_index < input_schema.schema.fields().len(),
-            "source FOR clock index is outside the input schema"
-        );
-        if let Some(index) = config.source_envelope_index {
-            let field = input_schema
-                .schema
-                .fields()
-                .get(index as usize)
-                .ok_or_else(|| {
-                    anyhow::anyhow!("source envelope marker index is outside the input schema")
-                })?;
-            anyhow::ensure!(
-                index as usize != input_schema.timestamp_index
-                    && field.name() == arroyo_rpc::SOURCE_ENVELOPE_FIELD
-                    && field.data_type() == &arrow_schema::DataType::UInt64
-                    && !field.is_nullable(),
-                "invalid source envelope marker schema"
-            );
-        }
+        let output_schema = arroyo_rpc::df::source_admission_output_schema(
+            &input_schema,
+            config.source_envelope_index.map(|index| index as usize),
+            config.preserve_source_envelope,
+        )?;
         if config.response_root_operator.is_some() {
             anyhow::ensure!(
                 input_schema
@@ -268,10 +253,6 @@ impl OperatorConstructor for WatermarkGeneratorConstructor {
             &DefaultPhysicalExtensionCodec {},
         )?;
 
-        anyhow::ensure!(
-            !config.preserve_source_envelope || config.source_envelope_index.is_some(),
-            "preserved source envelopes require a source marker"
-        );
         let mut generator = WatermarkGenerator::expression(
             Duration::from_micros(config.period_micros),
             config.idle_time_micros.map(Duration::from_micros),
@@ -281,21 +262,11 @@ impl OperatorConstructor for WatermarkGeneratorConstructor {
         );
         generator.preserve_source_envelope = config.preserve_source_envelope;
         if let Some(root) = config.response_root_operator {
-            let schema = if let Some(marker) = generator.source_envelope_index
-                && !generator.preserve_source_envelope
-            {
-                Arc::new(
-                    input_schema.schema.project(
-                        &(0..input_schema.schema.fields().len())
-                            .filter(|index| *index != marker)
-                            .collect::<Vec<_>>(),
-                    )?,
-                )
-            } else {
-                input_schema.schema.clone()
-            };
-            generator.response_root =
-                Some(ResponseRoot::new(root, input_schema.schema.clone(), schema));
+            generator.response_root = Some(ResponseRoot::new(
+                root,
+                input_schema.schema.clone(),
+                output_schema.schema,
+            ));
         }
         Ok(ConstructedOperator::from_operator(Box::new(generator)))
     }

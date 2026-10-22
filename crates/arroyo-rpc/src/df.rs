@@ -18,6 +18,148 @@ use std::ops::Range;
 use std::sync::Arc;
 use std::time::SystemTime;
 
+pub fn window_arrow_struct() -> DataType {
+    DataType::Struct(
+        vec![
+            Arc::new(arrow::datatypes::Field::new(
+                "start",
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                false,
+            )),
+            Arc::new(arrow::datatypes::Field::new(
+                "end",
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                false,
+            )),
+        ]
+        .into(),
+    )
+}
+
+/// Native source admission removes only the configured operation marker. Key
+/// metadata is reset at this unkeyed boundary; Arrow field/schema metadata and
+/// the source clock retain their exact native layout.
+pub fn source_admission_output_schema(
+    input: &ArroyoSchema,
+    marker: Option<usize>,
+    preserve_marker: bool,
+) -> Result<ArroyoSchema> {
+    anyhow::ensure!(
+        input.timestamp_index < input.schema.fields().len(),
+        "source FOR clock index is outside the input schema"
+    );
+    if let Some(index) = marker {
+        let field = input.schema.fields().get(index).ok_or_else(|| {
+            anyhow::anyhow!("source envelope marker index is outside the input schema")
+        })?;
+        anyhow::ensure!(
+            index != input.timestamp_index
+                && field.name() == crate::SOURCE_ENVELOPE_FIELD
+                && field.data_type() == &DataType::UInt64
+                && !field.is_nullable(),
+            "invalid source envelope marker schema"
+        );
+    }
+    anyhow::ensure!(
+        !preserve_marker || marker.is_some(),
+        "preserved source envelopes require a source marker"
+    );
+    let removed = marker.filter(|_| !preserve_marker);
+    let schema = if let Some(index) = removed {
+        Arc::new(
+            input.schema.project(
+                &(0..input.schema.fields().len())
+                    .filter(|column| *column != index)
+                    .collect::<Vec<_>>(),
+            )?,
+        )
+    } else {
+        input.schema.clone()
+    };
+    Ok(ArroyoSchema::new_unkeyed(
+        schema,
+        input.timestamp_index
+            - usize::from(removed.is_some_and(|index| index < input.timestamp_index)),
+    ))
+}
+
+/// Exact native finalized SESSION layout; shared by serialization and construction.
+pub fn session_output_schema(
+    input: &ArroyoSchema,
+    aggregate: &Schema,
+    window_name: &str,
+    window_index: usize,
+    declared: &ArroyoSchema,
+) -> Result<ArroyoSchema> {
+    anyhow::ensure!(
+        input.timestamp_index < input.schema.fields().len(),
+        "SESSION input clock index is outside schema"
+    );
+    anyhow::ensure!(
+        input.schema.field(input.timestamp_index).name() == TIMESTAMP_FIELD
+            && input.schema.field(input.timestamp_index).data_type()
+                == &DataType::Timestamp(TimeUnit::Nanosecond, None),
+        "SESSION input clock must be canonical nanoseconds"
+    );
+    anyhow::ensure!(
+        input.schema.index_of(crate::UPDATING_META_FIELD).is_err(),
+        "SESSION requires append input"
+    );
+    let keys = input.routing_keys().cloned().unwrap_or_default();
+    anyhow::ensure!(
+        keys.iter().copied().eq(0..keys.len()) && keys.len() <= input.schema.fields().len(),
+        "SESSION grouping keys must occupy the native input prefix"
+    );
+    anyhow::ensure!(
+        window_index <= keys.len() && !window_name.is_empty() && window_name != TIMESTAMP_FIELD,
+        "SESSION window insertion index/name is invalid"
+    );
+    let mut fields = Vec::new();
+    for (position, index) in keys.iter().enumerate() {
+        let output_index = position + usize::from(position >= window_index);
+        let output = declared
+            .schema
+            .fields()
+            .get(output_index)
+            .ok_or_else(|| anyhow::anyhow!("SESSION public grouping field missing"))?;
+        // KeyCalculation owns internal __key_i names. The public producer
+        // descriptor owns aliases; every other field attribute remains exact.
+        let expected = input.schema.fields()[*index]
+            .as_ref()
+            .clone()
+            .with_name(output.name());
+        anyhow::ensure!(
+            expected == **output,
+            "SESSION public grouping field differs from native key layout"
+        );
+        fields.push(output.clone());
+    }
+    fields.insert(
+        window_index,
+        Arc::new(Field::new(window_name, window_arrow_struct(), true)),
+    );
+    fields.extend(aggregate.fields().iter().cloned());
+    fields.push(Arc::new(Field::new(
+        TIMESTAMP_FIELD,
+        DataType::Timestamp(TimeUnit::Nanosecond, None),
+        false,
+    )));
+    let mut names = std::collections::HashSet::new();
+    anyhow::ensure!(
+        fields
+            .iter()
+            .all(|field| names.insert(field.name().clone())),
+        "SESSION output repeats a field name"
+    );
+    Ok(ArroyoSchema::from_schema_keys(
+        Arc::new(Schema::new_with_metadata(
+            fields,
+            aggregate.metadata().clone(),
+        )),
+        vec![],
+    )?)
+}
+
 pub type ArroyoSchemaRef = Arc<ArroyoSchema>;
 
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
@@ -439,4 +581,125 @@ pub fn server_for_hash_array(
     let division = div(hash, &range_scalar)?;
     let result: &PrimitiveArray<UInt64Type> = division.as_any().downcast_ref().unwrap();
     Ok(result.clone())
+}
+
+#[cfg(test)]
+mod session_layout_tests {
+    use super::*;
+    #[test]
+    fn session_source_admission_preserves_native_marker_clock_and_metadata_layout() {
+        let schema = Arc::new(Schema::new_with_metadata(
+            vec![
+                Field::new("value", DataType::Utf8, true),
+                Field::new(crate::SOURCE_ENVELOPE_FIELD, DataType::UInt64, false),
+                Field::new(
+                    TIMESTAMP_FIELD,
+                    DataType::Timestamp(TimeUnit::Nanosecond, None),
+                    false,
+                ),
+            ],
+            [("source".into(), "ordinary".into())].into_iter().collect(),
+        ));
+        let input = ArroyoSchema::from_schema_keys(schema.clone(), vec![]).unwrap();
+        let expected = ArroyoSchema::new_unkeyed(Arc::new(schema.project(&[0, 2]).unwrap()), 1);
+        assert_eq!(
+            source_admission_output_schema(&input, Some(1), false).unwrap(),
+            expected
+        );
+        assert_eq!(
+            source_admission_output_schema(&input, Some(1), true).unwrap(),
+            ArroyoSchema::new_unkeyed(schema, 2)
+        );
+        // Even without a marker, native watermark output is unkeyed (None),
+        // whereas scalar lowering may have explicit empty storage keys.
+        let plain = ArroyoSchema::from_schema_keys(expected.schema.clone(), vec![]).unwrap();
+        assert_eq!(
+            source_admission_output_schema(&plain, None, false).unwrap(),
+            expected
+        );
+        assert!(source_admission_output_schema(&input, Some(0), false).is_err());
+        assert!(source_admission_output_schema(&input, Some(2), false).is_err());
+        assert!(source_admission_output_schema(&input, Some(99), false).is_err());
+        assert!(source_admission_output_schema(&input, None, true).is_err());
+        let mut bad_clock = input.clone();
+        bad_clock.timestamp_index = usize::MAX;
+        assert!(source_admission_output_schema(&bad_clock, Some(1), false).is_err());
+        let mut fields = input.schema.fields().to_vec();
+        fields[1] = Arc::new(Field::new(
+            crate::SOURCE_ENVELOPE_FIELD,
+            DataType::UInt64,
+            true,
+        ));
+        let forged = ArroyoSchema::new_unkeyed(Arc::new(Schema::new(fields)), 2);
+        assert!(source_admission_output_schema(&forged, Some(1), false).is_err());
+    }
+    fn schemas() -> (ArroyoSchema, Schema, ArroyoSchema) {
+        let input = ArroyoSchema::from_schema_keys(
+            Arc::new(Schema::new(vec![
+                Field::new("__key_0", DataType::Utf8, false),
+                Field::new("value", DataType::Int64, true),
+                Field::new(
+                    TIMESTAMP_FIELD,
+                    DataType::Timestamp(TimeUnit::Nanosecond, None),
+                    false,
+                ),
+            ])),
+            vec![0],
+        )
+        .unwrap();
+        let aggregate = Schema::new(vec![Field::new("count", DataType::Int64, false)]);
+        let output = ArroyoSchema::from_schema_keys(
+            Arc::new(Schema::new(vec![
+                Field::new("public_key", DataType::Utf8, false),
+                Field::new("window", window_arrow_struct(), true),
+                aggregate.field(0).clone(),
+                Field::new(
+                    TIMESTAMP_FIELD,
+                    DataType::Timestamp(TimeUnit::Nanosecond, None),
+                    false,
+                ),
+            ])),
+            vec![],
+        )
+        .unwrap();
+        (input, aggregate, output)
+    }
+    #[test]
+    fn session_layout_preserves_public_key_alias_and_exact_native_fields() {
+        let (input, aggregate, output) = schemas();
+        assert_eq!(
+            session_output_schema(&input, &aggregate, "window", 1, &output).unwrap(),
+            output
+        );
+        let mut forged = output.clone();
+        forged.timestamp_index = usize::MAX;
+        assert_ne!(
+            session_output_schema(&input, &aggregate, "window", 1, &forged).unwrap(),
+            forged
+        );
+        assert!(session_output_schema(&input, &aggregate, "window", usize::MAX, &output).is_err());
+        let mut input = input;
+        input.timestamp_index = usize::MAX;
+        assert!(session_output_schema(&input, &aggregate, "window", 1, &output).is_err());
+    }
+    #[test]
+    fn session_layout_rejects_changed_native_key_type_nullability_and_metadata() {
+        let (input, aggregate, output) = schemas();
+        for field in [
+            Field::new("public_key", DataType::Int64, false),
+            Field::new("public_key", DataType::Utf8, true),
+            Field::new("public_key", DataType::Utf8, false)
+                .with_metadata([("changed".into(), "true".into())].into_iter().collect()),
+        ] {
+            let mut fields = output.schema.fields().to_vec();
+            fields[0] = Arc::new(field);
+            let forged = ArroyoSchema::new(
+                Arc::new(Schema::new(fields)),
+                output.timestamp_index,
+                output.storage_keys().cloned(),
+                output.routing_keys().cloned(),
+            );
+            assert!(session_output_schema(&input, &aggregate, "window", 1, &forged).is_err());
+        }
+    }
 }

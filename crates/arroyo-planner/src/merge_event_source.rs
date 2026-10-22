@@ -435,6 +435,9 @@ impl TreeNodeRewriter for EventSourceRewriter {
 }
 
 pub(super) fn resolve_with_slot(slot: u32, input: LogicalPlan) -> Result<LogicalPlan> {
+    if let Some(result) = crate::finalized_result::resolve(&input)? {
+        return Ok(result);
+    }
     if !input
         .schema()
         .has_column_with_unqualified_name(UPDATING_META_FIELD)
