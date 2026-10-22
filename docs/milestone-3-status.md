@@ -1,3 +1,10 @@
+## Active STR-147 native empty array execution — 2026-10-23
+
+- Fresh fetched base `a5d28ad868f8e64cd3d2daa158b12e11b52e3c03`, isolated branch `jason/native-empty-array-20261023`; original dirty checkout preserved. Read current AGENTS, build/test/team, this ledger/work-plan and STR-147; in-flight CLEAR.
+- Repair reproduced upstream native array_concat failure on zero-row CASE selections; preserve List/LargeList/null semantics and existing native function identity. No app SQL rewrite/UDF or engine capability/clock change.
+- Acceptance: generic zero-row/null/nonempty regressions, maintained dev/precompiled RocksDB checks/Clippy, unchanged Arcstream minimal CASE and metadata fixture outputs + real integration recovery, independent review and required CI. Baseline retained at `/home/jason/qa-evidence/arc18-readiness-20261023/empty-case-array-1/` and `publication-metadata-1/`.
+- Kernel/dependency patch delegated; root owns integration/build/evidence. STR-148/149 track SESSION/clock investigations separately. User explicitly says STR tickets are not automatically Arcstream release blockers; no automatic blocking relations added. Source and material fixture reviews APPROVE;13nested+2planner tests, fmt, lockedcheck and strictClippy all PASS. Firstcodecfixturefailure retained/fixed through existinginputadapter. Next: pinCLI and unchanged application kernel probes plus requiredCI. Userexplicitlyomittedmetadatafirstrelease, so147isnotArcstreamreleaseblocker. No production/capacity claim.
+
 ## Active STR-60 — 2026-10-18
 
 - Branch `jason/str-60-selectors-20261018`; initial base14353046, integrated8f937aa9 then current main eb5127db. Guidance reread; unrelated ledger entries and old transferred tree preserved. Staged only, no commits/PR.

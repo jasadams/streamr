@@ -2,6 +2,7 @@
 exclude = ["vendor/rdkafka-sys"]
 members = [
     "vendor/datafusion-functions-aggregate-common",
+    "vendor/datafusion-functions-nested",
     "crates/arroyo",
     "crates/arroyo-api",
     "crates/arroyo-compiler-service",
@@ -149,3 +150,4 @@ sqlparser = { git = "https://github.com/jasadams/sqlparser-rs", rev = "41e07aa42
 # The pinned DataFusion grouped adapter must consume terminal partial state.
 [patch."https://github.com/ArroyoSystems/arrow-datafusion"]
 datafusion-functions-aggregate-common = { path = "vendor/datafusion-functions-aggregate-common" }
+datafusion-functions-nested = { path = "vendor/datafusion-functions-nested" }

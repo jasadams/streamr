@@ -251,3 +251,122 @@ async fn nested_join_predicate_fails_during_planning() {
         "{error}"
     );
 }
+
+#[tokio::test]
+async fn native_array_concat_unused_nested_case_branch_is_typed_empty() {
+    use crate::physical::{ArroyoMemExec, ArroyoPhysicalExtensionCodec, DecodingContext};
+    use datafusion::datasource::memory::MemorySourceConfig;
+    use datafusion::physical_plan::ExecutionPlan;
+    use std::sync::RwLock;
+
+    // VALUES supplies immutable fixture rows, but its DataSourceExec has no
+    // production wire representation. Use the existing worker-input placeholder
+    // and reader, preserving the SQL-planned projection and original input rows.
+    fn adapt_values(
+        plan: Arc<dyn ExecutionPlan>,
+        values: &mut Vec<arrow_array::RecordBatch>,
+    ) -> Arc<dyn ExecutionPlan> {
+        if let Some(source) = plan
+            .as_any()
+            .downcast_ref::<datafusion::datasource::source::DataSourceExec>()
+        {
+            let memory = source
+                .data_source()
+                .as_any()
+                .downcast_ref::<MemorySourceConfig>()
+                .expect("fixture must have only a native VALUES source");
+            assert!(
+                values.is_empty(),
+                "fixture must have exactly one VALUES source"
+            );
+            assert!(memory.projection().is_none());
+            values.extend(memory.partitions().iter().flatten().cloned());
+            return Arc::new(ArroyoMemExec::new("concat_fixture".into(), plan.schema()));
+        }
+        let children = plan
+            .children()
+            .iter()
+            .map(|child| adapt_values(Arc::clone(child), values))
+            .collect();
+        plan.with_new_children(children).unwrap()
+    }
+
+    async fn execute(sql: &str) -> Vec<ScalarValue> {
+        let statement = crate::parse_sql(sql).unwrap().remove(0);
+        let logical =
+            crate::tables::produce_optimized_plan(&statement, &ArroyoSchemaProvider::new())
+                .unwrap();
+        let state = SessionStateBuilder::new()
+            .with_config(datafusion::prelude::SessionConfig::new().with_target_partitions(1))
+            .with_default_features()
+            .with_physical_optimizer_rules(vec![])
+            .build();
+        let physical = DefaultPhysicalPlanner::default()
+            .create_physical_plan(&logical, &state)
+            .await
+            .unwrap();
+        let mut values = Vec::new();
+        let physical = adapt_values(physical, &mut values);
+        assert_eq!(values.len(), 1);
+        let codec = ArroyoPhysicalExtensionCodec {
+            context: DecodingContext::Planning,
+        };
+        let bytes = PhysicalPlanNode::try_from_physical_plan(physical, &codec)
+            .unwrap()
+            .encode_to_vec();
+        let codec = ArroyoPhysicalExtensionCodec {
+            context: DecodingContext::LockedBatchVec(Arc::new(RwLock::new(values))),
+        };
+        let context = Arc::new(TaskContext::default());
+        let physical = PhysicalPlanNode::decode(bytes.as_slice())
+            .unwrap()
+            .try_into_physical_plan(
+                &crate::physical::new_registry(),
+                context.runtime_env().as_ref(),
+                &codec,
+            )
+            .unwrap();
+        let physical = crate::local_physical::wrap_local_execution(physical).unwrap();
+        let batches = datafusion::physical_plan::collect(physical, context)
+            .await
+            .unwrap();
+        batches
+            .iter()
+            .flat_map(|batch| {
+                (0..batch.num_rows())
+                    .map(|row| ScalarValue::try_from_array(batch.column(0), row).unwrap())
+            })
+            .collect()
+    }
+
+    // Keep the predicate and arrays as input columns so this exercises physical
+    // CASE selection, including its zero-row ELSE evaluation, after codec roundtrip.
+    let sql = "SELECT CASE WHEN flag THEN CASE WHEN flag THEN items ELSE array_concat(items, ARRAY['inner']) END ELSE array_concat(items, ARRAY['outer']) END FROM (VALUES (true, ARRAY['selected'])) AS input(flag, items)";
+    assert_eq!(
+        execute(sql).await,
+        vec![ScalarValue::List(ScalarValue::new_list(
+            &[ScalarValue::Utf8(Some("selected".into()))],
+            &arrow_schema::DataType::Utf8,
+            true,
+        ))]
+    );
+    let sql = "SELECT CASE WHEN flag THEN items ELSE array_concat(items, ARRAY['outer']) END FROM (VALUES (true, ARRAY['selected']), (false, ARRAY['other'])) AS input(flag, items)";
+    assert_eq!(
+        execute(sql).await,
+        vec![
+            ScalarValue::List(ScalarValue::new_list(
+                &[ScalarValue::Utf8(Some("selected".into()))],
+                &arrow_schema::DataType::Utf8,
+                true,
+            )),
+            ScalarValue::List(ScalarValue::new_list(
+                &[
+                    ScalarValue::Utf8(Some("other".into())),
+                    ScalarValue::Utf8(Some("outer".into()))
+                ],
+                &arrow_schema::DataType::Utf8,
+                true,
+            )),
+        ]
+    );
+}

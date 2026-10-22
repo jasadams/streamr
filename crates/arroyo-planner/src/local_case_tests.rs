@@ -166,3 +166,47 @@ async fn case_unchosen_failing_timestamp_branch_stays_lazy() {
         50_000_000_000
     );
 }
+
+#[tokio::test]
+async fn native_array_concat_evaluates_empty_case_else_without_losing_type() {
+    use datafusion::physical_expr::ScalarFunctionExpr;
+
+    let values: ArrayRef = ScalarValue::new_list(
+        &[ScalarValue::Utf8(Some("selected".into()))],
+        &DataType::Utf8,
+        true,
+    );
+    let list_type = values.data_type().clone();
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("flag", DataType::Boolean, false),
+            Field::new("items", list_type.clone(), false),
+        ])),
+        vec![
+            Arc::new(BooleanArray::from(vec![true])),
+            Arc::clone(&values),
+        ],
+    )
+    .unwrap();
+    let otherwise: Arc<dyn PhysicalExpr> = Arc::new(ScalarFunctionExpr::new(
+        "array_concat",
+        Arc::new(datafusion::functions_nested::concat::ArrayConcat::new().into()),
+        vec![column("items", 1), column("items", 1)],
+        Arc::new(Field::new("concatenated", list_type.clone(), true)),
+    ));
+    let expression = case(
+        None,
+        vec![(column("flag", 0), column("items", 1))],
+        Some(otherwise),
+    );
+    // Construct the physical expression directly: an optimizer must not fold
+    // away the unselected branch that originally failed on zero selected rows.
+    let upstream = expression.evaluate(&batch).unwrap().into_array(1).unwrap();
+    assert_eq!(upstream.to_data(), values.to_data());
+    let resolved = crate::local_physical::resolve_expression(expression, &batch)
+        .await
+        .unwrap();
+    let actual = resolved.evaluate(&batch).unwrap().into_array(1).unwrap();
+    assert_eq!(actual.data_type(), &list_type);
+    assert_eq!(actual.to_data(), values.to_data());
+}
