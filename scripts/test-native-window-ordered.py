@@ -51,7 +51,7 @@ def expected(kind):
             groups.setdefault((row['segment'], start), []).append(row)
     result = []
     for (segment, start), rows in groups.items():
-        ranked = sorted(rows, key=lambda row: row['ordinal'])
+        ranked = sorted(rows, key=lambda row: (row['timestamp'], row['ordinal']))
         filtered = [row['metric'] for row in ranked
                     if row['selected'] and row['metric'] is not None]
         selected_rows = [row for row in ranked if row['selected']]
@@ -111,7 +111,7 @@ def assert_rows(path, wanted):
         raise AssertionError((path, rows, wanted))
 
 
-def run_case(binary, directory, kind, backend, batch, protocol, native):
+def run_case(binary, directory, kind, backend, batch, protocol):
     write_fixture(directory, kind)
     wanted = expected(kind)
     env = dict(os.environ)
@@ -130,8 +130,7 @@ def run_case(binary, directory, kind, backend, batch, protocol, native):
         STREAMR_CAPTURE_EXPECTED_ROWS=str(len(wanted)),
         STREAMR_CAPTURE_CHECKPOINT_EPOCH='1',
     )
-    if native:
-        env['STREAMR_TEST_NATIVE_WINDOWS'] = '1'
+    env['STREAMR_TEST_NATIVE_WINDOWS'] = '1'
     log = directory / 'capture.log'
     with log.open('w') as output:
         result = subprocess.run(
@@ -150,7 +149,6 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('directory', type=Path)
     parser.add_argument('--binary', type=Path)
-    parser.add_argument('--baseline', action='store_true')
     parser.add_argument('--backend', choices=('memory', 'rocksdb'), action='append')
     parser.add_argument('--batch', choices=(1, 128), type=int, action='append')
     parser.add_argument('--protocol', choices=('controller', 'leader'), action='append')
@@ -167,11 +165,7 @@ def main():
             for batch in args.batch or (1, 128):
                 for protocol in args.protocol or ('controller', 'leader'):
                     name = f'native-{kind}-{backend}-{batch}-{protocol}'
-                    run_case(binary, root / name, kind, backend, batch, protocol, True)
-        if args.baseline:
-            for batch in args.batch or (1, 128):
-                name = f'baseline-{kind}-memory-{batch}-controller'
-                run_case(binary, root / name, kind, 'memory', batch, 'controller', False)
+                    run_case(binary, root / name, kind, backend, batch, protocol)
 
 
 if __name__ == '__main__':

@@ -25,6 +25,7 @@ const GROUP: u8 = b'G';
 const PARTIAL: u8 = b'P';
 const EXPIRY: u8 = b'E';
 const PROGRESS: u8 = b'M';
+const ARRIVAL: u8 = b'A';
 const VERSION: u8 = 1;
 
 #[derive(Clone, Copy, Debug)]
@@ -242,6 +243,24 @@ impl WindowStore {
     /// consuming another. The producer may be decoding the next page at the
     /// same time. Hold the first two batches' charge until both tasks finish;
     /// `WindowPartial` charges the currently decoded page separately.
+    /// Check the existing IPC/decoded/compacted-row allowance before DF state
+    /// construction. Actual reads retain their ordinary permits independently.
+    pub fn check_reader_capacity(&self) -> Result<()> {
+        drop(
+            self.resources.try_decoded_value(
+                self.limits
+                    .value_bytes
+                    .checked_mul(3)
+                    .context("retained reader allowance overflow")?,
+            )?,
+        );
+        Ok(())
+    }
+
+    pub fn reserve_retained_aggregate(&self, bytes: usize) -> Result<ResourcePermit> {
+        Ok(self.resources.try_decoded_value(bytes)?)
+    }
+
     pub fn reserve_final_input_queue(&self) -> Result<ResourcePermit> {
         Ok(self
             .resources
@@ -263,6 +282,38 @@ impl WindowStore {
                 Ok(Some(i64::from_be_bytes(bytes[1..9].try_into()?)))
             }
         }
+    }
+
+    /// Allocate source identities before any pane sorting or partial aggregation.
+    /// This known-key counter is checkpointed with the retained pane state.
+    pub async fn allocate_arrivals(&self, count: usize) -> Result<std::ops::Range<u64>> {
+        let first = match self
+            .table
+            .get(vec![ARRIVAL], None, ReadOptions { max_bytes: 9 })
+            .await?
+        {
+            None => 0,
+            Some(bytes) => {
+                ensure!(
+                    bytes.len() == 9 && bytes[0] == VERSION,
+                    "native window arrival version changed"
+                );
+                u64::from_be_bytes(bytes[1..9].try_into()?)
+            }
+        };
+        let end = first
+            .checked_add(u64::try_from(count)?)
+            .context("native window arrival ordinal overflow")?;
+        let mut value = vec![VERSION];
+        value.extend_from_slice(&end.to_be_bytes());
+        let mut writes = AdmittedWriteBatch::try_reserve(
+            self.resources.clone(),
+            self.limits.write_bytes,
+            self.limits.write_operations,
+        )?;
+        writes.put(&self.table.key(vec![ARRIVAL], None), &value)?;
+        self.backend.write_admitted(writes).await?;
+        Ok(first..end)
     }
 
     pub async fn set_progress(&self, end: i64) -> Result<()> {
@@ -929,6 +980,21 @@ mod tests {
         store_with_page_entries(1)
     }
 
+    #[tokio::test]
+    async fn arrival_counter_survives_checkpoint_without_reusing_ordinals() {
+        let store = store();
+        assert_eq!(store.allocate_arrivals(8).await.unwrap(), 0..8);
+        assert_eq!(store.allocate_arrivals(1).await.unwrap(), 8..9);
+        let directory =
+            std::env::temp_dir().join(format!("window-arrival-{}", uuid::Uuid::new_v4()));
+        let restored = store.checkpoint_restore_for_test(&directory).await;
+        assert_eq!(restored.allocate_arrivals(8).await.unwrap(), 9..17);
+        let backend = restored.backend.clone();
+        drop(restored);
+        backend.close().await.unwrap();
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
     fn partial(value: i64) -> RecordBatch {
         RecordBatch::try_new(
             Arc::new(Schema::new(vec![Field::new(
@@ -1035,6 +1101,7 @@ mod tests {
         )
         .unwrap();
         drop(tables);
+        assert_eq!(store.allocate_arrivals(8).await.unwrap(), 0..8);
         store.append(b"same", 17, &partial(3)).await.unwrap();
         store.append(b"same", 18, &partial(9)).await.unwrap();
         for epoch in 1..=2 {
@@ -1085,6 +1152,8 @@ mod tests {
             .await
             .unwrap();
             store = WindowStore::new(backend, table, resources, schema, limits).unwrap();
+            let first = 8 + (u64::from(epoch) - 1) * 8;
+            assert_eq!(store.allocate_arrivals(8).await.unwrap(), first..first + 8);
             let snapshot = store.snapshot().await.unwrap();
             if epoch == 1 {
                 assert_eq!(store.earliest_time().await.unwrap(), Some(17));

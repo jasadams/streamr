@@ -684,23 +684,29 @@ transition. A four-input-row epoch-1 checkpoint precedes fresh-worker restore.
 The recovered sink contains two creates and two updates; each update encodes its
 before and after rows in one Debezium record.
 
-The optional `--baseline` comparison reproduces an existing legacy moving-MAX
-defect after restore/retractions: one group reports 7 instead of the correct 9.
-The native counted index returns 9. That negative comparison is retained as
-evidence, rather than used as the native value oracle. SQL with equal ORDER BY
-tuples also permits ambiguous LAST results; the existing operator demonstrated
-different initial and recovered tie choices. Exact native value assertions use
-an explicit total-order tie-breaker.
+Historical evidence from that source: the then-optional `--baseline`
+comparison reproduced a legacy moving-MAX defect after restore/retractions:
+one group reported 7 instead of 9, while the native counted index returned 9.
+The retired operator also demonstrated different initial/recovered equal-order
+tie choices. These observations describe that preserved executable, not the
+current grouped-selector contract or a supported alternate execution method.
 
 The final-source rerun passed all eight native cases, followed by both generic
-state-table suites (16 cases and 64 full comparisons). The reproducible
-[ordering diagnostic](../scripts/test-native-aggregate-ordering.py) also passed
-four native/legacy memory cases with `--total-order` at source batch targets
-1/8, comparing exact initial, checkpoint and recovered values. Its default
-equal-order mode records permitted tie differences explicitly rather than
-requiring the existing operator's inconsistent choices. Logs are
-`/tmp/streamr-m3-native-aggregate-{final-matrix,total-order,equal-order}.log`
+state-table suites (16 cases and 64 full comparisons). The now-retired
+[ordering differential at base 14353046](https://github.com/jasadams/streamr/blob/14353046e5085325b66563981be61c96ecfed7b7/scripts/test-native-aggregate-ordering.py)
+also passed four native/legacy memory cases with `--total-order` at source batch
+targets 1/8. Its historical equal-order mode recorded differing outcomes.
+Logs remain `/tmp/streamr-m3-native-aggregate-{final-matrix,total-order,equal-order}.log`
 and `/tmp/streamr-m3-native-tables-aggregate-{batch,timestamp}.log`.
+
+STR-60 retires that differential and the legacy invocation in the generic
+aggregate driver. Current shared-selector verification uses retained scenario
+manifests from [`native_grouped_selectors.py`](../scripts/native_grouped_selectors.py)
+and [`native_window_selectors.py`](../scripts/native_window_selectors.py), captured
+by [`test-native-result-manifest.py`](../scripts/test-native-result-manifest.py).
+Current manifests require matching checkpoint flush boundaries and exact typed
+per-key uninterrupted/recovered output sequences. These historical passes are
+not evidence that the current-source selector matrix has run.
 
 These small operator captures and units do not qualify aggregate hot-key/high-
 cardinality capacity, every failure point, rescaling, native windows or the full

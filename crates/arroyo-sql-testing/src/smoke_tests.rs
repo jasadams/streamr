@@ -1201,6 +1201,161 @@ impl CaptureCounts {
     }
 }
 
+/// Flush each admitted batch through the existing checkpoint protocol. A barrier
+/// resets the source buffer, so suffix boundaries start at the forced prefix.
+fn capture_batch_boundaries(total: i32, prefix: i32, batch: i32) -> Vec<i32> {
+    assert!(total > prefix && prefix > 0 && batch > 0);
+    let mut boundaries = Vec::new();
+    let mut previous = 0_i32;
+    for end in [prefix, total] {
+        while let Some(next) = previous.checked_add(batch)
+            && next < end
+        {
+            boundaries.push(next);
+            previous = next;
+        }
+        if end == prefix {
+            boundaries.push(prefix);
+        }
+        previous = end;
+    }
+    boundaries
+}
+
+fn capture_boundary_noops(previous: i32, boundary: i32) -> i32 {
+    // Initial start, every nonstopping barrier, and restore automatically read
+    // one row before waiting. FIFO NoOps release only the remaining rows.
+    assert!(boundary > previous);
+    boundary - previous - 1
+}
+
+#[test]
+fn capture_batch_boundaries_preserve_partial_prefix_and_automatic_row() {
+    assert_eq!(capture_batch_boundaries(34, 19, 8), [8, 16, 19, 27]);
+    assert_eq!(capture_batch_boundaries(25, 19, 8), [8, 16, 19]);
+    assert_eq!(capture_batch_boundaries(9, 5, 8), [5]);
+    assert_eq!(
+        capture_batch_boundaries(25, 19, 1),
+        (1..25).collect::<Vec<_>>()
+    );
+    assert_eq!(capture_boundary_noops(0, 8), 7);
+    assert_eq!(capture_boundary_noops(16, 19), 2);
+    assert_eq!(capture_boundary_noops(19, 27), 7);
+    assert_eq!(capture_boundary_noops(18, 19), 0);
+}
+
+struct CaptureSourceReader {
+    task: Arc<arroyo_types::TaskInfo>,
+    tables: HashMap<String, arroyo_rpc::grpc::rpc::TableConfig>,
+    control: tokio::sync::mpsc::Sender<ControlResp>,
+    input_path: String,
+}
+
+impl CaptureSourceReader {
+    fn new(program: &Program, input_path: &str) -> Self {
+        use arroyo_operator::operator::OperatorNode;
+        use arroyo_worker::engine::SubtaskOrQueueNode;
+        let graph = program.graph.read().unwrap();
+        graph
+            .node_weights()
+            .find_map(|node| {
+                if let SubtaskOrQueueNode::SubtaskNode(node) = node
+                    && let OperatorNode::Source(source) = &node.node
+                    && source.operator.name() == "SingleFileSource"
+                {
+                    Some(Self {
+                        task: source.context.task_info.clone(),
+                        tables: source.operator.tables(),
+                        control: source.context.control_tx.clone(),
+                        input_path: input_path.to_owned(),
+                    })
+                } else {
+                    None
+                }
+            })
+            .expect("matching CDC source must be SingleFileSource")
+    }
+
+    async fn assert_saved_offset(&self, job: &str, epoch: u32, expected: i32, phase: &str) {
+        use arroyo_rpc::MetadataOrManifest;
+        use arroyo_state::tables::table_manager::TableManager;
+        let metadata = if leader_mode() {
+            let paths = arroyo_state_protocol::ProtocolPaths::new(
+                arroyo_types::PipelineId::new("pipe-test"),
+                arroyo_types::JobId::new(job),
+            );
+            let path = paths.checkpoint_manifest(
+                arroyo_state_protocol::types::Generation(0),
+                Epoch(u64::from(epoch)),
+            );
+            let storage = arroyo_state::get_storage_provider(&StorageProviderFor::Worker)
+                .await
+                .unwrap();
+            MetadataOrManifest::Manifest(
+                arroyo_state_protocol::store::read_protobuf(storage.as_ref(), &path)
+                    .await
+                    .unwrap()
+                    .expect("matching checkpoint manifest missing"),
+            )
+        } else {
+            MetadataOrManifest::Metadata(
+                StateBackend::load_checkpoint_metadata(&StorageProviderFor::Worker, job, epoch)
+                    .await
+                    .unwrap(),
+            )
+        };
+        let (mut reader, _) = TableManager::load(
+            self.task.clone(),
+            self.tables.clone(),
+            self.control.clone(),
+            Some(&metadata),
+        )
+        .await
+        .unwrap();
+        let saved = reader
+            .get_global_keyed_state::<String, usize>("f")
+            .await
+            .unwrap()
+            .get(&self.input_path)
+            .copied()
+            .expect("single-file saved offset missing");
+        assert_eq!(
+            saved,
+            usize::try_from(expected).unwrap(),
+            "checkpoint source offset differs"
+        );
+        println!(
+            "CAPTURE_BATCH_BOUNDARY phase={phase} epoch={epoch} input_rows={expected} saved_rows={saved}"
+        );
+    }
+}
+
+struct CaptureBatchStep<'a> {
+    previous: i32,
+    boundary: i32,
+    epoch: u32,
+    stop: bool,
+    phase: &'a str,
+}
+
+async fn capture_batch_checkpoint(
+    ctx: &mut SmokeTestContext<'_>,
+    reader: &CaptureSourceReader,
+    step: CaptureBatchStep<'_>,
+    finished: &mut HashSet<(u32, u32)>,
+) -> u64 {
+    advance(
+        ctx.engine,
+        capture_boundary_noops(step.previous, step.boundary),
+    )
+    .await;
+    let bytes = checkpoint_with_stop(ctx, step.epoch, step.stop, finished).await;
+    reader
+        .assert_saved_offset(ctx.job_id.as_ref(), step.epoch, step.boundary, step.phase)
+        .await;
+    bytes
+}
+
 /// Opt-in pause after a real input row, with the source blocked on its
 /// existing control channel. The ordinary capture path does not use this.
 #[derive(Debug, PartialEq, Eq)]
@@ -2030,6 +2185,42 @@ async fn external_sql_checkpoint_capture_inner() {
             .unwrap()
             .as_nanos()
     );
+    let match_initial_checkpoint =
+        env::var("STREAMR_CAPTURE_MATCH_INITIAL_CHECKPOINT").as_deref() == Ok("1");
+    if match_initial_checkpoint {
+        assert!(idle.is_none() && schedule.is_none() && !impulse);
+    }
+    let matching_input = match_initial_checkpoint.then(|| {
+        source_config.table["path"]
+            .as_str()
+            .expect("matching source path missing")
+            .to_owned()
+    });
+    let boundaries = if let Some(path) = &matching_input {
+        let total = i32::try_from(read_to_string(path).await.unwrap().lines().count())
+            .expect("matching input row count exceeds i32");
+        let batch = i32::try_from(config::config().pipeline.source_batch_size).unwrap();
+        let boundaries =
+            capture_batch_boundaries(total, capture.input_rows_before_checkpoint, batch);
+        assert_eq!(
+            u32::try_from(
+                boundaries
+                    .iter()
+                    .filter(|row| **row <= capture.input_rows_before_checkpoint)
+                    .count()
+            )
+            .unwrap(),
+            capture.checkpoint_epoch
+        );
+        boundaries
+    } else {
+        Vec::new()
+    };
+    let initial_job_id = if match_initial_checkpoint {
+        format!("{job_id}-uninterrupted")
+    } else {
+        job_id.clone()
+    };
     let initial_path = output_path.with_extension("initial.jsonl");
     let mut stale_paths = vec![output_path.clone(), initial_path.clone()];
     if idle.is_some() {
@@ -2053,13 +2244,53 @@ async fn external_sql_checkpoint_capture_inner() {
         }
     }
     let (control_tx, mut control_rx) = channel(128);
-    let program = local_program(&job_id, &logical.graph, &udfs, None, control_tx).await;
+    let program = local_program(&initial_job_id, &logical.graph, &udfs, None, control_tx).await;
+    let initial_reader = matching_input
+        .as_ref()
+        .map(|path| CaptureSourceReader::new(&program, path));
     crate::event_clock_probe::install(&program, &output_path, "initial");
-    let initial_engine = Engine::for_local(program, "pipe-test".into(), job_id.clone())
+    let initial_engine = Engine::for_local(program, "pipe-test".into(), initial_job_id.clone())
         .await
         .unwrap();
     let initial_started = tokio::time::Instant::now();
     let running = initial_engine.start().await;
+    if match_initial_checkpoint {
+        let mut previous = 0;
+        for (index, boundary) in boundaries.iter().copied().enumerate() {
+            capture_batch_checkpoint(
+                &mut SmokeTestContext {
+                    job_id: Arc::new(initial_job_id.clone()),
+                    engine: &running,
+                    control_rx: &mut control_rx,
+                    program: logical.clone(),
+                },
+                initial_reader.as_ref().unwrap(),
+                CaptureBatchStep {
+                    previous,
+                    boundary,
+                    epoch: u32::try_from(index + 1).unwrap(),
+                    stop: false,
+                    phase: "initial",
+                },
+                &mut HashSet::new(),
+            )
+            .await;
+            previous = boundary;
+            if boundary == capture.input_rows_before_checkpoint {
+                break;
+            }
+        }
+        let prefix_rows = capture_rows(
+            &output_path,
+            capture.expected_checkpoint_rows,
+            "STREAMR_CAPTURE_MAX_CHECKPOINT_ROWS",
+        )
+        .await;
+        println!(
+            "CAPTURE_MATCH_INITIAL_CHECKPOINT input_rows={} output_rows={}",
+            capture.input_rows_before_checkpoint, prefix_rows
+        );
+    }
     if let Some(schedule) = &schedule {
         schedule
             .run(&running, &mut control_rx, &output_path, initial_started)
@@ -2091,6 +2322,36 @@ async fn external_sql_checkpoint_capture_inner() {
         assert!(after_bytes.starts_with(&before_bytes) && after_rows >= before_rows);
         initial_source_rows = idle.source_row_target;
     }
+    if let Some(reader) = &initial_reader {
+        let mut previous = capture.input_rows_before_checkpoint;
+        for (index, boundary) in boundaries
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(|(_, row)| *row > capture.input_rows_before_checkpoint)
+        {
+            capture_batch_checkpoint(
+                &mut SmokeTestContext {
+                    job_id: Arc::new(initial_job_id.clone()),
+                    engine: &running,
+                    control_rx: &mut control_rx,
+                    program: logical.clone(),
+                },
+                reader,
+                CaptureBatchStep {
+                    previous,
+                    boundary,
+                    epoch: u32::try_from(index + 1).unwrap(),
+                    stop: false,
+                    phase: "initial",
+                },
+                &mut HashSet::new(),
+            )
+            .await;
+            previous = boundary;
+        }
+    }
+    drop(initial_reader);
     run_until_finished(&running, &mut control_rx).await;
     wait_for_capture_state_cleanup().await;
     let initial_rows = capture_rows(
@@ -2110,7 +2371,7 @@ async fn external_sql_checkpoint_capture_inner() {
 
     // The shared helper initializes leader generations for epoch 1. Other
     // configured first epochs require explicit generation initialization.
-    if leader_mode() && capture.checkpoint_epoch != 1 {
+    if leader_mode() && capture.checkpoint_epoch != 1 && !match_initial_checkpoint {
         use arroyo_state_protocol::workflow::{
             GenerationInitialization, InitializeGenerationRequest, initialize_generation,
         };
@@ -2136,6 +2397,9 @@ async fn external_sql_checkpoint_capture_inner() {
     }
     let (control_tx, mut control_rx) = channel(128);
     let program = local_program(&job_id, &logical.graph, &udfs, None, control_tx).await;
+    let prefix_reader = matching_input
+        .as_ref()
+        .map(|path| CaptureSourceReader::new(&program, path));
     crate::event_clock_probe::install(&program, &output_path, "checkpoint");
     let running = Engine::for_local(program, "pipe-test".into(), job_id.clone())
         .await
@@ -2157,23 +2421,56 @@ async fn external_sql_checkpoint_capture_inner() {
             test_runtime_timeout(),
         )
         .await;
-    } else {
+    } else if !match_initial_checkpoint {
         advance(&running, capture.input_rows_before_checkpoint - 1).await;
     }
     // Stop at the barrier so neither source can emit beyond the captured prefix.
     let mut finished_tasks = HashSet::new();
-    let checkpoint_bytes = checkpoint_with_stop(
-        &mut SmokeTestContext {
-            job_id: Arc::new(job_id.clone()),
-            engine: &running,
-            control_rx: &mut control_rx,
-            program: logical.clone(),
-        },
-        capture.checkpoint_epoch,
-        true,
-        &mut finished_tasks,
-    )
-    .await;
+    let checkpoint_bytes = if let Some(reader) = &prefix_reader {
+        let mut previous = 0;
+        let mut bytes = 0;
+        for (index, boundary) in boundaries
+            .iter()
+            .copied()
+            .enumerate()
+            .take_while(|(_, row)| *row <= capture.input_rows_before_checkpoint)
+        {
+            bytes = capture_batch_checkpoint(
+                &mut SmokeTestContext {
+                    job_id: Arc::new(job_id.clone()),
+                    engine: &running,
+                    control_rx: &mut control_rx,
+                    program: logical.clone(),
+                },
+                reader,
+                CaptureBatchStep {
+                    previous,
+                    boundary,
+                    epoch: u32::try_from(index + 1).unwrap(),
+                    stop: boundary == capture.input_rows_before_checkpoint,
+                    phase: "checkpoint",
+                },
+                &mut finished_tasks,
+            )
+            .await;
+            previous = boundary;
+        }
+        bytes
+    } else {
+        checkpoint_with_stop(
+            &mut SmokeTestContext {
+                job_id: Arc::new(job_id.clone()),
+                engine: &running,
+                control_rx: &mut control_rx,
+                program: logical.clone(),
+            },
+            capture.checkpoint_epoch,
+            true,
+            &mut finished_tasks,
+        )
+        .await
+    };
+    drop(prefix_reader);
     let checkpoint_rows = capture_rows(
         &output_path,
         capture.expected_checkpoint_rows,
@@ -2274,6 +2571,9 @@ async fn external_sql_checkpoint_capture_inner() {
         )
         .await;
     }
+    let restored_reader = matching_input
+        .as_ref()
+        .map(|path| CaptureSourceReader::new(&program, path));
     crate::event_clock_probe::install(&program, &output_path, "recovered");
     let restored = Engine::for_local(program, "pipe-test".into(), job_id.clone())
         .await
@@ -2308,6 +2608,36 @@ async fn external_sql_checkpoint_capture_inner() {
         assert!(after_bytes.starts_with(&before_bytes) && after_rows >= before_rows);
         restored_source_rows = idle.source_row_target;
     }
+    if let Some(reader) = &restored_reader {
+        let mut previous = capture.input_rows_before_checkpoint;
+        for (index, boundary) in boundaries
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(|(_, row)| *row > capture.input_rows_before_checkpoint)
+        {
+            capture_batch_checkpoint(
+                &mut SmokeTestContext {
+                    job_id: Arc::new(job_id.clone()),
+                    engine: &restored,
+                    control_rx: &mut control_rx,
+                    program: logical.clone(),
+                },
+                reader,
+                CaptureBatchStep {
+                    previous,
+                    boundary,
+                    epoch: u32::try_from(index + 1).unwrap(),
+                    stop: false,
+                    phase: "recovered",
+                },
+                &mut HashSet::new(),
+            )
+            .await;
+            previous = boundary;
+        }
+    }
+    drop(restored_reader);
     run_until_finished(&restored, &mut control_rx).await;
     drop(restored);
     wait_for_capture_state_cleanup().await;
@@ -2412,12 +2742,158 @@ fn process_rss_bytes() -> usize {
         * 1024
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct CaptureFrameLimits {
+    frame: usize,
+    page: usize,
+    aggregate_write: usize,
+    window_write: usize,
+    overlay: usize,
+    scan: usize,
+    write_scope: usize,
+    queued: usize,
+    pending: usize,
+    decoded: usize,
+}
+
+fn capture_frame_limits(
+    frame: Option<usize>,
+) -> std::result::Result<Option<CaptureFrameLimits>, String> {
+    let Some(frame) = frame else { return Ok(None) };
+    if !(32 * 1024..=1024 * 1024).contains(&frame) {
+        return Err("STREAMR_TEST_FRAME_BYTES must be in 32768..=1048576".into());
+    }
+    let scale = |factor: usize| {
+        frame
+            .checked_mul(factor)
+            .ok_or_else(|| "test frame limit overflow".to_string())
+    };
+    // Preserve the established aggregate64F scope, independently of window8F.
+    let aggregate_write = scale(64)?;
+    let overlay = aggregate_write;
+    let pending = scale(24)?;
+    // Output72F + scope(overlay64F/read3F) + separate selector decode3F.
+    let decoded = overlay
+        .checked_add(
+            pending
+                .checked_mul(3)
+                .ok_or("test pending limit overflow")?,
+        )
+        .and_then(|bytes| bytes.checked_add(frame.checked_mul(6)?))
+        .ok_or("test decoded limit overflow")?;
+    let write_scope =
+        arroyo_state::live::write::AdmittedWriteBatch::reservation_bytes(aggregate_write, 128)
+            .map_err(|error| error.to_string())?;
+    let queued = write_scope
+        .checked_mul(2)
+        .ok_or("test queued limit overflow")?;
+    Ok(Some(CaptureFrameLimits {
+        frame,
+        page: scale(2)?,
+        aggregate_write,
+        window_write: scale(8)?,
+        overlay,
+        scan: scale(16)?,
+        write_scope,
+        queued,
+        pending,
+        decoded,
+    }))
+}
+
+fn capture_checkpoint_headroom(
+    limits: &CaptureFrameLimits,
+    resources: &mut arroyo_rpc::config::LiveStateResourceConfig,
+) -> std::result::Result<usize, String> {
+    // Only this explicit test profile derives a pool. Product configuration is
+    // caller-owned. Recompute against the final scan/queue/database settings.
+    for _ in 0..usize::BITS {
+        let config = arroyo_state::live::resources::ResourceConfig {
+            block_cache_bytes: resources.block_cache_bytes,
+            memtable_bytes: resources.memtable_bytes,
+            queued_write_bytes: resources.queued_write_bytes,
+            decoded_value_bytes: resources.decoded_value_bytes,
+            scan_page_bytes: resources.scan_page_bytes,
+            max_blocking_operations: resources.max_blocking_operations,
+            max_snapshots: resources.max_snapshots,
+            max_open_databases: resources.max_open_databases,
+            disk_reserve_bytes: resources.disk_reserve_bytes,
+        };
+        let writer = arroyo_state::live::checkpoint::checkpoint_decoded_reservation(&config)
+            .map_err(|error| error.to_string())?;
+        let required = limits
+            .decoded
+            .checked_add(writer)
+            .ok_or("test checkpoint decoded overflow")?;
+        if resources.decoded_value_bytes >= required {
+            return Ok(writer);
+        }
+        resources.decoded_value_bytes = required;
+    }
+    Err("test checkpoint decoded fixed point did not converge".into())
+}
+
+#[test]
+fn explicit_capture_frame_limits_are_bounded() {
+    // No override reaches any config mutation: standard32KiB frame,
+    // pending512KiB and decoded16MiB configuration remains controlling.
+    assert_eq!(capture_frame_limits(None).unwrap(), None);
+    assert!(capture_frame_limits(Some(0)).is_err());
+    assert!(capture_frame_limits(Some(usize::MAX)).is_err());
+    assert!(capture_frame_limits(Some(1024 * 1024 + 1)).is_err());
+    let limits = capture_frame_limits(Some(1024 * 1024)).unwrap().unwrap();
+    assert_eq!(limits.page, 2 * 1024 * 1024);
+    assert_eq!(limits.aggregate_write, 64 * 1024 * 1024);
+    assert_eq!(limits.window_write, 8 * 1024 * 1024);
+    assert_eq!(limits.overlay, limits.aggregate_write);
+    assert_eq!(limits.pending, 24 * 1024 * 1024);
+    assert_eq!(limits.decoded, 142 * 1024 * 1024);
+    let reservation = arroyo_state::live::write::AdmittedWriteBatch::reservation_bytes(
+        limits.aggregate_write,
+        128,
+    )
+    .unwrap();
+    assert_eq!(limits.write_scope, reservation);
+    assert_eq!(limits.queued, reservation.checked_mul(2).unwrap());
+    assert!(limits.pending / 3 >= limits.frame * 8);
+    assert_eq!(
+        limits.overlay + 3 * limits.pending + 6 * limits.frame,
+        limits.decoded
+    );
+    assert!(139 * 1024 * 1024 < limits.decoded);
+    assert!(16 * 1024 * 1024 < limits.decoded);
+    let mut resources = arroyo_rpc::config::LiveStateResourceConfig {
+        block_cache_bytes: 8 * 1024 * 1024,
+        memtable_bytes: 4 * 1024 * 1024,
+        queued_write_bytes: limits.queued,
+        decoded_value_bytes: limits.decoded,
+        scan_page_bytes: limits.scan,
+        max_blocking_operations: 2,
+        max_snapshots: 8,
+        max_open_databases: 2,
+        disk_reserve_bytes: 0,
+    };
+    let writer = capture_checkpoint_headroom(&limits, &mut resources).unwrap();
+    assert_eq!(writer, 4_374_526);
+    assert_eq!(resources.decoded_value_bytes, 153_272_318);
+    assert_eq!(resources.decoded_value_bytes, limits.decoded + writer);
+    assert_eq!(
+        capture_checkpoint_headroom(&limits, &mut resources).unwrap(),
+        writer
+    );
+    let mut overflow = limits;
+    overflow.decoded = usize::MAX;
+    assert!(capture_checkpoint_headroom(&overflow, &mut resources).is_err());
+}
+
 fn configure_test_worker() {
     config::config();
     config::update(|c| {
         // reduce the batch size to increase consistency
         c.pipeline.source_batch_size = 32;
-        if env::var("STREAMR_CAPTURE_EVENT_CLOCK_PROBE").as_deref() == Ok("1") {
+        if env::var("STREAMR_CAPTURE_EVENT_CLOCK_PROBE").as_deref() == Ok("1")
+            || env::var("STREAMR_CAPTURE_MATCH_INITIAL_CHECKPOINT").as_deref() == Ok("1")
+        {
             // Keep focused clock fixture batches deterministic across backend startup.
             // Existing source barriers and EOF still flush partial batches.
             c.pipeline.source_batch_linger = Duration::from_secs(3600).into();
@@ -2586,10 +3062,36 @@ fn configure_test_worker() {
         let snapshots = positive_limit("STREAMR_TEST_MAX_SNAPSHOTS");
         let scan_page_bytes = positive_limit("STREAMR_TEST_SCAN_PAGE_BYTES");
         let queued_write_bytes = positive_limit("STREAMR_TEST_QUEUED_WRITE_BYTES");
+        let frame_limits = capture_frame_limits(positive_limit("STREAMR_TEST_FRAME_BYTES"))
+            .expect("invalid explicit test frame limits");
+        if let Some(limits) = &frame_limits {
+            assert!(scan_page_bytes.is_none_or(|bytes| bytes >= limits.scan));
+            assert!(queued_write_bytes.is_none_or(|bytes| bytes >= limits.queued));
+            assert!(c.worker.aggregate_state.is_some() || c.worker.window_state.is_some());
+            if let Some(aggregate) = c.worker.aggregate_state.as_mut() {
+                aggregate.value_bytes = limits.frame;
+                aggregate.page_bytes = limits.page;
+                aggregate.write_bytes = limits.aggregate_write;
+                aggregate.overlay_bytes = limits.overlay;
+                aggregate.max_pending_output_bytes = limits.pending;
+                aggregate
+                    .validate()
+                    .expect("invalid test aggregate frame configuration");
+            }
+            if let Some(window) = c.worker.window_state.as_mut() {
+                window.partial_bytes = limits.frame;
+                window.page_bytes = limits.page;
+                window.write_bytes = limits.window_write;
+                window
+                    .validate()
+                    .expect("invalid test window frame configuration");
+            }
+        }
         if databases.is_some()
             || snapshots.is_some()
             || scan_page_bytes.is_some()
             || queued_write_bytes.is_some()
+            || frame_limits.is_some()
         {
             let resources = c
                 .worker
@@ -2607,6 +3109,27 @@ fn configure_test_worker() {
             }
             if let Some(queued_write_bytes) = queued_write_bytes {
                 resources.queued_write_bytes = queued_write_bytes;
+            }
+            if let Some(limits) = frame_limits {
+                resources.scan_page_bytes = resources.scan_page_bytes.max(limits.scan);
+                resources.queued_write_bytes = resources.queued_write_bytes.max(limits.queued);
+                resources.decoded_value_bytes = resources.decoded_value_bytes.max(limits.decoded);
+                let checkpoint = capture_checkpoint_headroom(&limits, resources)
+                    .expect("invalid explicit checkpoint overlap limits");
+                println!(
+                    "\nCAPTURE_FRAME_LIMITS frame_bytes={} page_bytes={} aggregate_write_bytes={} window_write_bytes={} overlay_bytes={} max_pending_output_bytes={} scan_page_bytes={} queued_write_bytes={} write_reservation_bytes={} decoded_value_bytes={} checkpoint_writer_decoded_bytes={}",
+                    limits.frame,
+                    limits.page,
+                    limits.aggregate_write,
+                    limits.window_write,
+                    limits.overlay,
+                    limits.pending,
+                    resources.scan_page_bytes,
+                    resources.queued_write_bytes,
+                    limits.write_scope,
+                    resources.decoded_value_bytes,
+                    checkpoint
+                );
             }
         }
     });

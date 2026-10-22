@@ -154,6 +154,12 @@ impl OperatorConstructor for TumblingAggregateWindowConstructor {
             .ok_or_else(|| anyhow!("requires partial schema"))?
             .try_into()?;
 
+        anyhow::ensure!(
+            arroyo_rpc::config::config().worker.window_state.is_some()
+                || !super::window_native::has_grouped_selector(partial_aggregation_plan.as_ref()),
+            "grouped FIRST_VALUE/LAST_VALUE windows require worker.window-state and worker.live-state-resources"
+        );
+
         let native = arroyo_rpc::config::config()
             .worker
             .window_state
