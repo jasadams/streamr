@@ -1,5 +1,6 @@
 //! Updating equijoins retain identity-indexed rows in one checkpoint namespace.
 //! Fanout is streamed one pair at a time; independent input branches are not atomic.
+use super::aggregate_store::scan_diagnostics::OutputProbe;
 use super::aggregate_store::{AggregateScope, AggregateStore, AggregateStoreLimits};
 use crate::event_pair::{EventPair, EventPairState};
 use anyhow::{Context, Result};
@@ -8,6 +9,7 @@ use arrow::row::{RowConverter, SortField};
 use arrow_array::{Array, BooleanArray, FixedSizeBinaryArray, RecordBatch, StructArray};
 use arroyo_operator::CheckpointCounter;
 use arroyo_operator::context::{Collector, OperatorContext};
+use arroyo_operator::operator::EventResponseRole;
 use arroyo_operator::operator::{ArrowOperator, ConstructedOperator, Registry};
 use arroyo_planner::physical::{ArroyoPhysicalExtensionCodec, DecodingContext};
 use arroyo_rpc::config::JoinStateConfig;
@@ -60,6 +62,7 @@ pub struct UpdatingJoin {
 
 struct ResponseJoin {
     pair: EventPairState,
+    root_operator: u32,
     accepted: ArroyoSchema,
 }
 /// Native emit executes its real physical pair plan into this bounded internal
@@ -101,6 +104,8 @@ struct PreparedAccepted {
     // Keep output ownership admitted through delivery/error/cancellation. This
     // is NOT a backend snapshot, scan page or working-scope guard.
     _output: Option<ResourcePermit>,
+    // Field drop order releases output before the diagnostic release marker.
+    diagnostic: OutputProbe,
 }
 
 fn metadata(batch: &RecordBatch) -> Result<(&BooleanArray, &FixedSizeBinaryArray)> {
@@ -424,6 +429,7 @@ impl UpdatingJoin {
             return Ok(PreparedAccepted {
                 batch: None,
                 _output: None,
+                diagnostic: OutputProbe::new(),
             });
         }
         let store = self
@@ -435,6 +441,9 @@ impl UpdatingJoin {
             .max_pending_output_bytes
             .checked_mul(3)
             .context("event JOIN output workspace overflow")?;
+        // Declare before output so an early prepare error releases output
+        // ownership before the same diagnostic terminal marker.
+        let mut diagnostic = OutputProbe::new();
         let output = store
             .resources()
             .try_decoded_value(requested)
@@ -458,6 +467,19 @@ impl UpdatingJoin {
         };
         if !touched.is_empty() {
             let scope = store.begin().await?;
+            let scope_id = scope.diagnostic_scope_id();
+            diagnostic.bind(scope_id);
+            if let Some(scope_id) = scope_id {
+                eprintln!(
+                    "STREAMR_SCAN_DIAGNOSTIC {}",
+                    serde_json::json!({
+                        "event":"join_response_context","scope_id":scope_id,
+                        "operator_id":ctx.task_info.operator_id,"root_operator":pair.context.root_operator,
+                        "root_subtask":pair.context.root_subtask,"attempt_nonce":pair.context.attempt_nonce,
+                        "sequence":pair.context.sequence,"trigger_nanos":pair.context.trigger_nanos,"touched_full_keys":touched.len(),
+                    })
+                );
+            }
             for key in touched {
                 let left = self.final_native_row(&scope, 0, &key).await?;
                 let right = self.final_native_row(&scope, 1, &key).await?;
@@ -517,6 +539,7 @@ impl UpdatingJoin {
         Ok(PreparedAccepted {
             batch,
             _output: Some(output),
+            diagnostic,
         })
     }
 
@@ -777,6 +800,46 @@ impl UpdatingJoin {
 
 #[async_trait::async_trait]
 impl ArrowOperator for UpdatingJoin {
+    fn event_response_role(&self) -> EventResponseRole {
+        self.response
+            .as_ref()
+            .map_or(EventResponseRole::Ordinary, |mode| {
+                EventResponseRole::Join(mode.root_operator)
+            })
+    }
+    fn bind_event_response(
+        &mut self,
+        inputs: &[Arc<EventEdgeSpec>],
+        context: &OperatorContext,
+    ) -> DataflowResult<Option<Arc<EventEdgeSpec>>> {
+        let output = context.out_schema.as_deref().ok_or_else(|| {
+            arroyo_rpc::errors::DataflowError::ArgumentError(
+                "response operator output schema missing".into(),
+            )
+        })?;
+        let mode = self
+            .response
+            .as_ref()
+            .context("JOIN has no planned response mode")?;
+        join_ensure!(
+            inputs.len() == 2 && output.schema == mode.accepted.schema,
+            "event JOIN accepted/input descriptor mismatch"
+        );
+        for (side, input) in inputs.iter().enumerate() {
+            join_ensure!(
+                input.root_operator == mode.root_operator
+                    && input.root_subtask == 0
+                    && input.schema == self.schemas[side].schema
+                    && matches!(
+                        input.layout,
+                        arroyo_types::event_edge::EventLayout::Native { .. }
+                    ),
+                "event JOIN requires two matching native branch descriptors"
+            );
+        }
+        Ok(None)
+    }
+
     fn name(&self) -> String {
         "UpdatingJoin".into()
     }
@@ -847,7 +910,14 @@ impl ArrowOperator for UpdatingJoin {
         let context = pair.context;
         let accepted = self.prepare_accepted_pair(pair, ctx).await?;
         if let Some(batch) = accepted.batch {
-            collector.collect(batch).await?;
+            accepted.diagnostic.event("collector_begin");
+            let delivered = collector.collect(batch).await;
+            accepted.diagnostic.event(if delivered.is_ok() {
+                "collector_complete"
+            } else {
+                "collector_error"
+            });
+            delivered?;
         }
         // Both inputs stay parked in Processing while output awaits. Errors or
         // cancellation never finish; the attempt must fail and restore fresh.
@@ -1088,6 +1158,7 @@ fn build(
             }
             Some(ResponseJoin {
                 pair: EventPairState::new(root, 0),
+                root_operator: root,
                 accepted,
             })
         }

@@ -1,4 +1,4 @@
-//! External, unlinked source candidate. No runtime registration or activation.
+//! Pairs original-event branch responses for the native updating JOIN.
 use anyhow::{Result, ensure};
 use arroyo_operator::CheckpointCounter;
 use arroyo_types::SignalMessage;

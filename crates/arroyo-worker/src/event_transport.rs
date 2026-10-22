@@ -22,7 +22,12 @@ struct EventAttempt {
     destination_worker: u64,
 }
 impl EventAttempt {
-    fn from_assignments(generation: u64, quad: Quad, tasks: &[TaskAssignment]) -> Result<Self> {
+    fn from_assignments(
+        generation: u64,
+        quad: Quad,
+        task_ids: [u32; 2],
+        tasks: &[TaskAssignment],
+    ) -> Result<Self> {
         let worker = |id: usize, subtask: usize| -> Result<u64> {
             let mut matching = tasks
                 .iter()
@@ -42,8 +47,8 @@ impl EventAttempt {
         }
         Ok(Self {
             generation,
-            source_worker: worker(quad.src_id, quad.src_idx)?,
-            destination_worker: worker(quad.dst_id, quad.dst_idx)?,
+            source_worker: worker(task_ids[0] as usize, quad.src_idx)?,
+            destination_worker: worker(task_ids[1] as usize, quad.dst_idx)?,
         })
     }
     fn encode(self) -> [u8; ATTEMPT_BYTES] {
@@ -71,16 +76,19 @@ pub struct EventWireSpec {
 }
 impl EventWireSpec {
     /// Engine supplies CURRENT WorkerContext generation and CURRENT task
-    /// assignments. Never infer execution identity from packet/root nonce.
+    /// assignments. `quad` stays in the existing graph-index wire namespace;
+    /// `task_ids` are the actual graph endpoint node ids, validated by Engine.
+    /// Never infer execution identity from packet/root nonce or wire indices.
     pub fn registered(
         generation: u64,
         quad: Quad,
+        task_ids: [u32; 2],
         tasks: &[TaskAssignment],
         edge: Arc<EventEdgeSpec>,
     ) -> Result<Self> {
         Ok(Self {
             quad,
-            attempt: EventAttempt::from_assignments(generation, quad, tasks)?,
+            attempt: EventAttempt::from_assignments(generation, quad, task_ids, tasks)?,
             codec: ResponseSpec::from_edge(&edge)?,
             edge,
         })
@@ -244,7 +252,7 @@ mod tests {
     }
     #[tokio::test]
     async fn event_transport_empty_roundtrip_keeps_pure48_and_wire72() -> Result<()> {
-        let registered = EventWireSpec::registered(3, quad(), &tasks(), edge())?;
+        let registered = EventWireSpec::registered(3, quad(), [1, 2], &tasks(), edge())?;
         let encoded = registered.encode(&empty())?;
         let mut wire = Vec::new();
         registered.write_payload(&mut wire, &encoded).await?;
@@ -260,15 +268,15 @@ mod tests {
     #[tokio::test]
     async fn event_transport_stale_generation_or_worker_rejects_without_variable_body() -> Result<()>
     {
-        let fresh = EventWireSpec::registered(4, quad(), &tasks(), edge())?;
+        let fresh = EventWireSpec::registered(4, quad(), [1, 2], &tasks(), edge())?;
         let mut old_workers = tasks();
         old_workers[0].worker_id = 99;
         let mut old_destination = tasks();
         old_destination[1].worker_id = 199;
         for stale in [
-            EventWireSpec::registered(3, quad(), &tasks(), edge())?,
-            EventWireSpec::registered(4, quad(), &old_workers, edge())?,
-            EventWireSpec::registered(4, quad(), &old_destination, edge())?,
+            EventWireSpec::registered(3, quad(), [1, 2], &tasks(), edge())?,
+            EventWireSpec::registered(4, quad(), [1, 2], &old_workers, edge())?,
+            EventWireSpec::registered(4, quad(), [1, 2], &old_destination, edge())?,
         ] {
             let encoded = stale.encode(&empty())?;
             let (mut tx, mut rx) = tokio::io::duplex(128);
@@ -289,11 +297,11 @@ mod tests {
     fn event_transport_requires_exact_existing_task_assignment() -> Result<()> {
         let mut missing = tasks();
         missing.pop();
-        assert!(EventWireSpec::registered(0, quad(), &missing, edge()).is_err());
+        assert!(EventWireSpec::registered(0, quad(), [1, 2], &missing, edge()).is_err());
         let mut duplicated = tasks();
         duplicated.push(duplicated[0].clone());
-        assert!(EventWireSpec::registered(0, quad(), &duplicated, edge()).is_err());
-        let zero = EventWireSpec::registered(0, quad(), &tasks(), edge())?;
+        assert!(EventWireSpec::registered(0, quad(), [1, 2], &duplicated, edge()).is_err());
+        let zero = EventWireSpec::registered(0, quad(), [1, 2], &tasks(), edge())?;
         zero.require_quad(quad())?;
         let wrong = Quad {
             dst_id: 3,
@@ -303,7 +311,7 @@ mod tests {
             zero.require_quad(wrong).unwrap_err().to_string(),
             "response descriptor Quad mismatch"
         );
-        EventWireSpec::registered(u64::MAX, quad(), &tasks(), edge())?;
+        EventWireSpec::registered(u64::MAX, quad(), [1, 2], &tasks(), edge())?;
         Ok(())
     }
 }
@@ -356,6 +364,7 @@ mod repaired_tests {
         EventWireSpec::registered(
             4,
             quad(),
+            [1, 2],
             &tasks(),
             Arc::new(EventEdgeSpec {
                 root_operator: 7,
@@ -395,7 +404,7 @@ mod repaired_tests {
                     encoded_key_bytes: 512,
                 },
             });
-            let registered = EventWireSpec::registered(4, quad(), &tasks(), edge.clone())?;
+            let registered = EventWireSpec::registered(4, quad(), [1, 2], &tasks(), edge.clone())?;
             let response = EventResponse {
                 rows: Some(batch.clone()),
                 ..empty()
@@ -492,7 +501,7 @@ mod repaired_tests {
                 encoded_key_bytes: 512,
             },
         });
-        let registered = EventWireSpec::registered(4, quad(), &tasks(), edge.clone())?;
+        let registered = EventWireSpec::registered(4, quad(), [1, 2], &tasks(), edge.clone())?;
         let original = EventResponse {
             rows: Some(owned.clone()),
             ..empty()
@@ -543,7 +552,7 @@ mod repaired_tests {
                 "must need backing proof"
             );
             assert!(decoded.proves_native_projection(&next, &projected));
-            let next_wire = EventWireSpec::registered(4, quad(), &tasks(), next.clone())?;
+            let next_wire = EventWireSpec::registered(4, quad(), [1, 2], &tasks(), next.clone())?;
             let rebound = next_wire.rebind_rows(&decoded, Some(projected.clone()))?;
             assert_eq!(rebound.context, original.context);
             assert_eq!(rebound.touched_keys, original.touched_keys);
@@ -584,7 +593,7 @@ mod repaired_tests {
                 .unwrap_err(),
             "native body allocation exceeds registered proof"
         );
-        let small_wire = EventWireSpec::registered(4, quad(), &tasks(), next.clone())?;
+        let small_wire = EventWireSpec::registered(4, quad(), [1, 2], &tasks(), next.clone())?;
         let compact = small_wire.rebind_rows(&decoded, Some(projected.clone()))?;
         assert_eq!(compact.rows.as_ref(), Some(&fresh));
         assert!(compact.is_native_forward(&next));
@@ -619,7 +628,7 @@ mod repaired_tests {
             ..edge.as_ref().clone()
         });
         assert!(!decoded.proves_native_projection(&computed_edge, &computed));
-        let computed_wire = EventWireSpec::registered(4, quad(), &tasks(), computed_edge)?;
+        let computed_wire = EventWireSpec::registered(4, quad(), [1, 2], &tasks(), computed_edge)?;
         assert_eq!(
             computed_wire
                 .rebind_rows(&decoded, Some(computed))
@@ -650,7 +659,7 @@ mod repaired_tests {
                 encoded_key_bytes: 512,
             },
         });
-        let registered = EventWireSpec::registered(4, quad(), &tasks(), edge.clone())?;
+        let registered = EventWireSpec::registered(4, quad(), [1, 2], &tasks(), edge.clone())?;
         let encoded = registered.encode(&EventResponse {
             rows: Some(batch),
             ..empty()
@@ -673,7 +682,7 @@ mod repaired_tests {
             schema: alias_schema,
             ..edge.as_ref().clone()
         });
-        let next_wire = EventWireSpec::registered(4, quad(), &tasks(), next.clone())?;
+        let next_wire = EventWireSpec::registered(4, quad(), [1, 2], &tasks(), next.clone())?;
         // The old allocation fits once, but canonical IPC copies both aliases.
         let rebound = next_wire.rebind_rows(&decoded, Some(repeated))?;
         assert!(rebound.is_native_forward(&next));
@@ -760,7 +769,7 @@ mod repaired_tests {
     #[tokio::test]
     async fn event_transport_stale_signal_identity_rejects_without_payload() -> Result<()> {
         let registered = raw();
-        let old = EventWireSpec::registered(3, quad(), &tasks(), registered.edge.clone())?;
+        let old = EventWireSpec::registered(3, quad(), [1, 2], &tasks(), registered.edge.clone())?;
         let (mut tx, mut rx) = tokio::io::duplex(64);
         old.write_identity(&mut tx).await?;
         let error = tokio::time::timeout(

@@ -12,11 +12,13 @@ use arrow::datatypes::Schema;
 use arroyo_datastream::logical::{DylibUdfConfig, PythonUdfConfig};
 use arroyo_metrics::TaskCounters;
 use arroyo_rpc::df::ArroyoSchema;
+use arroyo_rpc::errors::DataflowError;
 use arroyo_rpc::errors::{DataflowResult, TaskError};
 use arroyo_rpc::grpc::rpc::{TableConfig, TaskCheckpointEventType};
 use arroyo_rpc::{ControlMessage, ControlResp};
 use arroyo_state::tables::table_manager::TableManager;
 use arroyo_storage::StorageProvider;
+use arroyo_types::event_edge::EventEdgeSpec;
 use arroyo_types::event_response::EventResponse;
 use arroyo_types::{
     ArrowMessage, ChainInfo, CheckpointBarrier, SignalMessage, TaskInfo, Watermark,
@@ -252,7 +254,27 @@ impl OperatorNode {
             task_index: self.task_index(),
         });
 
-        let collector = ArrowCollector::new(chain_info.clone(), out_schema, out_qs);
+        let event_spec = match self.as_ref() {
+            OperatorNode::Source(_) => None,
+            OperatorNode::Chained(chain) => chain
+                .iter()
+                .last()
+                .and_then(|(operator, _)| operator.event_response_output()),
+        };
+        let mut collector = ArrowCollector::new(chain_info.clone(), out_schema, out_qs);
+        if let Some(spec) = event_spec
+            && let Err(error) = collector.register_event_output(spec)
+        {
+            control_tx
+                .send(ControlResp::TaskFailed {
+                    task_id: chain_info.task_id,
+                    subtask_idx: chain_info.task_index,
+                    error: error.into(),
+                })
+                .await
+                .ok();
+            return in_qs;
+        }
 
         match self
             .run_behavior(
@@ -1261,9 +1283,38 @@ pub struct DisplayableOperator<'a> {
     pub fields: Vec<(&'static str, AsDisplayable<'a>)>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EventResponseRole {
+    Ordinary,
+    Scalar,
+    Root(u32),
+    Aggregate(u32),
+    Join(u32),
+}
+
 #[async_trait::async_trait]
 pub trait ArrowOperator: Send + 'static {
     fn name(&self) -> String;
+    fn event_response_role(&self) -> EventResponseRole {
+        EventResponseRole::Ordinary
+    }
+    fn event_response_output(&self) -> Option<Arc<EventEdgeSpec>> {
+        None
+    }
+    fn bind_event_response(
+        &mut self,
+        _inputs: &[Arc<EventEdgeSpec>],
+        _context: &OperatorContext,
+    ) -> DataflowResult<Option<Arc<EventEdgeSpec>>> {
+        Err(DataflowError::ArgumentError(
+            "operator does not bind event response descriptors".into(),
+        ))
+    }
+    fn validate_event_source_plumbing(&self) -> DataflowResult<()> {
+        Err(DataflowError::ArgumentError(
+            "operator is not canonical source plumbing".into(),
+        ))
+    }
 
     fn tables(&self) -> HashMap<String, TableConfig> {
         HashMap::new()

@@ -5,8 +5,8 @@ use arroyo_types::event_edge::{EventEdgeSpec, EventLayout};
 use arroyo_types::event_response::{EVENT_RESPONSE_VERSION, EventContext, EventResponse};
 
 use arroyo_operator::operator::{
-    ArrowOperator, AsDisplayable, ConstructedOperator, DisplayableOperator, OperatorConstructor,
-    Registry,
+    ArrowOperator, AsDisplayable, ConstructedOperator, DisplayableOperator, EventResponseRole,
+    OperatorConstructor, Registry,
 };
 use arroyo_rpc::df::ArroyoSchema;
 use arroyo_rpc::errors::DataflowResult;
@@ -303,6 +303,39 @@ impl OperatorConstructor for WatermarkGeneratorConstructor {
 
 #[async_trait]
 impl ArrowOperator for WatermarkGenerator {
+    fn event_response_role(&self) -> EventResponseRole {
+        self.response_root
+            .as_ref()
+            .map_or(EventResponseRole::Ordinary, |root| {
+                EventResponseRole::Root(root.spec.root_operator)
+            })
+    }
+    fn event_response_output(&self) -> Option<Arc<EventEdgeSpec>> {
+        self.response_root.as_ref().map(|root| root.spec.clone())
+    }
+    fn bind_event_response(
+        &mut self,
+        inputs: &[Arc<EventEdgeSpec>],
+        context: &OperatorContext,
+    ) -> DataflowResult<Option<Arc<EventEdgeSpec>>> {
+        let output = context.out_schema.as_deref().ok_or_else(|| {
+            arroyo_rpc::errors::DataflowError::ArgumentError(
+                "response operator output schema missing".into(),
+            )
+        })?;
+        let root = self
+            .response_root
+            .as_ref()
+            .ok_or_else(|| admission_error("watermark has no planned response root"))?;
+        root.validate_task(context)?;
+        if !inputs.is_empty() || root.spec.schema != output.schema {
+            return Err(admission_error(
+                "response root binding schema/input mismatch",
+            ));
+        }
+        Ok(Some(root.spec.clone()))
+    }
+
     fn tables(&self) -> HashMap<String, TableConfig> {
         global_table_config_with_version("s", "expression watermark state", WATERMARK_STATE_VERSION)
     }

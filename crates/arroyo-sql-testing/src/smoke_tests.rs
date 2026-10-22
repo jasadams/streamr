@@ -33,7 +33,6 @@ use serde_json::Value;
 use test_log::test as test_log;
 use tokio::fs::{File, read_to_string};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
-use tokio::sync::mpsc::error::TryRecvError;
 use tracing::info;
 
 #[test_log(rstest)]
@@ -368,13 +367,24 @@ fn test_runtime_timeout() -> Duration {
 async fn run_until_finished(engine: &RunningEngine, control_rx: &mut Receiver<ControlResp>) {
     tokio::time::timeout(test_runtime_timeout(), async {
         loop {
-            advance(engine, 10).await;
-            match control_rx.try_recv() {
-                Ok(ControlResp::TaskFailed { error, .. }) => panic!("worker failed: {error:?}"),
-                Ok(_) | Err(TryRecvError::Empty) => {
-                    tokio::time::sleep(Duration::from_millis(1)).await;
+            // Keep the same NoOp pacing future alive while observing failures:
+            // a failed downstream owner may leave source controls blocked.
+            let pacing = async {
+                advance(engine, 10).await;
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            };
+            tokio::pin!(pacing);
+            loop {
+                tokio::select! {
+                    response = control_rx.recv() => match response {
+                        Some(ControlResp::TaskFailed { error, .. }) => {
+                            panic!("worker failed: {error:?}");
+                        }
+                        Some(_) => {}
+                        None => return,
+                    },
+                    () = &mut pacing => break,
                 }
-                Err(TryRecvError::Disconnected) => break,
             }
         }
     })
@@ -3155,3 +3165,6 @@ mod smoke_str64_branches;
 
 #[path = "smoke_str64_selectors.rs"]
 mod smoke_str64_selectors;
+
+#[path = "smoke_str64_branch_lifecycle.rs"]
+mod smoke_str64_branch_lifecycle;

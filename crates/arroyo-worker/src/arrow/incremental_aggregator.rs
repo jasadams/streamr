@@ -25,6 +25,7 @@ use arrow_array::{
 };
 use arrow_schema::{DataType, Field, FieldRef, Schema, SchemaBuilder, TimeUnit};
 use arroyo_operator::context::Collector;
+use arroyo_operator::operator::EventResponseRole;
 use arroyo_operator::{
     context::OperatorContext,
     operator::{
@@ -549,6 +550,8 @@ pub struct IncrementalAggregatingFunc {
     emit_per_event: bool,
     response_root_operator: Option<u32>,
     response_previous: Option<EventContext>,
+    event_output: Option<Arc<EventEdgeSpec>>,
+    response_schemas: Option<(ArroyoSchema, ArroyoSchema)>,
     calendars: Vec<CalendarAggregate>,
 }
 
@@ -4162,6 +4165,67 @@ impl IncrementalAggregatingFunc {
 
 #[async_trait::async_trait]
 impl ArrowOperator for IncrementalAggregatingFunc {
+    fn event_response_role(&self) -> EventResponseRole {
+        self.response_root_operator
+            .map_or(EventResponseRole::Ordinary, EventResponseRole::Aggregate)
+    }
+    fn event_response_output(&self) -> Option<Arc<EventEdgeSpec>> {
+        self.event_output.clone()
+    }
+    fn bind_event_response(
+        &mut self,
+        inputs: &[Arc<EventEdgeSpec>],
+        context: &OperatorContext,
+    ) -> DataflowResult<Option<Arc<EventEdgeSpec>>> {
+        let output = context.out_schema.as_deref().ok_or_else(|| {
+            arroyo_rpc::errors::DataflowError::ArgumentError(
+                "response operator output schema missing".into(),
+            )
+        })?;
+        let root = self
+            .response_root_operator
+            .ok_or_else(|| anyhow!("aggregate has no planned response mode"))?;
+        if inputs.len() != 1
+            || inputs[0].root_operator != root
+            || inputs[0].root_subtask != 0
+            || !matches!(inputs[0].layout, EventLayout::Raw)
+            || self.event_output.is_some()
+        {
+            return Err(
+                anyhow!("aggregate response binding requires one matching raw root").into(),
+            );
+        }
+        let (native_input, native_output) = self
+            .response_schemas
+            .as_ref()
+            .context("response aggregate constructed schemas missing")?;
+        if context.in_schemas.len() != 1
+            || context.in_schemas[0].as_ref() != native_input
+            || output != native_output
+        {
+            return Err(anyhow!(
+                "response aggregate graph schema differs from actual constructed native owner"
+            )
+            .into());
+        }
+        let limits = self
+            .native_config
+            .context("aggregate response native limits missing")?;
+        let spec = Arc::new(EventEdgeSpec {
+            root_operator: root,
+            root_subtask: 0,
+            schema: output.schema.clone(),
+            layout: EventLayout::Native {
+                max_rows: limits.max_pending_output_rows.min(4),
+                owner_output_bytes: limits.max_pending_output_bytes,
+                encoded_key_bytes: limits.key_bytes,
+            },
+        });
+        crate::event_response_codec::ResponseSpec::from_edge(&spec)?;
+        self.event_output = Some(spec.clone());
+        Ok(Some(spec))
+    }
+
     fn name(&self) -> String {
         "UpdatingAggregatingFunc".to_string()
     }
@@ -4504,6 +4568,21 @@ impl IncrementalAggregatingConstructor {
     ) -> Result<IncrementalAggregatingFunc> {
         let emit_per_event = config.emit_per_event;
         let response_root_operator = config.response_root_operator;
+        let response_schemas = if response_root_operator.is_some() {
+            let input: ArroyoSchema = config
+                .input_schema
+                .clone()
+                .context("response aggregate input schema missing")?
+                .try_into()?;
+            let output: ArroyoSchema = config
+                .final_schema
+                .clone()
+                .context("response aggregate output schema missing")?
+                .try_into()?;
+            Some((input, output))
+        } else {
+            None
+        };
         ensure!(
             response_root_operator.is_none()
                 || (!emit_per_event
@@ -5208,6 +5287,8 @@ impl IncrementalAggregatingConstructor {
             emit_per_event,
             response_root_operator,
             response_previous: None,
+            event_output: None,
+            response_schemas,
             calendars,
         };
         operator.native_codec = Some(GroupCodec::with_calendar_layout(

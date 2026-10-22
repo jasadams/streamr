@@ -706,3 +706,130 @@ async fn scalar_response_releases_filtered_and_compacted_input_before_blocked_de
         }
     }).await.expect("finite scalar input lifetime scenario");
 }
+
+fn constructed_scalar(plan: Arc<dyn ExecutionPlan>, keyed: bool) -> Box<dyn ArrowOperator + Send> {
+    let bytes = PhysicalPlanNode::try_from_physical_plan(
+        plan,
+        &ArroyoPhysicalExtensionCodec {
+            context: DecodingContext::Planning,
+        },
+    )
+    .unwrap()
+    .encode_to_vec();
+    let registry = Arc::new(arroyo_planner::physical::new_registry());
+    let constructed = if keyed {
+        KeyExecutionConstructor
+            .with_config(
+                api::KeyPlanOperator {
+                    name: "runtime-reader-key".into(),
+                    physical_plan: bytes,
+                    key_fields: vec![0],
+                },
+                registry,
+            )
+            .unwrap()
+    } else {
+        ValueExecutionConstructor
+            .with_config(
+                api::ValuePlanOperator {
+                    name: "runtime-reader-value".into(),
+                    physical_plan: bytes,
+                },
+                registry,
+            )
+            .unwrap()
+    };
+    match constructed {
+        ConstructedOperator::Operator(operator) => operator,
+        ConstructedOperator::Source(_) => panic!("scalar constructor returned a source"),
+    }
+}
+async fn binding_context(schema: SchemaRef) -> OperatorContext {
+    let mut context = operator_context().await;
+    let schema = Arc::new(ArroyoSchema::new_unkeyed(schema, 0));
+    context.in_schemas = vec![schema.clone()];
+    context.out_schema = Some(schema);
+    context
+}
+
+#[tokio::test]
+async fn scalar_response_constructor_binds_actual_single_batch_reader_and_source_projection() {
+    let input = integers(vec![Some(10)]);
+    for keyed in [false, true] {
+        let plan: Arc<dyn ExecutionPlan> = Arc::new(
+            ProjectionExec::try_new(
+                vec![(
+                    Arc::new(Column::new("v", 0)) as Arc<dyn PhysicalExpr>,
+                    "v".into(),
+                )],
+                source(input.schema()),
+            )
+            .unwrap(),
+        );
+        // Exercise the production serialized constructor plus binding, unlike
+        // direct test registration which bypasses the physical admission walk.
+        let mut operator = constructed_scalar(plan.clone(), keyed);
+        operator.validate_event_source_plumbing().unwrap();
+        let context = binding_context(plan.schema()).await;
+        let registered = operator
+            .bind_event_response(&[raw(input.schema())], &context)
+            .unwrap()
+            .unwrap();
+        assert_eq!(registered.schema, plan.schema());
+        let output = callback(operator.as_mut(), response(Some(input.clone()), None)).await;
+        assert_eq!(output.responses[0].rows.as_ref(), Some(&input));
+    }
+}
+
+#[tokio::test]
+async fn scalar_response_constructor_preserves_empty_filter_completion_and_source_rejection() {
+    let input = integers(vec![Some(10)]);
+    for keyed in [false, true] {
+        for keep in [false, true] {
+            let plan = filtered(
+                input.schema(),
+                Arc::new(Literal::new(ScalarValue::Boolean(Some(keep)))),
+            );
+            let mut operator = constructed_scalar(plan.clone(), keyed);
+            let error = operator.validate_event_source_plumbing().unwrap_err();
+            let diagnostic = error.to_string();
+            assert!(diagnostic.contains("node=FilterExec"), "{diagnostic}");
+            assert!(diagnostic.contains("source=true"), "{diagnostic}");
+            operator
+                .bind_event_response(
+                    &[raw(input.schema())],
+                    &binding_context(plan.schema()).await,
+                )
+                .unwrap();
+            let output = callback(operator.as_mut(), response(Some(input.clone()), None)).await;
+            assert_eq!(output.responses[0].rows.as_ref(), keep.then_some(&input));
+        }
+    }
+}
+
+#[tokio::test]
+async fn scalar_response_constructor_rejects_coalescing_with_concrete_diagnostic() {
+    let input = integers(vec![Some(10)]);
+    let plan: Arc<dyn ExecutionPlan> = Arc::new(
+        datafusion::physical_plan::coalesce_batches::CoalesceBatchesExec::new(
+            source(input.schema()),
+            8,
+        ),
+    );
+    for keyed in [false, true] {
+        let mut operator = constructed_scalar(plan.clone(), keyed);
+        let error = operator
+            .bind_event_response(
+                &[raw(input.schema())],
+                &binding_context(plan.schema()).await,
+            )
+            .unwrap_err();
+        let diagnostic = error.to_string();
+        assert!(
+            diagnostic.contains("node=CoalesceBatchesExec"),
+            "{diagnostic}"
+        );
+        assert!(diagnostic.contains("source=false"), "{diagnostic}");
+        assert!(operator.event_response_output().is_none());
+    }
+}

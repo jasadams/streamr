@@ -1,5 +1,4 @@
-//! Disabled planner proof: one shared admitted source before both scalar paths.
-//! No production caller, RPC response dispatch, or worker event activation.
+//! Canonical shared source extraction for validated private response routes.
 use crate::builder::Planner;
 use crate::extension::debezium::DebeziumUnrollingExtension;
 use crate::extension::key_calculation::KeyCalculationExtension;
@@ -8,7 +7,7 @@ use crate::extension::table_source::TableSourceExtension;
 use crate::extension::watermark_node::WatermarkNode;
 use crate::physical::{ArroyoMemExec, ArroyoPhysicalExtensionCodec, DebeziumUnrollingExec};
 use crate::rewriters::SourceRewriter;
-use datafusion::common::{Column, Result, TableReference, plan_err};
+use datafusion::common::{Column, Result, plan_err};
 use datafusion::logical_expr::{Expr, Extension, LogicalPlan, Projection, UserDefinedLogicalNode};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion_proto::physical_plan::AsExecutionPlan;
@@ -29,7 +28,9 @@ fn extension(plan: &LogicalPlan) -> Option<&dyn UserDefinedLogicalNode> {
         _ => None,
     }
 }
-fn source_projection(plan: &LogicalPlan) -> Option<(&Projection, &TableSourceExtension)> {
+pub(crate) fn source_projection(
+    plan: &LogicalPlan,
+) -> Option<(&Projection, &TableSourceExtension)> {
     let LogicalPlan::Projection(projection) = plan else {
         return None;
     };
@@ -67,7 +68,7 @@ fn scalar_input(plan: &LogicalPlan) -> Result<&LogicalPlan> {
     }
     Ok(inputs[0])
 }
-fn find_source(plan: &LogicalPlan) -> Result<(&Projection, &TableSourceExtension)> {
+pub(crate) fn find_source(plan: &LogicalPlan) -> Result<(&Projection, &TableSourceExtension)> {
     if let Some(found) = source_projection(plan) {
         return Ok(found);
     }
@@ -267,6 +268,64 @@ pub(crate) fn validate_root_physical(plan: &dyn ExecutionPlan) -> Result<()> {
     }
     validate_root_physical(children[0].as_ref())
 }
+/// Recover the existing source-scope name only after exact canonical admission
+/// validation. The name is not the carrier identity or the root descriptor.
+pub(crate) fn source_for_response_admission(
+    root: &WatermarkNode,
+) -> Result<datafusion::common::TableReference> {
+    let slot = root.response_root_slot.ok_or_else(|| {
+        datafusion::common::plan_datafusion_err!(
+            "accepted response boundary has no private source root"
+        )
+    })?;
+    let remote = extension(&root.input)
+        .and_then(|node| node.as_any().downcast_ref::<RemoteTableExtension>())
+        .ok_or_else(|| {
+            datafusion::common::plan_datafusion_err!(
+                "accepted response boundary lacks canonical source calculation"
+            )
+        })?;
+    let (projection, source) = source_projection(&remote.input).ok_or_else(|| {
+        datafusion::common::plan_datafusion_err!(
+            "accepted response boundary contains non-source work below admission"
+        )
+    })?;
+    let indices = projection_columns(projection, source)?;
+    for index in &indices {
+        if let crate::tables::FieldSpec::Virtual { field, .. } = &source.table.fields[*index]
+            && source.table.event_time_field.as_ref() != Some(field.name())
+            && source.table.watermark_field.as_ref() != Some(field.name())
+        {
+            return plan_err!(
+                "accepted response boundary contains user source work below admission"
+            );
+        }
+    }
+    let expected =
+        SourceRewriter::canonical_projection(&source.table, &source.name, Some(indices))?;
+    if remote.materialize
+        || remote.name != source.name
+        || &remote.schema != remote.input.schema()
+        || remote.input != expected
+    {
+        return plan_err!("accepted response boundary source calculation is not canonical");
+    }
+    let mut expected_root = WatermarkNode::with_source_envelope(
+        root.input.clone(),
+        source.name.clone(),
+        SourceRewriter::watermark_expression(&source.table)?,
+        source.table.is_updating(),
+    )?;
+    expected_root.response_root_slot = Some(slot);
+    if root != &expected_root {
+        return plan_err!(
+            "accepted response boundary source schema or clock differs from canonical admission"
+        );
+    }
+    Ok(source.name.clone())
+}
+
+#[cfg(test)]
 pub(crate) fn prove_root_physical(root: &SharedSourceRoot, planner: &Planner) -> Result<()> {
     let watermark = extension(&root.root)
         .and_then(|n| n.as_any().downcast_ref::<WatermarkNode>())
@@ -296,6 +355,28 @@ pub(crate) fn prove_root_physical(root: &SharedSourceRoot, planner: &Planner) ->
     Ok(())
 }
 
+pub(crate) fn prove_admission_physical(watermark: &WatermarkNode, planner: &Planner) -> Result<()> {
+    let remote = extension(&watermark.input)
+        .and_then(|node| node.as_any().downcast_ref::<RemoteTableExtension>())
+        .ok_or_else(|| {
+            datafusion::common::plan_datafusion_err!("response root lacks canonical source capture")
+        })?;
+    let (projection, source) = find_source(&remote.input)?;
+    let indices = projection_columns(projection, source)?;
+    let expected =
+        SourceRewriter::canonical_projection(&source.table, &source.name, Some(indices))?;
+    let actual = planner.sync_plan(&remote.input)?;
+    let expected = planner.sync_plan(&expected)?;
+    validate_root_physical(actual.as_ref())?;
+    let codec = ArroyoPhysicalExtensionCodec::default();
+    if PhysicalPlanNode::try_from_physical_plan(actual, &codec)?.encode_to_vec()
+        != PhysicalPlanNode::try_from_physical_plan(expected, &codec)?.encode_to_vec()
+    {
+        return plan_err!("response root physical source differs from canonical source plumbing");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -303,6 +384,7 @@ mod tests {
     use crate::builder::PlanToGraphVisitor;
     use crate::tables::Table;
     use arroyo_datastream::logical::OperatorName;
+    use datafusion::common::TableReference;
     use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
     use datafusion::execution::SessionStateBuilder;
     use datafusion::logical_expr::Filter;
@@ -348,6 +430,50 @@ mod tests {
             )?),
         }))
     }
+    #[test]
+    fn accepted_boundary_requires_identical_canonical_source_admission() -> Result<()> {
+        let (_, source) = source();
+        let left = branch(&source, vec![0, 1], lit(false))?;
+        let right = branch(&source, vec![0, 2], lit(true))?;
+        let shared = extract_shared_source_root([&left, &right], 41)?;
+        let root = extension(&shared.root)
+            .and_then(|node| node.as_any().downcast_ref::<WatermarkNode>())
+            .expect("canonical admission root");
+        assert_eq!(
+            crate::merge_event_branches::common_admission_source(root, root, 41)?,
+            source.name
+        );
+        let mut different_slot = root.clone();
+        different_slot.response_root_slot = Some(42);
+        assert!(
+            crate::merge_event_branches::common_admission_source(root, &different_slot, 41)
+                .expect_err("different route must reject")
+                .to_string()
+                .contains("identical canonical response admission")
+        );
+        let mut unmarked = root.clone();
+        unmarked.response_root_slot = None;
+        assert!(
+            source_for_response_admission(&unmarked)
+                .expect_err("unmarked root must reject")
+                .to_string()
+                .contains("no private source root")
+        );
+        let mut changed_clock = root.clone();
+        changed_clock.watermark_expression = lit(55i64);
+        assert!(
+            crate::merge_event_branches::common_admission_source(
+                &changed_clock,
+                &changed_clock,
+                41
+            )
+            .expect_err("matching malformed roots must reject")
+            .to_string()
+            .contains("source schema or clock differs")
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn event_response_root_precedes_false_first_branch_and_unions_columns() -> Result<()> {
         let (provider, source) = source();

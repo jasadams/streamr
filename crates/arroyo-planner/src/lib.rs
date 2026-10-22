@@ -980,8 +980,13 @@ pub async fn parse_and_get_arrow_program(
                 {
                     return plan_err!("relation '{}' already exists", merge.name);
                 }
-                let (table, mutation) =
-                    continuous_merge::plan_named_merge(merge, &schema_provider)?;
+                let (table, mutation) = continuous_merge::plan_named_merge(
+                    merge,
+                    &schema_provider,
+                    u32::try_from(retained_mutations.len()).map_err(|_| {
+                        datafusion::common::plan_datafusion_err!("response route slot exceeds u32")
+                    })?,
+                )?;
                 schema_provider.insert_table(table, components);
                 retained_mutations.push(mutation);
                 continue;
@@ -1149,6 +1154,7 @@ pub async fn parse_and_get_arrow_program(
         })?
     };
 
+    merge_event_branches::validate_graph(&graph)?;
     let mut program = LogicalProgram::new(
         graph,
         ProgramConfig {
@@ -1402,6 +1408,6 @@ pub mod aggregate_capability;
 #[cfg(test)]
 mod local_case_tests;
 
-// Disabled branch-response source extraction proof; no production entry.
-#[cfg(test)]
+// Private, validated shared-source response planning.
 mod event_response_root;
+mod merge_event_branches;

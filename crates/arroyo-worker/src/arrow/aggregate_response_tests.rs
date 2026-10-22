@@ -211,3 +211,28 @@ async fn branch_response_aggregate_output_guard_lives_through_success_error_and_
         assert_eq!(resource_used(&registry,"snapshots"),0);
     }
 }
+
+#[tokio::test]
+async fn branch_response_aggregate_binding_preserves_all_serialized_schema_metadata() {
+    let (mut operator,ctx)=owner(false,false).await;
+    let raw=Arc::new(EventEdgeSpec {root_operator:7,root_subtask:0,schema:ctx.in_schemas[0].schema.clone(),layout:EventLayout::Raw});
+    let output=operator.bind_event_response(std::slice::from_ref(&raw),&ctx).unwrap().unwrap();
+    assert_eq!(output.schema,ctx.out_schema.as_ref().unwrap().schema);
+    for output_side in [false,true] {for kind in [0,1,2] {
+        let (mut operator,mut ctx)=owner(false,false).await;
+        let original=if output_side {ctx.out_schema.as_ref().unwrap().as_ref()} else {ctx.in_schemas[0].as_ref()};
+        let mut serialized:arroyo_rpc::grpc::api::ArroyoSchema=original.clone().into();
+        match kind {
+            0=>{serialized.has_keys = !serialized.has_keys;serialized.key_indices=vec![0];},
+            1=>{serialized.has_routing_keys = !serialized.has_routing_keys;serialized.routing_key_indices=vec![0];},
+            2=>{serialized.timestamp_index=(serialized.timestamp_index+1)%original.schema.fields().len() as u32;},
+            _=>unreachable!(),
+        }
+        let forged:ArroyoSchema=serialized.try_into().unwrap();
+        assert_eq!(forged.schema,original.schema,"only Arroyo key/routing/clock metadata changed");assert_ne!(&forged,original);
+        let raw=Arc::new(EventEdgeSpec {root_operator:7,root_subtask:0,schema:ctx.in_schemas[0].schema.clone(),layout:EventLayout::Raw});
+        if output_side {ctx.out_schema=Some(Arc::new(forged));} else {ctx.in_schemas[0]=Arc::new(forged);}
+        let error=operator.bind_event_response(std::slice::from_ref(&raw),&ctx).unwrap_err();
+        assert!(error.to_string().contains("graph schema differs from actual constructed native owner"),"{error}");
+    }}
+}

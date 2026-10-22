@@ -55,6 +55,15 @@ pub(crate) trait ArroyoExtension: Debug {
         input_schemas: Vec<ArroyoSchemaRef>,
     ) -> Result<NodeWithIncomingEdges>;
     fn output_schema(&self) -> ArroyoSchema;
+    fn validate_response_scope(&self) -> Result<()> {
+        Ok(())
+    }
+    fn response_root_slot(&self) -> Option<u32> {
+        None
+    }
+    fn bind_response_root(&self, _operator: u32) -> Result<Option<Box<dyn ArroyoExtension>>> {
+        Ok(None)
+    }
     fn transparent(&self) -> bool {
         false
     }

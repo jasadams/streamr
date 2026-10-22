@@ -19,7 +19,7 @@ use crate::rewriters::depends_on_event_clock;
 
 /// Before images recompute contributions; they have no stored scalar history.
 /// The operation's trigger clock can also differ from the original row's clock.
-fn validate_repeatable(expression: &Expr, schema: &DFSchema) -> Result<()> {
+pub(crate) fn validate_repeatable(expression: &Expr, schema: &DFSchema) -> Result<()> {
     if depends_on_event_clock(expression, schema) {
         return plan_err!("per-event correction requires repeatable source expressions");
     }
@@ -42,7 +42,7 @@ fn is_timestamp_column(mut expression: &Expr) -> bool {
     matches!(expression, Expr::Column(column) if column.name == TIMESTAMP_FIELD)
 }
 
-fn validate(aggregate: &UpdatingAggregateExtension) -> Result<()> {
+pub(crate) fn validate(aggregate: &UpdatingAggregateExtension) -> Result<()> {
     if aggregate.ttl.is_some() || !aggregate.calendar_aggregates.is_empty() {
         return plan_err!(
             "per-event aggregate MERGE requires SET updating_ttl = NULL and no calendar aggregates"
@@ -271,7 +271,7 @@ impl TreeNodeRewriter for PreserveEnvelope {
 }
 
 #[derive(Default)]
-struct EventSourceRewriter {
+pub(crate) struct EventSourceRewriter {
     aggregates: usize,
 }
 
@@ -380,7 +380,14 @@ impl TreeNodeRewriter for EventSourceRewriter {
     }
 }
 
-pub(super) fn resolve(input: LogicalPlan) -> Result<LogicalPlan> {
+pub(super) fn resolve_with_slot(slot: u32, input: LogicalPlan) -> Result<LogicalPlan> {
+    if !input
+        .schema()
+        .has_column_with_unqualified_name(UPDATING_META_FIELD)
+    {
+        return Ok(input);
+    }
+    let input = crate::merge_event_branches::resolve(input, slot)?;
     if !input
         .schema()
         .has_column_with_unqualified_name(UPDATING_META_FIELD)

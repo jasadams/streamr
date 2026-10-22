@@ -1,3 +1,7 @@
+use crate::event_transport::EventWireSpec;
+use arroyo_types::event_edge::EventEdgeSpec;
+#[path = "event_graph.rs"]
+mod event_graph;
 use crate::arrow::async_udf::AsyncUdfConstructor;
 use crate::arrow::incremental_aggregator::IncrementalAggregatingConstructor;
 use crate::arrow::instant_join::InstantJoinConstructor;
@@ -184,6 +188,8 @@ pub struct PhysicalGraphEdge {
     edge: LogicalEdgeType,
     tx: Option<BatchSender>,
     rx: Option<BatchReceiver>,
+    response: Option<Arc<EventEdgeSpec>>,
+    response_wire: Option<Arc<EventWireSpec>>,
 }
 
 impl Debug for PhysicalGraphEdge {
@@ -581,6 +587,8 @@ impl Program {
                             edge: edge.edge_type,
                             tx: Some(tx),
                             rx: Some(rx),
+                            response: None,
+                            response_wire: None,
                         };
                         physical.add_edge(*f, *t, edge);
                     }
@@ -599,6 +607,8 @@ impl Program {
                                 edge: edge.edge_type,
                                 tx: Some(tx),
                                 rx: Some(rx),
+                                response: None,
+                                response_wire: None,
                             };
                             physical.add_edge(*f, *t, edge);
                         }
@@ -607,6 +617,10 @@ impl Program {
             }
         }
 
+        event_graph::bind_constructed_graph(&mut physical).map_err(|error| StateError::Other {
+            table: "event response route".into(),
+            error: error.to_string(),
+        })?;
         Ok(Program {
             graph: Arc::new(RwLock::new(physical)),
             control_tx: Some(control_tx),
@@ -727,19 +741,24 @@ impl Engine {
         worker_context: WorkerContext,
         network_manager: NetworkManager,
         assignments: Vec<TaskAssignment>,
-    ) -> Self {
+    ) -> anyhow::Result<Self> {
+        event_graph::bind_wires(
+            &mut program.graph.write().unwrap(),
+            worker_context.generation,
+            &assignments,
+        )?;
         let assignments = assignments
             .into_iter()
             .map(|a| ((a.task_id, a.subtask_idx as usize), a))
             .collect();
 
-        Self {
+        Ok(Self {
             program,
             worker_context,
             network_manager,
             task_aborts: std::sync::Mutex::new(Vec::new()),
             assignments,
-        }
+        })
     }
 
     fn local_task_count(&self) -> usize {
@@ -760,33 +779,26 @@ impl Engine {
             .read()
             .unwrap()
             .node_weights()
-            .map(|n| {
-                (
-                    (n.id(), n.subtask_idx()),
-                    TaskAssignment {
-                        task_id: n.id(),
-                        subtask_idx: n.subtask_idx() as u32,
-                        worker_id: worker_id.0,
-                        worker_addr: "locahost:0".to_string(),
-                        worker_rpc: "http://localhost:0".to_string(),
-                    },
-                )
+            .map(|n| TaskAssignment {
+                task_id: n.id(),
+                subtask_idx: n.subtask_idx() as u32,
+                worker_id: worker_id.0,
+                worker_addr: "localhost:0".into(),
+                worker_rpc: "http://localhost:0".into(),
             })
             .collect();
-
-        Ok(Self {
+        Self::new(
             program,
-            worker_context: WorkerContext {
-                machine_id: MachineId(Arc::new("local".to_string())),
+            WorkerContext {
+                machine_id: MachineId(Arc::new("local".into())),
                 worker_id,
                 pipeline_id: PipelineId(Arc::new(pipeline_id)),
                 job_id: JobId(Arc::new(job_id)),
                 generation: 0,
             },
-            network_manager: NetworkManager::new(0).await?,
-            task_aborts: std::sync::Mutex::new(Vec::new()),
+            NetworkManager::new(0).await?,
             assignments,
-        })
+        )
     }
 
     pub async fn start(mut self) -> RunningEngine {
@@ -910,16 +922,29 @@ impl Engine {
                     dst_idx: target.subtask_idx(),
                 };
 
-                senders.add_reported(
-                    quad,
-                    edge.weight().schema.schema.clone(),
-                    edge.weight().tx.as_ref().unwrap().clone(),
-                    NetworkFailureReporter::new(
-                        control_tx.clone(),
-                        target.id(),
-                        target.subtask_idx(),
-                    ),
+                let failure = NetworkFailureReporter::new(
+                    control_tx.clone(),
+                    target.id(),
+                    target.subtask_idx(),
                 );
+                if let Some(spec) = &edge.weight().response_wire {
+                    // Preflight checked identity, queue capacity, and unique Quad before scheduling.
+                    senders
+                        .add_response(
+                            quad,
+                            spec.clone(),
+                            edge.weight().tx.as_ref().unwrap().clone(),
+                            Some(failure),
+                        )
+                        .expect("Engine prevalidated response registration and all wire Quads");
+                } else {
+                    senders.add_reported(
+                        quad,
+                        edge.weight().schema.schema.clone(),
+                        edge.weight().tx.as_ref().unwrap().clone(),
+                        failure,
+                    );
+                }
             }
 
             for edge in graph.edges_directed(idx, Direction::Incoming) {
@@ -932,29 +957,37 @@ impl Engine {
                     dst_idx: node_subtask_idx,
                 };
 
-                connects.push((edge.id(), quad, source.id(), source.subtask_idx()));
+                connects.push((
+                    edge.id(),
+                    quad,
+                    source.id(),
+                    source.subtask_idx(),
+                    edge.weight().response_wire.clone(),
+                ));
             }
         }
 
-        for (id, quad, task_id, subtask_idx) in connects {
+        for (id, quad, task_id, subtask_idx, response) in connects {
             let rx = {
                 let mut graph = self.program.graph.write().unwrap();
                 let edge = graph.edge_weight_mut(id).unwrap();
                 edge.rx.take().unwrap()
             };
 
-            self.network_manager
-                .connect_reported(
-                    &assignment.worker_addr,
-                    quad,
-                    rx,
-                    Some(NetworkFailureReporter::new(
-                        control_tx.clone(),
-                        task_id,
-                        subtask_idx,
-                    )),
-                )
-                .await;
+            let failure = Some(NetworkFailureReporter::new(
+                control_tx.clone(),
+                task_id,
+                subtask_idx,
+            ));
+            if let Some(spec) = response {
+                self.network_manager
+                    .connect_response_reported(&assignment.worker_addr, quad, rx, failure, spec)
+                    .await;
+            } else {
+                self.network_manager
+                    .connect_reported(&assignment.worker_addr, quad, rx, failure)
+                    .await;
+            }
         }
 
         info!(

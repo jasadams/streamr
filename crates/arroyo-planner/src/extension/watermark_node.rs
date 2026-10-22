@@ -98,6 +98,9 @@ impl ArroyoExtension for WatermarkNode {
         index: usize,
         input_schemas: Vec<ArroyoSchemaRef>,
     ) -> Result<NodeWithIncomingEdges> {
+        if self.response_root_slot.is_some() {
+            crate::event_response_root::prove_admission_physical(self, planner)?;
+        }
         let expression =
             planner.create_physical_expr(&self.watermark_expression, self.input.schema())?;
         let expression = serialize_physical_expr(&expression, &DefaultPhysicalExtensionCodec {})?;
@@ -108,7 +111,7 @@ impl ArroyoExtension for WatermarkNode {
             format!("watermark_{index}"),
             OperatorName::ExpressionWatermark,
             ExpressionWatermarkConfig {
-                response_root_operator: None,
+                response_root_operator: self.response_root_slot.map(|_| planned_id),
                 preserve_source_envelope: self.preserve_source_envelope,
                 period_micros: 1_000_000,
                 idle_time_micros: None,

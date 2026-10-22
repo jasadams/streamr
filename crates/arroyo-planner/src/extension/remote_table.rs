@@ -35,9 +35,21 @@ pub(crate) struct RemoteTableExtension {
 multifield_partial_ord!(RemoteTableExtension, input, name, materialize);
 
 impl ArroyoExtension for RemoteTableExtension {
+    fn validate_response_scope(&self) -> Result<()> {
+        crate::merge_event_branches::memo_slot(&self.input).map(|_| ())
+    }
     fn node_name(&self) -> Option<NamedNode> {
         if self.materialize {
-            Some(NamedNode::RemoteTable(self.name.to_owned()))
+            let slot = match crate::merge_event_branches::memo_slot(&self.input) {
+                Ok(slot) => slot,
+                // Both graph-entry paths validate before consulting this key;
+                // an invalid route must never fall back to an ordinary name.
+                Err(_) => return None,
+            };
+            Some(match slot {
+                Some(slot) => NamedNode::EventResponseRemoteTable(slot, self.name.to_owned()),
+                None => NamedNode::RemoteTable(self.name.to_owned()),
+            })
         } else {
             None
         }

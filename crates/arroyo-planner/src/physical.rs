@@ -661,6 +661,13 @@ impl PhysicalExtensionCodec for ArroyoPhysicalExtensionCodec {
     }
 }
 
+/// Identify the concrete one-batch reader installed when an existing MemExec
+/// is decoded with `SingleLockedBatch`. Keep its implementation private: route
+/// admission must not accept arbitrary leaf plans or rely on a display name.
+pub fn is_single_locked_batch_reader(plan: &dyn ExecutionPlan) -> bool {
+    plan.as_any().is::<RwLockRecordBatchReader>()
+}
+
 #[derive(Debug)]
 struct RwLockRecordBatchReader {
     schema: SchemaRef,

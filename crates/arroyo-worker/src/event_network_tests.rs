@@ -33,6 +33,7 @@ fn spec(generation: u64) -> Arc<EventWireSpec> {
         EventWireSpec::registered(
             generation,
             quad(),
+            [1, 2],
             &tasks(),
             Arc::new(EventEdgeSpec {
                 root_operator: 7,

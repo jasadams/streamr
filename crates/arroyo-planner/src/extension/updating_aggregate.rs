@@ -32,6 +32,7 @@ pub(crate) struct UpdatingAggregateExtension {
     pub(crate) ttl: Option<Duration>,
     pub(crate) calendar_aggregates: Vec<crate::plan::CalendarAggregate>,
     pub(crate) emit_per_event: bool,
+    pub(crate) response_route: Option<crate::merge_event_branches::ResponseRoute>,
 }
 
 impl UpdatingAggregateExtension {
@@ -57,6 +58,7 @@ impl UpdatingAggregateExtension {
             ttl,
             calendar_aggregates,
             emit_per_event: false,
+            response_route: None,
         })
     }
 }
@@ -116,11 +118,22 @@ impl UserDefinedLogicalNodeCore for UpdatingAggregateExtension {
             next.emit_per_event = true;
             next.final_calculation = next.aggregate.clone();
         }
+        next.response_route = self.response_route;
         Ok(next)
     }
 }
 
 impl ArroyoExtension for UpdatingAggregateExtension {
+    fn response_root_slot(&self) -> Option<u32> {
+        self.response_route.map(|route| route.slot)
+    }
+    fn bind_response_root(&self, operator: u32) -> Result<Option<Box<dyn ArroyoExtension>>> {
+        let mut next = self.clone();
+        if let Some(route) = &mut next.response_route {
+            route.operator = Some(operator);
+        }
+        Ok(Some(Box::new(next)))
+    }
     fn node_name(&self) -> Option<NamedNode> {
         None
     }
@@ -291,8 +304,17 @@ impl ArroyoExtension for UpdatingAggregateExtension {
             })
             .collect::<Result<Vec<_>>>()?;
         let config = UpdatingAggregateOperator {
+            response_root_operator: self
+                .response_route
+                .map(|route| {
+                    route.operator.ok_or_else(|| {
+                        datafusion::common::plan_datafusion_err!(
+                            "response aggregate has no bound graph root"
+                        )
+                    })
+                })
+                .transpose()?,
             emit_per_event: self.emit_per_event,
-            response_root_operator: None,
             calendar_aggregates,
             collection_output_limits,
             name: "UpdatingAggregate".to_string(),
@@ -318,7 +340,14 @@ impl ArroyoExtension for UpdatingAggregateExtension {
             1,
         );
 
-        let edge = LogicalEdge::project_all(LogicalEdgeType::Shuffle, (*input_schema).clone());
+        let edge = LogicalEdge::project_all(
+            if self.response_route.is_some() {
+                LogicalEdgeType::Forward
+            } else {
+                LogicalEdgeType::Shuffle
+            },
+            (*input_schema).clone(),
+        );
 
         Ok(NodeWithIncomingEdges {
             node,

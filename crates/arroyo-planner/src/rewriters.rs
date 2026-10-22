@@ -854,6 +854,17 @@ struct EventClockLineage {
 impl EventClockLineage {
     fn visit(&mut self, plan: &LogicalPlan) -> DFResult<()> {
         if let LogicalPlan::Extension(extension) = plan {
+            if let Some(join) = extension
+                .node
+                .as_any()
+                .downcast_ref::<crate::extension::join::JoinExtension>()
+                && join.response_route.is_some()
+            {
+                // Only the validated response JOIN restores the admitted root
+                // clock. Its native internal timestamp MAX remains private.
+                self.trigger_sources += 1;
+                return Ok(());
+            }
             if let Some(updating) = extension
                 .node
                 .as_any()

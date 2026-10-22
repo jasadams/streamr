@@ -397,6 +397,8 @@ impl TreeNodeRewriter for JoinRewriter<'_> {
             is_instant,
             updating,
             left_outer: join_type == JoinType::Left,
+            response_route: None,
+            accepted_schema: None,
             // only non-instant (updating) joins have a TTL
             ttl: (!is_instant && !updating)
                 .then_some(self.schema_provider.planning_options.join_ttl),

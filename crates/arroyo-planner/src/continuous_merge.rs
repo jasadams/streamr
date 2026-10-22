@@ -1,6 +1,6 @@
 //! Native, event-driven retained table planning. No storage or runtime SQL lives here.
 #[path = "merge_event_source.rs"]
-mod event_source;
+pub(crate) mod event_source;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -280,6 +280,7 @@ pub(crate) fn bind_keys(
 pub(crate) fn plan_named_merge(
     merge: NamedMerge,
     provider: &ArroyoSchemaProvider,
+    response_route_slot: u32,
 ) -> Result<(Table, LogicalPlan)> {
     let expected = ["source", "old", "new", "action"];
     if merge.returning.len() != expected.len() || !merge.returning.iter().zip(expected).all(|(item, name)| {
@@ -314,7 +315,8 @@ pub(crate) fn plan_named_merge(
     // never a separately regenerated source query or a relookup of old/new.
     let source_sql = format!("SELECT * FROM {source}");
     let source_statement = parse_sql(&source_sql)?.remove(0);
-    let input = crate::rewriters::bind_event_clocks(event_source::resolve(
+    let input = crate::rewriters::bind_event_clocks(event_source::resolve_with_slot(
+        response_route_slot,
         crate::rewrite_plan_deferred_clocks(
             produce_optimized_plan(&source_statement, provider)?,
             provider,
