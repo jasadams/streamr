@@ -93,15 +93,16 @@ async fn read_rows(path: &Path) -> Vec<Value> {
 }
 fn assert_time(value: &Value, seconds: u32) {
     let text = value.as_str().expect("timestamp must serialize as text");
-    // Fixture clocks are elapsed epoch seconds within the first UTC day.
-    // Normalize hours/minutes rather than treating elapsed seconds as a field.
+    // Fixture clocks are elapsed epoch seconds within the first two UTC days.
+    // Keep dates, hours and minutes explicit; ordinary Jan1 cases are unchanged.
     assert!(
-        seconds < 24 * 60 * 60,
-        "fixture clock must fit its declared UTC day"
+        seconds < 2 * 24 * 60 * 60,
+        "fixture clock must fit its declared Jan1/Jan2 domain"
     );
     let expected = format!(
-        "1970-01-01T{:02}:{:02}:{:02}",
-        seconds / 3600,
+        "1970-01-{:02}T{:02}:{:02}:{:02}",
+        1 + seconds / 86400,
+        (seconds % 86400) / 3600,
         (seconds / 60) % 60,
         seconds % 60
     );
@@ -118,6 +119,7 @@ struct CorrectionCase {
     expected: &'static str,
     source_filter: bool,
     aggregate_filter: bool,
+    calendar: bool,
 }
 const FULL_BATCH: CorrectionCase = CorrectionCase {
     name: "full-batch",
@@ -125,6 +127,7 @@ const FULL_BATCH: CorrectionCase = CorrectionCase {
     expected: include_str!("test/str64-correction-full-batch-expected.json"),
     source_filter: false,
     aggregate_filter: false,
+    calendar: false,
 };
 const MOVES: CorrectionCase = CorrectionCase {
     name: "moves-absence",
@@ -132,6 +135,7 @@ const MOVES: CorrectionCase = CorrectionCase {
     expected: include_str!("test/str64-correction-moves-absence-expected.json"),
     source_filter: false,
     aggregate_filter: false,
+    calendar: false,
 };
 const SOURCE_FILTER: CorrectionCase = CorrectionCase {
     name: "source-filter",
@@ -139,6 +143,7 @@ const SOURCE_FILTER: CorrectionCase = CorrectionCase {
     expected: include_str!("test/str64-correction-source-filter-expected.json"),
     source_filter: true,
     aggregate_filter: false,
+    calendar: false,
 };
 const AGGREGATE_FILTER: CorrectionCase = CorrectionCase {
     name: "aggregate-filter",
@@ -146,7 +151,28 @@ const AGGREGATE_FILTER: CorrectionCase = CorrectionCase {
     expected: include_str!("test/str64-correction-aggregate-filter-expected.json"),
     source_filter: false,
     aggregate_filter: true,
+    calendar: false,
 };
+const CALENDAR_CDC: CorrectionCase = CorrectionCase {
+    name: "calendar-cdc",
+    input: include_str!("test/str64-calendar-cdc.jsonl"),
+    expected: include_str!("test/str64-calendar-cdc-expected.json"),
+    source_filter: false,
+    aggregate_filter: false,
+    calendar: true,
+};
+#[test_log(tokio::test)]
+#[ignore = "explicit calendar CDC backend/batch validation"]
+async fn maintained_calendar_merge_cdc_completed_checkpoint_replay() {
+    correction_setup();
+    run_correction_case(CALENDAR_CDC, true, None).await;
+}
+#[test_log(tokio::test)]
+#[ignore = "explicit calendar CDC delivery failure/fresh replay validation"]
+async fn maintained_calendar_merge_cdc_blocked_delivery_failure_replay() {
+    correction_setup();
+    run_correction_case(CALENDAR_CDC, true, Some(false)).await;
+}
 #[test_log(tokio::test)]
 #[ignore = "explicit correction backend/batch matrix"]
 async fn maintained_merge_correction_full_batch_and_marker_reuse() {
@@ -231,7 +257,20 @@ async fn run_correction_case(case: CorrectionCase, restore: bool, fault_owner: O
     } else {
         "MAX(value) AS peak"
     };
-    let sql=include_str!("test/str64-correction-prefix.sql")
+    let template = if case.calendar {
+        include_str!("test/str64-correction-prefix.sql")
+            .replace(
+                "COUNT(*) AS total",
+                "COUNT(*) FILTER (WHERE CAST(event_time AS DATE)=EVENT_DATE()) AS total",
+            )
+            .replace(
+                "MAX(value) AS peak",
+                "SUM(value) FILTER (WHERE CAST(event_time AS DATE)=EVENT_DATE()) AS peak",
+            )
+    } else {
+        include_str!("test/str64-correction-prefix.sql").to_owned()
+    };
+    let sql=template
         .replace("__INPUT__",input.to_str().unwrap()).replace("__OUTPUT__",output.to_str().unwrap()).replace("__MIRROR__",mirror.to_str().unwrap())
         .replace("MAX(value) AS peak",peak)
         .replace("FROM changes GROUP BY k",&format!("FROM changes WHERE {source_predicate} GROUP BY k"))
@@ -266,7 +305,7 @@ async fn run_correction_case(case: CorrectionCase, restore: bool, fault_owner: O
         .await;
     assert_eq!(running.source_controls().len(), 1);
     if restore {
-        assert_eq!(case.name, "full-batch");
+        assert!(matches!(case.name, "full-batch" | "calendar-cdc"));
         advance(&running, 1).await;
         let mut stopped = HashSet::new();
         checkpoint_with_stop(

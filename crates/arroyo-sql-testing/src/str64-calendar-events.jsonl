@@ -1,0 +1,6 @@
+{"tenant":"t","k":"a","event_time":"2026-10-20T12:00:10Z"}
+{"tenant":"t","k":"b","event_time":"2026-10-20T12:00:20Z"}
+{"tenant":"t","k":"c","event_time":"2026-10-20T12:00:30Z"}
+{"tenant":"t","k":"d","event_time":"2026-10-21T00:00:10Z"}
+{"tenant":"t","k":"e","event_time":"2026-10-23T00:00:10Z"}
+{"tenant":"t","k":"unused","event_time":"2026-10-24T00:00:10Z"}

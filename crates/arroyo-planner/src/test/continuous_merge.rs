@@ -187,7 +187,7 @@ async fn maintained_merge_rejects_unsupported_event_lineage_and_ordering() {
 }
 
 #[test(tokio::test)]
-async fn maintained_merge_rejects_calendar_results_before_worker_construction() {
+async fn maintained_merge_preserves_native_calendar_descriptors_and_accepted_schema() {
     let declarations = "CREATE TABLE events (counter BIGINT NOT NULL, event_time TIMESTAMP NOT NULL,
         WATERMARK FOR event_time AS event_time - INTERVAL '1' DAY)
         WITH (connector='single_file',path='/tmp/str64-rejected-calendar.jsonl',format='json',type='source');
@@ -197,7 +197,29 @@ async fn maintained_merge_rejects_calendar_results_before_worker_construction() 
         "COUNT(*) FILTER (WHERE CAST(event_time AS DATE) = EVENT_DATE())",
     )
     .replace(DECLARATIONS, declarations);
-    reject(&sql, "no calendar aggregates").await;
+    let compiled = plan(&sql).await;
+    let aggregates = compiled
+        .program
+        .graph
+        .node_weights()
+        .flat_map(|node| node.operator_chain.iter())
+        .filter(|(operator, _)| operator.operator_name == OperatorName::UpdatingAggregate)
+        .map(|(operator, _)| {
+            arroyo_rpc::grpc::api::UpdatingAggregateOperator::decode(
+                operator.operator_config.as_slice(),
+            )
+            .unwrap()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(aggregates.len(), 1);
+    assert!(aggregates[0].emit_per_event);
+    assert!(aggregates[0].response_root_operator.is_none());
+    assert_eq!(aggregates[0].calendar_aggregates.len(), 1);
+    assert_eq!(aggregates[0].calendar_aggregates[0].horizon_days, 1);
+    let output: arrow_schema::Schema =
+        serde_json::from_str(&aggregates[0].final_schema.as_ref().unwrap().arrow_schema).unwrap();
+    assert!(output.index_of(arroyo_rpc::UPDATING_META_FIELD).is_err());
+    assert_eq!(state_operators(&compiled).len(), 1);
 }
 
 #[test(tokio::test)]
@@ -1326,4 +1348,58 @@ async fn maintained_merge_count_ordering_reaches_the_route_guard() {
         "CREATE VIEW counts AS SELECT counter, COUNT(counter) AS quantity FROM events GROUP BY counter;",view);
     plan(&sql.replace("COUNT(counter ORDER BY counter)", "COUNT(counter)")).await;
     reject(&sql,"per-event aggregate MERGE supports native non-distinct COUNT/MAX and grouped selectors only").await;
+}
+
+#[test(tokio::test)]
+async fn maintained_merge_accepts_native_calendar_sum_with_nullable_snapshot() {
+    let declarations = "CREATE TABLE events (counter BIGINT NOT NULL, event_time TIMESTAMP NOT NULL,
+        WATERMARK FOR event_time AS event_time - INTERVAL '1' DAY)
+        WITH (connector='single_file',path='/tmp/str64-calendar-sum.jsonl',format='json',type='source');
+        CREATE STATE TABLE inventory (counter BIGINT PRIMARY KEY, quantity BIGINT) PARTITION BY counter;";
+    let sql = aggregate_merge(
+        "SET updating_ttl = NULL;",
+        "SUM(counter) FILTER (WHERE CAST(event_time AS DATE)=EVENT_DATE())",
+    )
+    .replace(DECLARATIONS, declarations);
+    let compiled = plan(&sql).await;
+    let aggregates = compiled
+        .program
+        .graph
+        .node_weights()
+        .flat_map(|node| node.operator_chain.iter())
+        .filter(|(op, _)| op.operator_name == OperatorName::UpdatingAggregate)
+        .map(|(op, _)| {
+            arroyo_rpc::grpc::api::UpdatingAggregateOperator::decode(op.operator_config.as_slice())
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(aggregates.len(), 1);
+    assert!(aggregates[0].emit_per_event);
+    assert!(aggregates[0].response_root_operator.is_none());
+    assert_eq!(aggregates[0].calendar_aggregates.len(), 1);
+    assert_eq!(aggregates[0].calendar_aggregates[0].horizon_days, 1);
+    let schema: arrow_schema::Schema =
+        serde_json::from_str(&aggregates[0].final_schema.as_ref().unwrap().arrow_schema).unwrap();
+    // Physical aggregate fields keep expression names; the calendar descriptor
+    // addresses that field after the configured grouping-key prefix.
+    let grouping_fields = aggregates[0]
+        .input_schema
+        .as_ref()
+        .unwrap()
+        .key_indices
+        .len();
+    let calendar_index = aggregates[0].calendar_aggregates[0].aggregate_index as usize;
+    let result = schema.field(grouping_fields + calendar_index);
+    assert_eq!(result.data_type(), &arrow_schema::DataType::Int64);
+    assert!(result.is_nullable());
+    assert!(schema.index_of(arroyo_rpc::UPDATING_META_FIELD).is_err());
+    // The public alias is applied by the scalar projection before MERGE. Prove
+    // that handoff independently rather than assuming the physical field name.
+    let accesses = state_operators(&compiled);
+    assert_eq!(accesses.len(), 1);
+    let public: arrow_schema::Schema =
+        serde_json::from_str(&accesses[0].input_schema.as_ref().unwrap().arrow_schema).unwrap();
+    let quantity = public.field_with_name("quantity").unwrap();
+    assert_eq!(quantity.data_type(), &arrow_schema::DataType::Int64);
+    assert!(quantity.is_nullable());
 }

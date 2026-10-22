@@ -43,10 +43,8 @@ fn is_timestamp_column(mut expression: &Expr) -> bool {
 }
 
 pub(crate) fn validate(aggregate: &UpdatingAggregateExtension) -> Result<()> {
-    if aggregate.ttl.is_some() || !aggregate.calendar_aggregates.is_empty() {
-        return plan_err!(
-            "per-event aggregate MERGE requires SET updating_ttl = NULL and no calendar aggregates"
-        );
+    if aggregate.ttl.is_some() {
+        return plan_err!("per-event aggregate MERGE requires SET updating_ttl = NULL");
     }
     let LogicalPlan::Aggregate(plan) = &aggregate.aggregate else {
         return plan_err!("per-event aggregate MERGE requires a grouped aggregate");
@@ -78,9 +76,14 @@ pub(crate) fn validate(aggregate: &UpdatingAggregateExtension) -> Result<()> {
             return plan_err!("per-event aggregate MERGE supports native COUNT/MAX only");
         };
         let selector = crate::grouped_selector_udaf::classify(&function.func);
+        let calendar = aggregate
+            .calendar_aggregates
+            .iter()
+            .any(|calendar| calendar.aggregate_index == index);
         if function.params.distinct
             || (selector.is_none()
-                && (!matches!(function.func.name(), "count" | "max")
+                && (!(matches!(function.func.name(), "count" | "max")
+                    || (calendar && function.func.name() == "sum"))
                     || function.params.order_by.is_some()))
         {
             return plan_err!(

@@ -1,0 +1,119 @@
+[
+  [
+    {
+      "k": "a",
+      "total": 1,
+      "peak": 10,
+      "last_seen": 40,
+      "trigger_time": 40,
+      "old_total": null,
+      "old_peak": null,
+      "old_seen": null,
+      "action": "insert"
+    }
+  ],
+  [
+    {
+      "k": "a",
+      "total": 2,
+      "peak": 30,
+      "last_seen": 50,
+      "trigger_time": 50,
+      "old_total": 1,
+      "old_peak": 10,
+      "old_seen": 40,
+      "action": "update"
+    }
+  ],
+  [
+    {
+      "k": "a",
+      "total": 1,
+      "peak": 5,
+      "last_seen": 86405,
+      "trigger_time": 86405,
+      "old_total": 2,
+      "old_peak": 30,
+      "old_seen": 50,
+      "action": "update"
+    }
+  ],
+  [
+    {
+      "k": "a",
+      "total": 1,
+      "peak": 7,
+      "last_seen": 86407,
+      "trigger_time": 86407,
+      "old_total": 1,
+      "old_peak": 5,
+      "old_seen": 86405,
+      "action": "update"
+    }
+  ],
+  [
+    {
+      "k": "a",
+      "total": 0,
+      "peak": null,
+      "last_seen": 40,
+      "trigger_time": 86430,
+      "old_total": 1,
+      "old_peak": 7,
+      "old_seen": 86407,
+      "action": "update"
+    },
+    {
+      "k": "b",
+      "total": 1,
+      "peak": 30,
+      "last_seen": 86430,
+      "trigger_time": 86430,
+      "old_total": null,
+      "old_peak": null,
+      "old_seen": null,
+      "action": "insert"
+    }
+  ],
+  [],
+  [
+    {
+      "k": "a",
+      "total": 1,
+      "peak": 8,
+      "last_seen": 86408,
+      "trigger_time": 86408,
+      "old_total": 0,
+      "old_peak": null,
+      "old_seen": 40,
+      "action": "update"
+    }
+  ],
+  [],
+  [
+    {
+      "k": "b",
+      "total": 1,
+      "peak": 9,
+      "last_seen": 86409,
+      "trigger_time": 86409,
+      "old_total": 1,
+      "old_peak": 30,
+      "old_seen": 86430,
+      "action": "update"
+    }
+  ],
+  [
+    {
+      "k": "c",
+      "total": 1,
+      "peak": 12,
+      "last_seen": 86412,
+      "trigger_time": 86412,
+      "old_total": null,
+      "old_peak": null,
+      "old_seen": null,
+      "action": "insert"
+    }
+  ]
+]
