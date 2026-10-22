@@ -10,6 +10,7 @@ use std::ops::{Deref, RangeInclusive};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+pub mod event_response;
 pub mod event_time;
 
 // worker configuration

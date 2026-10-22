@@ -2,7 +2,7 @@
 use super::{
     LiveStateBackend, ScanRange, ScanRequest, StateNamespace, StateSnapshot, WriteBatch,
     WriteOperation, encoding,
-    resources::{CheckpointDirection, CheckpointObservation, WorkerStateResources},
+    resources::{CheckpointDirection, CheckpointObservation, ResourceConfig, WorkerStateResources},
 };
 use anyhow::{Result, bail, ensure};
 use arrow_array::{Array, ArrayRef, BinaryArray, RecordBatch};
@@ -54,17 +54,31 @@ struct ParquetCheckpointBudget {
 
 impl ParquetCheckpointBudget {
     fn new(resources: Option<&WorkerStateResources>) -> Result<Self> {
+        Self::from_config(resources.map(WorkerStateResources::config))
+    }
+
+    fn from_config(resources: Option<&ResourceConfig>) -> Result<Self> {
+        if let Some(config) = resources {
+            ensure!(
+                config.max_open_databases > 0,
+                "checkpoint owner count must be positive"
+            );
+            ensure!(
+                config
+                    .max_open_databases
+                    .checked_add(1)
+                    .and_then(|n| n.checked_mul(8))
+                    .is_some(),
+                "checkpoint owner count overflow"
+            );
+        }
         let per_owner_writer_budget = resources.map_or(6 * PAGE_BYTES, |r| {
-            (r.config().decoded_value_bytes / r.config().max_open_databases.saturating_add(1))
-                .min(6 * PAGE_BYTES)
+            (r.decoded_value_bytes / r.max_open_databases.saturating_add(1)).min(6 * PAGE_BYTES)
         });
         let page_bytes = resources.map_or(PAGE_BYTES, |r| {
             PAGE_BYTES
-                .min(
-                    r.config().scan_page_bytes
-                        / (8 * r.config().max_open_databases.saturating_add(1)),
-                )
-                .min(r.config().queued_write_bytes / 8)
+                .min(r.scan_page_bytes / (8 * r.max_open_databases.saturating_add(1)))
+                .min(r.queued_write_bytes / 8)
                 .saturating_sub(32768)
         });
         ensure!(page_bytes > 0, "checkpoint resource budgets are too small");
@@ -88,7 +102,7 @@ impl ParquetCheckpointBudget {
         let writer_reservation =
             file_limit + page_bytes * 3 + PARQUET_FOOTER_ALLOWANCE + PAGE_ROWS * 128;
         ensure!(
-            resources.is_none_or(|r| writer_reservation <= r.config().decoded_value_bytes),
+            resources.is_none_or(|r| writer_reservation <= r.decoded_value_bytes),
             "checkpoint Parquet writer cannot fit configured decoded-value budget"
         );
         Ok(Self {
@@ -97,6 +111,12 @@ impl ParquetCheckpointBudget {
             decoded_bytes: writer_reservation,
         })
     }
+}
+
+/// Existing decoded reservation for one serial logical checkpoint exporter.
+/// This is per owner; other concurrent owners share the same worker pool.
+pub fn checkpoint_decoded_reservation(config: &ResourceConfig) -> Result<usize> {
+    Ok(ParquetCheckpointBudget::from_config(Some(config))?.decoded_bytes)
 }
 
 struct OpenParquetFile {
@@ -327,7 +347,13 @@ async fn export_snapshot_inner(
     // permit while waiting for another exporter to release its writer memory.
     let _writer_memory = resources
         .as_ref()
-        .map(|r| r.try_decoded_value(writer_reservation))
+        .map(|r| {
+            r.try_decoded_value(writer_reservation).map_err(|error| {
+                anyhow::anyhow!(
+                    "checkpoint export decoded reservation requested={writer_reservation}: {error}"
+                )
+            })
+        })
         .transpose()?;
     let mut cursor = None;
     let mut active: Option<OpenParquetFile> = None;
@@ -1010,6 +1036,44 @@ mod tests {
     };
     use arroyo_storage::StorageProvider;
     use std::sync::Arc;
+
+    #[test]
+    fn shared_checkpoint_reservation_matches_export_and_rejects_invalid_owner_arithmetic() {
+        let frame = 1024 * 1024;
+        let config = ResourceConfig {
+            block_cache_bytes: frame,
+            memtable_bytes: frame,
+            queued_write_bytes: 640 * frame,
+            decoded_value_bytes: 142 * frame,
+            scan_page_bytes: 16 * frame,
+            max_blocking_operations: 2,
+            max_snapshots: 8,
+            max_open_databases: 2,
+            disk_reserve_bytes: 0,
+        };
+        let expected = checkpoint_decoded_reservation(&config).unwrap();
+        assert_eq!(expected, 4_374_526);
+        let resources = WorkerStateResources::new(config.clone()).unwrap();
+        assert_eq!(
+            ParquetCheckpointBudget::new(Some(&resources))
+                .unwrap()
+                .decoded_bytes,
+            expected
+        );
+        let mut invalid = config.clone();
+        invalid.max_open_databases = 0;
+        assert!(checkpoint_decoded_reservation(&invalid).is_err());
+        invalid.max_open_databases = usize::MAX;
+        assert!(checkpoint_decoded_reservation(&invalid).is_err());
+        invalid = config;
+        invalid.scan_page_bytes = 0;
+        assert!(checkpoint_decoded_reservation(&invalid).is_err());
+        assert!(
+            resources
+                .try_decoded_value(resources.config().decoded_value_bytes)
+                .is_ok()
+        );
+    }
 
     fn namespace() -> StateNamespace {
         StateNamespace {

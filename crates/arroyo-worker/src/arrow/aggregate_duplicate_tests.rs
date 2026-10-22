@@ -54,7 +54,7 @@ async fn duplicate_progress_sparse_nulls_prefixes_insertion_and_rollback() {
         let mut scope = store.begin().await.unwrap();
         scope.set_member_progress(progress.take());
         duplicate_delta(&operator, &mut scope, group, generation, &values[row], 0, true).await.unwrap();
-        let (primary, secondary, _) = operator.native_member_keys(group, generation, 0, &values[row], ordinal).unwrap();
+        let (primary, secondary, _) = operator.inspect_member_keys(group, generation, 0, &values[row], ordinal).unwrap();
         assert!(scope.get(&primary).await.unwrap().is_none());
         assert!(scope.get(&secondary).await.unwrap().is_none());
         progress = scope.commit_member_progress().await.unwrap();
@@ -65,7 +65,7 @@ async fn duplicate_progress_sparse_nulls_prefixes_insertion_and_rollback() {
     scope.set_member_progress(progress.take());
     duplicate_delta(&operator, &mut scope, b"A", 0, &values[0], 0, false).await.unwrap();
     duplicate_delta(&operator, &mut scope, b"A", 0, &values[0], 0, true).await.unwrap();
-    let (primary, secondary, _) = operator.native_member_keys(b"A", 0, 0, &values[0], 12).unwrap();
+    let (primary, secondary, _) = operator.inspect_member_keys(b"A", 0, 0, &values[0], 12).unwrap();
     assert!(scope.get(&primary).await.unwrap().is_some());
     assert!(scope.get(&secondary).await.unwrap().is_some());
     progress = scope.commit_member_progress().await.unwrap();
@@ -343,12 +343,12 @@ async fn duplicate_progress_maximum_logical_key_rocks_scans_and_exact_pair_owner
     let store = operator.native_store.as_ref().unwrap();
     let raw = batch(&[Some("equal")], &[1], &[Some(true)]);
     let values = operator.compute_inputs(&raw).unwrap()[0].selected_values(Some(0)).unwrap().unwrap();
-    let (_, secondary, _) = operator.native_member_keys(&[], 0, 0, &values, 1).unwrap();
+    let (_, secondary, _) = operator.inspect_member_keys(&[], 0, 0, &values, 1).unwrap();
     let group = vec![0; limits.key_bytes - secondary.len()];
     let mut progress = store.try_member_progress(native_test_config().max_pending_output_bytes);
     assert!(progress.is_some());
     for ordinal in [1, 4, 9] {
-        let (primary, secondary, _) = operator.native_member_keys(&group, 0, 0, &values, ordinal).unwrap();
+        let (primary, secondary, _) = operator.inspect_member_keys(&group, 0, 0, &values, ordinal).unwrap();
         assert_eq!(secondary.len(), limits.key_bytes); assert!(primary.len() <= limits.key_bytes);
         let mut scope = store.begin().await.unwrap();
         duplicate_delta(&operator, &mut scope, &group, 0, &values, ordinal, false).await.unwrap();
@@ -357,13 +357,13 @@ async fn duplicate_progress_maximum_logical_key_rocks_scans_and_exact_pair_owner
     for ordinal in [1, 4] {
         let mut scope = store.begin().await.unwrap(); scope.set_member_progress(progress.take());
         duplicate_delta(&operator, &mut scope, &group, 0, &values, 0, true).await.unwrap();
-        let (primary, secondary, _) = operator.native_member_keys(&group, 0, 0, &values, ordinal).unwrap();
+        let (primary, secondary, _) = operator.inspect_member_keys(&group, 0, 0, &values, ordinal).unwrap();
         assert!(scope.get(&primary).await.unwrap().is_none()); assert!(scope.get(&secondary).await.unwrap().is_none());
         progress = scope.commit_member_progress().await.unwrap();
     }
     drop(progress);
     let scope = store.begin().await.unwrap();
-    let (primary, secondary, _) = operator.native_member_keys(&group, 0, 0, &values, 9).unwrap();
+    let (primary, secondary, _) = operator.inspect_member_keys(&group, 0, 0, &values, 9).unwrap();
     assert!(scope.get(&primary).await.unwrap().is_some()); assert!(scope.get(&secondary).await.unwrap().is_some());
     assert_eq!(CollectionStats::decode(scope.get(&native_collection_totals_key(&group, 0).unwrap()).await.unwrap()).unwrap().members, 1);
     drop(scope);

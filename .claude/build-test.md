@@ -87,6 +87,17 @@ Unsupported actual native settings fail explicitly instead of substituting a
 wrong archive. Keep native mode stable during ordinary iterations: switching
 modes invalidates RocksDB and its dependents.
 
+## Run preserved test executables and fixtures
+
+For finite validation outside Cargo caches, set `STREAMR_BUILD_EVIDENCE_ROOT`
+to an existing canonical absolute evidence directory, then use
+`scripts/cargo-dev --exec <command> ...`. The wrapper mounts that directory at
+the same absolute path in the maintained image, preserving caller fixture and
+pinned-executable paths. Paths containing colon/control characters, aliases and
+`/app` mounts are rejected. Use one outer `scripts/rust-build` reservation for
+the build, executable preservation and dependent validation. This optional mount
+does not change profiles, native archive selection or default container mounts.
+
 ## Build and preserve a CLI package
 
 Use a new evidence directory outside checkouts and Cargo caches, and supply

@@ -153,7 +153,7 @@ async fn maintained_merge_rejects_unresolved_retention_and_other_aggregates() {
     .await;
     reject(
         &aggregate_merge("SET updating_ttl = NULL;", "SUM(counter)"),
-        "COUNT/MAX only",
+        "COUNT/MAX and grouped selectors only",
     )
     .await;
     reject(
@@ -171,7 +171,6 @@ async fn maintained_merge_rejects_unsupported_event_lineage_and_ordering() {
     let cases = [
         ("join", base.replace(view, "CREATE VIEW counts AS SELECT a.counter, COUNT(*) AS quantity FROM events a JOIN events b ON a.counter=b.counter GROUP BY a.counter;")),
         ("nested", base.replace(view, "CREATE VIEW inner_counts AS SELECT counter, COUNT(*) AS n FROM events GROUP BY counter; CREATE VIEW counts AS SELECT counter, COUNT(*) AS quantity FROM inner_counts GROUP BY counter;")),
-        ("ordered", aggregate_merge("SET updating_ttl = NULL;", "FIRST_VALUE(counter ORDER BY counter)")),
     ];
     for (case, sql) in cases {
         let result = parse_and_get_program(
@@ -1068,4 +1067,263 @@ async fn str64_correction_boundary_probe_declared_payload_time_control() {
         &views,
     ))
     .await;
+}
+
+// Shared only with final-reader clock regressions. Generic JSON values keep the
+// actual selector/clock/view/MERGE composition independent of an application.
+pub(super) fn str64_pending_selector_parts(format: &str, selector: &str) -> (String, String) {
+    let declarations = format!(
+        "SET updating_ttl = NULL;
+         CREATE TABLE selector_events (
+          row_id BIGINT PRIMARY KEY,k TEXT NOT NULL,payload TEXT,eligible BOOLEAN NOT NULL,
+          event_time TIMESTAMP NOT NULL,
+          WATERMARK FOR event_time AS event_time - INTERVAL '1' DAY
+         ) WITH(connector='single_file',path='/tmp/str64-pending-selector.jsonl',format='{format}',type='source');
+         CREATE STATE TABLE selector_values (k TEXT PRIMARY KEY,v TEXT,clock TIMESTAMP) PARTITION BY k;
+         CREATE VIEW selector_inputs AS SELECT k,
+          JSON_VALUE(payload,'$.v') AS v,eligible FROM selector_events
+          WHERE JSON_EXISTS(payload,'$.v');
+         CREATE VIEW pending_selector AS SELECT k,{selector} AS v,
+          EVENT_TIMESTAMP() AS clock FROM selector_inputs GROUP BY k;"
+    );
+    let mutation = "CREATE VIEW selector_applied AS
+         MERGE INTO selector_values AS previous USING pending_selector AS incoming
+         ON previous.k=incoming.k
+         WHEN MATCHED THEN UPDATE SET v=incoming.v,clock=incoming.clock
+         WHEN NOT MATCHED THEN INSERT(k,v,clock) VALUES(incoming.k,incoming.v,incoming.clock)
+         RETURNING source AS source,old AS old,new AS new,action AS action;"
+        .to_owned();
+    (declarations, mutation)
+}
+
+#[test(tokio::test)]
+async fn str64_pending_selector_clock_view_binds_only_after_merge_route_validation() {
+    use datafusion_proto::physical_plan::AsExecutionPlan;
+    let (declarations, mutation) = str64_pending_selector_parts("json", "LAST_VALUE(v)");
+    let compiled = plan(&format!(
+        "{declarations}{mutation}
+         SELECT source.k,source.clock AS source_clock,new.clock AS accepted_clock,EVENT_TIMESTAMP() AS original_clock FROM selector_applied;"
+    ))
+    .await;
+    let aggregates: Vec<_> = compiled
+        .program
+        .graph
+        .node_weights()
+        .flat_map(|node| node.operator_chain.iter())
+        .filter(|(op, _)| op.operator_name == OperatorName::UpdatingAggregate)
+        .map(|(op, _)| {
+            arroyo_rpc::grpc::api::UpdatingAggregateOperator::decode(op.operator_config.as_slice())
+                .unwrap()
+        })
+        .collect();
+    assert_eq!(aggregates.len(), 1);
+    let aggregate = &aggregates[0];
+    assert!(aggregate.emit_per_event);
+    let accesses = state_operators(&compiled);
+    assert_eq!(accesses.len(), 1);
+    let source: arrow_schema::Schema =
+        serde_json::from_str(&accesses[0].input_schema.as_ref().unwrap().arrow_schema).unwrap();
+    assert_eq!(
+        source.field_with_name("clock").unwrap().data_type(),
+        &arrow_schema::DataType::Timestamp(arrow_schema::TimeUnit::Nanosecond, None)
+    );
+    let wire =
+        datafusion_proto::protobuf::PhysicalPlanNode::decode(aggregate.aggregate_exec.as_slice())
+            .unwrap();
+    str64_assert_serialized_clock_bound(&wire);
+    let mut value_plans = 0;
+    for node in compiled.program.graph.node_weights() {
+        for (operator, _) in node.operator_chain.iter() {
+            match operator.operator_name {
+                OperatorName::ArrowValue => {
+                    let config = arroyo_rpc::grpc::api::ValuePlanOperator::decode(
+                        operator.operator_config.as_slice(),
+                    )
+                    .unwrap();
+                    let wire = datafusion_proto::protobuf::PhysicalPlanNode::decode(
+                        config.physical_plan.as_slice(),
+                    )
+                    .unwrap();
+                    str64_assert_serialized_clock_bound(&wire);
+                    value_plans += 1;
+                }
+                OperatorName::ArrowKey => {
+                    let config = arroyo_rpc::grpc::api::KeyPlanOperator::decode(
+                        operator.operator_config.as_slice(),
+                    )
+                    .unwrap();
+                    let wire = datafusion_proto::protobuf::PhysicalPlanNode::decode(
+                        config.physical_plan.as_slice(),
+                    )
+                    .unwrap();
+                    str64_assert_serialized_clock_bound(&wire);
+                }
+                _ => {}
+            }
+        }
+    }
+    assert!(
+        value_plans > 0,
+        "serialized worker value plans must be inspected"
+    );
+    let registry = ArroyoSchemaProvider::new();
+    let runtime = datafusion::execution::runtime_env::RuntimeEnvBuilder::new()
+        .build()
+        .unwrap();
+    let codec = crate::physical::ArroyoPhysicalExtensionCodec {
+        context: crate::physical::DecodingContext::Planning,
+    };
+    let physical = wire
+        .try_into_physical_plan(&registry, &runtime, &codec)
+        .unwrap();
+    let physical = physical
+        .as_any()
+        .downcast_ref::<datafusion::physical_plan::aggregates::AggregateExec>()
+        .unwrap();
+    let selectors: Vec<_> = physical
+        .aggr_expr()
+        .iter()
+        .filter(|expression| crate::grouped_selector_udaf::classify(expression.fun()).is_some())
+        .collect();
+    assert_eq!(selectors.len(), 1);
+    assert_eq!(
+        crate::grouped_selector_udaf::classify(selectors[0].fun()),
+        Some((crate::grouped_selector::SelectorKind::Last, true))
+    );
+    crate::grouped_selector_udaf::selector_spec(selectors[0], &physical.input_schema()).unwrap();
+    let primary = &selectors[0].order_bys().unwrap()[0];
+    assert!(!primary.options.descending && !primary.options.nulls_first);
+    let column = primary
+        .expr
+        .as_any()
+        .downcast_ref::<datafusion::physical_expr::expressions::Column>()
+        .unwrap();
+    assert_eq!(column.name(), arroyo_rpc::TIMESTAMP_FIELD);
+    assert_eq!(
+        column.index(),
+        physical
+            .input_schema()
+            .index_of(arroyo_rpc::TIMESTAMP_FIELD)
+            .unwrap()
+    );
+}
+
+#[test(tokio::test)]
+async fn str64_pending_correction_selector_generated_ordinal_and_primary_are_valid() {
+    let (declarations, mutation) = str64_pending_selector_parts(
+        "debezium_json",
+        "LAST_VALUE(v ORDER BY v) FILTER (WHERE eligible)",
+    );
+    let compiled = plan(&format!(
+        "{declarations}{mutation} SELECT source.clock,new.v FROM selector_applied;"
+    ))
+    .await;
+    assert_eq!(state_operators(&compiled).len(), 1);
+}
+
+#[test(tokio::test)]
+async fn str64_pending_correction_selector_rejects_volatile_user_value_filter_and_secondary() {
+    for selector in [
+        "LAST_VALUE(uuid())",
+        "LAST_VALUE(v) FILTER (WHERE uuid() IS NOT NULL)",
+        "LAST_VALUE(v ORDER BY uuid())",
+    ] {
+        let (declarations, mutation) = str64_pending_selector_parts("debezium_json", selector);
+        reject(
+            &format!("{declarations}{mutation} SELECT new.v FROM selector_applied;"),
+            "per-event correction requires repeatable source expressions",
+        )
+        .await;
+    }
+}
+
+#[test(tokio::test)]
+async fn str64_pending_correction_selector_rejects_user_trigger_value_filter_and_secondary() {
+    for selector in [
+        "LAST_VALUE(CAST(EVENT_TIMESTAMP() AS TEXT))",
+        "LAST_VALUE(v) FILTER (WHERE EVENT_TIMESTAMP() > TIMESTAMP '1970-01-01 00:00:07')",
+        "LAST_VALUE(v ORDER BY EVENT_TIMESTAMP())",
+    ] {
+        let (declarations, mutation) = str64_pending_selector_parts("debezium_json", selector);
+        let sql = format!("{declarations}{mutation} SELECT new.v FROM selector_applied;");
+        let error = parse_and_get_program(
+            &sql,
+            ArroyoSchemaProvider::new(),
+            SqlConfig {
+                default_parallelism: 1,
+            },
+        )
+        .await
+        .unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("unsupported clock-dependent aggregate")
+                || message.contains("per-event correction requires repeatable source expressions"),
+            "unexpected rejection for {selector}: {message}"
+        );
+    }
+}
+
+fn str64_assert_serialized_clock_bound(wire: &impl std::fmt::Debug) {
+    // These fixtures explicitly alias output clock fields. In decoded physical
+    // protobufs a marker UDF is identified by its exact function name, rather
+    // than matching display/SQL substrings or stripping user expressions.
+    let wire = format!("{wire:?}");
+    for marker in ["event_timestamp", "event_date"] {
+        assert!(
+            !wire.contains(&format!("name: \"{marker}\"")),
+            "unresolved contextual UDF in worker wire: {wire}"
+        );
+    }
+}
+
+#[test(tokio::test)]
+async fn maintained_merge_count_ordering_reaches_the_route_guard() {
+    use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+    use datafusion::logical_expr::{Expr, LogicalPlan};
+    let view = "CREATE VIEW counts AS SELECT counter,
+        COUNT(counter ORDER BY counter) AS quantity,
+        EVENT_TIMESTAMP() AS trigger_clock FROM events GROUP BY counter;";
+    // The pending contextual projection retains the analyzed aggregate order
+    // until the MERGE route validator; inspect that exact native view template.
+    let mut provider = ArroyoSchemaProvider::new();
+    let source = crate::parse_sql("CREATE TABLE events WITH (connector='impulse',event_rate='1');")
+        .unwrap()
+        .remove(0);
+    let table = crate::tables::Table::try_from_statement(&source, &provider)
+        .unwrap()
+        .unwrap();
+    provider.insert_table(table, vec!["events".to_owned()]);
+    let statement = crate::parse_sql(view).unwrap().remove(0);
+    let table = crate::tables::Table::try_from_statement(&statement, &provider)
+        .unwrap()
+        .unwrap();
+    let crate::tables::Table::TableFromQuery { logical_plan, .. } = table else {
+        panic!("expected native view template");
+    };
+    let mut ordered_counts = 0;
+    logical_plan.apply(|node| {
+        if let LogicalPlan::Extension(extension)=node
+            && let Some(aggregate)=extension.node.as_any().downcast_ref::<crate::extension::updating_aggregate::UpdatingAggregateExtension>()
+            && let LogicalPlan::Aggregate(plan)=&aggregate.aggregate {
+            for expression in &plan.aggr_expr {
+                let mut expression=expression;
+                while let Expr::Alias(alias)=expression {expression=&alias.expr;}
+                if let Expr::AggregateFunction(function)=expression && function.func.name()=="count" {
+                    assert!(!function.params.distinct);
+                    let orders=function.params.order_by.as_ref().expect("COUNT ORDER BY must remain present before route validation");
+                    assert_eq!(orders.len(),1);
+                    assert!(matches!(&orders[0].expr,Expr::Column(column) if column.name=="counter"));
+                    ordered_counts+=1;
+                }
+            }
+            return Ok(TreeNodeRecursion::Jump);
+        }
+        Ok(TreeNodeRecursion::Continue)
+    }).unwrap();
+    assert_eq!(ordered_counts, 1);
+    let sql=aggregate_merge("SET updating_ttl = NULL;","COUNT(counter)").replace(
+        "CREATE VIEW counts AS SELECT counter, COUNT(counter) AS quantity FROM events GROUP BY counter;",view);
+    plan(&sql.replace("COUNT(counter ORDER BY counter)", "COUNT(counter)")).await;
+    reject(&sql,"per-event aggregate MERGE supports native non-distinct COUNT/MAX and grouped selectors only").await;
 }

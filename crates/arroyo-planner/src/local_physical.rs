@@ -9,7 +9,7 @@ use datafusion::{
     },
     physical_expr::{
         PhysicalExpr, ScalarFunctionExpr,
-        expressions::{CaseExpr, Literal},
+        expressions::{CaseExpr, Literal, try_cast},
     },
     physical_plan::{ExecutionPlan, execute_stream},
 };
@@ -236,6 +236,10 @@ pub fn resolve_expression(
             return Err(error("local expression evaluation requires one outer row"));
         }
         if let Some(case) = expression.as_any().downcast_ref::<CaseExpr>() {
+            // Returning a selected child must retain CASE's declared result
+            // type. In particular, a chosen untyped NULL is a typed null value,
+            // as in DataFusion's native CASE evaluator.
+            let result_type = expression.data_type(batch.schema().as_ref())?;
             let base = if let Some(base) = case.expr() {
                 Some(scalar(
                     &resolve_expression(base.clone(), batch).await?,
@@ -251,14 +255,21 @@ pub fn resolve_expression(
                     None => condition == ScalarValue::Boolean(Some(true)),
                 };
                 if matches {
-                    return resolve_expression(then.clone(), batch).await;
+                    return try_cast(
+                        resolve_expression(then.clone(), batch).await?,
+                        batch.schema().as_ref(),
+                        result_type,
+                    );
                 }
             }
             return match case.else_expr() {
-                Some(other) => resolve_expression(other.clone(), batch).await,
-                None => Ok(Arc::new(Literal::new(ScalarValue::try_from(
-                    &expression.data_type(batch.schema().as_ref())?,
-                )?)) as Arc<dyn PhysicalExpr>),
+                Some(other) => try_cast(
+                    resolve_expression(other.clone(), batch).await?,
+                    batch.schema().as_ref(),
+                    result_type,
+                ),
+                None => Ok(Arc::new(Literal::new(ScalarValue::try_from(&result_type)?))
+                    as Arc<dyn PhysicalExpr>),
             };
         }
         let mut children = Vec::new();

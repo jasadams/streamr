@@ -20,7 +20,7 @@ use sqlparser::tokenizer::Token;
 
 use crate::extension::state_table::{StateTableAccess, StateTableClause, StateTableDescriptor};
 use crate::tables::{Table, produce_optimized_plan};
-use crate::{ArroyoSchemaProvider, parse_sql, rewrite_plan};
+use crate::{ArroyoSchemaProvider, parse_sql};
 
 #[derive(Debug)]
 pub(crate) struct NamedMerge {
@@ -314,9 +314,11 @@ pub(crate) fn plan_named_merge(
     // never a separately regenerated source query or a relookup of old/new.
     let source_sql = format!("SELECT * FROM {source}");
     let source_statement = parse_sql(&source_sql)?.remove(0);
-    let input = event_source::resolve(rewrite_plan(
-        produce_optimized_plan(&source_statement, provider)?,
-        provider,
+    let input = crate::rewriters::bind_event_clocks(event_source::resolve(
+        crate::rewrite_plan_deferred_clocks(
+            produce_optimized_plan(&source_statement, provider)?,
+            provider,
+        )?,
     )?)?;
     if input
         .schema()

@@ -72,6 +72,8 @@ use tonic::codegen::InterceptedService;
 use uuid::Uuid;
 
 pub mod arrow;
+#[cfg(test)]
+mod event_response_codec;
 
 pub mod engine;
 pub mod job_controller;

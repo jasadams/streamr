@@ -1,6 +1,7 @@
 [workspace]
 exclude = ["vendor/rdkafka-sys"]
 members = [
+    "vendor/datafusion-functions-aggregate-common",
     "crates/arroyo",
     "crates/arroyo-api",
     "crates/arroyo-compiler-service",
@@ -144,3 +145,7 @@ jiter = {git = "https://github.com/ArroyoSystems/jiter", branch = "disable_pytho
 # instance across the whole dependency graph.
 [patch."https://github.com/ArroyoSystems/sqlparser-rs"]
 sqlparser = { git = "https://github.com/jasadams/sqlparser-rs", rev = "41e07aa42c01ba8e9e625311f5e15202e0d5bf58" }
+
+# The pinned DataFusion grouped adapter must consume terminal partial state.
+[patch."https://github.com/ArroyoSystems/arrow-datafusion"]
+datafusion-functions-aggregate-common = { path = "vendor/datafusion-functions-aggregate-common" }

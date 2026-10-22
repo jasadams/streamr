@@ -44,6 +44,7 @@ class CargoDevTest(unittest.TestCase):
                         PATH=f"{self.bin}:{os.environ['PATH']}", WRAPPER_TEST_LOG=str(self.log))
         self.env.pop("RUST_BUILD_QUEUE_HELD", None)
         self.env.pop("STREAMR_DEV_IMAGE", None)
+        self.env.pop("STREAMR_BUILD_EVIDENCE_ROOT", None)
         self.env.pop("CARGO_BUILD_JOBS", None)
         self.env.pop("CARGO_INCREMENTAL", None)
         self.env.pop("ROCKSDB_COMPILE", None)
@@ -120,6 +121,23 @@ sys.exit(int(os.environ.get('COMMAND_STATUS', '0')))
         self.assertEqual(run['cwd'], str(self.root))
         self.assertEqual(run['queue'], str(self.base / 'cache/rust-build/build.lock'))
         self.assertIsNone(image['queue'])
+
+    def test_evidence_root_mount_preserves_absolute_paths_and_spaced_arguments(self):
+        evidence = self.base / "evidence with spaces"
+        evidence.mkdir()
+        result = self.run_wrapper('--exec', 'python3', str(evidence / 'fixture.py'),
+                                  STREAMR_BUILD_EVIDENCE_ROOT=str(evidence))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        args = self.records()[-1]['args']
+        self.assertIn(f'{evidence}:{evidence}:z', args)
+        self.assertEqual(args[-2:], ['python3', str(evidence / 'fixture.py')])
+        alias = self.base / 'alias'
+        alias.symlink_to(evidence, target_is_directory=True)
+        for invalid in ('relative', str(self.base / 'missing'), '/', '/app',
+                        str(evidence) + ':suffix', str(alias)):
+            result = self.run_wrapper('--exec', 'true', STREAMR_BUILD_EVIDENCE_ROOT=invalid)
+            self.assertEqual(result.returncode, 2, (invalid, result.stderr))
+            self.assertFalse(self.log.exists())
 
     def test_build_database_and_migrations_use_owned_network(self):
         db = 'a' * 64

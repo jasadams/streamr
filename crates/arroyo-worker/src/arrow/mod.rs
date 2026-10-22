@@ -378,6 +378,75 @@ pub fn decode_aggregate(
 
     match expr_type {
         ExprType::AggregateExpr(agg_node) => {
+            // Validate lifecycle bindings before DataFusion's builder asks a
+            // Column for its datatype (which indexes the schema directly).
+            if let Some(AggregateFunction::UserDefinedAggrFunction(name)) =
+                &agg_node.aggregate_function
+            {
+                let descriptor = registry.udaf(name).ok().and_then(|function| {
+                    arroyo_planner::grouped_selector_udaf::classify(&function)
+                });
+                if let Some((_, declared)) = descriptor {
+                    use arroyo_planner::grouped_selector::{ORDINAL_FIELD, ORDINAL_MARKER};
+                    let valid_ordinal = agg_node.expr.len() == 2
+                        && match agg_node.expr[1].expr_type.as_ref() {
+                            Some(ExprType::Column(column)) => {
+                                column.name == ORDINAL_FIELD
+                                    && schema.index_of(ORDINAL_FIELD).ok()
+                                        == Some(column.index as usize)
+                                    && schema.fields().get(column.index as usize).is_some_and(
+                                        |field| {
+                                            field.name() == ORDINAL_FIELD
+                                                && field.data_type()
+                                                    == &arrow_schema::DataType::UInt64
+                                                && !field.is_nullable()
+                                        },
+                                    )
+                            }
+                            Some(ExprType::ScalarUdf(function)) => {
+                                function.name == ORDINAL_MARKER && function.args.is_empty()
+                            }
+                            _ => false,
+                        };
+                    if !valid_ordinal {
+                        return Err(proto_error("invalid grouped selector lifecycle ordinal"));
+                    }
+                    if declared {
+                        let valid_clock = agg_node.ordering_req.first().is_some_and(|sort| {
+                            sort.asc
+                                && !sort.nulls_first
+                                && sort.expr.as_ref().is_some_and(|expr| {
+                                    match expr.expr_type.as_ref() {
+                                        Some(ExprType::Column(column)) => {
+                                            column.name == arroyo_rpc::TIMESTAMP_FIELD
+                                                && schema.index_of(arroyo_rpc::TIMESTAMP_FIELD).ok()
+                                                    == Some(column.index as usize)
+                                                && schema
+                                                    .fields()
+                                                    .get(column.index as usize)
+                                                    .is_some_and(|field| {
+                                                        field.name() == arroyo_rpc::TIMESTAMP_FIELD
+                                                            && matches!(
+                                                                field.data_type(),
+                                                                arrow_schema::DataType::Timestamp(
+                                                                    _,
+                                                                    _
+                                                                )
+                                                            )
+                                                    })
+                                        }
+                                        _ => false,
+                                    }
+                                })
+                        });
+                        if !valid_clock {
+                            return Err(proto_error(
+                                "invalid grouped selector raw FOR primary order",
+                            ));
+                        }
+                    }
+                }
+            }
             let input_phy_expr: Vec<Arc<dyn PhysicalExpr>> = agg_node
                 .expr
                 .iter()

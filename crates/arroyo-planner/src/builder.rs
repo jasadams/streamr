@@ -86,7 +86,12 @@ impl<'a> Planner<'a> {
     }
 
     pub(crate) fn sync_plan(&self, plan: &LogicalPlan) -> Result<Arc<dyn ExecutionPlan>> {
-        let fut = self.planner.create_physical_plan(plan, self.session_state);
+        // This copy is physical-plan local: the streaming edge carries raw
+        // rows, and its lifecycle owner appends the persisted write ordinal.
+        let bound = bind_grouped_selector_ordinals(plan.clone())?;
+        let fut = self
+            .planner
+            .create_physical_plan(&bound, self.session_state);
         let (tx, mut rx) = oneshot::channel();
         thread::scope(|s| {
             let _handle = tokio::runtime::Handle::current();
@@ -242,9 +247,52 @@ impl<'a> Planner<'a> {
 pub(crate) enum NamedNode {
     Source(TableReference),
     Watermark(TableReference),
+    EventResponseRoot(u32),
     RemoteTable(TableReference),
     Sink(TableReference),
     StateTableMerge(TableReference),
+}
+
+/// Add the internal ordinal only to the physical aggregate reader. Never add
+/// it to the graph edge schema or let the volatile marker execute as a UDF.
+fn bind_grouped_selector_ordinals(plan: LogicalPlan) -> Result<LogicalPlan> {
+    use crate::grouped_selector::{ORDINAL_FIELD, ORDINAL_MARKER};
+    use datafusion::common::tree_node::Transformed;
+    use datafusion::logical_expr::Aggregate;
+    plan.transform_up(|node| {
+        let LogicalPlan::Aggregate(mut aggregate) = node else { return Ok(Transformed::no(node)) };
+        let mut marker_found = false;
+        for expression in &aggregate.aggr_expr {
+            expression.apply(|expr| {
+                marker_found |= matches!(expr, Expr::ScalarFunction(function) if function.name() == ORDINAL_MARKER);
+                Ok(TreeNodeRecursion::Continue)
+            })?;
+        }
+        if !marker_found { return Ok(Transformed::no(LogicalPlan::Aggregate(aggregate))) }
+        let LogicalPlan::Extension(extension) = aggregate.input.as_ref() else {
+            return plan_err!("grouped selector requires its native keyed input reader");
+        };
+        let Some(input) = extension.node.as_any().downcast_ref::<KeyCalculationExtension>() else {
+            return plan_err!("grouped selector requires a native key-calculation reader");
+        };
+        if input.schema.has_column_with_unqualified_name(ORDINAL_FIELD) {
+            return plan_err!("reserved grouped selector ordinal field collides with input schema");
+        }
+        let mut input = input.clone();
+        let mut fields = crate::fields_with_qualifiers(&input.schema);
+        fields.push(crate::DFField::new(None, ORDINAL_FIELD, arrow_schema::DataType::UInt64, false));
+        input.schema = Arc::new(crate::schema_from_df_fields_with_metadata(&fields, input.schema.metadata().clone())?);
+        aggregate.input = Arc::new(LogicalPlan::Extension(Extension { node: Arc::new(input) }));
+        aggregate.aggr_expr = aggregate.aggr_expr.into_iter().map(|expr| {
+            Ok(expr.transform_up(|expr| {
+                if matches!(&expr, Expr::ScalarFunction(function) if function.name() == ORDINAL_MARKER) {
+                    Ok(Transformed::yes(Expr::Column(datafusion::common::Column::new_unqualified(ORDINAL_FIELD))))
+                } else { Ok(Transformed::no(expr)) }
+            })?.data)
+        }).collect::<Result<Vec<_>>>()?;
+        let aggregate = Aggregate::try_new_with_schema(aggregate.input, aggregate.group_expr, aggregate.aggr_expr, aggregate.schema)?;
+        Ok(Transformed::yes(LogicalPlan::Aggregate(aggregate)))
+    }).map(|result| result.data)
 }
 
 struct ArroyoExtensionPlanner {}

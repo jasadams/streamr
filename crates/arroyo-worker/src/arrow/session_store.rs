@@ -34,6 +34,7 @@ pub(crate) struct SessionMeta {
 
 pub(crate) struct SessionRow {
     pub key: Vec<u8>,
+    pub ordinal: u64,
     pub batch: RecordBatch,
     _permit: ResourcePermit,
 }
@@ -654,6 +655,54 @@ impl SessionStore {
                 .map(<[u8]>::to_vec);
         }
         Ok(())
+    }
+
+    /// Check the existing IPC/decoded/compacted-row allowance before DF state
+    /// construction. Actual reads retain their ordinary permits independently.
+    pub fn check_reader_capacity(&self) -> Result<()> {
+        drop(
+            self.resources.try_decoded_value(
+                self.limits
+                    .partial_bytes
+                    .checked_mul(3)
+                    .context("retained reader allowance overflow")?,
+            )?,
+        );
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(super) fn clear_test_proof_caches(&self) {
+        self.last_group.lock().unwrap().take();
+        self.deadline.lock().unwrap().take();
+    }
+
+    pub fn reserve_retained_aggregate(&self, bytes: usize) -> Result<ResourcePermit> {
+        // The raw final-input queue already owns six values. Optional proof
+        // caches were admitted above the old nine-value reader peak; they
+        // must yield to newly required companion ownership rather than make
+        // an otherwise sufficient configured pool reject a closure.
+        let required = self
+            .limits
+            .partial_bytes
+            .checked_mul(3)
+            .and_then(|reader| reader.checked_add(bytes))
+            .context("native SESSION companion reader allowance overflow")?;
+        match self.resources.try_decoded_value(required) {
+            Ok(probe) => drop(probe),
+            Err(_) => {
+                self.last_group
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("native SESSION group cache lock poisoned"))?
+                    .take();
+                self.deadline
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("native SESSION deadline cache lock poisoned"))?
+                    .take();
+                drop(self.resources.try_decoded_value(required)?);
+            }
+        }
+        Ok(self.resources.try_decoded_value(bytes)?)
     }
 
     pub fn reserve_final_input_queue(&self) -> Result<ResourcePermit> {
@@ -1403,6 +1452,7 @@ impl SessionStore {
             "native SESSION decoded retained row exceeds configured value limit"
         );
         Ok(Some(SessionRow {
+            ordinal: u64::from_be_bytes(entry.key.key[prefix_len + 8..prefix_len + 16].try_into()?),
             key: entry.key.key,
             batch,
             _permit: permit,
@@ -3727,6 +3777,34 @@ pub(super) mod tests {
             recovered.next_session(b"a", None).await.unwrap(),
             Some(current)
         );
+    }
+
+    #[tokio::test]
+    async fn retained_reader_preserves_arrival_when_event_time_reorders_rows() {
+        let store = store();
+        for (time, value) in [(10, 0), (0, 1), (10, 2)] {
+            store
+                .insert(b"a", time, &row(store.schema.clone(), value))
+                .await
+                .unwrap();
+        }
+        let snapshot = store.snapshot().await.unwrap();
+        let mut after = None;
+        let mut ordinals = Vec::new();
+        while let Some(row) = store
+            .next_row(
+                &snapshot,
+                b"a",
+                SessionMeta { start: 0, end: 10 },
+                after.as_deref(),
+            )
+            .await
+            .unwrap()
+        {
+            ordinals.push(row.ordinal);
+            after = Some(row.key);
+        }
+        assert_eq!(ordinals, vec![1, 0, 2]);
     }
 
     #[tokio::test]

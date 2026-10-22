@@ -46,7 +46,7 @@ pub struct SourceRewriter<'a> {
 }
 
 impl SourceRewriter<'_> {
-    fn watermark_expression(table: &ConnectorTable) -> DFResult<Expr> {
+    pub(crate) fn watermark_expression(table: &ConnectorTable) -> DFResult<Expr> {
         let expr = match table.watermark_field.clone() {
             Some(watermark_field) => table
                 .fields
@@ -158,36 +158,36 @@ impl SourceRewriter<'_> {
     }
 
     fn projection(&self, table_scan: &TableScan, table: &ConnectorTable) -> DFResult<LogicalPlan> {
-        let qualifier = table_scan.table_name.clone();
-
-        let table_source_extension = LogicalPlan::Extension(Extension {
-            node: Arc::new(TableSourceExtension::new(
-                qualifier.to_owned(),
-                table.clone(),
-            )),
-        });
-
-        let (projection_input, projection) = if table.is_updating() {
-            let mut projection_offsets = table_scan.projection.clone();
-            if let Some(offsets) = projection_offsets.as_mut() {
-                offsets.push(table.fields.len())
-            }
-            (
-                LogicalPlan::Extension(Extension {
-                    node: Arc::new(DebeziumUnrollingExtension::try_new(
-                        table_source_extension,
-                        table.primary_keys.clone(),
-                    )?),
-                }),
-                None,
-            )
+        // Preserve the ordinary source path: CDC exposes all unrolled fields.
+        let projection = if table.is_updating() {
+            None
         } else {
-            (table_source_extension, table_scan.projection.clone())
+            table_scan.projection.clone()
         };
+        Self::canonical_projection(table, &table_scan.table_name, projection)
+    }
 
+    pub(crate) fn canonical_projection(
+        table: &ConnectorTable,
+        qualifier: &TableReference,
+        projection: Option<Vec<usize>>,
+    ) -> DFResult<LogicalPlan> {
+        let source = LogicalPlan::Extension(Extension {
+            node: Arc::new(TableSourceExtension::new(qualifier.clone(), table.clone())),
+        });
+        let input = if table.is_updating() {
+            LogicalPlan::Extension(Extension {
+                node: Arc::new(DebeziumUnrollingExtension::try_new(
+                    source,
+                    table.primary_keys.clone(),
+                )?),
+            })
+        } else {
+            source
+        };
         Ok(LogicalPlan::Projection(Projection::try_new(
-            Self::projection_expressions(table, &qualifier, &projection)?,
-            Arc::new(projection_input),
+            Self::projection_expressions(table, qualifier, &projection)?,
+            Arc::new(input),
         )?))
     }
 
@@ -799,6 +799,7 @@ pub(crate) fn event_timestamp_index(input: &LogicalPlan) -> Option<usize> {
 /// progress or an aggregate's retained/output timestamp.
 pub(crate) struct EventClockRewriter<'a> {
     pub input: &'a LogicalPlan,
+    pub defer_aggregate: bool,
 }
 
 // Versioned Arrow field provenance, carried by existing serialized schemas.
@@ -924,6 +925,11 @@ impl TreeNodeRewriter for EventClockRewriter<'_> {
             );
         }
         if lineage.aggregate {
+            if self.defer_aggregate {
+                // A view is a template: its consumer has not established an
+                // emission contract yet. Never bind this to aggregate MAX time.
+                return Ok(Transformed::no(node));
+            }
             return plan_err!(
                 "EVENT_TIMESTAMP()/EVENT_DATE() requires current-trigger clock metadata across maintained aggregates (STR-62); aggregate output time is not an event clock"
             );
@@ -1024,4 +1030,27 @@ impl TreeNodeRewriter for SinkInputRewriter<'_> {
         }
         Ok(Transformed::no(node))
     }
+}
+
+/// Finish contextual clock binding after the consumer establishes its emission
+/// contract. This pass does not rewrite native aggregate/source operators.
+pub(crate) fn bind_event_clocks(plan: LogicalPlan) -> DFResult<LogicalPlan> {
+    Ok(plan
+        .transform_up_with_subqueries(|node| {
+            let input = match &node {
+                LogicalPlan::Projection(projection) => Some(projection.input.clone()),
+                LogicalPlan::Filter(filter) => Some(filter.input.clone()),
+                _ => None,
+            };
+            let Some(input) = input else {
+                return Ok(Transformed::no(node));
+            };
+            node.map_expressions(|expression| {
+                expression.rewrite(&mut EventClockRewriter {
+                    input: &input,
+                    defer_aggregate: false,
+                })
+            })
+        })?
+        .data)
 }

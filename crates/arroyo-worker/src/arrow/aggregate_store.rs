@@ -6,7 +6,9 @@ use anyhow::{Context, Result, ensure};
 #[path = "aggregate_scan_diagnostics.rs"]
 pub(super) mod scan_diagnostics;
 use arroyo_state::live::{
-    LiveStateBackend, ReadOptions, ScanRange, ScanRequest, StateSnapshot, encoding,
+    LiveStateBackend, ReadOptions, ScanRange, ScanRequest, StateKey, StateNamespace, StateSnapshot,
+    checkpoint::checkpoint_decoded_reservation,
+    encoding,
     resources::{ResourcePermit, WorkerStateResources},
     table::LiveTable,
     write::AdmittedWriteBatch,
@@ -54,6 +56,7 @@ pub(crate) struct AggregateStore {
     resources: WorkerStateResources,
     limits: AggregateStoreLimits,
     max_encoded_entry_bytes: usize,
+    selector_checkpoint_headroom: bool,
 }
 
 /// A logical expiry lower bound for one serial flush, never a backend cursor.
@@ -84,6 +87,65 @@ pub(crate) struct AggregateScope<'a> {
     diagnostic: Option<scan_diagnostics::ScopeProbe>,
 }
 
+/// Maximum zero-escaped key framing, using the backend's namespace codec.
+pub(crate) fn aggregate_encoded_key_bound(
+    namespace: &StateNamespace,
+    key_bytes: usize,
+) -> Result<usize> {
+    let empty = StateKey {
+        namespace: namespace.clone(),
+        key: Vec::new(),
+        routing_hash: None,
+    };
+    encoding::encoded_key_size(&empty)?
+        .checked_add(
+            key_bytes
+                .checked_mul(2)
+                .context("aggregate encoded key bound overflow")?,
+        )
+        .context("aggregate encoded key bound overflow")
+}
+
+/// One serial owner's foreground peak. Point reads and candidate decoding are
+/// sequential. The common bound also admits the RocksDB adapter's owned read.
+pub(crate) fn aggregate_decoded_foreground(
+    limits: AggregateStoreLimits,
+    output_bytes: usize,
+    selector: bool,
+    encoded_key_bytes: usize,
+) -> Result<usize> {
+    let point = limits
+        .value_bytes
+        .checked_add(
+            encoded_key_bytes
+                .checked_mul(2)
+                .context("aggregate point-read workspace overflow")?,
+        )
+        .and_then(|n| {
+            n.checked_add(std::mem::size_of::<Vec<u8>>() + std::mem::size_of::<Option<Vec<u8>>>())
+        })
+        .context("aggregate point-read workspace overflow")?;
+    let candidate = if selector {
+        limits
+            .value_bytes
+            .checked_mul(3)
+            .context("selector workspace overflow")?
+    } else {
+        0
+    };
+    limits
+        .overlay_bytes
+        .checked_add(
+            limits
+                .value_bytes
+                .checked_mul(3)
+                .context("aggregate scope workspace overflow")?,
+        )
+        .and_then(|n| n.checked_add(output_bytes.checked_mul(3)?))
+        .and_then(|n| n.checked_add(candidate.max(point)))
+        .context("aggregate foreground workspace overflow")
+}
+
 impl AggregateStore {
     pub fn new(
         backend: Arc<dyn LiveStateBackend>,
@@ -92,8 +154,7 @@ impl AggregateStore {
         limits: AggregateStoreLimits,
     ) -> Result<Self> {
         let limits = limits.validate()?;
-        let max_key = table.key(vec![0; limits.key_bytes], None);
-        let encoded_key_bytes = encoding::encoded_key_size(&max_key)?;
+        let encoded_key_bytes = aggregate_encoded_key_bound(table.namespace(), limits.key_bytes)?;
         let one_write = encoded_key_bytes
             .checked_add(limits.value_bytes.saturating_add(1))
             .context("aggregate maximum write size overflow")?;
@@ -146,7 +207,25 @@ impl AggregateStore {
             resources,
             limits,
             max_encoded_entry_bytes: one_write,
+            selector_checkpoint_headroom: false,
         })
+    }
+
+    pub fn preserve_selector_checkpoint_headroom(&mut self) {
+        self.selector_checkpoint_headroom = true;
+    }
+
+    pub fn optional_progress_peak(&self, output_bytes: usize, existing: usize) -> Option<usize> {
+        if !self.selector_checkpoint_headroom {
+            return Some(existing);
+        }
+        let encoded_key = self
+            .max_encoded_entry_bytes
+            .checked_sub(self.limits.value_bytes + 1)?;
+        let foreground =
+            aggregate_decoded_foreground(self.limits, output_bytes, true, encoded_key).ok()?;
+        let checkpoint = checkpoint_decoded_reservation(self.resources.config()).ok()?;
+        Some(existing.max(foreground.checked_add(checkpoint)?))
     }
 
     pub async fn begin(&self) -> Result<AggregateScope<'_>> {
@@ -161,12 +240,24 @@ impl AggregateStore {
 
     async fn begin_scope(&self, stable_scan: bool) -> Result<AggregateScope<'_>> {
         // Reserve every retained decoded value/overlay before processing input.
-        let decoded = self.resources.try_decoded_value(
-            self.limits
-                .overlay_bytes
-                .checked_add(self.limits.value_bytes.saturating_mul(3))
-                .context("aggregate decoded scope size overflow")?,
-        )?;
+        let requested = self
+            .limits
+            .overlay_bytes
+            .checked_add(
+                self.limits
+                    .value_bytes
+                    .checked_mul(3)
+                    .context("aggregate decoded scope size overflow")?,
+            )
+            .context("aggregate decoded scope size overflow")?;
+        let decoded = self
+            .resources
+            .try_decoded_value(requested)
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "aggregate scope decoded reservation requested={requested}: {error}"
+                )
+            })?;
         let writes = AdmittedWriteBatch::try_reserve(
             self.resources.clone(),
             self.limits.write_bytes,
@@ -232,6 +323,7 @@ impl AggregateStore {
             .checked_add(output_bytes.checked_mul(3)?)?
             .checked_add(self.max_encoded_entry_bytes.checked_mul(2)?)?
             .checked_add(128)?;
+        let mandatory = self.optional_progress_peak(output_bytes, mandatory)?;
         if mandatory.checked_add(charge)? > self.resources.config().decoded_value_bytes {
             return None;
         }
@@ -252,6 +344,12 @@ impl AggregateStore {
 }
 
 impl AggregateScope<'_> {
+    /// Resources belong to this scope's store, including when the serial owner
+    /// temporarily takes the store out of its operator during input/flush.
+    pub fn resources(&self) -> &WorkerStateResources {
+        self.store.resources()
+    }
+
     pub fn limits(&self) -> AggregateStoreLimits {
         self.store.limits
     }
@@ -605,6 +703,53 @@ mod tests {
         Ownership, StateKey, StateNamespace, lifecycle::RocksStateConfig, memory::MemoryLiveState,
         resources::ResourceConfig, rocks::RocksLiveState, table::LiveTableManager,
     };
+
+    #[test]
+    fn aggregate_foreground_uses_actual_zero_escaped_key_bound_and_checked_peak() {
+        let namespace = StateNamespace {
+            ownership: arroyo_state::live::Ownership::PartitionLocal {
+                subtask: 0,
+                parallelism: 1,
+            },
+            table: b"native-aggregate-v1".to_vec(),
+        };
+        for size in [0, 1, 8, 512] {
+            let bound = aggregate_encoded_key_bound(&namespace, size).unwrap();
+            for byte in [0, 1, 255] {
+                let key = StateKey {
+                    namespace: namespace.clone(),
+                    key: vec![byte; size],
+                    routing_hash: None,
+                };
+                let actual = encoding::encoded_key_size(&key).unwrap();
+                assert!(actual <= bound);
+                if byte == 0 {
+                    assert_eq!(actual, bound);
+                }
+            }
+        }
+        assert!(aggregate_encoded_key_bound(&namespace, usize::MAX).is_err());
+        let limits = AggregateStoreLimits {
+            key_bytes: 512,
+            value_bytes: 128,
+            page_bytes: 2048,
+            page_entries: 1,
+            write_bytes: 4096,
+            write_operations: 8,
+            overlay_bytes: 4096,
+        };
+        let key = aggregate_encoded_key_bound(&namespace, limits.key_bytes).unwrap();
+        let point = limits.value_bytes
+            + 2 * key
+            + std::mem::size_of::<Vec<u8>>()
+            + std::mem::size_of::<Option<Vec<u8>>>();
+        assert!(point > 3 * limits.value_bytes);
+        assert_eq!(
+            aggregate_decoded_foreground(limits, 256, true, key).unwrap(),
+            limits.overlay_bytes + 3 * limits.value_bytes + 3 * 256 + point
+        );
+        assert!(aggregate_decoded_foreground(limits, usize::MAX, true, key).is_err());
+    }
 
     #[tokio::test]
     async fn rocks_scan_progresses_at_exact_composite_admission_boundary() {

@@ -478,7 +478,25 @@ impl UserDefinedLogicalNodeCore for AggregateExtension {
                 WindowBehavior::InData => "InData".to_string(),
                 WindowBehavior::FromOperator { window, .. } => format!("FromOperator({window:?})"),
             }
-        )
+        )?;
+        if let LogicalPlan::Aggregate(aggregate) = &self.aggregate
+            && aggregate
+                .aggr_expr
+                .iter()
+                .any(|expr| expr.to_string().contains("__streamr_grouped_"))
+        {
+            write!(
+                f,
+                ": aggr=[{}]",
+                aggregate
+                    .aggr_expr
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )?;
+        }
+        Ok(())
     }
 
     fn with_exprs_and_inputs(&self, _exprs: Vec<Expr>, inputs: Vec<LogicalPlan>) -> Result<Self> {

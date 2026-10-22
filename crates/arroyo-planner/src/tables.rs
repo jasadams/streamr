@@ -1,3 +1,4 @@
+use crate::DEFAULT_IDLE_TIME;
 use crate::extension::remote_table::RemoteTableExtension;
 use crate::types::convert_data_type;
 use crate::{
@@ -5,7 +6,6 @@ use crate::{
     external::{ProcessingMode, SqlSource},
     fields_with_qualifiers, multifield_partial_ord, parse_sql,
 };
-use crate::{DEFAULT_IDLE_TIME, rewrite_plan};
 use arrow_schema::{DataType, Field, FieldRef, Schema};
 use arroyo_connectors::connector_for_type;
 use arroyo_datastream::default_sink;
@@ -938,7 +938,10 @@ impl Table {
                     input,
                     ..
                 }))) => {
-                    let rewritten_plan = rewrite_plan(input.as_ref().clone(), schema_provider)?;
+                    let rewritten_plan = crate::rewrite_plan_deferred_clocks(
+                        input.as_ref().clone(),
+                        schema_provider,
+                    )?;
                     let schema = rewritten_plan.schema().clone();
                     let remote_extension = RemoteTableExtension {
                         input: rewritten_plan,

@@ -568,3 +568,63 @@ async fn event_clock_local_view_insert_preserves_correlated_values() {
             CAST((SELECT d FROM (VALUES (clocks.day)) AS local(d)) AS TEXT) AS reference_date FROM clocks;
         INSERT INTO output SELECT id, reference, reference_date FROM evaluated")).await;
 }
+
+async fn str64_rejects_singleton(sql: &str, diagnostic: &str) {
+    let error = parse_and_get_program(
+        sql,
+        ArroyoSchemaProvider::new(),
+        SqlConfig {
+            default_parallelism: 1,
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        error.to_string().contains(diagnostic),
+        "expected {diagnostic}, got {error}"
+    );
+}
+
+#[test(tokio::test)]
+async fn str64_pending_selector_clock_ordinary_final_reader_stays_rejected() {
+    let (declarations, _) =
+        super::continuous_merge::str64_pending_selector_parts("json", "LAST_VALUE(v)");
+    str64_rejects_singleton(
+        &format!("{declarations} SELECT k,v,clock FROM pending_selector;"),
+        "aggregate output time is not an event clock",
+    )
+    .await;
+}
+
+#[test(tokio::test)]
+async fn str64_pending_selector_clock_nested_alias_reader_stays_rejected() {
+    let (declarations, _) =
+        super::continuous_merge::str64_pending_selector_parts("json", "LAST_VALUE(v)");
+    str64_rejects_singleton(
+        &format!(
+            "{declarations}
+        CREATE VIEW nested_selector AS SELECT k,v,clock AS aliased_clock FROM pending_selector;
+        SELECT nested.k,nested.aliased_clock FROM nested_selector AS nested;"
+        ),
+        "aggregate output time is not an event clock",
+    )
+    .await;
+}
+
+#[test(tokio::test)]
+async fn str64_pending_selector_clock_mixed_readers_do_not_inherit_merge_capability() {
+    let (declarations, mutation) =
+        super::continuous_merge::str64_pending_selector_parts("json", "LAST_VALUE(v)");
+    let ordinary = "SELECT k,v,clock FROM pending_selector;";
+    let captured = "SELECT source.clock,new.v FROM selector_applied;";
+    for readers in [
+        format!("{ordinary}{mutation}{captured}"),
+        format!("{mutation}{captured}{ordinary}"),
+    ] {
+        str64_rejects_singleton(
+            &format!("{declarations}{readers}"),
+            "aggregate output time is not an event clock",
+        )
+        .await;
+    }
+}

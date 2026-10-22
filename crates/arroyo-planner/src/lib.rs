@@ -5,6 +5,8 @@ pub(crate) mod continuous_merge;
 pub(crate) mod extension;
 pub mod external;
 mod functions;
+pub mod grouped_selector;
+pub mod grouped_selector_udaf;
 pub mod like_regex;
 pub mod local_physical;
 mod local_planning;
@@ -148,6 +150,7 @@ pub fn register_functions(registry: &mut dyn FunctionRegistry) {
     datafusion_functions_json::register_all(registry).unwrap();
 
     functions::register_all(registry);
+    grouped_selector_udaf::register(registry);
 
     for p in SessionStateDefaults::default_scalar_functions() {
         let p = if p.name() == "now" {
@@ -749,9 +752,28 @@ pub fn rewrite_plan(
     plan: LogicalPlan,
     schema_provider: &ArroyoSchemaProvider,
 ) -> Result<LogicalPlan> {
+    rewrite_plan_clocks(plan, schema_provider, false)
+}
+
+/// Views and MERGE sources retain postaggregate markers until the consumer has
+/// validated its emission contract. Final readers must bind them strictly.
+pub(crate) fn rewrite_plan_deferred_clocks(
+    plan: LogicalPlan,
+    schema_provider: &ArroyoSchemaProvider,
+) -> Result<LogicalPlan> {
+    rewrite_plan_clocks(plan, schema_provider, true)
+}
+
+fn rewrite_plan_clocks(
+    plan: LogicalPlan,
+    schema_provider: &ArroyoSchemaProvider,
+    defer_aggregate_clocks: bool,
+) -> Result<LogicalPlan> {
     let has_event_clock = rewriters::plan_contains_event_clock(&plan)?;
+    let mut rewriter = ArroyoRewriter::new(schema_provider);
+    rewriter.defer_aggregate_clocks = defer_aggregate_clocks;
     let rewritten_plan = plan
-        .rewrite_with_subqueries(&mut ArroyoRewriter::new(schema_provider))?
+        .rewrite_with_subqueries(&mut rewriter)?
         .data
         .rewrite_with_subqueries(&mut UnnestRewriter {})?;
 
@@ -760,7 +782,12 @@ pub fn rewrite_plan(
         .data
         .visit_with_subqueries(&mut TimeWindowUdfChecker {})?;
 
-    if has_event_clock {
+    let rewritten_plan = if defer_aggregate_clocks {
+        rewritten_plan.data
+    } else {
+        rewriters::bind_event_clocks(rewritten_plan.data)?
+    };
+    if has_event_clock && !defer_aggregate_clocks {
         // Constant folding is deferred while event-clock markers need row
         // context. Now that they are columns, simplify standard stable
         // expressions (including CURRENT_DATE/CURRENT_TIMESTAMP) as usual.
@@ -768,12 +795,12 @@ pub fn rewrite_plan(
             datafusion::optimizer::simplify_expressions::SimplifyExpressions::new(),
         )])
         .optimize(
-            rewritten_plan.data,
+            rewritten_plan,
             &datafusion::optimizer::OptimizerContext::default(),
             |_plan, _rule| {},
         )
     } else {
-        Ok(rewritten_plan.data)
+        Ok(rewritten_plan)
     }
 }
 
@@ -1369,3 +1396,12 @@ impl DFField {
         self
     }
 }
+
+pub mod aggregate_capability;
+
+#[cfg(test)]
+mod local_case_tests;
+
+// Disabled branch-response source extraction proof; no production entry.
+#[cfg(test)]
+mod event_response_root;

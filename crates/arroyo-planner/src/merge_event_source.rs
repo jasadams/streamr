@@ -4,6 +4,7 @@ use std::sync::Arc;
 use arroyo_rpc::{SOURCE_ENVELOPE_FIELD, TIMESTAMP_FIELD, UPDATING_META_FIELD};
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion, TreeNodeRewriter};
 use datafusion::common::{DFSchema, Result, plan_err};
+use datafusion::logical_expr::ExprSchemable;
 use datafusion::logical_expr::{
     Expr, Extension, Filter, LogicalPlan, Projection, SubqueryAlias, Volatility,
 };
@@ -76,13 +77,51 @@ fn validate(aggregate: &UpdatingAggregateExtension) -> Result<()> {
         let Expr::AggregateFunction(function) = expression else {
             return plan_err!("per-event aggregate MERGE supports native COUNT/MAX only");
         };
-        if !matches!(function.func.name(), "count" | "max")
-            || function.params.distinct
-            || function.params.order_by.is_some()
+        let selector = crate::grouped_selector_udaf::classify(&function.func);
+        if function.params.distinct
+            || (selector.is_none()
+                && (!matches!(function.func.name(), "count" | "max")
+                    || function.params.order_by.is_some()))
         {
             return plan_err!(
-                "per-event aggregate MERGE supports native non-distinct COUNT/MAX only"
+                "per-event aggregate MERGE supports native non-distinct COUNT/MAX and grouped selectors only"
             );
+        }
+        if let Some((_, declared)) = selector {
+            let args = &function.params.args;
+            if args.len() != 2
+                || !matches!(&args[1], Expr::ScalarFunction(marker)
+                    if marker.name() == crate::grouped_selector::ORDINAL_MARKER
+                        && marker.args.is_empty()
+                        && args[1].get_type(plan.input.schema())? == arrow_schema::DataType::UInt64)
+            {
+                return plan_err!("per-event selector lacks its native write ordinal");
+            }
+            let orders = function.params.order_by.as_deref().unwrap_or_default();
+            if declared
+                && !orders.first().is_some_and(|order| {
+                    is_timestamp_column(&order.expr)
+                        && order.asc
+                        && !order.nulls_first
+                        && matches!(
+                            order.expr.get_type(plan.input.schema()),
+                            Ok(arrow_schema::DataType::Timestamp(_, _))
+                        )
+                })
+            {
+                return plan_err!("per-event selector requires raw FOR timestamp ASC NULLS LAST");
+            }
+            if corrections {
+                // Only generated lifecycle inputs are exempt: user values,
+                // secondary sort expressions and FILTER must be replayable.
+                validate_repeatable(&args[0], plan.input.schema())?;
+                for order in orders.iter().skip(usize::from(declared)) {
+                    validate_repeatable(&order.expr, plan.input.schema())?;
+                }
+                if let Some(filter) = &function.params.filter {
+                    validate_repeatable(filter, plan.input.schema())?;
+                }
+            }
         }
         if corrections {
             // plan/aggregate appends this hidden clock MAX, whose retraction uses
@@ -94,7 +133,7 @@ fn validate(aggregate: &UpdatingAggregateExtension) -> Result<()> {
                 && function.params.args.len() == 1
                 && is_timestamp_column(&function.params.args[0])
                 && function.params.filter.is_none();
-            if !injected_clock {
+            if !injected_clock && selector.is_none() {
                 validate_repeatable(output, plan.input.schema())?;
             }
         }

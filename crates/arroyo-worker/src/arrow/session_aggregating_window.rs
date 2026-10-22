@@ -725,6 +725,11 @@ impl OperatorConstructor for SessionAggregatingWindowConstructor {
             &RuntimeEnvBuilder::new().build()?,
             &codec,
         )?;
+        anyhow::ensure!(
+            worker_config().worker.window_state.is_some()
+                || !super::window_native::has_grouped_selector(final_execution_plan.as_ref()),
+            "grouped FIRST_VALUE/LAST_VALUE SESSION requires worker.window-state and worker.live-state-resources"
+        );
 
         let input_schema: ArroyoSchema = config
             .input_schema

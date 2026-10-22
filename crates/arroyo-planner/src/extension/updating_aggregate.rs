@@ -79,7 +79,25 @@ impl UserDefinedLogicalNodeCore for UpdatingAggregateExtension {
     }
 
     fn fmt_for_explain(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "UpdatingAggregateExtension")
+        write!(f, "UpdatingAggregateExtension")?;
+        if let LogicalPlan::Aggregate(aggregate) = &self.aggregate
+            && aggregate
+                .aggr_expr
+                .iter()
+                .any(|expr| expr.to_string().contains("__streamr_grouped_"))
+        {
+            write!(
+                f,
+                ": aggr=[{}]",
+                aggregate
+                    .aggr_expr
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )?;
+        }
+        Ok(())
     }
 
     fn with_exprs_and_inputs(

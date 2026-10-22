@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Candidate generic two-stage updating aggregate fixture and independent oracle.
+"""Generic two-stage updating aggregate fixture and independent oracle.
 
-This prepares data only. The parent runner supplies its own Bookworm test binary,
-backend, checkpoint mode and source batch size. Equal ORDER BY ties should also
-be compared against the existing operator in the same batch configuration.
+Preparation does not execute SQL. Runtime checks use a supplied Bookworm test binary,
+backend, checkpoint mode and source batch size. FIRST/LAST use the shared
+grouped selector implementation; no alternate execution path is invoked.
 """
 import argparse
 import json
@@ -58,8 +58,7 @@ def expected(prefix, deterministic=True):
             latest = ordered[-1]["amount"]
         else:
             ordered = sorted(rows, key=lambda row: (row["sort_seq"], row["ordinal"]))
-            # Candidate stable tie policy. Compare to the existing operator
-            # separately because equal ORDER BY tuples do not define a result.
+            # No declared FOR: preserve the explicit-order first-write tie policy.
             latest = sorted(rows, key=lambda row: (-row["sort_seq"], row["ordinal"]))[0]["amount"]
         earliest = next((row["amount"] for row in ordered if row["amount"] is not None), None)
         result[tenant] = dict(
@@ -75,29 +74,13 @@ def expected(prefix, deterministic=True):
     return result
 
 
-def tied_latest_values(prefix):
-    """All legal LAST_VALUE members among active items with maximal sort_seq."""
-    groups = {}
-    for event in EVENTS[:prefix]:
-        groups.setdefault((event["tenant_id"], event["item_id"]), []).append(event)
-    active = {}
-    for (tenant, _), rows in groups.items():
-        amounts = [row["amount"] for row in rows if row["amount"] is not None]
-        active.setdefault(tenant, []).append((max(row["seq"] for row in rows),
-                                              max(amounts) if amounts else None))
-    return {tenant: {amount for seq, amount in members
-                     if seq == max(position for position, _ in members)}
-            for tenant, members in active.items()}
-
-
-def strict_reduce(path, target, compare_tied_latest=True, prefix_count=None):
+def strict_reduce(path, target, deterministic=True, prefix_count=None):
     """Validate every Debezium transition, not just a final-row projection."""
     rows = [json.loads(line) for line in Path(path).read_text().splitlines()]
     current = {}
     actions = []
     positions = {}
-    prefixes = [expected(index, compare_tied_latest) for index in range(1, (prefix_count or len(EVENTS)) + 1)]
-    tied = [tied_latest_values(index) for index in range(1, len(prefixes) + 1)]
+    prefixes = [expected(index, deterministic) for index in range(1, (prefix_count or len(EVENTS)) + 1)]
     for record in rows:
         row = record.get("payload", record)
         assert set(row) >= {"before", "after", "op"}, row
@@ -112,13 +95,8 @@ def strict_reduce(path, target, compare_tied_latest=True, prefix_count=None):
         assert current.get(key) == before, (key, before, current.get(key), row)
         if after is not None:
             assert key in target, key
-            candidate = {field: val for field, val in after.items()
-                         if compare_tied_latest or field != "latest"}
             candidates = [index for index, snapshot in enumerate(prefixes)
-                          if index >= positions.get(key, -1) and key in snapshot
-                          and {field: val for field, val in snapshot[key].items()
-                               if compare_tied_latest or field != "latest"} == candidate
-                          and (compare_tied_latest or after["latest"] in tied[index][key])]
+                          if index >= positions.get(key, -1) and after == snapshot.get(key)]
             assert candidates, ("not a forward source-prefix aggregate", after)
             positions[key] = candidates[0]
         if after is None:
@@ -126,19 +104,11 @@ def strict_reduce(path, target, compare_tied_latest=True, prefix_count=None):
         else:
             current[key] = after
         actions.append((key, op))
-    if compare_tied_latest:
-        assert current == target, (current, target)
-    else:
-        assert set(current) == set(target), (current, target)
-        for key in target:
-            expected_other = {field: value for field, value in target[key].items() if field != "latest"}
-            actual_other = {field: value for field, value in current[key].items() if field != "latest"}
-            assert actual_other == expected_other, (key, actual_other, expected_other)
-            assert current[key]["latest"] in tied[-1][key], (key, current[key], tied[-1][key])
+    assert current == target, (current, target)
     return actions, current
 
 
-def write_fixture(directory, equal_order, native):
+def write_fixture(directory, equal_order):
     directory.mkdir(parents=True, exist_ok=True)
     (directory / "input.jsonl").write_text(
         "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in EVENTS)
@@ -148,7 +118,7 @@ def write_fixture(directory, equal_order, native):
             json.dumps(expected(count, not equal_order), ensure_ascii=False, indent=2) + "\n"
         )
     order = "sort_seq" if equal_order else "sort_seq, item_id"
-    retention = "SET updating_ttl = NULL;" if native else "SET updating_ttl = INTERVAL '24 hours';"
+    retention = "SET updating_ttl = NULL;"
     query = f"""
 {retention}
 CREATE TABLE aggregate_input (tenant_id TEXT NOT NULL, item_id BIGINT NOT NULL, amount BIGINT, seq BIGINT NOT NULL)
@@ -174,8 +144,8 @@ INSERT INTO aggregate_output SELECT tenant_id, items, positive_items, total, lo,
     (directory / "query.sql").write_text(query)
 
 
-def run_case(binary, directory, backend, batch, mode, equal_order, native):
-    write_fixture(directory, equal_order, native)
+def run_case(binary, directory, backend, batch, mode, equal_order):
+    write_fixture(directory, equal_order)
     environment = dict(
         os.environ,
         STREAMR_TEST_SOURCE_BATCH_ROWS=str(batch),
@@ -193,10 +163,7 @@ def run_case(binary, directory, backend, batch, mode, equal_order, native):
         STREAMR_CAPTURE_MAX_ROWS=str(len(EVENTS)),
         STREAMR_CAPTURE_CHECKPOINT_EPOCH="1",
     )
-    if native:
-        environment["STREAMR_TEST_NATIVE_AGGREGATES"] = "1"
-    else:
-        environment.pop("STREAMR_TEST_NATIVE_AGGREGATES", None)
+    environment["STREAMR_TEST_NATIVE_AGGREGATES"] = "1"
     log = directory / "capture.log"
     with log.open("w") as output:
         completed = subprocess.run(
@@ -239,17 +206,16 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("directory", type=Path)
     parser.add_argument("--binary", type=Path, help="fresh arroyo-sql-testing test executable")
-    parser.add_argument("--baseline", action="store_true", help="also run existing memory operator at batch 1/8")
     parser.add_argument("--check", type=Path, help="reduce an actual Debezium JSONL output")
     parser.add_argument("--prefix", type=int, default=len(EVENTS))
     parser.add_argument(
         "--equal-order", action="store_true",
-        help="omit item_id tie-breaker for differential legacy/native comparison",
+        help="omit item_id tie-breaker and verify no-FOR first-write ties",
     )
     args = parser.parse_args()
     directory = args.directory.resolve()
     if not args.binary:
-        write_fixture(directory, args.equal_order, True)
+        write_fixture(directory, args.equal_order)
         if args.check:
             print(strict_reduce(args.check, expected(args.prefix, not args.equal_order), not args.equal_order, prefix_count=args.prefix))
         else:
@@ -259,25 +225,13 @@ def main():
             )
         return
     binary = args.binary.resolve(strict=True)
-    outcomes = {}
     for backend in ("memory", "rocksdb"):
         for batch in (1, 8):
             for mode in ("controller", "leader"):
                 case = f"native-{backend}-{batch}-{mode}"
-                outcomes[(backend, batch, mode)] = run_case(
-                    binary, directory / case, backend, batch, mode, args.equal_order, True
+                run_case(
+                    binary, directory / case, backend, batch, mode, args.equal_order
                 )
-    if args.baseline:
-        for batch in (1, 8):
-            case = f"baseline-memory-{batch}-controller"
-            baseline = run_case(
-                binary, directory / case, "memory", batch, "controller", args.equal_order, False
-            )
-            native = outcomes[("memory", batch, "controller")]
-            assert baseline[0] == native[0], (batch, "initial", baseline[0], native[0])
-            assert baseline[1] == native[1], (batch, "checkpoint", baseline[1], native[1])
-            assert baseline[2] == native[2], (batch, "recovered", baseline[2], native[2])
-            print(f"PASS differential batch={batch}", flush=True)
 
 
 if __name__ == "__main__":

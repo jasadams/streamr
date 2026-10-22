@@ -24,6 +24,7 @@ pub struct WatermarkNode {
     pub schema: DFSchemaRef,
     timestamp_index: usize,
     pub(crate) preserve_source_envelope: bool,
+    pub(crate) response_root_slot: Option<u32>,
 }
 
 multifield_partial_ord!(
@@ -32,7 +33,8 @@ multifield_partial_ord!(
     qualifier,
     watermark_expression,
     timestamp_index,
-    preserve_source_envelope
+    preserve_source_envelope,
+    response_root_slot
 );
 
 impl UserDefinedLogicalNodeCore for WatermarkNode {
@@ -76,13 +78,18 @@ impl UserDefinedLogicalNodeCore for WatermarkNode {
             schema: self.schema.clone(),
             timestamp_index,
             preserve_source_envelope: self.preserve_source_envelope,
+            response_root_slot: self.response_root_slot,
         })
     }
 }
 
 impl ArroyoExtension for WatermarkNode {
     fn node_name(&self) -> Option<NamedNode> {
-        (!self.preserve_source_envelope).then(|| NamedNode::Watermark(self.qualifier.clone()))
+        if let Some(slot) = self.response_root_slot {
+            Some(NamedNode::EventResponseRoot(slot))
+        } else {
+            (!self.preserve_source_envelope).then(|| NamedNode::Watermark(self.qualifier.clone()))
+        }
     }
 
     fn plan_node(
@@ -94,8 +101,10 @@ impl ArroyoExtension for WatermarkNode {
         let expression =
             planner.create_physical_expr(&self.watermark_expression, self.input.schema())?;
         let expression = serialize_physical_expr(&expression, &DefaultPhysicalExtensionCodec {})?;
+        let planned_id = u32::try_from(index)
+            .map_err(|_| DataFusionError::Plan("watermark graph id exceeds u32".to_owned()))?;
         let node = LogicalNode::single(
-            index as u32,
+            planned_id,
             format!("watermark_{index}"),
             OperatorName::ExpressionWatermark,
             ExpressionWatermarkConfig {
@@ -111,7 +120,11 @@ impl ArroyoExtension for WatermarkNode {
                     .map(|i| i as u32),
             }
             .encode_to_vec(),
-            "watermark".to_string(),
+            if self.response_root_slot.is_some() {
+                format!("event_root_{planned_id}")
+            } else {
+                "watermark".to_owned()
+            },
             1,
         );
 
@@ -163,6 +176,7 @@ impl WatermarkNode {
             schema,
             timestamp_index,
             preserve_source_envelope,
+            response_root_slot: None,
         })
     }
     pub(crate) fn arroyo_schema(&self) -> ArroyoSchema {

@@ -35,6 +35,172 @@ fn unalias(mut expression: &Expr) -> &Expr {
     expression
 }
 
+/// Grouped selectors use the raw declared FOR clock, not watermark progress.
+/// Bind through the same lineage checks as EVENT_TIMESTAMP(), including views
+/// and retained lookups. Inputs without a declaration retain DataFusion ordering.
+fn order_event_time_selectors(
+    expressions: &mut [Expr],
+    input: &LogicalPlan,
+    schema: &Arc<DFSchema>,
+    provider: &ArroyoSchemaProvider,
+) -> Result<Arc<DFSchema>> {
+    let mut selectors = Vec::new();
+    for (index, expression) in expressions.iter().enumerate() {
+        if matches!(unalias(expression), Expr::AggregateFunction(function)
+            if matches!(function.func.name(), "first_value" | "last_value"))
+        {
+            selectors.push(index);
+        }
+    }
+    if selectors.is_empty() {
+        return Ok(schema.clone());
+    }
+    let mut declared = false;
+    input.apply(|plan| {
+        // A prior aggregate owns output time, not a triggering row's raw FOR
+        // clock. Do not infer a declaration from sources behind that boundary.
+        if matches!(plan, LogicalPlan::Aggregate(_)) {
+            return Ok(TreeNodeRecursion::Jump);
+        }
+        if let LogicalPlan::Extension(extension) = plan {
+            if extension.node.as_any().is::<AggregateExtension>()
+                || extension.node.as_any().is::<UpdatingAggregateExtension>()
+            {
+                return Ok(TreeNodeRecursion::Jump);
+            }
+            declared |= extension
+                .node
+                .as_any()
+                .downcast_ref::<crate::extension::table_source::TableSourceExtension>()
+                .is_some_and(|source| source.table.event_time_field.is_some());
+        }
+        Ok(TreeNodeRecursion::Continue)
+    })?;
+    let marker = Expr::ScalarFunction(datafusion::logical_expr::expr::ScalarFunction::new_udf(
+        provider.functions["event_timestamp"].clone(),
+        vec![],
+    ));
+    let timestamp = if declared {
+        let binding = marker
+            .rewrite(&mut crate::rewriters::EventClockRewriter {
+                input,
+                defer_aggregate: false,
+            })?
+            .data;
+        Some(unalias(&binding).clone())
+    } else {
+        None
+    };
+    for index in selectors {
+        let original_name = expressions[index].schema_name().to_string();
+        let had_alias = matches!(expressions[index], Expr::Alias(_));
+        let mut expression = &mut expressions[index];
+        while let Expr::Alias(alias) = expression {
+            expression = alias.expr.as_mut();
+        }
+        let Expr::AggregateFunction(function) = expression else {
+            unreachable!()
+        };
+        let kind = if function.func.name() == "first_value" {
+            crate::grouped_selector::SelectorKind::First
+        } else {
+            crate::grouped_selector::SelectorKind::Last
+        };
+        if let Some(timestamp) = &timestamp {
+            function
+                .params
+                .order_by
+                .get_or_insert_with(Vec::new)
+                .insert(0, timestamp.clone().sort(true, false));
+        }
+        function.func = crate::grouped_selector_udaf::grouped_selector(kind, declared);
+        function.params.args.push(Expr::ScalarFunction(
+            datafusion::logical_expr::expr::ScalarFunction::new_udf(
+                crate::grouped_selector_udaf::ordinal_marker(),
+                vec![],
+            ),
+        ));
+        if !had_alias {
+            expressions[index] = expressions[index].clone().alias(original_name);
+        }
+    }
+    // Internal provenance comes from the UDAF descriptor, never inherited
+    // aggregate schema metadata whose ordinals can describe a prior stage.
+    let mut metadata = schema.metadata().clone();
+    metadata.retain(|key, _| !key.starts_with("streamr.event_time_selector."));
+    Ok(Arc::new(schema_from_df_fields_with_metadata(
+        &fields_with_qualifiers(schema),
+        metadata,
+    )?))
+}
+
+/// Materialize variable-width companion arguments once, using the existing key
+/// projection. Native admission can then inspect the exact stored value before
+/// invoking the upstream accumulator, without evaluating a volatile expression
+/// again. FILTER stays on the aggregate, as in DataFusion's argument-before-
+/// filter evaluation; separate aggregate occurrences never share a new field.
+fn project_companion_arguments(
+    aggregates: &mut [Expr],
+    input: &LogicalPlan,
+    projection: &mut Vec<Expr>,
+    fields: &mut Vec<DFField>,
+) -> Result<()> {
+    use arrow_schema::DataType;
+    use datafusion::functions_aggregate::{approx_distinct::ApproxDistinct, count::Count};
+    use datafusion::logical_expr::ExprSchemable;
+    for (aggregate_index, aggregate) in aggregates.iter_mut().enumerate() {
+        let original_name = aggregate.schema_name().to_string();
+        let had_alias = matches!(aggregate, Expr::Alias(_));
+        let mut expression = &mut *aggregate;
+        while let Expr::Alias(alias) = expression {
+            expression = alias.expr.as_mut();
+        }
+        let Expr::AggregateFunction(function) = expression else {
+            continue;
+        };
+        let builtin = function.func.inner().as_any();
+        let hll = builtin.is::<ApproxDistinct>() && !function.params.distinct;
+        let distinct_count = builtin.is::<Count>() && function.params.distinct;
+        if (!hll && !distinct_count) || function.params.args.len() != 1 {
+            continue;
+        }
+        let argument = &function.params.args[0];
+        if matches!(unalias(argument), Expr::Column(_)) {
+            continue;
+        }
+        let kind = argument.get_type(input.schema().as_ref())?;
+        let variable = matches!(
+            kind,
+            DataType::Utf8
+                | DataType::LargeUtf8
+                | DataType::Utf8View
+                | DataType::Binary
+                | DataType::LargeBinary
+        ) || (distinct_count && kind == DataType::BinaryView);
+        if !variable {
+            continue;
+        }
+        let base = format!("__streamr_companion_arg_v1_{aggregate_index}_0");
+        let mut name = base.clone();
+        let mut suffix = 0usize;
+        // Check every unqualified name, including qualified source columns: a
+        // new unqualified reference must never become ambiguous with either.
+        while fields.iter().any(|field| field.name() == &name) {
+            suffix += 1;
+            name = format!("{base}_{suffix}");
+        }
+        let projected = argument.clone().alias(name);
+        let field: DFField = projected.to_field(input.schema().as_ref())?.into();
+        function.params.args[0] = Expr::Column(field.qualified_column());
+        projection.push(projected);
+        fields.push(field);
+        if !had_alias {
+            *aggregate = aggregate.clone().alias(original_name);
+        }
+    }
+    Ok(())
+}
+
 fn event_date(expression: &Expr) -> bool {
     matches!(unalias(expression), Expr::ScalarFunction(function)
         if function.name() == "event_date" && function.args.is_empty())
@@ -170,7 +336,10 @@ fn calendar_filters(
         })?;
         let reference_date = reference
             .expect("temporal clause has reference date")
-            .rewrite(&mut EventClockRewriter { input })?
+            .rewrite(&mut EventClockRewriter {
+                input,
+                defer_aggregate: false,
+            })?
             .data;
         let static_filter = static_clauses
             .into_iter()
@@ -205,11 +374,6 @@ impl AggregateRewriter<'_> {
         let key_count = key_fields.len();
         key_fields.extend(fields_with_qualifiers(input.schema()));
 
-        let key_schema = Arc::new(schema_from_df_fields_with_metadata(
-            &key_fields,
-            schema.metadata().clone(),
-        )?);
-
         let mut key_projection_expressions = group_expr
             .iter()
             .zip(key_fields.iter())
@@ -222,6 +386,16 @@ impl AggregateRewriter<'_> {
                 .map(|field| Expr::Column(field.qualified_column())),
         );
 
+        project_companion_arguments(
+            &mut aggr_expr,
+            &input,
+            &mut key_projection_expressions,
+            &mut key_fields,
+        )?;
+        let key_schema = Arc::new(schema_from_df_fields_with_metadata(
+            &key_fields,
+            schema.metadata().clone(),
+        )?);
         let key_projection =
             LogicalPlan::Projection(logical_expr::Projection::try_new_with_schema(
                 key_projection_expressions.clone(),
@@ -298,13 +472,15 @@ impl TreeNodeRewriter for AggregateRewriter<'_> {
         let LogicalPlan::Aggregate(Aggregate {
             input,
             mut group_expr,
-            aggr_expr,
+            mut aggr_expr,
             schema,
             ..
         }) = node
         else {
             return Ok(Transformed::no(node));
         };
+        let schema =
+            order_event_time_selectors(&mut aggr_expr, &input, &schema, self.schema_provider)?;
         if group_expr
             .iter()
             .any(|expression| crate::rewriters::depends_on_event_clock(expression, input.schema()))
@@ -417,11 +593,6 @@ impl TreeNodeRewriter for AggregateRewriter<'_> {
         let key_count = key_fields.len();
         key_fields.extend(fields_with_qualifiers(input.schema()));
 
-        let key_schema = Arc::new(schema_from_df_fields_with_metadata(
-            &key_fields,
-            schema.metadata().clone(),
-        )?);
-
         let mut key_projection_expressions = group_expr
             .iter()
             .zip(key_fields.iter())
@@ -434,6 +605,16 @@ impl TreeNodeRewriter for AggregateRewriter<'_> {
                 .map(|field| Expr::Column(field.qualified_column())),
         );
 
+        project_companion_arguments(
+            &mut aggr_expr,
+            &input,
+            &mut key_projection_expressions,
+            &mut key_fields,
+        )?;
+        let key_schema = Arc::new(schema_from_df_fields_with_metadata(
+            &key_fields,
+            schema.metadata().clone(),
+        )?);
         let key_projection =
             LogicalPlan::Projection(logical_expr::Projection::try_new_with_schema(
                 key_projection_expressions.clone(),
@@ -736,6 +917,448 @@ mod bounded_collection_tests {
             "array_slice(array_agg(counter ORDER BY counter), 1, 5), array_slice(array_agg(counter ORDER BY counter), 1, 3)",
         ] {
             assert!(limits(select).await.is_empty(), "{select}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod event_time_selector_tests {
+    use crate::{ArroyoSchemaProvider, SqlConfig, parse_and_get_program};
+    use arroyo_datastream::logical::OperatorName;
+    use arroyo_rpc::grpc::api::UpdatingAggregateOperator;
+    use datafusion_proto::protobuf::{
+        PhysicalPlanNode, physical_expr_node::ExprType, physical_plan_node::PhysicalPlanType,
+    };
+    use prost::Message;
+
+    async fn aggregate(
+        declared: bool,
+        select: &str,
+        view: &str,
+    ) -> datafusion_proto::protobuf::AggregateExecNode {
+        let watermark = if declared {
+            ", WATERMARK FOR event_time AS completeness - INTERVAL '5' SECOND"
+        } else {
+            ""
+        };
+        let sql = format!("CREATE TABLE events (id BIGINT PRIMARY KEY, event_time TIMESTAMP NOT NULL,
+            completeness TIMESTAMP NOT NULL, value TEXT, priority BIGINT{watermark})
+            WITH (connector='single_file', path='/tmp/selectors.jsonl', format='debezium_json', type='source');
+            {view} SELECT id, {select} FROM selected GROUP BY id");
+        let compiled =
+            parse_and_get_program(&sql, ArroyoSchemaProvider::new(), SqlConfig::default())
+                .await
+                .unwrap_or_else(|e| panic!("{e}: {sql}"));
+        let config = compiled
+            .program
+            .graph
+            .node_weights()
+            .flat_map(|node| node.operator_chain.iter())
+            .find(|(operator, _)| operator.operator_name == OperatorName::UpdatingAggregate)
+            .map(|(operator, _)| {
+                UpdatingAggregateOperator::decode(operator.operator_config.as_slice()).unwrap()
+            })
+            .unwrap();
+        let raw_schema: arroyo_rpc::df::ArroyoSchema =
+            config.input_schema.clone().unwrap().try_into().unwrap();
+        assert!(
+            raw_schema
+                .schema
+                .index_of(crate::grouped_selector::ORDINAL_FIELD)
+                .is_err()
+        );
+        let wire = PhysicalPlanNode::decode(config.aggregate_exec.as_slice()).unwrap();
+        assert!(!format!("{wire:?}").contains(crate::grouped_selector::ORDINAL_MARKER));
+        let provider = ArroyoSchemaProvider::new();
+        let runtime = datafusion::execution::runtime_env::RuntimeEnvBuilder::new()
+            .build()
+            .unwrap();
+        let codec = crate::physical::ArroyoPhysicalExtensionCodec {
+            context: crate::physical::DecodingContext::Planning,
+        };
+        use datafusion_proto::physical_plan::AsExecutionPlan;
+        let decoded = wire
+            .clone()
+            .try_into_physical_plan(&provider, &runtime, &codec)
+            .unwrap();
+        let decoded = decoded
+            .as_any()
+            .downcast_ref::<datafusion::physical_plan::aggregates::AggregateExec>()
+            .unwrap();
+        for expression in decoded.aggr_expr() {
+            if crate::grouped_selector_udaf::classify(expression.fun()).is_some() {
+                crate::grouped_selector_udaf::selector_spec(expression, &decoded.input_schema())
+                    .unwrap();
+            }
+        }
+        let Some(PhysicalPlanType::Aggregate(aggregate)) =
+            PhysicalPlanNode::decode(config.aggregate_exec.as_slice())
+                .unwrap()
+                .physical_plan_type
+        else {
+            panic!("expected aggregate")
+        };
+        *aggregate
+    }
+
+    #[tokio::test]
+    async fn declared_selector_order_survives_view_filter_and_serialization() {
+        let plan = aggregate(true,
+            "FIRST_VALUE(value) AS earliest, LAST_VALUE(NULLIF(value, '') ORDER BY priority DESC NULLS FIRST, event_time DESC NULLS LAST) FILTER (WHERE priority > 0) IGNORE NULLS AS latest, ARRAY_AGG(value ORDER BY priority ASC) AS values",
+            "CREATE VIEW selected AS SELECT * FROM events WHERE id > 0;").await;
+        let orders = plan
+            .aggr_expr
+            .iter()
+            .take(3)
+            .map(|expr| {
+                let Some(ExprType::AggregateExpr(expr)) = &expr.expr_type else {
+                    panic!("expected aggregate expression")
+                };
+                expr.ordering_req.clone()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            orders.iter().map(Vec::len).collect::<Vec<_>>(),
+            vec![1, 3, 1]
+        );
+        for order in &orders[..2] {
+            let Some(ExprType::Column(column)) = &order[0].expr.as_ref().unwrap().expr_type else {
+                panic!("expected raw clock column")
+            };
+            assert_eq!(column.name, "_timestamp");
+            assert!(order[0].asc);
+            assert!(!order[0].nulls_first);
+        }
+        assert!(!orders[1][1].asc);
+        assert!(orders[1][1].nulls_first);
+        assert!(!orders[1][2].asc);
+        assert!(!orders[1][2].nulls_first);
+        assert!(plan.filter_expr[1].expr.is_some());
+        let Some(ExprType::AggregateExpr(last)) = &plan.aggr_expr[1].expr_type else {
+            panic!("expected last selector")
+        };
+        assert!(last.ignore_nulls);
+        assert!(orders[2][0].asc);
+    }
+
+    #[tokio::test]
+    async fn undeclared_selectors_keep_explicit_order_only() {
+        let plan = aggregate(false,
+            "FIRST_VALUE(value ORDER BY priority DESC NULLS LAST) AS earliest, LAST_VALUE(value ORDER BY priority ASC NULLS FIRST) AS latest",
+            "CREATE VIEW selected AS SELECT * FROM events;").await;
+        for (index, expr) in plan.aggr_expr.iter().take(2).enumerate() {
+            let Some(ExprType::AggregateExpr(expr)) = &expr.expr_type else {
+                panic!("expected aggregate expression")
+            };
+            assert_eq!(expr.ordering_req.len(), 1);
+            assert_eq!(expr.ordering_req[0].asc, index == 1);
+            assert_eq!(expr.ordering_req[0].nulls_first, index == 1);
+        }
+    }
+    #[tokio::test]
+    async fn declared_selector_keeps_raw_clock_when_view_hides_declared_column() {
+        let plan = aggregate(true, "LAST_VALUE(value ORDER BY priority ASC) AS latest",
+            "CREATE VIEW renamed AS SELECT id, value, priority, event_time AS renamed_time FROM events; CREATE VIEW selected AS SELECT id, value, priority FROM renamed;").await;
+        let Some(ExprType::AggregateExpr(last)) = &plan.aggr_expr[0].expr_type else {
+            panic!("expected selector")
+        };
+        assert_eq!(last.ordering_req.len(), 2);
+        let Some(ExprType::Column(clock)) = &last.ordering_req[0].expr.as_ref().unwrap().expr_type
+        else {
+            panic!("expected raw clock")
+        };
+        assert_eq!(clock.name, "_timestamp");
+    }
+
+    #[tokio::test]
+    async fn declared_selector_rejects_ambiguous_sources() {
+        let sql = "CREATE TABLE events (id BIGINT, event_time TIMESTAMP NOT NULL,
+            WATERMARK FOR event_time AS event_time - INTERVAL '5' SECOND)
+            WITH (connector='single_file', path='/tmp/selectors.jsonl', format='json', type='source');
+            SELECT a.id, LAST_VALUE(b.id) FROM events a JOIN events b ON a.id = b.id GROUP BY a.id";
+        let error = parse_and_get_program(sql, ArroyoSchemaProvider::new(), SqlConfig::default())
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("ambiguous triggering sources"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn analytic_selector_keeps_declared_sql_order() {
+        use arroyo_rpc::grpc::api::WindowFunctionOperator;
+        let sql = "CREATE TABLE events (id BIGINT, event_time TIMESTAMP NOT NULL, priority BIGINT,
+            WATERMARK FOR event_time AS event_time - INTERVAL '5' SECOND)
+            WITH (connector='single_file', path='/tmp/analytic-selectors.jsonl', format='json', type='source');
+            SELECT id, LAST_VALUE(priority) OVER (PARTITION BY window ORDER BY priority DESC ROWS BETWEEN CURRENT ROW AND 1 FOLLOWING) AS latest FROM (
+                SELECT id, MAX(priority) AS priority, TUMBLE(INTERVAL '10' SECOND) AS window
+                FROM events GROUP BY id, window)";
+        let compiled =
+            parse_and_get_program(sql, ArroyoSchemaProvider::new(), SqlConfig::default())
+                .await
+                .unwrap();
+        let mut found = false;
+        for (operator, _) in compiled
+            .program
+            .graph
+            .node_weights()
+            .flat_map(|node| node.operator_chain.iter())
+        {
+            if operator.operator_name == OperatorName::WindowFunction {
+                let config =
+                    WindowFunctionOperator::decode(operator.operator_config.as_slice()).unwrap();
+                let proto =
+                    PhysicalPlanNode::decode(config.window_function_plan.as_slice()).unwrap();
+                let display = format!("{proto:?}");
+                assert!(display.contains("priority"), "{display}");
+                // The declared clock remains an input field, but is never an
+                // additional analytic ordering key.
+                let provider = ArroyoSchemaProvider::new();
+                let runtime = datafusion::execution::runtime_env::RuntimeEnvBuilder::new()
+                    .build()
+                    .unwrap();
+                let codec = crate::physical::ArroyoPhysicalExtensionCodec {
+                    context: crate::physical::DecodingContext::Planning,
+                };
+                use datafusion_proto::physical_plan::AsExecutionPlan;
+                let plan = proto
+                    .try_into_physical_plan(&provider, &runtime, &codec)
+                    .unwrap();
+                let display = format!(
+                    "{}",
+                    datafusion::physical_plan::displayable(plan.as_ref()).indent(true)
+                );
+                let window = display
+                    .lines()
+                    .find(|line| line.contains("WindowAggExec"))
+                    .unwrap();
+                assert!(!window.contains("_timestamp"), "{window}");
+                found = true;
+            }
+        }
+        assert!(found);
+    }
+}
+
+#[cfg(test)]
+mod companion_projection_tests {
+    use super::*;
+    use crate::{SqlConfig, parse_and_get_program};
+    use arroyo_datastream::logical::OperatorName;
+    use arroyo_rpc::grpc::api::{
+        KeyPlanOperator, SessionWindowAggregateOperator, TumblingWindowAggregateOperator,
+        UpdatingAggregateOperator,
+    };
+    use datafusion::physical_expr::{ScalarFunctionExpr, expressions::Column};
+    use datafusion::physical_plan::{aggregates::AggregateExec, projection::ProjectionExec};
+    use datafusion_proto::{physical_plan::AsExecutionPlan, protobuf::PhysicalPlanNode};
+    use prost::Message;
+
+    #[tokio::test]
+    async fn computed_variable_companions_are_stored_once_across_ordinary_and_window_plans() {
+        for window in [
+            None,
+            Some("TUMBLE(INTERVAL '10' SECOND)"),
+            Some("SESSION(INTERVAL '10' SECOND)"),
+        ] {
+            for volatile in [false, true] {
+                let argument = if volatile {
+                    "CAST(random() AS TEXT)"
+                } else {
+                    "repeat(value, 2)"
+                };
+                let count_argument = if volatile {
+                    argument
+                } else {
+                    "repeat(value, 3)"
+                };
+                let window_select =
+                    window.map_or(String::new(), |window| format!(", {window} AS window"));
+                let window_group = if window.is_some() { ", window" } else { "" };
+                let sql = format!("CREATE TABLE src (
+                    __streamr_companion_arg_v1_0_0 BIGINT, value TEXT, event_time TIMESTAMP NOT NULL,
+                    completeness TIMESTAMP NOT NULL,
+                    WATERMARK FOR event_time AS completeness - INTERVAL '5' SECOND
+                ) WITH (connector='single_file', path='/tmp/companion-projection.jsonl', format='json', type='source');
+                SELECT __streamr_companion_arg_v1_0_0,
+                    APPROX_DISTINCT({argument}) FILTER (WHERE value <> '') AS approx_values,
+                    COUNT(DISTINCT {count_argument}) FILTER (WHERE value IS NOT NULL) AS distinct_values,
+                    FIRST_VALUE(value) AS first_value{window_select}
+                FROM src GROUP BY __streamr_companion_arg_v1_0_0{window_group}");
+                let provider = ArroyoSchemaProvider::new();
+                let compiled = parse_and_get_program(&sql, provider.clone(), SqlConfig::default())
+                    .await
+                    .unwrap_or_else(|e| panic!("{e}: {sql}"));
+                let runtime = datafusion::execution::runtime_env::RuntimeEnvBuilder::new()
+                    .build()
+                    .unwrap();
+                let codec = crate::physical::ArroyoPhysicalExtensionCodec {
+                    context: crate::physical::DecodingContext::Planning,
+                };
+                let decode = |bytes: &[u8]| {
+                    PhysicalPlanNode::decode(bytes)
+                        .unwrap()
+                        .try_into_physical_plan(&provider, &runtime, &codec)
+                        .unwrap()
+                };
+                let mut projected_names = Vec::new();
+                let mut aggregate_names = Vec::new();
+                let mut random_calls = 0;
+                for (operator, _) in compiled
+                    .program
+                    .graph
+                    .node_weights()
+                    .flat_map(|node| node.operator_chain.iter())
+                {
+                    let plan = match operator.operator_name {
+                        OperatorName::ArrowKey => {
+                            let config =
+                                KeyPlanOperator::decode(operator.operator_config.as_slice())
+                                    .unwrap();
+                            let plan = decode(&config.physical_plan);
+                            plan.apply(|node| {
+                                if let Some(projection) =
+                                    node.as_any().downcast_ref::<ProjectionExec>()
+                                {
+                                    for (expression, name) in projection.expr() {
+                                        if name.starts_with("__streamr_companion_arg_v1_")
+                                            && !expression.as_any().is::<Column>()
+                                        {
+                                            projected_names.push(name.clone());
+                                            if !volatile {
+                                                use arrow_array::{
+                                                    ArrayRef, Int64Array, RecordBatch, StringArray,
+                                                    TimestampNanosecondArray,
+                                                };
+                                                let schema = projection.input().schema();
+                                                let columns = schema
+                                                    .fields()
+                                                    .iter()
+                                                    .map(|field| match field.data_type() {
+                                                        arrow_schema::DataType::Int64 => {
+                                                            Arc::new(Int64Array::from(vec![
+                                                                1, 2, 3,
+                                                            ]))
+                                                                as ArrayRef
+                                                        }
+                                                        arrow_schema::DataType::Utf8 => {
+                                                            Arc::new(StringArray::from(vec![
+                                                                Some("ab"),
+                                                                Some(""),
+                                                                None,
+                                                            ]))
+                                                                as ArrayRef
+                                                        }
+                                                        arrow_schema::DataType::Timestamp(
+                                                            arrow_schema::TimeUnit::Nanosecond,
+                                                            _,
+                                                        ) => Arc::new(
+                                                            TimestampNanosecondArray::from(vec![
+                                                                1, 2, 3,
+                                                            ]),
+                                                        )
+                                                            as ArrayRef,
+                                                        kind => panic!(
+                                                            "unexpected source test field {kind:?}"
+                                                        ),
+                                                    })
+                                                    .collect();
+                                                let batch =
+                                                    RecordBatch::try_new(schema, columns).unwrap();
+                                                let actual = expression
+                                                    .evaluate(&batch)
+                                                    .unwrap()
+                                                    .into_array(3)
+                                                    .unwrap();
+                                                let expected = if name
+                                                    .starts_with("__streamr_companion_arg_v1_0_0")
+                                                {
+                                                    "abab"
+                                                } else {
+                                                    "ababab"
+                                                };
+                                                assert_eq!(
+                                                    actual.as_ref(),
+                                                    &StringArray::from(vec![
+                                                        Some(expected),
+                                                        Some(""),
+                                                        None
+                                                    ])
+                                                );
+                                            }
+                                            expression.apply(|child| {
+                                                random_calls += usize::from(
+                                                    child
+                                                        .as_any()
+                                                        .downcast_ref::<ScalarFunctionExpr>()
+                                                        .is_some_and(|function| {
+                                                            function.name() == "random"
+                                                        }),
+                                                );
+                                                Ok(TreeNodeRecursion::Continue)
+                                            })?;
+                                        }
+                                    }
+                                }
+                                Ok(TreeNodeRecursion::Continue)
+                            })
+                            .unwrap();
+                            continue;
+                        }
+                        OperatorName::UpdatingAggregate => decode(
+                            &UpdatingAggregateOperator::decode(operator.operator_config.as_slice())
+                                .unwrap()
+                                .aggregate_exec,
+                        ),
+                        OperatorName::TumblingWindowAggregate => decode(
+                            &TumblingWindowAggregateOperator::decode(
+                                operator.operator_config.as_slice(),
+                            )
+                            .unwrap()
+                            .partial_aggregation_plan,
+                        ),
+                        OperatorName::SessionWindowAggregate => decode(
+                            &SessionWindowAggregateOperator::decode(
+                                operator.operator_config.as_slice(),
+                            )
+                            .unwrap()
+                            .final_aggregation_plan,
+                        ),
+                        _ => continue,
+                    };
+                    plan.apply(|node| {
+                        if let Some(aggregate) = node.as_any().downcast_ref::<AggregateExec>() {
+                            for (index, expression) in aggregate.aggr_expr().iter().enumerate() {
+                                if expression.fun().name() == "approx_distinct" || (expression.fun().name() == "count" && expression.is_distinct()) {
+                                    let arguments = expression.expressions();
+                                    let column = arguments[0].as_any().downcast_ref::<Column>().expect("native admission must see the stored argument, never re-evaluate the expression");
+                                    aggregate_names.push(column.name().to_string());
+                                    assert!(aggregate.filter_expr()[index].is_some());
+                                }
+                            }
+                        }
+                        Ok(TreeNodeRecursion::Continue)
+                    }).unwrap();
+                }
+                projected_names.sort();
+                projected_names.dedup();
+                aggregate_names.sort();
+                aggregate_names.dedup();
+                assert_eq!(projected_names.len(), 2, "{sql}");
+                assert_eq!(aggregate_names, projected_names);
+                assert!(
+                    projected_names
+                        .iter()
+                        .all(|name| name != "__streamr_companion_arg_v1_0_0"),
+                    "source column name must not collide"
+                );
+                assert_eq!(
+                    random_calls,
+                    if volatile { 2 } else { 0 },
+                    "separate volatile aggregate occurrences must remain separate: {sql}"
+                );
+            }
         }
     }
 }
