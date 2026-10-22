@@ -76,18 +76,57 @@ pub(crate) fn validate(aggregate: &UpdatingAggregateExtension) -> Result<()> {
             return plan_err!("per-event aggregate MERGE supports native COUNT/MAX only");
         };
         let selector = crate::grouped_selector_udaf::classify(&function.func);
-        let calendar = aggregate
-            .calendar_aggregates
-            .iter()
-            .any(|calendar| calendar.aggregate_index == index);
-        if function.params.distinct
-            || (selector.is_none()
-                && (!(matches!(function.func.name(), "count" | "max")
-                    || (calendar && function.func.name() == "sum"))
-                    || function.params.order_by.is_some()))
-        {
+        if selector.is_none() {
+            use datafusion::physical_expr::{
+                LexOrdering, PhysicalSortExpr, aggregate::AggregateExprBuilder,
+            };
+            let properties = datafusion::logical_expr::execution_props::ExecutionProps::new();
+            let physical = |expr: &Expr| {
+                datafusion::physical_expr::create_physical_expr(
+                    expr,
+                    plan.input.schema(),
+                    &properties,
+                )
+            };
+            let arguments = function
+                .params
+                .args
+                .iter()
+                .map(physical)
+                .collect::<Result<Vec<_>>>()?;
+            let schema = Arc::new(arrow_schema::Schema::from(plan.input.schema().as_ref()));
+            let mut builder = AggregateExprBuilder::new(function.func.clone(), arguments)
+                .schema(schema.clone())
+                .alias(output.schema_name().to_string());
+            if function.params.distinct {
+                builder = builder.distinct();
+            }
+            if let Some(order) = &function.params.order_by {
+                let order = order
+                    .iter()
+                    .map(|sort| {
+                        Ok(PhysicalSortExpr::new(
+                            physical(&sort.expr)?,
+                            arrow::compute::SortOptions {
+                                descending: !sort.asc,
+                                nulls_first: sort.nulls_first,
+                            },
+                        ))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                if !order.is_empty() {
+                    builder = builder.order_by(LexOrdering::new(order));
+                }
+            }
+            let aggregate = builder.build()?;
+            if !crate::aggregate_capability::supports_native_result(&aggregate, &schema)? {
+                return plan_err!(
+                    "per-event aggregate MERGE requires a verified non-distinct native result capability"
+                );
+            }
+        } else if function.params.distinct {
             return plan_err!(
-                "per-event aggregate MERGE supports native non-distinct COUNT/MAX and grouped selectors only"
+                "per-event aggregate MERGE requires a verified non-distinct native result capability"
             );
         }
         if let Some((_, declared)) = selector {

@@ -13,7 +13,7 @@ use crate::arrow::decode_aggregate;
 use crate::arrow::updating_cache::{Key, UpdatingCache};
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use arrow::compute::{SortOptions, filter, max_array};
-use arrow::row::{RowConverter, SortField};
+use arrow::row::{RowConverter, Rows, SortField};
 use arrow_array::builder::{
     BinaryBuilder, TimestampNanosecondBuilder, UInt32Builder, UInt64Builder,
 };
@@ -35,6 +35,7 @@ use arroyo_operator::{
 };
 use arroyo_planner::aggregate_capability::{
     AggregateCapability, AggregateDescriptor, aggregate_descriptor, is_extremum,
+    supports_native_result,
 };
 use arroyo_planner::grouped_selector::{SelectorBudget, SelectorSpec, bounded_row_size};
 use arroyo_planner::grouped_selector_udaf::{classify, selector_spec};
@@ -2029,6 +2030,75 @@ impl IncrementalAggregatingFunc {
         Ok(values)
     }
 
+    /// Apply one whole source operation through the ordinary native mutation
+    /// kernel. Callers own publication/commit policy, never alternate arithmetic.
+    async fn native_apply_operation(
+        &self,
+        scope: &mut AggregateScope<'_>,
+        keys: &Rows,
+        inputs: &[AggregateInput],
+        calendar_inputs: &[CalendarInput],
+        rows: std::ops::Range<usize>,
+        changes: Option<(&BooleanArray, &FixedSizeBinaryArray)>,
+    ) -> Result<Vec<usize>> {
+        let mut affected = Vec::<usize>::new();
+        for row in rows {
+            let key = keys.row(row);
+            if !affected
+                .iter()
+                .any(|known| keys.row(*known).as_ref() == key.as_ref())
+            {
+                affected.push(row);
+            }
+            let (retract, row_id) = changes.map_or((false, None), |(retracts, ids)| {
+                (retracts.value(row), Some(ids.value(row)))
+            });
+            self.native_process_calendar_event_with_progress(
+                scope,
+                NativeCalendarEvent {
+                    group_key: key.as_ref(),
+                    inputs,
+                    row,
+                    retract,
+                    row_id,
+                    calendar_inputs,
+                },
+                &mut None,
+            )
+            .await?;
+        }
+        Ok(affected)
+    }
+
+    /// Presence and final native values are independent of delivery. Absence
+    /// cannot become an implicit MERGE delete; unchanged values remain a result.
+    async fn native_prepare_group_result(
+        &self,
+        scope: &AggregateScope<'_>,
+        key: &[u8],
+    ) -> Result<(EncodedGroup, Option<Vec<ScalarValue>>)> {
+        let bytes = scope
+            .get(&native_group_key(b'G', key)?)
+            .await?
+            .context("native operation lost its affected group")?;
+        let group = self
+            .native_group_codec()?
+            .decode(&bytes, scope.limits().value_bytes)?;
+        let values = if self.native_has_group_keys() && group.live_rows == 0 {
+            None
+        } else {
+            Some(self.native_accepted_values(scope, key, &group).await?)
+        };
+        Ok((group, values))
+    }
+
+    fn native_operation_needs_snapshot(&self) -> bool {
+        !self.calendars.is_empty()
+            || self.aggregates.iter().any(|aggregate| {
+                aggregate.accumulator_type == AccumulatorType::Batch && aggregate.selector.is_none()
+            })
+    }
+
     /// Preserve every accepted append prefix without dirty-key enumeration or
     /// ordinary changelog replacement/equality suppression. Aggregate and
     /// target remain independent owners and recover from an aligned checkpoint.
@@ -2093,39 +2163,29 @@ impl IncrementalAggregatingFunc {
                 .map_err(anyhow::Error::from)?;
             let mut end = batch.num_rows().min(start.saturating_add(chunk_rows));
             loop {
-                let mut scope = if self.calendars.is_empty() {
-                    store.begin_point().await?
-                } else {
+                let mut scope = if self.native_operation_needs_snapshot() {
                     store.begin().await?
+                } else {
+                    store.begin_point().await?
                 };
                 let mut output = Vec::new();
                 let mut output_bytes = 0usize;
                 let mut shorter = None;
                 for row in start..end {
                     let key = keys.row(row);
-                    self.native_process_calendar_event_with_progress(
+                    self.native_apply_operation(
                         &mut scope,
-                        NativeCalendarEvent {
-                            group_key: key.as_ref(),
-                            inputs: &inputs,
-                            row,
-                            retract: false,
-                            row_id: None,
-                            calendar_inputs: &calendar_inputs,
-                        },
-                        &mut None,
+                        &keys,
+                        &inputs,
+                        &calendar_inputs,
+                        row..row + 1,
+                        None,
                     )
                     .await?;
-                    let bytes = scope
-                        .get(&native_group_key(b'G', key.as_ref())?)
-                        .await?
-                        .context("per-event aggregate lost its accepted group")?;
-                    let mut group = self
-                        .native_group_codec()?
-                        .decode(&bytes, limits.value_bytes)?;
-                    let mut values = self
-                        .native_accepted_values(&scope, key.as_ref(), &group)
+                    let (mut group, values) = self
+                        .native_prepare_group_result(&scope, key.as_ref())
                         .await?;
+                    let mut values = values.context("append operation has no accepted group")?;
                     if !self.calendars.is_empty() {
                         // Maintenance compares native relation values (including
                         // its stored clock); the public event clock below is a
@@ -2172,7 +2232,7 @@ impl IncrementalAggregatingFunc {
                 if let Some(next_end) = shorter {
                     // No writes have committed. Reprepare the fitting prefix in
                     // a fresh scope, excluding the event that crossed the bound.
-                    // Input expressions are computed once and COUNT/MAX replay
+                    // Input expressions are computed once and native replay
                     // has no external effects or processing-time SQL evaluation.
                     end = next_end;
                     continue;
@@ -2251,42 +2311,25 @@ impl IncrementalAggregatingFunc {
                 .map_err(anyhow::Error::from)?;
             let mut scope = store.begin().await?;
             output_diagnostic.bind(scope.diagnostic_scope_id());
-            let mut affected = Vec::<usize>::new();
-            for row in range.clone() {
-                let key = keys.row(row);
-                if !affected
-                    .iter()
-                    .any(|known| keys.row(*known).as_ref() == key.as_ref())
-                {
-                    affected.push(row);
-                }
-                self.native_process_calendar_event_with_progress(
+            let affected = self
+                .native_apply_operation(
                     &mut scope,
-                    NativeCalendarEvent {
-                        group_key: key.as_ref(),
-                        inputs: &inputs,
-                        row,
-                        retract: retracts.value(row),
-                        row_id: Some(ids.value(row)),
-                        calendar_inputs: &calendar_inputs,
-                    },
-                    &mut None,
+                    &keys,
+                    &inputs,
+                    &calendar_inputs,
+                    range.clone(),
+                    Some((retracts, ids)),
                 )
                 .await?;
-            }
             let trigger = range.end - 1;
             let mut output = Vec::new();
             let mut output_bytes = 0usize;
             for row in affected {
                 let key = keys.row(row);
                 let storage_key = native_group_key(b'G', key.as_ref())?;
-                let encoded = scope
-                    .get(&storage_key)
-                    .await?
-                    .context("per-event aggregate lost its accepted group")?;
-                let mut group = self
-                    .native_group_codec()?
-                    .decode(&encoded, limits.value_bytes)?;
+                let (mut group, values) = self
+                    .native_prepare_group_result(&scope, key.as_ref())
+                    .await?;
                 if group.live_rows == 0 {
                     // Noncalendar retractions have no deferred lifecycle state.
                     // Calendar generations retire through ordinary B/J/U/H
@@ -2307,9 +2350,7 @@ impl IncrementalAggregatingFunc {
                 if output.len() >= configured.max_pending_output_rows {
                     return Err(anyhow!("one per-event aggregate operation exceeds configured pending-output row budget").into());
                 }
-                let mut values = self
-                    .native_accepted_values(&scope, key.as_ref(), &group)
-                    .await?;
+                let mut values = values.context("present operation result has no values")?;
                 if !self.calendars.is_empty() {
                     group.last_emitted = Some(values.clone());
                     scope.put(
@@ -2475,20 +2516,11 @@ impl IncrementalAggregatingFunc {
             affected.len() <= 2,
             "branch response aggregate touches more than two full keys"
         );
-        let fallback = self
-            .aggregates
-            .iter()
-            .filter(|aggregate| aggregate.accumulator_type == AccumulatorType::Batch)
-            .count();
-        let operations = (3usize
-            .checked_add(
-                fallback
-                    .checked_mul(2)
-                    .context("response operation count overflow")?,
-            )
-            .and_then(|per_image| per_image.checked_mul(batch.num_rows())))
-        .and_then(|images| images.checked_add(affected.len().checked_mul(2)?))
-        .context("response operation count overflow")?;
+        let operations = self
+            .native_operations_per_image()?
+            .checked_mul(batch.num_rows())
+            .and_then(|images| images.checked_add(affected.len().checked_mul(2)?))
+            .context("response operation count overflow")?;
         let limits = store.limits();
         ensure!(
             operations <= limits.write_operations
@@ -2510,24 +2542,16 @@ impl IncrementalAggregatingFunc {
             )
             .map_err(anyhow::Error::from)?;
         let mut scope = store.begin().await?;
-        for row in 0..batch.num_rows() {
-            let (retract, row_id) = changes.as_ref().map_or((false, None), |(retracts, ids)| {
-                (retracts.value(row), Some(ids.value(row)))
-            });
-            self.native_process_calendar_event_with_progress(
+        let affected = self
+            .native_apply_operation(
                 &mut scope,
-                NativeCalendarEvent {
-                    group_key: keys.row(row).as_ref(),
-                    inputs: &inputs,
-                    row,
-                    retract,
-                    row_id,
-                    calendar_inputs: &[],
-                },
-                &mut None,
+                &keys,
+                &inputs,
+                &[],
+                0..batch.num_rows(),
+                changes,
             )
             .await?;
-        }
         let mut output_keys = Vec::new();
         let mut output_values = vec![Vec::new(); self.aggregates.len()];
         let mut retracts = Vec::new();
@@ -2542,14 +2566,8 @@ impl IncrementalAggregatingFunc {
             );
             touched.append_value(key);
             let storage = native_group_key(b'G', key)?;
-            let bytes = scope
-                .get(&storage)
-                .await?
-                .context("branch response aggregate lost affected group")?;
-            let mut group = self
-                .native_group_codec()?
-                .decode(&bytes, limits.value_bytes)?;
-            let delta = self.native_group_delta(&scope, key, &group).await?;
+            let (mut group, values) = self.native_prepare_group_result(&scope, key).await?;
+            let delta = Self::native_group_delta_from_values(key, &group, values)?;
             retained = retained
                 .checked_add(delta.retained_bytes)
                 .context("response output size overflow")?;
@@ -3133,7 +3151,20 @@ impl IncrementalAggregatingFunc {
         group: &EncodedGroup,
     ) -> Result<NativeGroupDelta> {
         let next = self.native_accepted_values(scope, key, group).await?;
-        let append = !self.native_has_group_keys() || group.live_rows > 0;
+        Self::native_group_delta_from_values(
+            key,
+            group,
+            (!self.native_has_group_keys() || group.live_rows > 0).then_some(next),
+        )
+    }
+
+    fn native_group_delta_from_values(
+        key: &[u8],
+        group: &EncodedGroup,
+        values: Option<Vec<ScalarValue>>,
+    ) -> Result<NativeGroupDelta> {
+        let append = values.is_some();
+        let next = values.unwrap_or_default();
         let unchanged = append
             && group.last_emitted.as_ref().is_some_and(|old| {
                 old.iter()
@@ -4899,6 +4930,10 @@ impl IncrementalAggregatingConstructor {
             })
             .map_ok(|(agg, t, filter, descriptor)| {
                 let is_selector = classify(agg.fun()).is_some();
+                if emit_per_event {
+                    ensure!(supports_native_result(&agg, &expression_schema)?,
+                        "per-event aggregate MERGE requires a verified non-distinct native result capability");
+                }
                 ensure!(!is_selector || native_config.is_some(),
                     "grouped FIRST_VALUE/LAST_VALUE requires worker.aggregate-state and worker.live-state-resources limits");
                 ensure!(!is_selector || native_append_only || agg.order_bys().is_some_and(|order| !order.is_empty()),
@@ -5010,26 +5045,8 @@ impl IncrementalAggregatingConstructor {
             ensure!(
                 !key_fields.is_empty()
                     && final_schema.schema.fields().len() == key_fields.len() + aggregates.len()
-                    && final_schema.timestamp_index + 1 == final_schema.schema.fields().len()
-                    && aggregates.iter().enumerate().all(
-                        |(index, (agg, kind, _, _, _, _, _, _, _))| {
-                            let selector = classify(agg.fun()).is_some();
-                            !agg.is_distinct()
-                                && if selector {
-                                    *kind == AccumulatorType::Batch
-                                        && selector_spec(agg, &expression_schema).is_ok()
-                                } else {
-                                    (matches!(agg.fun().name(), "count" | "max")
-                                        || (agg.fun().name() == "sum"
-                                            && config.calendar_aggregates.iter().any(|calendar| {
-                                                calendar.aggregate_index as usize == index
-                                            })))
-                                        && (*kind != AccumulatorType::Batch || !native_append_only)
-                                        && agg.order_bys().is_none()
-                                }
-                        }
-                    ),
-                "per-event aggregate MERGE requires keyed native COUNT/MAX or grouped selector snapshots"
+                    && final_schema.timestamp_index + 1 == final_schema.schema.fields().len(),
+                "per-event aggregate MERGE requires keyed verified native result snapshots"
             );
             let (clock, _, _, _, arguments, filter, _, _, _) = aggregates
                 .last()
@@ -5394,6 +5411,9 @@ mod tests {
     }
     mod aggregate_response_tests {
         include!("aggregate_response_tests.rs");
+    }
+    mod aggregate_result_tests {
+        include!("aggregate_result_tests.rs");
     }
     use arrow::compute::SortOptions;
     use arrow_array::{Int64Array, StringArray, TimestampNanosecondArray};

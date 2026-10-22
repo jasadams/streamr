@@ -145,20 +145,16 @@ async fn maintained_merge_event_clock_rejects_an_overwritten_input_clock() {
 }
 
 #[test(tokio::test)]
-async fn maintained_merge_rejects_unresolved_retention_and_other_aggregates() {
+async fn maintained_merge_uses_native_capabilities_and_rejects_unresolved_retention_or_distinct() {
     reject(
         &aggregate_merge("", "COUNT(*)"),
         "requires SET updating_ttl = NULL",
     )
     .await;
-    reject(
-        &aggregate_merge("SET updating_ttl = NULL;", "SUM(counter)"),
-        "COUNT/MAX and grouped selectors only",
-    )
-    .await;
+    plan(&aggregate_merge("SET updating_ttl = NULL;", "SUM(counter)")).await;
     reject(
         &aggregate_merge("SET updating_ttl = NULL;", "COUNT(DISTINCT counter)"),
-        "non-distinct COUNT/MAX",
+        "verified non-distinct native result capability",
     )
     .await;
 }
@@ -1347,7 +1343,11 @@ async fn maintained_merge_count_ordering_reaches_the_route_guard() {
     let sql=aggregate_merge("SET updating_ttl = NULL;","COUNT(counter)").replace(
         "CREATE VIEW counts AS SELECT counter, COUNT(counter) AS quantity FROM events GROUP BY counter;",view);
     plan(&sql.replace("COUNT(counter ORDER BY counter)", "COUNT(counter)")).await;
-    reject(&sql,"per-event aggregate MERGE supports native non-distinct COUNT/MAX and grouped selectors only").await;
+    reject(
+        &sql,
+        "per-event aggregate MERGE requires a verified non-distinct native result capability",
+    )
+    .await;
 }
 
 #[test(tokio::test)]
@@ -1402,4 +1402,51 @@ async fn maintained_merge_accepts_native_calendar_sum_with_nullable_snapshot() {
     let quantity = public.field_with_name("quantity").unwrap();
     assert_eq!(quantity.data_type(), &arrow_schema::DataType::Int64);
     assert!(quantity.is_nullable());
+}
+
+#[test(tokio::test)]
+async fn maintained_merge_direct_array_retains_native_collection_result_and_public_source() {
+    let declarations = "CREATE TABLE events (counter BIGINT NOT NULL, item TEXT,
+        event_time TIMESTAMP NOT NULL, WATERMARK FOR event_time AS event_time - INTERVAL '1' DAY)
+        WITH (connector='single_file',path='/tmp/native-array-handoff.jsonl',format='json',type='source');
+        CREATE STATE TABLE inventory (counter BIGINT PRIMARY KEY, quantity BIGINT) PARTITION BY counter;";
+    let sql = aggregate_merge("SET updating_ttl = NULL;", "COUNT(*)")
+        .replace(DECLARATIONS, declarations)
+        .replace(
+            "COUNT(*) AS quantity",
+            "COUNT(*) AS quantity, ARRAY_AGG(item ORDER BY item) AS items",
+        )
+        .replace(
+            "SELECT new.quantity FROM applied",
+            "SELECT source.items, old.quantity, new.quantity, action FROM applied",
+        );
+    let compiled = plan(&sql).await;
+    let operations = compiled
+        .program
+        .graph
+        .node_weights()
+        .flat_map(|node| node.operator_chain.iter())
+        .collect::<Vec<_>>();
+    let aggregates = operations
+        .iter()
+        .filter(|(op, _)| op.operator_name == OperatorName::UpdatingAggregate)
+        .map(|(op, _)| {
+            arroyo_rpc::grpc::api::UpdatingAggregateOperator::decode(op.operator_config.as_slice())
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(aggregates.len(), 1);
+    assert!(aggregates[0].emit_per_event);
+    assert!(aggregates[0].response_root_operator.is_none());
+    let physical: arrow_schema::Schema =
+        serde_json::from_str(&aggregates[0].final_schema.as_ref().unwrap().arrow_schema).unwrap();
+    assert!(physical.fields().iter().any(|field| matches!(field.data_type(), arrow_schema::DataType::List(child) if child.data_type() == &arrow_schema::DataType::Utf8)));
+    let accesses = state_operators(&compiled);
+    assert_eq!(accesses.len(), 1);
+    let source: arrow_schema::Schema =
+        serde_json::from_str(&accesses[0].input_schema.as_ref().unwrap().arrow_schema).unwrap();
+    assert!(matches!(
+        source.field_with_name("items").unwrap().data_type(),
+        arrow_schema::DataType::List(_)
+    ));
 }
