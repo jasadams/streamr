@@ -14,16 +14,38 @@ use std::time::Duration;
 
 pub(crate) const JOIN_NODE_NAME: &str = "JoinNode";
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct JoinExtension {
     pub(crate) rewritten_join: LogicalPlan,
     pub(crate) is_instant: bool,
     pub(crate) updating: bool,
     pub(crate) left_outer: bool,
     pub(crate) ttl: Option<Duration>,
+    pub(crate) response_route: Option<crate::merge_event_branches::ResponseRoute>,
+    pub(crate) accepted_schema: Option<DFSchemaRef>,
 }
 
+crate::multifield_partial_ord!(
+    JoinExtension,
+    rewritten_join,
+    is_instant,
+    updating,
+    left_outer,
+    ttl,
+    response_route
+);
+
 impl ArroyoExtension for JoinExtension {
+    fn response_root_slot(&self) -> Option<u32> {
+        self.response_route.map(|route| route.slot)
+    }
+    fn bind_response_root(&self, operator: u32) -> Result<Option<Box<dyn ArroyoExtension>>> {
+        let mut next = self.clone();
+        if let Some(route) = &mut next.response_route {
+            route.operator = Some(operator);
+        }
+        Ok(Some(Box::new(next)))
+    }
     fn node_name(&self) -> Option<NamedNode> {
         None
     }
@@ -56,7 +78,27 @@ impl ArroyoExtension for JoinExtension {
             name: format!("join_{index}"),
             left_schema: Some(left_schema.as_ref().clone().into()),
             right_schema: Some(right_schema.as_ref().clone().into()),
-            output_schema: Some(self.output_schema().into()),
+            output_schema: Some(
+                ArroyoSchema::from_schema_unkeyed(self.rewritten_join.schema().inner().clone())?
+                    .into(),
+            ),
+            response_root_operator: self
+                .response_route
+                .map(|route| {
+                    route.operator.ok_or_else(|| {
+                        datafusion::common::plan_datafusion_err!(
+                            "response JOIN has no bound graph root"
+                        )
+                    })
+                })
+                .transpose()?,
+            accepted_output_schema: self
+                .accepted_schema
+                .as_ref()
+                .map(|schema| {
+                    ArroyoSchema::from_schema_unkeyed(schema.inner().clone()).map(Into::into)
+                })
+                .transpose()?,
             join_plan: physical_plan_node.encode_to_vec(),
             ttl_micros: self.ttl.map(|t| t.as_micros() as u64),
             updating: self.updating,
@@ -97,7 +139,9 @@ impl UserDefinedLogicalNodeCore for JoinExtension {
     }
 
     fn schema(&self) -> &DFSchemaRef {
-        self.rewritten_join.schema()
+        self.accepted_schema
+            .as_ref()
+            .unwrap_or_else(|| self.rewritten_join.schema())
     }
 
     fn expressions(&self) -> Vec<Expr> {
@@ -115,6 +159,8 @@ impl UserDefinedLogicalNodeCore for JoinExtension {
             updating: self.updating,
             left_outer: self.left_outer,
             ttl: self.ttl,
+            response_route: self.response_route,
+            accepted_schema: self.accepted_schema.clone(),
         })
     }
 }

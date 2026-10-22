@@ -322,11 +322,15 @@ impl TreeNodeVisitor<'_> for WindowDetectingVisitor {
 // ensuring they have _timestamp field, amongst other things.
 pub struct ArroyoRewriter<'a> {
     pub(crate) schema_provider: &'a ArroyoSchemaProvider,
+    pub(crate) defer_aggregate_clocks: bool,
 }
 
 impl<'a> ArroyoRewriter<'a> {
     pub fn new(schema_provider: &'a ArroyoSchemaProvider) -> Self {
-        Self { schema_provider }
+        Self {
+            schema_provider,
+            defer_aggregate_clocks: false,
+        }
     }
 }
 
@@ -369,6 +373,7 @@ impl TreeNodeRewriter for ArroyoRewriter<'_> {
                             .clone()
                             .rewrite(&mut EventClockRewriter {
                                 input: &projection.input,
+                                defer_aggregate: self.defer_aggregate_clocks,
                             })?
                             .data)
                     })
@@ -491,7 +496,10 @@ impl TreeNodeRewriter for ArroyoRewriter<'_> {
             LogicalPlan::Filter(mut f) => {
                 f.predicate = f
                     .predicate
-                    .rewrite(&mut EventClockRewriter { input: &f.input })?
+                    .rewrite(&mut EventClockRewriter {
+                        input: &f.input,
+                        defer_aggregate: self.defer_aggregate_clocks,
+                    })?
                     .data;
 
                 // Joins with windows in the join condition can cause IS NOT NULL predicates to get

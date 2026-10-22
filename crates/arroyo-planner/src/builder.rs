@@ -247,7 +247,9 @@ impl<'a> Planner<'a> {
 pub(crate) enum NamedNode {
     Source(TableReference),
     Watermark(TableReference),
+    EventResponseRoot(u32),
     RemoteTable(TableReference),
+    EventResponseRemoteTable(u32, TableReference),
     Sink(TableReference),
     StateTableMerge(TableReference),
 }
@@ -367,6 +369,8 @@ impl PlanToGraphVisitor<'_> {
         input_nodes: Vec<NodeIndex>,
         extension: &dyn ArroyoExtension,
     ) -> Result<()> {
+        extension.validate_response_scope()?;
+
         if let Some(node_name) = extension.node_name()
             && self.named_nodes.contains_key(&node_name)
         {
@@ -388,6 +392,26 @@ impl PlanToGraphVisitor<'_> {
             })
             .collect::<Result<Vec<_>>>()?;
 
+        // This visitor owns the graph and its memoization map. Resolve slots
+        // from the already-planned root payload, never from NodeIndex or names.
+        let bound = if let Some(slot) = extension.response_root_slot() {
+            let root_index = self
+                .named_nodes
+                .get(&NamedNode::EventResponseRoot(slot))
+                .ok_or_else(|| {
+                    datafusion::common::plan_datafusion_err!(
+                        "response root was not planned before its consumer"
+                    )
+                })?;
+            let root = &self.graph[*root_index];
+            if root.parallelism != 1 {
+                return plan_err!("response root requires singleton execution");
+            }
+            extension.bind_response_root(root.node_id)?
+        } else {
+            None
+        };
+        let extension = bound.as_deref().unwrap_or(extension);
         let NodeWithIncomingEdges { node, edges } = extension
             .plan_node(&self.planner, self.graph.node_count(), input_schemas)
             .map_err(|e| e.context(format!("planning operator {extension:?}")))?;
@@ -420,6 +444,8 @@ impl TreeNodeVisitor<'_> for PlanToGraphVisitor<'_> {
         let arroyo_extension: &dyn ArroyoExtension = node
             .try_into()
             .map_err(|e: DataFusionError| e.context("converting extension"))?;
+        arroyo_extension.validate_response_scope()?;
+
         if arroyo_extension.transparent() {
             return Ok(TreeNodeRecursion::Continue);
         }

@@ -83,9 +83,24 @@ class ClippyGateTest(unittest.TestCase):
                 self.assertTrue(self.log.exists())
                 self.assertIn("runner diagnostic remains visible", result.stderr)
 
+    def test_manifest_preserves_ci_flags_and_package_scope(self):
+        for packages, scope in (((), ["--workspace"]),
+                                (("-p", "sqlparser"), ["-p", "sqlparser"])):
+            with self.subTest(packages=packages):
+                manifest = "/app/dependency with spaces/Cargo.toml"
+                result = self.run_gate("--manifest-path", manifest, *packages)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(self.invocation()["args"], [
+                    "clippy", "--locked", "--no-deps", "--all-features", "--all-targets",
+                    "--manifest-path", manifest, *scope, "--", "-D", "warnings",
+                ])
+
     def test_invalid_arguments_do_not_run_cargo(self):
         for args in (("--unknown",), ("-p",), ("-p", ""),
-                     ("-p", "--help"), ("crate",), ("--",)):
+                     ("-p", "--help"), ("crate",), ("--",),
+                     ("--manifest-path",), ("--manifest-path", ""),
+                     ("--manifest-path", "--help"),
+                     ("--manifest-path", "one", "--manifest-path", "two")):
             with self.subTest(args=args):
                 result = self.run_gate(*args)
                 self.assertEqual(result.returncode, 2)

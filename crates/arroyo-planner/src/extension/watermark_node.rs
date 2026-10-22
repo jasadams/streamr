@@ -23,6 +23,8 @@ pub struct WatermarkNode {
     pub watermark_expression: Expr,
     pub schema: DFSchemaRef,
     timestamp_index: usize,
+    pub(crate) preserve_source_envelope: bool,
+    pub(crate) response_root_slot: Option<u32>,
 }
 
 multifield_partial_ord!(
@@ -30,7 +32,9 @@ multifield_partial_ord!(
     input,
     qualifier,
     watermark_expression,
-    timestamp_index
+    timestamp_index,
+    preserve_source_envelope,
+    response_root_slot
 );
 
 impl UserDefinedLogicalNodeCore for WatermarkNode {
@@ -73,13 +77,19 @@ impl UserDefinedLogicalNodeCore for WatermarkNode {
             watermark_expression: exprs.into_iter().next().unwrap(),
             schema: self.schema.clone(),
             timestamp_index,
+            preserve_source_envelope: self.preserve_source_envelope,
+            response_root_slot: self.response_root_slot,
         })
     }
 }
 
 impl ArroyoExtension for WatermarkNode {
     fn node_name(&self) -> Option<NamedNode> {
-        Some(NamedNode::Watermark(self.qualifier.clone()))
+        if let Some(slot) = self.response_root_slot {
+            Some(NamedNode::EventResponseRoot(slot))
+        } else {
+            (!self.preserve_source_envelope).then(|| NamedNode::Watermark(self.qualifier.clone()))
+        }
     }
 
     fn plan_node(
@@ -88,14 +98,21 @@ impl ArroyoExtension for WatermarkNode {
         index: usize,
         input_schemas: Vec<ArroyoSchemaRef>,
     ) -> Result<NodeWithIncomingEdges> {
+        if self.response_root_slot.is_some() {
+            crate::event_response_root::prove_admission_physical(self, planner)?;
+        }
         let expression =
             planner.create_physical_expr(&self.watermark_expression, self.input.schema())?;
         let expression = serialize_physical_expr(&expression, &DefaultPhysicalExtensionCodec {})?;
+        let planned_id = u32::try_from(index)
+            .map_err(|_| DataFusionError::Plan("watermark graph id exceeds u32".to_owned()))?;
         let node = LogicalNode::single(
-            index as u32,
+            planned_id,
             format!("watermark_{index}"),
             OperatorName::ExpressionWatermark,
             ExpressionWatermarkConfig {
+                response_root_operator: self.response_root_slot.map(|_| planned_id),
+                preserve_source_envelope: self.preserve_source_envelope,
                 period_micros: 1_000_000,
                 idle_time_micros: None,
                 expression: expression.encode_to_vec(),
@@ -107,7 +124,11 @@ impl ArroyoExtension for WatermarkNode {
                     .map(|i| i as u32),
             }
             .encode_to_vec(),
-            "watermark".to_string(),
+            if self.response_root_slot.is_some() {
+                format!("event_root_{planned_id}")
+            } else {
+                "watermark".to_owned()
+            },
             1,
         );
 
@@ -129,9 +150,18 @@ impl WatermarkNode {
         qualifier: TableReference,
         watermark_expression: Expr,
     ) -> Result<Self> {
+        Self::with_source_envelope(input, qualifier, watermark_expression, false)
+    }
+
+    pub(crate) fn with_source_envelope(
+        input: LogicalPlan,
+        qualifier: TableReference,
+        watermark_expression: Expr,
+        preserve_source_envelope: bool,
+    ) -> Result<Self> {
         let fields = crate::fields_with_qualifiers(input.schema())
             .into_iter()
-            .filter(|field| field.field.name() != SOURCE_ENVELOPE_FIELD)
+            .filter(|field| preserve_source_envelope || field.field.name() != SOURCE_ENVELOPE_FIELD)
             .collect::<Vec<_>>();
         let schema = add_timestamp_field(
             Arc::new(crate::schema_from_df_fields_with_metadata(
@@ -149,6 +179,8 @@ impl WatermarkNode {
             watermark_expression,
             schema,
             timestamp_index,
+            preserve_source_envelope,
+            response_root_slot: None,
         })
     }
     pub(crate) fn arroyo_schema(&self) -> ArroyoSchema {

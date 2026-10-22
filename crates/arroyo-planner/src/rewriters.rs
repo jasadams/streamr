@@ -46,7 +46,7 @@ pub struct SourceRewriter<'a> {
 }
 
 impl SourceRewriter<'_> {
-    fn watermark_expression(table: &ConnectorTable) -> DFResult<Expr> {
+    pub(crate) fn watermark_expression(table: &ConnectorTable) -> DFResult<Expr> {
         let expr = match table.watermark_field.clone() {
             Some(watermark_field) => table
                 .fields
@@ -158,36 +158,36 @@ impl SourceRewriter<'_> {
     }
 
     fn projection(&self, table_scan: &TableScan, table: &ConnectorTable) -> DFResult<LogicalPlan> {
-        let qualifier = table_scan.table_name.clone();
-
-        let table_source_extension = LogicalPlan::Extension(Extension {
-            node: Arc::new(TableSourceExtension::new(
-                qualifier.to_owned(),
-                table.clone(),
-            )),
-        });
-
-        let (projection_input, projection) = if table.is_updating() {
-            let mut projection_offsets = table_scan.projection.clone();
-            if let Some(offsets) = projection_offsets.as_mut() {
-                offsets.push(table.fields.len())
-            }
-            (
-                LogicalPlan::Extension(Extension {
-                    node: Arc::new(DebeziumUnrollingExtension::try_new(
-                        table_source_extension,
-                        table.primary_keys.clone(),
-                    )?),
-                }),
-                None,
-            )
+        // Preserve the ordinary source path: CDC exposes all unrolled fields.
+        let projection = if table.is_updating() {
+            None
         } else {
-            (table_source_extension, table_scan.projection.clone())
+            table_scan.projection.clone()
         };
+        Self::canonical_projection(table, &table_scan.table_name, projection)
+    }
 
+    pub(crate) fn canonical_projection(
+        table: &ConnectorTable,
+        qualifier: &TableReference,
+        projection: Option<Vec<usize>>,
+    ) -> DFResult<LogicalPlan> {
+        let source = LogicalPlan::Extension(Extension {
+            node: Arc::new(TableSourceExtension::new(qualifier.clone(), table.clone())),
+        });
+        let input = if table.is_updating() {
+            LogicalPlan::Extension(Extension {
+                node: Arc::new(DebeziumUnrollingExtension::try_new(
+                    source,
+                    table.primary_keys.clone(),
+                )?),
+            })
+        } else {
+            source
+        };
         Ok(LogicalPlan::Projection(Projection::try_new(
-            Self::projection_expressions(table, &qualifier, &projection)?,
-            Arc::new(projection_input),
+            Self::projection_expressions(table, qualifier, &projection)?,
+            Arc::new(input),
         )?))
     }
 
@@ -799,6 +799,7 @@ pub(crate) fn event_timestamp_index(input: &LogicalPlan) -> Option<usize> {
 /// progress or an aggregate's retained/output timestamp.
 pub(crate) struct EventClockRewriter<'a> {
     pub input: &'a LogicalPlan,
+    pub defer_aggregate: bool,
 }
 
 // Versioned Arrow field provenance, carried by existing serialized schemas.
@@ -843,6 +844,74 @@ pub(crate) fn depends_on_event_clock(expr: &Expr, schema: &datafusion::common::D
     .expect("infallible expression visitor")
 }
 
+#[derive(Default)]
+struct EventClockLineage {
+    aggregate: bool,
+    trigger_sources: usize,
+    overwritten: bool,
+}
+
+impl EventClockLineage {
+    fn visit(&mut self, plan: &LogicalPlan) -> DFResult<()> {
+        if let LogicalPlan::Extension(extension) = plan {
+            if let Some(join) = extension
+                .node
+                .as_any()
+                .downcast_ref::<crate::extension::join::JoinExtension>()
+                && join.response_route.is_some()
+            {
+                // Only the validated response JOIN restores the admitted root
+                // clock. Its native internal timestamp MAX remains private.
+                self.trigger_sources += 1;
+                return Ok(());
+            }
+            if let Some(updating) = extension
+                .node
+                .as_any()
+                .downcast_ref::<crate::extension::updating_aggregate::UpdatingAggregateExtension>(
+            ) && updating.emit_per_event
+            {
+                let LogicalPlan::Aggregate(aggregate) = &updating.aggregate else {
+                    return plan_err!("per-event aggregate clock has no native aggregate plan");
+                };
+                // This private route emits an original trigger timestamp for
+                // each accepted input. Skip only its own aggregate node; its
+                // input must still prove one source and an unmodified clock.
+                return self.visit(&aggregate.input);
+            }
+            if extension.node.as_any().is::<TableSourceExtension>() {
+                self.trigger_sources += 1;
+            }
+            self.aggregate |= extension
+                .node
+                .as_any()
+                .is::<crate::extension::aggregate::AggregateExtension>();
+        }
+        if let LogicalPlan::Projection(projection) = plan {
+            let source_projection = matches!(projection.input.as_ref(), LogicalPlan::Extension(extension)
+                if extension.node.as_any().is::<TableSourceExtension>()
+                    || extension.node.as_any().is::<DebeziumUnrollingExtension>());
+            if !source_projection {
+                for (index, expression) in projection.expr.iter().enumerate() {
+                    if projection.schema.field(index).name() != TIMESTAMP_FIELD {
+                        continue;
+                    }
+                    let mut expression = expression;
+                    while let Expr::Alias(alias) = expression {
+                        expression = alias.expr.as_ref();
+                    }
+                    self.overwritten |= !matches!(expression, Expr::Column(column) if column.name == TIMESTAMP_FIELD);
+                }
+            }
+        }
+        self.aggregate |= matches!(plan, LogicalPlan::Aggregate(_));
+        for input in plan.inputs() {
+            self.visit(input)?;
+        }
+        Ok(())
+    }
+}
+
 impl TreeNodeRewriter for EventClockRewriter<'_> {
     type Node = Expr;
 
@@ -854,50 +923,29 @@ impl TreeNodeRewriter for EventClockRewriter<'_> {
             return Ok(Transformed::no(node));
         }
 
-        let mut aggregate = false;
-        let mut trigger_sources = 0;
-        let mut overwritten = false;
-        self.input.exists(|plan| {
-            if let LogicalPlan::Extension(extension) = plan {
-                if extension.node.as_any().is::<TableSourceExtension>() {
-                    trigger_sources += 1;
-                }
-                aggregate |= extension.node.as_any().is::<crate::extension::aggregate::AggregateExtension>();
-            }
-            if let LogicalPlan::Projection(projection) = plan {
-                let source_projection = matches!(projection.input.as_ref(), LogicalPlan::Extension(extension)
-                    if extension.node.as_any().is::<TableSourceExtension>()
-                        || extension.node.as_any().is::<DebeziumUnrollingExtension>());
-                if !source_projection {
-                    for (index, expression) in projection.expr.iter().enumerate() {
-                        if projection.schema.field(index).name() != TIMESTAMP_FIELD { continue; }
-                        let mut expression = expression;
-                        while let Expr::Alias(alias) = expression {
-                            expression = alias.expr.as_ref();
-                        }
-                        overwritten |= !matches!(expression, Expr::Column(column) if column.name == TIMESTAMP_FIELD);
-                    }
-                }
-            }
-            aggregate |= matches!(plan, LogicalPlan::Aggregate(_));
-            Ok(false)
-        })?;
-        if trigger_sources == 0 {
+        let mut lineage = EventClockLineage::default();
+        lineage.visit(self.input)?;
+        if lineage.trigger_sources == 0 {
             return plan_err!(
                 "EVENT_TIMESTAMP()/EVENT_DATE() requires a current triggering event source"
             );
         }
-        if trigger_sources != 1 {
+        if lineage.trigger_sources != 1 {
             return plan_err!(
                 "EVENT_TIMESTAMP()/EVENT_DATE() has ambiguous triggering sources; a single triggering source is required"
             );
         }
-        if aggregate {
+        if lineage.aggregate {
+            if self.defer_aggregate {
+                // A view is a template: its consumer has not established an
+                // emission contract yet. Never bind this to aggregate MAX time.
+                return Ok(Transformed::no(node));
+            }
             return plan_err!(
                 "EVENT_TIMESTAMP()/EVENT_DATE() requires current-trigger clock metadata across maintained aggregates (STR-62); aggregate output time is not an event clock"
             );
         }
-        if overwritten {
+        if lineage.overwritten {
             return plan_err!(
                 "event clock triggering timestamp was replaced by a projection; alias the retained or calculated timestamp to a different output name"
             );
@@ -993,4 +1041,27 @@ impl TreeNodeRewriter for SinkInputRewriter<'_> {
         }
         Ok(Transformed::no(node))
     }
+}
+
+/// Finish contextual clock binding after the consumer establishes its emission
+/// contract. This pass does not rewrite native aggregate/source operators.
+pub(crate) fn bind_event_clocks(plan: LogicalPlan) -> DFResult<LogicalPlan> {
+    Ok(plan
+        .transform_up_with_subqueries(|node| {
+            let input = match &node {
+                LogicalPlan::Projection(projection) => Some(projection.input.clone()),
+                LogicalPlan::Filter(filter) => Some(filter.input.clone()),
+                _ => None,
+            };
+            let Some(input) = input else {
+                return Ok(Transformed::no(node));
+            };
+            node.map_expressions(|expression| {
+                expression.rewrite(&mut EventClockRewriter {
+                    input: &input,
+                    defer_aggregate: false,
+                })
+            })
+        })?
+        .data)
 }

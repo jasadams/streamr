@@ -1,0 +1,94 @@
+[
+  [
+    {
+      "k": "a",
+      "total": 1,
+      "peak": null,
+      "last_seen": 10,
+      "trigger_time": 10,
+      "old_total": null,
+      "old_peak": null,
+      "old_seen": null,
+      "action": "insert"
+    }
+  ],
+  [
+    {
+      "k": "a",
+      "total": 2,
+      "peak": 20,
+      "last_seen": 20,
+      "trigger_time": 20,
+      "old_total": 1,
+      "old_peak": null,
+      "old_seen": 10,
+      "action": "update"
+    }
+  ],
+  [
+    {
+      "k": "a",
+      "total": 2,
+      "peak": null,
+      "last_seen": 30,
+      "trigger_time": 30,
+      "old_total": 2,
+      "old_peak": 20,
+      "old_seen": 20,
+      "action": "update"
+    }
+  ],
+  [
+    {
+      "k": "a",
+      "total": 2,
+      "peak": null,
+      "last_seen": 30,
+      "trigger_time": 5,
+      "old_total": 2,
+      "old_peak": null,
+      "old_seen": 30,
+      "action": "none"
+    }
+  ],
+  [
+    {
+      "k": "a",
+      "total": 2,
+      "peak": 7,
+      "last_seen": 7,
+      "trigger_time": 7,
+      "old_total": 2,
+      "old_peak": null,
+      "old_seen": 30,
+      "action": "update"
+    }
+  ],
+  [
+    {
+      "k": "a",
+      "total": 1,
+      "peak": 7,
+      "last_seen": 7,
+      "trigger_time": 5,
+      "old_total": 2,
+      "old_peak": 7,
+      "old_seen": 7,
+      "action": "update"
+    }
+  ],
+  [],
+  [
+    {
+      "k": "a",
+      "total": 1,
+      "peak": null,
+      "last_seen": 8,
+      "trigger_time": 8,
+      "old_total": 1,
+      "old_peak": 7,
+      "old_seen": 7,
+      "action": "update"
+    }
+  ]
+]

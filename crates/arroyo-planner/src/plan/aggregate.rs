@@ -82,7 +82,10 @@ fn order_event_time_selectors(
     ));
     let timestamp = if declared {
         let binding = marker
-            .rewrite(&mut crate::rewriters::EventClockRewriter { input })?
+            .rewrite(&mut crate::rewriters::EventClockRewriter {
+                input,
+                defer_aggregate: false,
+            })?
             .data;
         Some(unalias(&binding).clone())
     } else {
@@ -333,7 +336,10 @@ fn calendar_filters(
         })?;
         let reference_date = reference
             .expect("temporal clause has reference date")
-            .rewrite(&mut EventClockRewriter { input })?
+            .rewrite(&mut EventClockRewriter {
+                input,
+                defer_aggregate: false,
+            })?
             .data;
         let static_filter = static_clauses
             .into_iter()

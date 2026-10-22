@@ -752,9 +752,28 @@ pub fn rewrite_plan(
     plan: LogicalPlan,
     schema_provider: &ArroyoSchemaProvider,
 ) -> Result<LogicalPlan> {
+    rewrite_plan_clocks(plan, schema_provider, false)
+}
+
+/// Views and MERGE sources retain postaggregate markers until the consumer has
+/// validated its emission contract. Final readers must bind them strictly.
+pub(crate) fn rewrite_plan_deferred_clocks(
+    plan: LogicalPlan,
+    schema_provider: &ArroyoSchemaProvider,
+) -> Result<LogicalPlan> {
+    rewrite_plan_clocks(plan, schema_provider, true)
+}
+
+fn rewrite_plan_clocks(
+    plan: LogicalPlan,
+    schema_provider: &ArroyoSchemaProvider,
+    defer_aggregate_clocks: bool,
+) -> Result<LogicalPlan> {
     let has_event_clock = rewriters::plan_contains_event_clock(&plan)?;
+    let mut rewriter = ArroyoRewriter::new(schema_provider);
+    rewriter.defer_aggregate_clocks = defer_aggregate_clocks;
     let rewritten_plan = plan
-        .rewrite_with_subqueries(&mut ArroyoRewriter::new(schema_provider))?
+        .rewrite_with_subqueries(&mut rewriter)?
         .data
         .rewrite_with_subqueries(&mut UnnestRewriter {})?;
 
@@ -763,7 +782,12 @@ pub fn rewrite_plan(
         .data
         .visit_with_subqueries(&mut TimeWindowUdfChecker {})?;
 
-    if has_event_clock {
+    let rewritten_plan = if defer_aggregate_clocks {
+        rewritten_plan.data
+    } else {
+        rewriters::bind_event_clocks(rewritten_plan.data)?
+    };
+    if has_event_clock && !defer_aggregate_clocks {
         // Constant folding is deferred while event-clock markers need row
         // context. Now that they are columns, simplify standard stable
         // expressions (including CURRENT_DATE/CURRENT_TIMESTAMP) as usual.
@@ -771,12 +795,12 @@ pub fn rewrite_plan(
             datafusion::optimizer::simplify_expressions::SimplifyExpressions::new(),
         )])
         .optimize(
-            rewritten_plan.data,
+            rewritten_plan,
             &datafusion::optimizer::OptimizerContext::default(),
             |_plan, _rule| {},
         )
     } else {
-        Ok(rewritten_plan.data)
+        Ok(rewritten_plan)
     }
 }
 
@@ -956,8 +980,13 @@ pub async fn parse_and_get_arrow_program(
                 {
                     return plan_err!("relation '{}' already exists", merge.name);
                 }
-                let (table, mutation) =
-                    continuous_merge::plan_named_merge(merge, &schema_provider)?;
+                let (table, mutation) = continuous_merge::plan_named_merge(
+                    merge,
+                    &schema_provider,
+                    u32::try_from(retained_mutations.len()).map_err(|_| {
+                        datafusion::common::plan_datafusion_err!("response route slot exceeds u32")
+                    })?,
+                )?;
                 schema_provider.insert_table(table, components);
                 retained_mutations.push(mutation);
                 continue;
@@ -1125,6 +1154,7 @@ pub async fn parse_and_get_arrow_program(
         })?
     };
 
+    merge_event_branches::validate_graph(&graph)?;
     let mut program = LogicalProgram::new(
         graph,
         ProgramConfig {
@@ -1374,3 +1404,10 @@ impl DFField {
 }
 
 pub mod aggregate_capability;
+
+#[cfg(test)]
+mod local_case_tests;
+
+// Private, validated shared-source response planning.
+mod event_response_root;
+mod merge_event_branches;

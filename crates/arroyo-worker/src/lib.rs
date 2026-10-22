@@ -72,6 +72,7 @@ use tonic::codegen::InterceptedService;
 use uuid::Uuid;
 
 pub mod arrow;
+mod event_response_codec;
 
 pub mod engine;
 pub mod job_controller;
@@ -469,7 +470,7 @@ impl WorkerState {
                 self.worker_context.clone(),
                 network_manager,
                 req.tasks,
-            );
+            )?;
             engine.start().await
         };
 
@@ -1534,6 +1535,7 @@ mod engine_lifetime_tests {
         // connector setup; the listener and control receiver are real tasks.
         let mut phase = {
             let engine = Engine::new(program, context, network, Vec::new())
+                .unwrap()
                 .start()
                 .await;
             let state = EngineState {
@@ -1696,6 +1698,7 @@ mod engine_lifetime_tests {
             network,
             Vec::new(),
         )
+        .unwrap()
         .start()
         .await;
         *state.phase.lock().unwrap() = WorkerExecutionPhase::Running(EngineState {
@@ -1971,3 +1974,7 @@ mod udf_shadowing_tests {
         initialize_inner_rejects(None, Some("json_query")).await;
     }
 }
+
+pub mod event_transport;
+
+mod event_pair;

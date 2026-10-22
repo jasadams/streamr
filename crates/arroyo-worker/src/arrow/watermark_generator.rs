@@ -1,10 +1,12 @@
 use arrow::compute::kernels;
 use arrow_array::{Array, BooleanArray, RecordBatch, TimestampNanosecondArray, UInt64Array};
 use arroyo_operator::context::{Collector, OperatorContext};
+use arroyo_types::event_edge::{EventEdgeSpec, EventLayout};
+use arroyo_types::event_response::{EVENT_RESPONSE_VERSION, EventContext, EventResponse};
 
 use arroyo_operator::operator::{
-    ArrowOperator, AsDisplayable, ConstructedOperator, DisplayableOperator, OperatorConstructor,
-    Registry,
+    ArrowOperator, AsDisplayable, ConstructedOperator, DisplayableOperator, EventResponseRole,
+    OperatorConstructor, Registry,
 };
 use arroyo_rpc::df::ArroyoSchema;
 use arroyo_rpc::errors::DataflowResult;
@@ -46,6 +48,8 @@ pub struct WatermarkGenerator {
     expression: Arc<dyn PhysicalExpr>,
     timestamp_index: usize,
     source_envelope_index: Option<usize>,
+    preserve_source_envelope: bool,
+    response_root: Option<ResponseRoot>,
 }
 
 impl WatermarkGenerator {
@@ -65,6 +69,8 @@ impl WatermarkGenerator {
             expression,
             timestamp_index,
             source_envelope_index,
+            preserve_source_envelope: false,
+            response_root: None,
         }
     }
 }
@@ -116,7 +122,9 @@ impl WatermarkGenerator {
             .as_any()
             .downcast_ref::<TimestampNanosecondArray>()
             .unwrap();
-        let output = if let Some(marker) = self.source_envelope_index {
+        let output = if let Some(marker) = self.source_envelope_index
+            && !self.preserve_source_envelope
+        {
             admitted.project(
                 &(0..admitted.num_columns())
                     .filter(|i| *i != marker)
@@ -157,7 +165,22 @@ impl WatermarkGenerator {
         });
         // Validate even progress conversions before any data is forwarded.
         let finite_progress = progress.map(signed_timestamp).transpose()?;
-        collector.collect(output).await?;
+        if let Some(root) = &mut self.response_root {
+            if task_index != 0 {
+                return Err(admission_error(
+                    "response root requires singleton subtask zero",
+                ));
+            }
+            let clocks = admitted
+                .column(self.timestamp_index)
+                .as_any()
+                .downcast_ref::<TimestampNanosecondArray>()
+                .unwrap();
+            root.forward_admitted(output, representatives, clocks, collector)
+                .await?;
+        } else {
+            collector.collect(output).await?;
+        }
         self.last_event = SystemTime::now();
         let (Some(progress), Some(finite_progress), Some(max_timestamp)) =
             (progress, finite_progress, max_timestamp)
@@ -200,6 +223,12 @@ impl OperatorConstructor for WatermarkGeneratorConstructor {
         config: Self::ConfigT,
         registry: Arc<Registry>,
     ) -> anyhow::Result<ConstructedOperator> {
+        if config.response_root_operator.is_some() {
+            anyhow::ensure!(
+                config.input_schema.is_some(),
+                "response root requires planned input schema"
+            );
+        }
         let input_schema: ArroyoSchema = config.input_schema.unwrap().try_into()?;
         anyhow::ensure!(
             input_schema.timestamp_index < input_schema.schema.fields().len(),
@@ -221,6 +250,16 @@ impl OperatorConstructor for WatermarkGeneratorConstructor {
                 "invalid source envelope marker schema"
             );
         }
+        if config.response_root_operator.is_some() {
+            anyhow::ensure!(
+                input_schema
+                    .schema
+                    .field(input_schema.timestamp_index)
+                    .data_type()
+                    == &arrow_schema::DataType::Timestamp(arrow_schema::TimeUnit::Nanosecond, None),
+                "response root FOR clock must be Timestamp(Nanosecond,None)"
+            );
+        }
         let expression = PhysicalExprNode::decode(&mut config.expression.as_slice())?;
         let expression = parse_physical_expr(
             &expression,
@@ -229,19 +268,74 @@ impl OperatorConstructor for WatermarkGeneratorConstructor {
             &DefaultPhysicalExtensionCodec {},
         )?;
 
-        let generator = WatermarkGenerator::expression(
+        anyhow::ensure!(
+            !config.preserve_source_envelope || config.source_envelope_index.is_some(),
+            "preserved source envelopes require a source marker"
+        );
+        let mut generator = WatermarkGenerator::expression(
             Duration::from_micros(config.period_micros),
             config.idle_time_micros.map(Duration::from_micros),
             expression,
             input_schema.timestamp_index,
             config.source_envelope_index.map(|i| i as usize),
         );
+        generator.preserve_source_envelope = config.preserve_source_envelope;
+        if let Some(root) = config.response_root_operator {
+            let schema = if let Some(marker) = generator.source_envelope_index
+                && !generator.preserve_source_envelope
+            {
+                Arc::new(
+                    input_schema.schema.project(
+                        &(0..input_schema.schema.fields().len())
+                            .filter(|index| *index != marker)
+                            .collect::<Vec<_>>(),
+                    )?,
+                )
+            } else {
+                input_schema.schema.clone()
+            };
+            generator.response_root =
+                Some(ResponseRoot::new(root, input_schema.schema.clone(), schema));
+        }
         Ok(ConstructedOperator::from_operator(Box::new(generator)))
     }
 }
 
 #[async_trait]
 impl ArrowOperator for WatermarkGenerator {
+    fn event_response_role(&self) -> EventResponseRole {
+        self.response_root
+            .as_ref()
+            .map_or(EventResponseRole::Ordinary, |root| {
+                EventResponseRole::Root(root.spec.root_operator)
+            })
+    }
+    fn event_response_output(&self) -> Option<Arc<EventEdgeSpec>> {
+        self.response_root.as_ref().map(|root| root.spec.clone())
+    }
+    fn bind_event_response(
+        &mut self,
+        inputs: &[Arc<EventEdgeSpec>],
+        context: &OperatorContext,
+    ) -> DataflowResult<Option<Arc<EventEdgeSpec>>> {
+        let output = context.out_schema.as_deref().ok_or_else(|| {
+            arroyo_rpc::errors::DataflowError::ArgumentError(
+                "response operator output schema missing".into(),
+            )
+        })?;
+        let root = self
+            .response_root
+            .as_ref()
+            .ok_or_else(|| admission_error("watermark has no planned response root"))?;
+        root.validate_task(context)?;
+        if !inputs.is_empty() || root.spec.schema != output.schema {
+            return Err(admission_error(
+                "response root binding schema/input mismatch",
+            ));
+        }
+        Ok(Some(root.spec.clone()))
+    }
+
     fn tables(&self) -> HashMap<String, TableConfig> {
         global_table_config_with_version("s", "expression watermark state", WATERMARK_STATE_VERSION)
     }
@@ -266,6 +360,9 @@ impl ArrowOperator for WatermarkGenerator {
     }
 
     async fn on_start(&mut self, ctx: &mut OperatorContext) -> DataflowResult<()> {
+        if let Some(root) = &self.response_root {
+            root.validate_task(ctx)?;
+        }
         let gs = ctx
             .table_manager
             .get_global_keyed_state::<u32, WatermarkGeneratorState>("s")
@@ -406,9 +503,205 @@ fn signed_timestamp(nanos: i64) -> DataflowResult<SystemTime> {
     })
 }
 
+/// Per-attempt context only; checkpoint admission state remains unchanged.
+/// The root is planner-assigned logical identity, NOT physical chained task ID.
+struct ResponseRoot {
+    input_schema: arrow_schema::SchemaRef,
+    spec: Arc<EventEdgeSpec>,
+    nonce: [u8; 16],
+    next_sequence: Option<u64>,
+}
+impl ResponseRoot {
+    fn new(
+        root: u32,
+        input_schema: arrow_schema::SchemaRef,
+        schema: arrow_schema::SchemaRef,
+    ) -> Self {
+        Self {
+            input_schema,
+            spec: Arc::new(EventEdgeSpec {
+                root_operator: root,
+                root_subtask: 0,
+                schema,
+                layout: EventLayout::Raw,
+            }),
+            nonce: rand::random(),
+            next_sequence: Some(1),
+        }
+    }
+    fn validate_task(&self, ctx: &OperatorContext) -> DataflowResult<()> {
+        if ctx.task_info.parallelism != 1
+            || ctx.task_info.task_index != 0
+            || ctx.in_schemas.len() != 1
+        {
+            return Err(admission_error(
+                "response root requires one singleton input/subtask",
+            ));
+        }
+        if ctx.in_schemas[0].schema != self.input_schema {
+            return Err(admission_error(
+                "response root input differs from planned raw schema",
+            ));
+        }
+        if !matches!(self.spec.layout, EventLayout::Raw)
+            || self.spec.root_subtask != 0
+            || ctx
+                .out_schema
+                .as_ref()
+                .is_none_or(|output| output.schema != self.spec.schema)
+        {
+            return Err(admission_error(
+                "response root output differs from registered raw schema",
+            ));
+        }
+        // engine.rs supplies operator_idx=node_id to EVERY chained context;
+        // comparing it with logical root identity would reject valid chaining.
+        Ok(())
+    }
+    async fn forward_admitted(
+        &mut self,
+        rows: RecordBatch,
+        representatives: &BooleanArray,
+        clocks: &TimestampNanosecondArray,
+        collector: &mut dyn Collector,
+    ) -> DataflowResult<()> {
+        if rows.num_rows() != representatives.len() || rows.num_rows() != clocks.len() {
+            return Err(admission_error("response root admission arrays differ"));
+        }
+        let mut start = 0;
+        for end in 1..=rows.num_rows() {
+            if !representatives.value(end - 1) {
+                continue;
+            }
+            let length = end - start;
+            if length == 0 || length > 2 || clocks.is_null(end - 1) {
+                return Err(admission_error(
+                    "response root requires one complete source operation",
+                ));
+            }
+            let sequence = self
+                .next_sequence
+                .ok_or_else(|| admission_error("response root sequence exhausted"))?;
+            if sequence == 0 {
+                return Err(admission_error("response root sequence must start at one"));
+            }
+            let response = EventResponse {
+                context: EventContext {
+                    version: EVENT_RESPONSE_VERSION,
+                    root_operator: self.spec.root_operator,
+                    root_subtask: 0,
+                    attempt_nonce: self.nonce,
+                    sequence,
+                    trigger_nanos: clocks.value(end - 1),
+                },
+                rows: Some(rows.slice(start, length)),
+                touched_keys: None,
+                native_body: None,
+            };
+            self.spec
+                .validate(&response)
+                .map_err(|error| admission_error(&error))?;
+            // Collector awaits every branch before E+1; never await a mate.
+            collector.collect_response(response).await?;
+            self.next_sequence = sequence.checked_add(1);
+            start = end;
+        }
+        if start != rows.num_rows() {
+            return Err(admission_error(
+                "response root has an unfinished source operation",
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod signed_timestamp_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn direct_correction_preserves_marker_only_when_configured() {
+        #[derive(Default)]
+        struct Captures(Vec<RecordBatch>);
+        #[async_trait]
+        impl Collector for Captures {
+            async fn collect(&mut self, batch: RecordBatch) -> DataflowResult<()> {
+                self.0.push(batch);
+                Ok(())
+            }
+            async fn broadcast_watermark(&mut self, _: Watermark) -> DataflowResult<()> {
+                Ok(())
+            }
+        }
+        let schema = Arc::new(arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new(
+                arroyo_rpc::TIMESTAMP_FIELD,
+                arrow_schema::DataType::Timestamp(arrow_schema::TimeUnit::Nanosecond, None),
+                false,
+            ),
+            arrow_schema::Field::new(
+                arroyo_rpc::SOURCE_ENVELOPE_FIELD,
+                arrow_schema::DataType::UInt64,
+                false,
+            ),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(TimestampNanosecondArray::from(vec![20, 5])),
+                Arc::new(UInt64Array::from(vec![0, 0])),
+            ],
+        )
+        .unwrap();
+        for preserve in [false, true] {
+            let mut generator = WatermarkGenerator::expression(
+                Duration::from_secs(1),
+                None,
+                Arc::new(datafusion::physical_expr::expressions::Column::new(
+                    arroyo_rpc::TIMESTAMP_FIELD,
+                    0,
+                )),
+                0,
+                Some(1),
+            );
+            generator.preserve_source_envelope = preserve;
+            let mut captures = Captures::default();
+            generator
+                .admit_batch(batch.clone(), 0, &mut captures)
+                .await
+                .unwrap();
+            assert_eq!(captures.0.len(), 1);
+            assert_eq!(captures.0[0].num_rows(), 2);
+            assert_eq!(
+                captures.0[0]
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<TimestampNanosecondArray>()
+                    .unwrap()
+                    .values()
+                    .as_ref(),
+                &[5, 5]
+            );
+            assert_eq!(
+                captures.0[0]
+                    .column_by_name(arroyo_rpc::SOURCE_ENVELOPE_FIELD)
+                    .is_some(),
+                preserve
+            );
+            if preserve {
+                assert_eq!(
+                    captures.0[0]
+                        .column(1)
+                        .as_any()
+                        .downcast_ref::<UInt64Array>()
+                        .unwrap()
+                        .values()
+                        .as_ref(),
+                    &[0, 0]
+                );
+            }
+        }
+    }
 
     #[test]
     fn admission_preserves_update_envelopes_and_does_not_pair_equal_keys() {
@@ -527,3 +820,7 @@ mod signed_timestamp_tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "watermark_root_response_tests.rs"]
+mod root_response_tests;

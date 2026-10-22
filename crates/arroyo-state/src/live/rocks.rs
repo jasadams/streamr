@@ -15,6 +15,9 @@ use std::sync::{
 };
 use tokio::sync::oneshot;
 
+#[path = "scan_diagnostics.rs"]
+mod scan_diagnostics;
+
 pub struct RocksLiveState {
     db: Arc<NativeDb>,
     completion: oneshot::Receiver<Result<()>>,
@@ -425,14 +428,19 @@ impl LiveStateBackend for RocksLiveState {
             .run_blocking(move || {
                 let _latency = resources.operation_timer("snapshot");
                 let snapshot = OwnedNativeSnapshot::new(db, |owner| owner.snapshot());
-                Ok(StateSnapshot(Arc::new(RocksSnapshot {
+                let reader = Arc::new(RocksSnapshot {
                     view: Arc::new(NativeReadView {
                         snapshot,
                         _permit: permit,
+                        _scan_diagnostic: if scan_diagnostics::enabled() { Some(scan_diagnostics::SnapshotReleased(id)) } else { None },
                     }),
                     id,
                     resources,
-                })))
+                });
+                if scan_diagnostics::enabled() {
+                    scan_diagnostics::emit(serde_json::json!({"event":"native_snapshot_begin","snapshot_id":id,"snapshot_ptr":Arc::as_ptr(&reader) as usize}));
+                }
+                Ok(StateSnapshot(reader))
             })
             .await
             .map_err(LiveStateError::from)?
@@ -516,6 +524,8 @@ self_cell::self_cell!(
 struct NativeReadView {
     snapshot: OwnedNativeSnapshot,
     _permit: ResourcePermit,
+    // Must remain last: the snapshot and permit release before the marker.
+    _scan_diagnostic: Option<scan_diagnostics::SnapshotReleased>,
 }
 
 struct RocksSnapshot {
@@ -580,14 +590,11 @@ fn encoded_prefix_end(prefix: &[u8]) -> Option<Vec<u8>> {
     Some(end)
 }
 
-fn set_scan_upper_bound(
-    read: &mut rocksdb::ReadOptions,
+fn scan_upper_bound(
     namespace: &[u8],
     prefix: Option<&[u8]>,
     end: Option<&[u8]>,
-) {
-    // An encoded prefix includes its namespace, so its successor is already
-    // no greater than the namespace successor. Allocate only that candidate.
+) -> Option<Vec<u8>> {
     let prefix = prefix.unwrap_or(namespace);
     debug_assert!(prefix.starts_with(namespace));
     let mut upper = encoded_prefix_end(prefix);
@@ -598,6 +605,9 @@ fn set_scan_upper_bound(
     {
         upper = Some(end.to_vec());
     }
+    upper
+}
+fn set_scan_upper_bound(read: &mut rocksdb::ReadOptions, upper: Option<Vec<u8>>) {
     if let Some(upper) = upper {
         read.set_iterate_upper_bound(upper);
     }
@@ -702,6 +712,7 @@ impl RocksSnapshot {
     async fn scan_admission(&self, request: ScanRequest, fail_fast: bool) -> Result<ScanPage> {
         request.validate(self.id)?;
         let id = self.id;
+        let snapshot_ptr = self as *const Self as usize;
         let db = DbHandle::Snapshot(self.view.clone());
         let namespace_bytes = encoding::encoded_namespace_size(&request.range.namespace)?;
         let request_bytes = namespace_bytes.saturating_mul(5).saturating_add(
@@ -777,13 +788,13 @@ impl RocksSnapshot {
                 // Rust checks below define the same range, but run only after
                 // native Seek/Next. Bound those operations too, so an empty
                 // prefix cannot walk unrelated deleted keys to find a live row.
-                set_scan_upper_bound(
-                    &mut native_read,
-                    &namespace,
-                    prefix.as_deref(),
-                    end.as_deref(),
-                );
+                let upper = scan_upper_bound(&namespace,prefix.as_deref(),end.as_deref());
+                let diagnostic_upper = scan_diagnostics::enabled().then(|| upper.clone());
+                set_scan_upper_bound(&mut native_read, upper);
                 let mut iterator = db.raw_iterator_opt(native_read);
+                let mut diagnostic = diagnostic_upper.map(|upper| scan_diagnostics::NativeScanProbe::start(serde_json::json!({
+                    "snapshot_id":id,"snapshot_ptr":snapshot_ptr,"namespace":namespace,"logical_prefix":request.range.prefix,"native_prefix":prefix,"seek_key":lower,"iterate_lower_bound":null,"iterate_upper_bound":upper,"cursor_present":request.cursor.is_some(),"max_entries":request.max_entries,"max_bytes":request.max_bytes
+                })));
                 iterator.seek(lower);
                 let mut first = true;
                 let mut entries = Vec::new();
@@ -791,12 +802,14 @@ impl RocksSnapshot {
                 let mut next_cursor = None;
                 loop {
                     if !first {
+                        if let Some(probe) = &mut diagnostic { probe.next(); }
                         iterator.next();
                     }
                     first = false;
                     if !iterator.valid() {
                         break;
                     }
+                    if let Some(probe) = &mut diagnostic { probe.candidate(); }
                     let encoded_key = iterator.key().expect("valid iterator key");
                     let encoded_value = iterator.value().expect("valid iterator value");
                     if !encoded_key.starts_with(&namespace) {
@@ -850,6 +863,7 @@ impl RocksSnapshot {
                     });
                 }
                 iterator.status().map_err(backend)?;
+                if let Some(probe) = &mut diagnostic { probe.complete(entries.len(),used,next_cursor.is_some()); }
                 Ok(ScanPage {
                     entries,
                     next_cursor,
@@ -2093,7 +2107,7 @@ mod tests {
             read.set_snapshot(&after);
             if bounded {
                 read.set_iterate_lower_bound(prefix.clone());
-                set_scan_upper_bound(&mut read, &namespace, Some(&prefix), None);
+                set_scan_upper_bound(&mut read, scan_upper_bound(&namespace, Some(&prefix), None));
             }
             let mut iterator = db.raw_iterator_opt(read);
             perf.reset();
@@ -2161,7 +2175,7 @@ mod tests {
             let mut read = rocksdb::ReadOptions::default();
             read.set_snapshot(&after);
             if bounded {
-                set_scan_upper_bound(&mut read, &namespace, Some(&prefix), None);
+                set_scan_upper_bound(&mut read, scan_upper_bound(&namespace, Some(&prefix), None));
             }
             let mut iterator = db.raw_iterator_opt(read);
             perf.reset();
@@ -2245,7 +2259,10 @@ mod tests {
                         let fresh = db.snapshot();
                         let mut read = rocksdb::ReadOptions::default();
                         read.set_snapshot(if mode == "stable" { &pinned } else { &fresh });
-                        set_scan_upper_bound(&mut read, &namespace, Some(&prefix), None);
+                        set_scan_upper_bound(
+                            &mut read,
+                            scan_upper_bound(&namespace, Some(&prefix), None),
+                        );
                         let mut iterator = db.raw_iterator_opt(read);
                         iterator.seek(after.as_deref().unwrap_or(&prefix));
                         issued_seeks += 1;
@@ -2436,7 +2453,10 @@ mod tests {
                                 let mut prefix = namespace.clone();
                                 prefix.push(b'C');
                                 read.set_iterate_lower_bound(prefix.clone());
-                                set_scan_upper_bound(&mut read, &namespace, Some(&prefix), None);
+                                set_scan_upper_bound(
+                                    &mut read,
+                                    scan_upper_bound(&namespace, Some(&prefix), None),
+                                );
                                 perf.reset();
                                 let scan_cpu = cpu_ticks();
                                 let scan_start = std::time::Instant::now();
@@ -2470,9 +2490,7 @@ mod tests {
                                     read.set_iterate_lower_bound(prefix.clone());
                                     set_scan_upper_bound(
                                         &mut read,
-                                        &namespace,
-                                        Some(&prefix),
-                                        None,
+                                        scan_upper_bound(&namespace, Some(&prefix), None),
                                     );
                                     perf.reset();
                                     let scan_cpu = cpu_ticks();

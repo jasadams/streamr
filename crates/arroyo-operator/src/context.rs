@@ -30,6 +30,9 @@ use tokio::sync::mpsc::error::SendError;
 use tokio::sync::mpsc::{Receiver, Sender, UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tracing::{trace, warn};
 
+use arroyo_types::event_edge::EventEdgeSpec;
+use arroyo_types::event_response::EventResponse;
+
 pub type QueueItem = ArrowMessage;
 
 pub struct WatermarkHolder {
@@ -101,6 +104,7 @@ fn message_count(item: &QueueItem, size: u32) -> u32 {
     match item {
         QueueItem::Data(d) => (d.num_rows() as u32).min(size),
         QueueItem::Signal(_) => 1,
+        QueueItem::Event(response) => response.queue_cost(size),
     }
 }
 
@@ -109,11 +113,15 @@ fn message_bytes(item: &QueueItem) -> u64 {
     match item {
         QueueItem::Data(d) => d.get_array_memory_size() as u64,
         QueueItem::Signal(s) => size_of_val(s) as u64,
+        QueueItem::Event(response) => response.retained_bytes() as u64,
     }
 }
 
 impl BatchSender {
     pub async fn send(&self, item: QueueItem) -> Result<(), SendError<QueueItem>> {
+        if matches!(&item, QueueItem::Event(_)) && self.size == 0 {
+            return Err(SendError(item));
+        }
         // Ensure that every message is sendable, even if it's bigger than our max size
         let count = message_count(&item, self.size);
         loop {
@@ -188,6 +196,10 @@ pub struct BatchReceiver {
 }
 
 impl BatchReceiver {
+    pub fn size(&self) -> u32 {
+        self.size
+    }
+
     pub async fn recv(&mut self) -> Option<QueueItem> {
         let item = self.rx.recv().await;
         if let Some(item) = &item {
@@ -550,6 +562,11 @@ impl ErrorReporter {
 #[async_trait]
 pub trait Collector: Send {
     async fn collect(&mut self, batch: RecordBatch) -> DataflowResult<()>;
+    async fn collect_response(&mut self, _response: EventResponse) -> DataflowResult<()> {
+        Err(DataflowError::ArgumentError(
+            "collector does not accept event responses".into(),
+        ))
+    }
     async fn broadcast_watermark(&mut self, watermark: Watermark) -> DataflowResult<()>;
 }
 
@@ -557,6 +574,7 @@ pub trait Collector: Send {
 pub struct ArrowCollector {
     pub chain_info: Arc<ChainInfo>,
     out_schema: Option<Arc<ArroyoSchema>>,
+    event_spec: Option<Arc<EventEdgeSpec>>,
     out_qs: Vec<Vec<BatchSender>>,
     tx_queue_rem_gauges: QueueGauges,
     tx_queue_size_gauges: QueueGauges,
@@ -568,6 +586,15 @@ fn repartition<'a>(
     keys: Option<&'a Vec<usize>>,
     qs: usize,
 ) -> impl Iterator<Item = (usize, RecordBatch)> + 'a {
+    // One destination is an identity operation: keep the original order and
+    // complete logical input batch without sorting equal destination IDs.
+    if qs == 1 {
+        return (record.num_rows() != 0)
+            .then(|| (0, record.clone()))
+            .into_iter()
+            .collect::<Vec<_>>()
+            .into_iter();
+    }
     let mut buf = vec![0; record.num_rows()];
 
     if let Some(keys) = keys {
@@ -622,6 +649,11 @@ fn repartition<'a>(
 #[async_trait]
 impl Collector for ArrowCollector {
     async fn collect(&mut self, record: RecordBatch) -> DataflowResult<()> {
+        if self.event_spec.is_some() {
+            return Err(DataflowError::ArgumentError(
+                "ordinary Data on response edge".into(),
+            ));
+        }
         TaskCounters::MessagesSent
             .for_task(&self.chain_info, |c| c.inc_by(record.num_rows() as u64));
         TaskCounters::BatchesSent.for_task(&self.chain_info, |c| c.inc());
@@ -668,6 +700,43 @@ impl Collector for ArrowCollector {
         Ok(())
     }
 
+    async fn collect_response(&mut self, mut response: EventResponse) -> DataflowResult<()> {
+        let spec = self
+            .event_spec
+            .as_ref()
+            .ok_or_else(|| DataflowError::ArgumentError("unregistered response output".into()))?;
+        response.discard_invalid_body_proof(spec);
+        spec.validate(&response)
+            .map_err(DataflowError::ArgumentError)?;
+        if self
+            .out_qs
+            .iter()
+            .any(|group| group.len() != 1 || group[0].size() == 0)
+        {
+            return Err(DataflowError::ArgumentError(
+                "response route requires singleton forward destinations".into(),
+            ));
+        }
+        // Await delivery of this ONE response to every branch before returning
+        // to the root caller; even an empty response is never repartitioned away.
+        for (i, group) in self.out_qs.iter_mut().enumerate() {
+            group[0]
+                .send(ArrowMessage::Event(response.clone()))
+                .await
+                .map_err(|_| queue_closed_error())?;
+            self.tx_queue_rem_gauges[i][0]
+                .iter()
+                .for_each(|g| g.set(group[0].capacity() as i64));
+            self.tx_queue_size_gauges[i][0]
+                .iter()
+                .for_each(|g| g.set(group[0].size() as i64));
+            self.tx_queue_bytes_gauges[i][0]
+                .iter()
+                .for_each(|g| g.set(group[0].queued_bytes() as i64));
+        }
+        Ok(())
+    }
+
     async fn broadcast_watermark(&mut self, watermark: Watermark) -> DataflowResult<()> {
         self.broadcast_checked(SignalMessage::Watermark(watermark))
             .await
@@ -675,6 +744,26 @@ impl Collector for ArrowCollector {
 }
 
 impl ArrowCollector {
+    /// Engine registration only; no operator is implicitly switched to events.
+    pub fn register_event_output(&mut self, spec: Arc<EventEdgeSpec>) -> DataflowResult<()> {
+        if self.event_spec.is_some()
+            || self
+                .out_schema
+                .as_ref()
+                .is_none_or(|schema| schema.schema != spec.schema)
+            || self
+                .out_qs
+                .iter()
+                .any(|group| group.len() != 1 || group[0].size() == 0)
+        {
+            return Err(DataflowError::ArgumentError(
+                "invalid or duplicate response edge registration".into(),
+            ));
+        }
+        self.event_spec = Some(spec);
+        Ok(())
+    }
+
     pub fn new(
         chain_info: Arc<ChainInfo>,
         out_schema: Option<Arc<ArroyoSchema>>,
@@ -712,6 +801,7 @@ impl ArrowCollector {
         Self {
             chain_info,
             out_schema,
+            event_spec: None,
             out_qs,
             tx_queue_rem_gauges,
             tx_queue_size_gauges,
@@ -804,6 +894,23 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+
+    #[test]
+    fn single_destination_preserves_one_batch_order_and_backing_ownership() {
+        let input = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("id", DataType::UInt64, false)])),
+            vec![Arc::new(UInt64Array::from(vec![8, 1, 7, 1, 3, 0, 3, 9]))],
+        )
+        .unwrap();
+        for keys in [None, Some(vec![0])] {
+            let output = repartition(&input, keys.as_ref(), 1).collect::<Vec<_>>();
+            assert_eq!(output.len(), 1);
+            assert_eq!(output[0].0, 0);
+            assert_eq!(output[0].1, input);
+            assert!(Arc::ptr_eq(output[0].1.column(0), input.column(0)));
+            assert!(Arc::ptr_eq(&output[0].1.schema(), &input.schema()));
+        }
+    }
 
     #[test]
     fn test_watermark_holder() {

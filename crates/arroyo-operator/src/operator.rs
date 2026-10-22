@@ -12,11 +12,14 @@ use arrow::datatypes::Schema;
 use arroyo_datastream::logical::{DylibUdfConfig, PythonUdfConfig};
 use arroyo_metrics::TaskCounters;
 use arroyo_rpc::df::ArroyoSchema;
+use arroyo_rpc::errors::DataflowError;
 use arroyo_rpc::errors::{DataflowResult, TaskError};
 use arroyo_rpc::grpc::rpc::{TableConfig, TaskCheckpointEventType};
 use arroyo_rpc::{ControlMessage, ControlResp};
 use arroyo_state::tables::table_manager::TableManager;
 use arroyo_storage::StorageProvider;
+use arroyo_types::event_edge::EventEdgeSpec;
+use arroyo_types::event_response::EventResponse;
 use arroyo_types::{
     ArrowMessage, ChainInfo, CheckpointBarrier, SignalMessage, TaskInfo, Watermark,
 };
@@ -251,7 +254,27 @@ impl OperatorNode {
             task_index: self.task_index(),
         });
 
-        let collector = ArrowCollector::new(chain_info.clone(), out_schema, out_qs);
+        let event_spec = match self.as_ref() {
+            OperatorNode::Source(_) => None,
+            OperatorNode::Chained(chain) => chain
+                .iter()
+                .last()
+                .and_then(|(operator, _)| operator.event_response_output()),
+        };
+        let mut collector = ArrowCollector::new(chain_info.clone(), out_schema, out_qs);
+        if let Some(spec) = event_spec
+            && let Err(error) = collector.register_event_output(spec)
+        {
+            control_tx
+                .send(ControlResp::TaskFailed {
+                    task_id: chain_info.task_id,
+                    subtask_idx: chain_info.task_index,
+                    error: error.into(),
+                })
+                .await
+                .ok();
+            return in_qs;
+        }
 
         match self
             .run_behavior(
@@ -458,6 +481,41 @@ where
         Ok(())
     }
 
+    async fn collect_response(&mut self, response: EventResponse) -> DataflowResult<()> {
+        if self.cur.operator.event_pair_mode() && self.in_partitions != 2 {
+            return Err(anyhow!("event pair callback bypassed indexed two-input run loop").into());
+        }
+        if let Some(next) = &mut self.cur.next {
+            let mut collector = ChainedCollector {
+                cur: next,
+                final_collector: self.final_collector,
+                index: 0,
+                in_partitions: 1,
+            };
+            self.cur
+                .operator
+                .process_response_index(
+                    self.index,
+                    self.in_partitions,
+                    response,
+                    &mut self.cur.context,
+                    &mut collector,
+                )
+                .await
+        } else {
+            self.cur
+                .operator
+                .process_response_index(
+                    self.index,
+                    self.in_partitions,
+                    response,
+                    &mut self.cur.context,
+                    self.final_collector,
+                )
+                .await
+        }
+    }
+
     async fn broadcast_watermark(&mut self, watermark: Watermark) -> DataflowResult<()> {
         self.cur
             .handle_watermark(watermark, self.index, self.final_collector)
@@ -632,6 +690,25 @@ impl ChainedOperator {
             .collect(batch)
             .await
             .map_err(|e| e.with_operator(self.context.task_info.operator_id.clone()))
+    }
+
+    pub(crate) async fn process_response_index(
+        &mut self,
+        index: usize,
+        in_partitions: usize,
+        response: EventResponse,
+        final_collector: &mut ArrowCollector,
+    ) -> DataflowResult<()> {
+        let mut collector = ChainedCollector {
+            cur: self,
+            index,
+            in_partitions,
+            final_collector,
+        };
+        collector
+            .collect_response(response)
+            .await
+            .map_err(|error| error.with_operator(self.context.task_info.operator_id.clone()))
     }
 
     #[allow(clippy::type_complexity)]
@@ -945,6 +1022,16 @@ async fn operator_run_behavior(
     collector: &mut ArrowCollector,
     ready: Arc<Barrier>,
 ) -> DataflowResult<Option<SignalMessage>> {
+    if this
+        .iter()
+        .skip(1)
+        .any(|(operator, _)| operator.event_pair_mode())
+    {
+        return Err(anyhow!("event pair operator must be the physical chain head").into());
+    }
+    if this.operator.event_pair_mode() && in_qs.len() != 2 {
+        return Err(anyhow!("event pair route requires exactly two physical inputs").into());
+    }
     this.on_start().await?;
 
     let chain_info = &mut collector.chain_info.clone();
@@ -971,8 +1058,11 @@ async fn operator_run_behavior(
     for (i, q) in in_qs.iter_mut().enumerate() {
         let stream = async_stream::stream! {
           while let Some(item) = q.recv().await {
-            yield(i, item);
+            yield(i, Some(item));
           }
+          // Preserve the originating input index at EOF. Ordinary operators'
+          // default hook does nothing and still finish when all streams end.
+          yield(i, None);
         };
         sel.push(Box::pin(stream));
     }
@@ -1018,6 +1108,11 @@ async fn operator_run_behavior(
             p = sel.next(), if !shutdown_after_commit && restore_commit_epoch.is_none() => {
                 match p {
                     Some(((idx, message), s)) => {
+                        let Some(message) = message else {
+                            this.operator.check_event_input_eof(idx, &counter, &closed)?;
+                            if this.operator.event_pair_mode() { closed.insert(idx); }
+                            continue;
+                        };
                         let local_idx = idx;
 
                         trace!("[{}] Handling message {}-{}, {:?}",
@@ -1025,6 +1120,9 @@ async fn operator_run_behavior(
 
                         match message {
                             ArrowMessage::Data(record) => {
+                                if this.operator.event_pair_mode() {
+                                    return Err(anyhow!("event pair route received ordinary Data").into());
+                                }
                                 TaskCounters::BatchesReceived.for_task(chain_info, |c| c.inc());
                                 TaskCounters::MessagesReceived.for_task(chain_info, |c| c.inc_by(record.num_rows() as u64));
                                 TaskCounters::BytesReceived.for_task(chain_info, |c| c.inc_by(record.get_array_memory_size() as u64));
@@ -1035,7 +1133,16 @@ async fn operator_run_behavior(
                                         subtask_idx = chain_info.task_index)
                                 ).await?;
                             }
+                            ArrowMessage::Event(response) => {
+                                if this.operator.event_pair_mode() &&
+                                    (counter.is_blocked(idx) || this.operator.event_input_blocked(idx)) {
+                                    return Err(anyhow!("event response bypassed a parked input").into());
+                                }
+                                this.operator.check_event_response_input(idx, &counter, &closed)?;
+                                this.process_response_index(idx, in_partitions, response, collector).await?;
+                            }
                             ArrowMessage::Signal(signal) => {
+                                this.operator.check_event_control_input(idx, &signal, &counter, &closed)?;
                                 match this.handle_control_message(idx, &signal, &mut counter, &mut closed, in_partitions,
                                     &control_tx, chain_info, collector).await? {
                                     ControlOutcome::Continue => {}
@@ -1059,16 +1166,22 @@ async fn operator_run_behavior(
                             }
                         }
 
-                        if counter.is_blocked(idx){
-                            blocked.push(s);
+                        if counter.is_blocked(idx) || this.operator.event_input_blocked(idx) {
+                            blocked.push((idx, s));
                         } else {
-                            if counter.all_clear() && !blocked.is_empty(){
-                                for q in blocked.drain(..){
-                                    sel.push(q);
-                                }
-                            }
                             sel.push(s);
                         }
+                        // A mate callback may unpark the earlier input. Retain
+                        // its identity; checkpoint and event parks compose.
+                        let mut still_blocked = Vec::new();
+                        for (parked_idx, stream) in blocked.drain(..) {
+                            if counter.is_blocked(parked_idx) || this.operator.event_input_blocked(parked_idx) {
+                                still_blocked.push((parked_idx, stream));
+                            } else {
+                                sel.push(stream);
+                            }
+                        }
+                        blocked = still_blocked;
                     }
                     None => {
                         info!("[{}] Stream completed", chain_info);
@@ -1170,9 +1283,38 @@ pub struct DisplayableOperator<'a> {
     pub fields: Vec<(&'static str, AsDisplayable<'a>)>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EventResponseRole {
+    Ordinary,
+    Scalar,
+    Root(u32),
+    Aggregate(u32),
+    Join(u32),
+}
+
 #[async_trait::async_trait]
 pub trait ArrowOperator: Send + 'static {
     fn name(&self) -> String;
+    fn event_response_role(&self) -> EventResponseRole {
+        EventResponseRole::Ordinary
+    }
+    fn event_response_output(&self) -> Option<Arc<EventEdgeSpec>> {
+        None
+    }
+    fn bind_event_response(
+        &mut self,
+        _inputs: &[Arc<EventEdgeSpec>],
+        _context: &OperatorContext,
+    ) -> DataflowResult<Option<Arc<EventEdgeSpec>>> {
+        Err(DataflowError::ArgumentError(
+            "operator does not bind event response descriptors".into(),
+        ))
+    }
+    fn validate_event_source_plumbing(&self) -> DataflowResult<()> {
+        Err(DataflowError::ArgumentError(
+            "operator is not canonical source plumbing".into(),
+        ))
+    }
 
     fn tables(&self) -> HashMap<String, TableConfig> {
         HashMap::new()
@@ -1196,6 +1338,54 @@ pub trait ArrowOperator: Send + 'static {
     #[allow(unused_variables)]
     async fn on_start(&mut self, ctx: &mut OperatorContext) -> DataflowResult<()> {
         Ok(())
+    }
+
+    /// Private event-pair route only. Ordinary operators retain existing polling.
+    fn event_pair_mode(&self) -> bool {
+        false
+    }
+    fn event_input_blocked(&self, _index: usize) -> bool {
+        false
+    }
+    fn check_event_response_input(
+        &self,
+        _index: usize,
+        _counter: &CheckpointCounter,
+        _closed: &HashSet<usize>,
+    ) -> DataflowResult<()> {
+        Ok(())
+    }
+    fn check_event_control_input(
+        &self,
+        _index: usize,
+        _signal: &SignalMessage,
+        _counter: &CheckpointCounter,
+        _closed: &HashSet<usize>,
+    ) -> DataflowResult<()> {
+        Ok(())
+    }
+    fn check_event_input_eof(
+        &self,
+        _index: usize,
+        _counter: &CheckpointCounter,
+        _closed: &HashSet<usize>,
+    ) -> DataflowResult<()> {
+        Ok(())
+    }
+
+    /// Explicit response callback. Ordinary native operators reject packets;
+    /// future eligible scalar/aggregate/JOIN adapters must opt in individually.
+    async fn process_response_index(
+        &mut self,
+        _index: usize,
+        _in_partitions: usize,
+        _response: EventResponse,
+        _ctx: &mut OperatorContext,
+        _collector: &mut dyn Collector,
+    ) -> DataflowResult<()> {
+        Err(arroyo_rpc::errors::DataflowError::ArgumentError(
+            "operator does not accept event responses".into(),
+        ))
     }
 
     #[allow(unused_variables)]
@@ -1531,5 +1721,616 @@ impl FunctionRegistry for Registry {
 
     fn expr_planners(&self) -> Vec<Arc<dyn ExprPlanner>> {
         vec![]
+    }
+}
+
+#[cfg(test)]
+mod event_pair_input_tests {
+    use super::*;
+    use crate::context::batch_bounded;
+    use arroyo_types::event_edge::{EventEdgeSpec, EventLayout};
+    use arroyo_types::event_response::{EVENT_RESPONSE_VERSION, EventContext};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::sync::{Notify, mpsc::UnboundedSender};
+
+    // This is a run-loop test operator, not a native JOIN implementation. The
+    // worker EventPair has separate direct tests. No SQL output is fabricated.
+    struct PairProbe {
+        waiting: Option<(usize, EventContext)>,
+        processing: bool,
+        observed: UnboundedSender<String>,
+        phase: Arc<AtomicUsize>,
+        delivered: Arc<Notify>,
+        committing: bool,
+    }
+    impl PairProbe {
+        fn require_ready(
+            &self,
+            index: usize,
+            counter: &CheckpointCounter,
+            closed: &HashSet<usize>,
+        ) -> DataflowResult<()> {
+            if index >= 2
+                || !counter.all_clear()
+                || !closed.is_empty()
+                || self.event_input_blocked(index)
+            {
+                return Err(anyhow!("pair response crossed checkpoint/terminal/park gate").into());
+            }
+            Ok(())
+        }
+    }
+    #[async_trait]
+    impl ArrowOperator for PairProbe {
+        fn name(&self) -> String {
+            "pair-runloop-probe".into()
+        }
+        fn event_pair_mode(&self) -> bool {
+            true
+        }
+        fn event_input_blocked(&self, side: usize) -> bool {
+            self.processing || self.waiting.is_some_and(|(first, _)| first == side)
+        }
+        fn check_event_response_input(
+            &self,
+            side: usize,
+            counter: &CheckpointCounter,
+            closed: &HashSet<usize>,
+        ) -> DataflowResult<()> {
+            self.require_ready(side, counter, closed)
+        }
+        fn check_event_control_input(
+            &self,
+            side: usize,
+            message: &SignalMessage,
+            counter: &CheckpointCounter,
+            closed: &HashSet<usize>,
+        ) -> DataflowResult<()> {
+            if closed.contains(&side) || counter.is_blocked(side) || self.event_input_blocked(side)
+            {
+                return Err(anyhow!("pair control bypassed parked/closed input").into());
+            }
+            if !closed.is_empty() && matches!(message, SignalMessage::Barrier(_)) {
+                return Err(anyhow!("barrier follows a terminal branch input").into());
+            }
+            if self.waiting.is_some()
+                && (!counter.all_clear() || !matches!(message, SignalMessage::Watermark(_)))
+            {
+                return Err(anyhow!("barrier/terminal overtook missing pair response").into());
+            }
+            match message {
+                SignalMessage::Watermark(watermark) => {
+                    self.observed
+                        .send(format!("input-watermark-{side}-{watermark:?}"))
+                        .unwrap();
+                }
+                SignalMessage::Stop | SignalMessage::EndOfData => {
+                    self.observed
+                        .send(format!("input-terminal-{side}"))
+                        .unwrap();
+                }
+                SignalMessage::Barrier(_) => {}
+            }
+            Ok(())
+        }
+        fn check_event_input_eof(
+            &self,
+            side: usize,
+            counter: &CheckpointCounter,
+            _: &HashSet<usize>,
+        ) -> DataflowResult<()> {
+            if self.waiting.is_some() || self.processing || !counter.all_clear() {
+                return Err(anyhow!("EOF with unfinished event/checkpoint").into());
+            }
+            self.observed.send(format!("input-eof-{side}")).unwrap();
+            Ok(())
+        }
+        async fn process_batch(
+            &mut self,
+            _: RecordBatch,
+            _: &mut OperatorContext,
+            _: &mut dyn Collector,
+        ) -> DataflowResult<()> {
+            Err(anyhow!("pair probe received Data").into())
+        }
+        async fn process_response_index(
+            &mut self,
+            side: usize,
+            partitions: usize,
+            response: EventResponse,
+            _: &mut OperatorContext,
+            collector: &mut dyn Collector,
+        ) -> DataflowResult<()> {
+            assert_eq!(partitions, 2);
+            if let Some((first, context)) = self.waiting {
+                assert_ne!(first, side);
+                assert_eq!(context, response.context);
+                self.processing = true;
+                self.phase.store(2, Ordering::SeqCst);
+                self.observed.send("processing".into()).unwrap();
+                collector.collect_response(response).await?;
+                // Keep Processing through the ACTUAL awaited bounded collector.
+                self.processing = false;
+                self.waiting = None;
+                self.phase.store(0, Ordering::SeqCst);
+                self.delivered.notify_one();
+            } else {
+                self.waiting = Some((side, response.context));
+                self.phase.store(1, Ordering::SeqCst);
+                self.observed
+                    .send(format!("waiting-{side}-{}", response.context.sequence))
+                    .unwrap();
+            }
+            Ok(())
+        }
+        async fn handle_watermark(
+            &mut self,
+            watermark: Watermark,
+            _: &mut OperatorContext,
+            _: &mut dyn Collector,
+        ) -> DataflowResult<Option<Watermark>> {
+            let _ = watermark;
+            Ok(None)
+        }
+        fn is_committing(&self) -> bool {
+            self.committing
+        }
+        async fn handle_commit(
+            &mut self,
+            _: u32,
+            _: &HashMap<String, HashMap<u32, Vec<u8>>>,
+            _: &mut OperatorContext,
+        ) -> DataflowResult<()> {
+            self.observed.send("commit".into()).unwrap();
+            Ok(())
+        }
+        async fn handle_checkpoint(
+            &mut self,
+            _: CheckpointBarrier,
+            _: &mut OperatorContext,
+            _: &mut dyn Collector,
+        ) -> DataflowResult<()> {
+            self.observed.send("checkpoint".into()).unwrap();
+            Ok(())
+        }
+    }
+    fn response(sequence: u64) -> ArrowMessage {
+        ArrowMessage::Event(EventResponse {
+            native_body: None,
+            context: EventContext {
+                version: EVENT_RESPONSE_VERSION,
+                root_operator: 7,
+                root_subtask: 0,
+                attempt_nonce: [9; 16],
+                sequence,
+                trigger_nanos: 5,
+            },
+            rows: None,
+            touched_keys: None,
+        })
+    }
+    fn barrier(epoch: u32) -> ArrowMessage {
+        ArrowMessage::Signal(SignalMessage::Barrier(CheckpointBarrier {
+            epoch,
+            min_epoch: 0,
+            timestamp: SystemTime::UNIX_EPOCH,
+            then_stop: false,
+        }))
+    }
+    struct Running {
+        input: [crate::context::BatchSender; 2],
+        output: crate::context::BatchReceiver,
+        commands: Sender<ControlMessage>,
+        observed: tokio::sync::mpsc::UnboundedReceiver<String>,
+        events: Receiver<ControlResp>,
+        phase: Arc<AtomicUsize>,
+        delivered: Arc<Notify>,
+        task: tokio::task::JoinHandle<DataflowResult<Option<SignalMessage>>>,
+    }
+    impl Drop for Running {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+    impl Running {
+        async fn observe(&mut self) -> String {
+            tokio::time::timeout(Duration::from_secs(3), self.observed.recv())
+                .await
+                .unwrap()
+                .unwrap()
+        }
+        async fn alignment_started(&mut self) {
+            tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    match self.events.recv().await {
+                        Some(ControlResp::CheckpointEvent(event))
+                            if event.event_type == TaskCheckpointEventType::StartedAlignment =>
+                        {
+                            break;
+                        }
+                        Some(_) => {}
+                        None => panic!("run loop ended before actual checkpoint alignment"),
+                    }
+                }
+            })
+            .await
+            .unwrap();
+        }
+        async fn abort_drain(&mut self) {
+            self.task.abort();
+            let result = tokio::time::timeout(Duration::from_secs(3), &mut self.task)
+                .await
+                .unwrap();
+            assert!(result.is_err_and(|error| error.is_cancelled()));
+        }
+        async fn error(&mut self, message: &str) {
+            let result = tokio::time::timeout(Duration::from_secs(3), &mut self.task)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(result.unwrap_err().to_string().contains(message));
+        }
+    }
+    struct OrdinaryHead;
+    #[async_trait]
+    impl ArrowOperator for OrdinaryHead {
+        fn name(&self) -> String {
+            "ordinary-head-probe".into()
+        }
+        async fn process_batch(
+            &mut self,
+            _: RecordBatch,
+            _: &mut OperatorContext,
+            _: &mut dyn Collector,
+        ) -> DataflowResult<()> {
+            Ok(())
+        }
+    }
+    async fn start(restored: bool, block_output: bool) -> Running {
+        start_shape(restored, block_output, false).await
+    }
+    async fn start_shape(restored: bool, block_output: bool, pair_as_tail: bool) -> Running {
+        let (control, events) = tokio::sync::mpsc::channel(128);
+        let (commands, command_rx) = tokio::sync::mpsc::channel(8);
+        let (observed, observed_rx) = tokio::sync::mpsc::unbounded_channel();
+        let phase = Arc::new(AtomicUsize::new(0));
+        let delivered = Arc::new(Notify::new());
+        let task = Arc::new(TaskInfo {
+            job_id: format!(
+                "pair-runloop-{}-{}",
+                std::process::id(),
+                rand::random::<u64>()
+            ),
+            operator_idx: 97,
+            operator_name: "pair-probe".into(),
+            operator_id: "pair-probe".into(),
+            task_index: 0,
+            parallelism: 1,
+            key_range: 0..=u64::MAX,
+            checkpoint_file_path_layout: Default::default(),
+        });
+        let mut context = OperatorContext::new(
+            task.clone(),
+            None,
+            control.clone(),
+            2,
+            vec![],
+            None,
+            HashMap::new(),
+        )
+        .await;
+        if restored {
+            context.restore_commit_epoch = Some(7);
+        }
+        let mut operator = ChainedOperator::new(
+            Box::new(PairProbe {
+                waiting: None,
+                processing: false,
+                observed,
+                phase: phase.clone(),
+                delivered: delivered.clone(),
+                committing: restored,
+            }),
+            context,
+        );
+        if pair_as_tail {
+            let head_context = OperatorContext::new(
+                task.clone(),
+                None,
+                control.clone(),
+                2,
+                vec![],
+                None,
+                HashMap::new(),
+            )
+            .await;
+            let mut head = ChainedOperator::new(Box::new(OrdinaryHead), head_context);
+            head.next = Some(Box::new(operator));
+            operator = head;
+        }
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new(
+                "_timestamp",
+                arrow::datatypes::DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None),
+                false,
+            ),
+        ]));
+        let edge = Arc::new(EventEdgeSpec {
+            root_operator: 7,
+            root_subtask: 0,
+            schema: schema.clone(),
+            layout: EventLayout::Raw,
+        });
+        let info = Arc::new(ChainInfo {
+            job_id: task.job_id.clone(),
+            task_id: 97,
+            description: "pair-runloop-probe".into(),
+            task_index: 0,
+        });
+        let (out, output) = batch_bounded(1);
+        if block_output {
+            out.send(ArrowMessage::Signal(SignalMessage::Stop))
+                .await
+                .unwrap();
+        }
+        let mut collector = ArrowCollector::new(
+            info,
+            Some(Arc::new(arroyo_rpc::df::ArroyoSchema::new_unkeyed(
+                schema, 0,
+            ))),
+            vec![vec![out]],
+        );
+        collector.register_event_output(edge).unwrap();
+        let (left, left_rx) = batch_bounded(1);
+        let (right, right_rx) = batch_bounded(1);
+        let task = tokio::spawn(async move {
+            operator_run_behavior(
+                &mut operator,
+                &mut [left_rx, right_rx],
+                control,
+                command_rx,
+                &mut collector,
+                Arc::new(Barrier::new(1)),
+            )
+            .await
+        });
+        Running {
+            input: [left, right],
+            output,
+            commands,
+            observed: observed_rx,
+            events,
+            phase,
+            delivered,
+            task,
+        }
+    }
+
+    #[tokio::test]
+    async fn pair_runloop_parks_only_unmatched_side_and_retains_processing_through_collect() {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            for first in [0, 1] {
+                let mut run = start(false, true).await;
+                run.input[first]
+                    .send(ArrowMessage::Signal(SignalMessage::Watermark(
+                        Watermark::EventTime(SystemTime::UNIX_EPOCH),
+                    )))
+                    .await
+                    .unwrap();
+                assert!(run.observe().await.starts_with("input-watermark-"));
+                run.input[first].send(response(1)).await.unwrap();
+                assert_eq!(run.observe().await, format!("waiting-{first}-1"));
+                run.input[first].send(response(2)).await.unwrap();
+                let sender = run.input[first].clone();
+                let mut third = Box::pin(sender.send(response(3)));
+                assert!(futures::poll!(&mut third).is_pending());
+                let other = 1 - first;
+                for watermark in [
+                    Watermark::EventTime(SystemTime::UNIX_EPOCH),
+                    Watermark::Idle,
+                ] {
+                    run.input[other]
+                        .send(ArrowMessage::Signal(SignalMessage::Watermark(watermark)))
+                        .await
+                        .unwrap();
+                    assert!(run.observe().await.starts_with("input-watermark-"));
+                    assert_eq!(run.phase.load(Ordering::SeqCst), 1);
+                }
+                run.input[other].send(response(1)).await.unwrap();
+                assert_eq!(run.observe().await, "processing");
+                assert_eq!(run.phase.load(Ordering::SeqCst), 2);
+                assert!(futures::poll!(&mut third).is_pending());
+                assert_eq!(
+                    run.output.recv().await,
+                    Some(ArrowMessage::Signal(SignalMessage::Stop))
+                );
+                tokio::time::timeout(Duration::from_secs(3), run.delivered.notified())
+                    .await
+                    .unwrap();
+                assert_eq!(run.output.recv().await, Some(response(1)));
+                assert_eq!(run.observe().await, format!("waiting-{first}-2"));
+                tokio::time::timeout(Duration::from_secs(3), third)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                run.abort_drain().await;
+            }
+        })
+        .await
+        .expect("finite actual run-loop scenario timed out");
+    }
+    #[tokio::test]
+    async fn pair_runloop_pending_pair_rejects_barrier_and_terminal_overtake() {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            for control in [
+                barrier(1),
+                ArrowMessage::Signal(SignalMessage::Stop),
+                ArrowMessage::Signal(SignalMessage::EndOfData),
+            ] {
+                let mut run = start(false, false).await;
+                run.input[0].send(response(1)).await.unwrap();
+                assert_eq!(run.observe().await, "waiting-0-1");
+                run.input[1].send(control).await.unwrap();
+                run.error("barrier/terminal overtook").await;
+            }
+        })
+        .await
+        .expect("finite actual run-loop scenario timed out");
+    }
+    #[tokio::test]
+    async fn pair_runloop_unfinished_mate_eof_is_not_silent_success() {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let mut run = start(false, false).await;
+            run.input[0].send(response(1)).await.unwrap();
+            assert_eq!(run.observe().await, "waiting-0-1");
+            // Replacing and dropping the actual last sender closes indexed input1.
+            let (replacement, _unused) = batch_bounded(1);
+            drop(std::mem::replace(&mut run.input[1], replacement));
+            run.error("EOF with unfinished").await;
+        })
+        .await
+        .expect("finite actual run-loop scenario timed out");
+    }
+    #[tokio::test]
+    async fn pair_runloop_actual_counter_blocks_cross_prefix_response_in_both_orders() {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            for first in [0, 1] {
+                let mut run = start(false, false).await;
+                run.input[first].send(barrier(1)).await.unwrap();
+                run.alignment_started().await;
+                // FIFO watermark proves the other side remains pollable, while
+                // its response must fail the actual partially marked counter gate.
+                run.input[1 - first]
+                    .send(ArrowMessage::Signal(SignalMessage::Watermark(
+                        Watermark::Idle,
+                    )))
+                    .await
+                    .unwrap();
+                assert!(run.observe().await.starts_with("input-watermark-"));
+                run.input[1 - first].send(response(1)).await.unwrap();
+                run.error("checkpoint/terminal/park").await;
+            }
+        })
+        .await
+        .expect("finite actual run-loop scenario timed out");
+    }
+    #[tokio::test]
+    async fn pair_runloop_actual_aligned_checkpoint_releases_both_inputs() {
+        tokio::time::timeout(Duration::from_secs(15), async {
+        for first in [0,1] {
+            let mut run = start(false,false).await;
+            run.input[first].send(barrier(1)).await.unwrap();
+            run.alignment_started().await;
+            run.input[1-first].send(barrier(1)).await.unwrap();
+            assert_eq!(run.observe().await,"checkpoint");
+            let barrier = tokio::time::timeout(Duration::from_secs(3),run.output.recv()).await.unwrap().unwrap();
+            assert!(matches!(barrier,ArrowMessage::Signal(SignalMessage::Barrier(checkpoint)) if checkpoint.epoch==1));
+            run.input[first].send(response(1)).await.unwrap();
+            let waiting=run.observe().await;
+            assert_eq!(waiting,format!("waiting-{first}-1"));
+            run.input[1-first].send(response(1)).await.unwrap();
+            assert_eq!(run.observe().await,"processing");
+            assert_eq!(tokio::time::timeout(Duration::from_secs(3),run.output.recv()).await.unwrap(),Some(response(1)));
+            run.abort_drain().await;
+        }
+
+        }).await.expect("finite actual run-loop scenario timed out");
+    }
+    #[tokio::test]
+    async fn pair_runloop_restored_commit_precedes_responses_and_rejects_wrong_epoch() {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            for epoch in [7, 8] {
+                let mut run = start(true, false).await;
+                run.input[0].send(response(1)).await.unwrap();
+                assert!(matches!(
+                    tokio::time::timeout(Duration::from_secs(3), run.events.recv())
+                        .await
+                        .unwrap(),
+                    Some(ControlResp::TaskStarted { .. })
+                ));
+                run.commands
+                    .send(ControlMessage::Commit {
+                        epoch,
+                        commit_data: HashMap::new(),
+                    })
+                    .await
+                    .unwrap();
+                if epoch == 7 {
+                    assert_eq!(run.observe().await, "commit");
+                    assert_eq!(run.observe().await, "waiting-0-1");
+                    run.abort_drain().await;
+                } else {
+                    run.error("restore commit epoch mismatch").await;
+                    assert!(run.observed.try_recv().is_err());
+                }
+            }
+        })
+        .await
+        .expect("finite actual run-loop scenario timed out");
+    }
+    #[tokio::test]
+    async fn pair_runloop_terminal_side_cannot_be_bypassed_by_later_response() {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            for terminal in [SignalMessage::Stop, SignalMessage::EndOfData] {
+                let mut run = start(false, false).await;
+                run.input[0]
+                    .send(ArrowMessage::Signal(terminal))
+                    .await
+                    .unwrap();
+                assert_eq!(run.observe().await, "input-terminal-0");
+                run.input[1].send(response(1)).await.unwrap();
+                run.error("checkpoint/terminal/park").await;
+            }
+        })
+        .await
+        .expect("finite terminal scenario");
+    }
+    #[tokio::test]
+    async fn pair_runloop_rejects_pair_chained_after_ordinary_head() {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let mut run = start_shape(false, false, true).await;
+            run.error("physical chain head").await;
+            assert!(run.observed.try_recv().is_err());
+        })
+        .await
+        .expect("finite physical head scenario");
+    }
+
+    #[tokio::test]
+    async fn pair_runloop_barrier_after_either_terminal_cannot_finish_successfully() {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            for first in [0, 1] {
+                for explicit in [false, true] {
+                    let mut run = start(false, false).await;
+                    if explicit {
+                        run.input[first]
+                            .send(ArrowMessage::Signal(SignalMessage::EndOfData))
+                            .await
+                            .unwrap();
+                        assert_eq!(run.observe().await, format!("input-terminal-{first}"));
+                    } else {
+                        let (replacement, _unused) = batch_bounded(1);
+                        drop(std::mem::replace(&mut run.input[first], replacement));
+                        assert_eq!(run.observe().await, format!("input-eof-{first}"));
+                    }
+                    // A real trailing watermark on the live mate is allowed.
+                    run.input[1 - first]
+                        .send(ArrowMessage::Signal(SignalMessage::Watermark(
+                            Watermark::Idle,
+                        )))
+                        .await
+                        .unwrap();
+                    assert!(run.observe().await.starts_with("input-watermark-"));
+                    run.input[1 - first].send(barrier(1)).await.unwrap();
+                    run.error("barrier follows a terminal branch input").await;
+                    assert!(
+                        run.observed.try_recv().is_err(),
+                        "terminal barrier must not checkpoint or invoke event callback"
+                    );
+                }
+            }
+        })
+        .await
+        .expect("finite terminal-to-barrier scenario");
     }
 }

@@ -1,4 +1,6 @@
 //! Native, event-driven retained table planning. No storage or runtime SQL lives here.
+#[path = "merge_event_source.rs"]
+pub(crate) mod event_source;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -18,7 +20,7 @@ use sqlparser::tokenizer::Token;
 
 use crate::extension::state_table::{StateTableAccess, StateTableClause, StateTableDescriptor};
 use crate::tables::{Table, produce_optimized_plan};
-use crate::{ArroyoSchemaProvider, parse_sql, rewrite_plan};
+use crate::{ArroyoSchemaProvider, parse_sql};
 
 #[derive(Debug)]
 pub(crate) struct NamedMerge {
@@ -278,6 +280,7 @@ pub(crate) fn bind_keys(
 pub(crate) fn plan_named_merge(
     merge: NamedMerge,
     provider: &ArroyoSchemaProvider,
+    response_route_slot: u32,
 ) -> Result<(Table, LogicalPlan)> {
     let expected = ["source", "old", "new", "action"];
     if merge.returning.len() != expected.len() || !merge.returning.iter().zip(expected).all(|(item, name)| {
@@ -312,10 +315,13 @@ pub(crate) fn plan_named_merge(
     // never a separately regenerated source query or a relookup of old/new.
     let source_sql = format!("SELECT * FROM {source}");
     let source_statement = parse_sql(&source_sql)?.remove(0);
-    let input = rewrite_plan(
-        produce_optimized_plan(&source_statement, provider)?,
-        provider,
-    )?;
+    let input = crate::rewriters::bind_event_clocks(event_source::resolve_with_slot(
+        response_route_slot,
+        crate::rewrite_plan_deferred_clocks(
+            produce_optimized_plan(&source_statement, provider)?,
+            provider,
+        )?,
+    )?)?;
     if input
         .schema()
         .has_column_with_unqualified_name(arroyo_rpc::UPDATING_META_FIELD)
@@ -362,9 +368,8 @@ pub(crate) fn plan_named_merge(
             .as_ref()
             .map(|sql| expression(sql, &expression_schema, provider))
             .transpose()?;
-        if predicate
-            .as_ref()
-            .is_some_and(|e| e.get_type(&expression_schema).ok() != Some(DataType::Boolean))
+        if let Some(predicate) = &predicate
+            && predicate.get_type(&expression_schema)? != DataType::Boolean
         {
             return plan_err!("MERGE WHEN predicate must be boolean");
         }

@@ -5,6 +5,7 @@ use crate::physical::ArroyoPhysicalExtensionCodec;
 use arroyo_datastream::logical::{LogicalEdge, LogicalEdgeType, LogicalNode, OperatorName};
 use arroyo_rpc::config::config;
 use arroyo_rpc::{df::ArroyoSchema, grpc::api::UpdatingAggregateOperator};
+use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion::common::{DFSchemaRef, Result, TableReference, ToDFSchema, plan_err};
 use datafusion::logical_expr::expr::ScalarFunction;
 use datafusion::logical_expr::{
@@ -30,6 +31,8 @@ pub(crate) struct UpdatingAggregateExtension {
     pub(crate) timestamp_qualifier: Option<TableReference>,
     pub(crate) ttl: Option<Duration>,
     pub(crate) calendar_aggregates: Vec<crate::plan::CalendarAggregate>,
+    pub(crate) emit_per_event: bool,
+    pub(crate) response_route: Option<crate::merge_event_branches::ResponseRoute>,
 }
 
 impl UpdatingAggregateExtension {
@@ -54,6 +57,8 @@ impl UpdatingAggregateExtension {
             timestamp_qualifier,
             ttl,
             calendar_aggregates,
+            emit_per_event: false,
+            response_route: None,
         })
     }
 }
@@ -102,17 +107,33 @@ impl UserDefinedLogicalNodeCore for UpdatingAggregateExtension {
         _exprs: Vec<datafusion::prelude::Expr>,
         inputs: Vec<LogicalPlan>,
     ) -> Result<Self> {
-        Self::new(
+        let mut next = Self::new(
             inputs[0].clone(),
             self.key_fields.clone(),
             self.timestamp_qualifier.clone(),
             self.ttl,
             self.calendar_aggregates.clone(),
-        )
+        )?;
+        if self.emit_per_event {
+            next.emit_per_event = true;
+            next.final_calculation = next.aggregate.clone();
+        }
+        next.response_route = self.response_route;
+        Ok(next)
     }
 }
 
 impl ArroyoExtension for UpdatingAggregateExtension {
+    fn response_root_slot(&self) -> Option<u32> {
+        self.response_route.map(|route| route.slot)
+    }
+    fn bind_response_root(&self, operator: u32) -> Result<Option<Box<dyn ArroyoExtension>>> {
+        let mut next = self.clone();
+        if let Some(route) = &mut next.response_route {
+            route.operator = Some(operator);
+        }
+        Ok(Some(Box::new(next)))
+    }
     fn node_name(&self) -> Option<NamedNode> {
         None
     }
@@ -131,6 +152,55 @@ impl ArroyoExtension for UpdatingAggregateExtension {
         }
 
         let input_schema = input_schemas[0].clone();
+        if self.emit_per_event
+            && input_schema
+                .schema
+                .index_of(arroyo_rpc::UPDATING_META_FIELD)
+                .is_ok()
+        {
+            // Extension boundaries become separate memory readers in physical
+            // plans. Check EVERY segment down to the source, not just the last.
+            self.aggregate.apply(|node| {
+                if let LogicalPlan::Extension(extension) = node {
+                    let input = if let Some(watermark) = extension
+                        .node
+                        .as_any()
+                        .downcast_ref::<super::watermark_node::WatermarkNode>(
+                    ) {
+                        if !watermark.preserve_source_envelope {
+                            return plan_err!(
+                                "per-event correction watermark drops source envelope"
+                            );
+                        }
+                        Some(&watermark.input)
+                    } else if let Some(remote) = extension
+                        .node
+                        .as_any()
+                        .downcast_ref::<super::remote_table::RemoteTableExtension>(
+                    ) {
+                        Some(&remote.input)
+                    } else {
+                        extension
+                            .node
+                            .as_any()
+                            .downcast_ref::<super::key_calculation::KeyCalculationExtension>()
+                            .map(|key| &key.input)
+                    };
+                    if let Some(input) = input {
+                        crate::physical::validate_complete_source_batch(
+                            planner.sync_plan(input)?.as_ref(),
+                        )?;
+                    }
+                }
+                Ok(TreeNodeRecursion::Continue)
+            })?;
+            let LogicalPlan::Aggregate(aggregate) = &self.aggregate else {
+                return plan_err!("per-event correction requires aggregate input");
+            };
+            crate::physical::validate_complete_source_batch(
+                planner.sync_plan(&aggregate.input)?.as_ref(),
+            )?;
+        }
         let input_dfschema = input_schema.schema.clone().to_dfschema()?;
 
         let aggregate_exec = PhysicalPlanNode::try_from_physical_plan(
@@ -234,6 +304,17 @@ impl ArroyoExtension for UpdatingAggregateExtension {
             })
             .collect::<Result<Vec<_>>>()?;
         let config = UpdatingAggregateOperator {
+            response_root_operator: self
+                .response_route
+                .map(|route| {
+                    route.operator.ok_or_else(|| {
+                        datafusion::common::plan_datafusion_err!(
+                            "response aggregate has no bound graph root"
+                        )
+                    })
+                })
+                .transpose()?,
+            emit_per_event: self.emit_per_event,
             calendar_aggregates,
             collection_output_limits,
             name: "UpdatingAggregate".to_string(),
@@ -259,7 +340,14 @@ impl ArroyoExtension for UpdatingAggregateExtension {
             1,
         );
 
-        let edge = LogicalEdge::project_all(LogicalEdgeType::Shuffle, (*input_schema).clone());
+        let edge = LogicalEdge::project_all(
+            if self.response_route.is_some() {
+                LogicalEdgeType::Forward
+            } else {
+                LogicalEdgeType::Shuffle
+            },
+            (*input_schema).clone(),
+        );
 
         Ok(NodeWithIncomingEdges {
             node,

@@ -9,8 +9,9 @@ use arroyo_datastream::logical::{
 };
 use arroyo_rpc::df::{ArroyoSchema, ArroyoSchemaRef};
 use arroyo_rpc::grpc::api::{
-    FusedStateTableOperator, FusedStateTableStep, ProjectionOperator, StateTableCaptureOperator,
-    StateTableDefinition, StateTableOperator, ValuePlanOperator,
+    FusedStateTableOperator, FusedStateTableStep, JoinOperator, KeyPlanOperator,
+    ProjectionOperator, StateTableCaptureOperator, StateTableDefinition, StateTableOperator,
+    UpdatingAggregateOperator, ValuePlanOperator,
 };
 use datafusion::common::{DataFusionError, Result};
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
@@ -63,6 +64,16 @@ fn reject(message: impl Into<String>) -> DataFusionError {
 /// union, join, repartition, table scan, arbitrary UDF, and row-expanding
 /// nodes remain unsupported. An operator name alone cannot prove this.
 pub(crate) trait ScalarPlanAdmission {
+    fn admit_join_key(
+        &self,
+        _plan: &KeyPlanOperator,
+        _input: &ArroyoSchemaRef,
+        _output: &ArroyoSchemaRef,
+    ) -> Result<()> {
+        Err(reject(
+            "native JOIN key projection requires concrete physical admission",
+        ))
+    }
     fn admit_projection(
         &self,
         plan: &ProjectionOperator,
@@ -361,6 +372,37 @@ fn admit_plan(
 }
 
 impl ScalarPlanAdmission for BoundedScalarAdmission<'_> {
+    fn admit_join_key(
+        &self,
+        plan: &KeyPlanOperator,
+        input: &ArroyoSchemaRef,
+        output: &ArroyoSchemaRef,
+    ) -> Result<()> {
+        validate_join_key_fields(plan, output)?;
+        let proto = PhysicalPlanNode::decode(plan.physical_plan.as_slice())
+            .map_err(|error| reject(format!("invalid native JOIN key projection: {error}")))?;
+        let runtime = RuntimeEnvBuilder::new().build_arc()?;
+        let physical = proto.try_into_physical_plan(
+            self.registry,
+            &runtime,
+            &crate::physical::ArroyoPhysicalExtensionCodec {
+                context: crate::physical::DecodingContext::Planning,
+            },
+        )?;
+        let mut inputs = 0;
+        admit_native_key_plan(physical.as_ref(), &mut inputs, &input.schema)?;
+        if inputs != 1 {
+            return Err(reject(
+                "native JOIN key plan requires exactly one side input",
+            ));
+        }
+        let projection = physical
+            .as_any()
+            .downcast_ref::<ProjectionExec>()
+            .ok_or_else(|| reject("native JOIN keys require their canonical projection"))?;
+        validate_join_key_projection(projection, plan.key_fields.len(), input, output)
+    }
+
     fn admit_projection(
         &self,
         plan: &ProjectionOperator,
@@ -611,12 +653,314 @@ fn ownership_signature(access: &StateTableOperator) -> Result<(Vec<String>, Vec<
     Ok((access.ownership_bindings.clone(), types))
 }
 
+// These native operators are outside the fused state owner. Logical route
+// validation already proves scalar repeatability; do not impose the owner's
+// narrower SQL-function admission policy on native execution.
+fn admit_native_key_plan(
+    plan: &dyn ExecutionPlan,
+    input_count: &mut usize,
+    expected_input: &SchemaRef,
+) -> Result<()> {
+    if plan.as_any().is::<crate::physical::ArroyoMemExec>() {
+        if plan.schema().as_ref() != expected_input.as_ref() || !plan.children().is_empty() {
+            return Err(reject("native JOIN key input differs from its graph edge"));
+        }
+        *input_count += 1;
+        return Ok(());
+    }
+    if !plan.as_any().is::<ProjectionExec>() && !plan.as_any().is::<FilterExec>() {
+        return Err(reject(
+            "native JOIN key plan can expand, reorder, or retain side input",
+        ));
+    }
+    let children = plan.children();
+    if children.len() != 1 {
+        return Err(reject("native JOIN key plan requires one scalar child"));
+    }
+    admit_native_key_plan(children[0].as_ref(), input_count, expected_input)
+}
+
+fn validate_join_key_projection(
+    projection: &ProjectionExec,
+    count: usize,
+    input: &ArroyoSchemaRef,
+    output: &ArroyoSchemaRef,
+) -> Result<()> {
+    use datafusion::physical_expr::expressions::Column;
+    let width = input.schema.fields().len();
+    let total = count
+        .checked_add(width)
+        .ok_or_else(|| reject("native JOIN projection width overflow"))?;
+    let timestamp = count
+        .checked_add(input.timestamp_index)
+        .ok_or_else(|| reject("native JOIN projection timestamp overflow"))?;
+    if projection.input().schema() != input.schema
+        || projection.expr().len() != total
+        || output.schema.fields().len() != total
+        || output.timestamp_index != timestamp
+        || projection.schema() != output.schema
+        || output.schema.metadata() != input.schema.metadata()
+    {
+        return Err(reject(
+            "native JOIN key adapter must retain its full unchanged input suffix",
+        ));
+    }
+    for index in 0..width {
+        let (expression, _) = &projection.expr()[count + index];
+        if expression
+            .as_any()
+            .downcast_ref::<Column>()
+            .is_none_or(|column| column.index() != index)
+            || output.schema.field(count + index) != input.schema.field(index)
+        {
+            return Err(reject(
+                "native JOIN key adapter suffix must copy each input column exactly once in order",
+            ));
+        }
+    }
+    let mut copied = BTreeSet::new();
+    for index in 0..count {
+        let (expression, _) = &projection.expr()[index];
+        let column = expression
+            .as_any()
+            .downcast_ref::<Column>()
+            .ok_or_else(|| reject("native JOIN grouping keys must be direct copied columns"))?;
+        let original = column.index();
+        if original >= width
+            || !copied.insert(original)
+            || output.schema.field(index).name() != &format!("_key_{index}")
+            || input.schema.field(original).is_nullable()
+            || output.schema.field(index).data_type() != input.schema.field(original).data_type()
+            || output.schema.field(index).is_nullable()
+        {
+            return Err(reject(
+                "native JOIN key prefix must copy distinct nonnull grouping columns from its unchanged suffix",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_join_key_fields(plan: &KeyPlanOperator, output: &ArroyoSchemaRef) -> Result<()> {
+    let declared: arroyo_rpc::grpc::api::ArroyoSchema = output.as_ref().clone().into();
+    let count = plan.key_fields.len();
+    let count_u64 = u64::try_from(count).map_err(|_| reject("native JOIN key arity overflow"))?;
+    let minimum_fields = count
+        .checked_mul(2)
+        .ok_or_else(|| reject("native JOIN key width overflow"))?;
+    if count == 0
+        || plan.key_fields.iter().copied().ne(0..count_u64)
+        || !declared.has_keys
+        || declared
+            .key_indices
+            .iter()
+            .copied()
+            .map(u64::from)
+            .ne(plan.key_fields.iter().copied())
+        || output.schema.fields().len() < minimum_fields
+    {
+        return Err(reject(
+            "native JOIN key adapter must retain the complete ordered leading key tuple",
+        ));
+    }
+    Ok(())
+}
+
+// The accepted JOIN emits ordinary append Data to a separate serial owner.
+// Its native inputs and state kernels are never members of the fused region.
+fn accepted_join_boundary(
+    graph: &LogicalGraph,
+    boundary: NodeIndex,
+    join: &JoinOperator,
+    admission: &dyn ScalarPlanAdmission,
+) -> Result<bool> {
+    let Some(root) = join.response_root_operator else {
+        if join.accepted_output_schema.is_some() {
+            return Err(reject("accepted JOIN boundary has no response root"));
+        }
+        return Ok(false);
+    };
+    crate::merge_event_branches::validate_graph(graph)?;
+    let accepted: ArroyoSchema = join
+        .accepted_output_schema
+        .clone()
+        .ok_or_else(|| reject("accepted JOIN boundary has no public schema"))?
+        .try_into()?;
+    if graph[boundary].parallelism != 1
+        || step_output_schema(graph, boundary)?.as_ref() != &accepted
+        || graph
+            .edges_directed(boundary, Outgoing)
+            .any(|edge| edge.weight().edge_type != LogicalEdgeType::Forward)
+    {
+        return Err(reject(
+            "accepted JOIN boundary output differs from its declared append schema",
+        ));
+    }
+    let inputs = graph.edges_directed(boundary, Incoming).collect::<Vec<_>>();
+    if inputs.len() != 2
+        || inputs
+            .iter()
+            .filter(|edge| edge.weight().edge_type == LogicalEdgeType::LeftJoin)
+            .count()
+            != 1
+        || inputs
+            .iter()
+            .filter(|edge| edge.weight().edge_type == LogicalEdgeType::RightJoin)
+            .count()
+            != 1
+    {
+        return Err(reject(
+            "accepted JOIN boundary requires one native input per side",
+        ));
+    }
+    let mut aggregates = BTreeSet::new();
+    let mut key_arity = None;
+    for edge in inputs {
+        let declared = match edge.weight().edge_type {
+            LogicalEdgeType::LeftJoin => &join.left_schema,
+            LogicalEdgeType::RightJoin => &join.right_schema,
+            _ => unreachable!("input sides checked above"),
+        };
+        let declared: ArroyoSchema = declared
+            .clone()
+            .ok_or_else(|| reject("accepted JOIN input lacks its native schema"))?
+            .try_into()?;
+        if edge.weight().schema.as_ref() != &declared {
+            return Err(reject("accepted JOIN input differs from its native schema"));
+        }
+        let mut current = edge.source();
+        let mut seen = BTreeSet::new();
+        let mut key_seen = false;
+        loop {
+            if !seen.insert(current.index()) || graph[current].parallelism != 1 {
+                return Err(reject(
+                    "accepted JOIN input requires acyclic singleton lineage",
+                ));
+            }
+            let operator = single_operator(graph, current)?;
+            if operator.operator_name == OperatorName::UpdatingAggregate {
+                let aggregate =
+                    UpdatingAggregateOperator::decode(operator.operator_config.as_slice())
+                        .map_err(|error| {
+                            reject(format!("invalid response aggregate boundary: {error}"))
+                        })?;
+                if aggregate.response_root_operator != Some(root)
+                    || aggregate.emit_per_event
+                    || aggregate.retain_indefinitely != Some(true)
+                    || aggregate.ttl_micros != 0
+                    || !aggregates.insert(current.index())
+                    || !key_seen
+                {
+                    return Err(reject(
+                        "accepted JOIN requires two distinct matching native response aggregates",
+                    ));
+                }
+                break;
+            }
+            if operator.operator_name == OperatorName::ArrowKey && current == edge.source() {
+                let plan = KeyPlanOperator::decode(operator.operator_config.as_slice())
+                    .map_err(|error| reject(format!("invalid native JOIN key adapter: {error}")))?;
+                let (parent, incoming) = only_parent(graph, current)?;
+                let output = step_output_schema(graph, current)?;
+                admission.admit_join_key(&plan, &incoming.schema, &output)?;
+                if key_arity
+                    .replace(plan.key_fields.len())
+                    .is_some_and(|previous| previous != plan.key_fields.len())
+                {
+                    return Err(reject(
+                        "native JOIN sides require equal full grouping arity",
+                    ));
+                }
+                key_seen = true;
+                current = parent;
+                continue;
+            }
+            if !matches!(
+                operator.operator_name,
+                OperatorName::ArrowValue | OperatorName::Projection
+            ) {
+                return Err(reject(format!(
+                    "accepted JOIN input node {} contains non-scalar {:?} work after its aggregate",
+                    graph[current].node_id, operator.operator_name,
+                )));
+            }
+            current = only_parent(graph, current)?.0;
+        }
+    }
+    Ok(true)
+}
+
 fn is_valid_input_boundary(
     graph: &LogicalGraph,
     boundary: NodeIndex,
     admission: &dyn ScalarPlanAdmission,
 ) -> Result<bool> {
     let operator = single_operator(graph, boundary)?;
+    if operator.operator_name == OperatorName::Join {
+        let join = JoinOperator::decode(operator.operator_config.as_slice())
+            .map_err(|error| reject(format!("invalid JOIN input boundary: {error}")))?;
+        return accepted_join_boundary(graph, boundary, &join, admission);
+    }
+    if operator.operator_name == OperatorName::UpdatingAggregate {
+        let aggregate = UpdatingAggregateOperator::decode(operator.operator_config.as_slice())
+            .map_err(|error| reject(format!("invalid aggregate input boundary: {error}")))?;
+        if !aggregate.emit_per_event {
+            return Ok(false);
+        }
+        let incoming = graph.edges_directed(boundary, Incoming).collect::<Vec<_>>();
+        if graph[boundary].parallelism != 1
+            || incoming.len() != 1
+            || aggregate.retain_indefinitely != Some(true)
+        {
+            return Err(reject(
+                "aggregate event-result boundary requires singleton input and indefinite retention",
+            ));
+        }
+        if incoming[0]
+            .weight()
+            .schema
+            .schema
+            .index_of(arroyo_rpc::UPDATING_META_FIELD)
+            .is_ok()
+        {
+            let mut current = incoming[0].source();
+            let mut seen = BTreeSet::new();
+            loop {
+                if !seen.insert(current.index()) || graph[current].parallelism != 1 {
+                    return Err(reject(
+                        "per-event correction lineage requires acyclic singleton tasks",
+                    ));
+                }
+                let operation = single_operator(graph, current)?;
+                let parents = graph.edges_directed(current, Incoming).collect::<Vec<_>>();
+                if operation.operator_name == OperatorName::ConnectorSource {
+                    if !parents.is_empty() {
+                        return Err(reject("per-event correction source is not a root"));
+                    }
+                    break;
+                }
+                if !matches!(
+                    operation.operator_name,
+                    OperatorName::ArrowValue
+                        | OperatorName::ArrowKey
+                        | OperatorName::Projection
+                        | OperatorName::ExpressionWatermark
+                ) || parents.len() != 1
+                {
+                    return Err(reject(
+                        "per-event correction requires a direct batch-preserving source lineage",
+                    ));
+                }
+                // One destination invokes the collector's identity path even
+                // for the aggregate key edge. No keyed reorder is permitted.
+                current = parents[0].source();
+            }
+        }
+        // The logical route validates one direct source and COUNT/MAX. The
+        // aggregate remains a separate owner; only its accepted rows enter
+        // this fused region, in their original input order.
+        return Ok(true);
+    }
     let mut current = match operator.operator_name {
         OperatorName::ConnectorSource => boundary,
         OperatorName::ExpressionWatermark => only_parent(graph, boundary)?.0,
@@ -1464,6 +1808,169 @@ FROM applied r WHERE r.source.selected_for_output;
             source,
             target,
             LogicalEdge::project_all(LogicalEdgeType::Forward, schema()),
+        );
+    }
+
+    #[test]
+    fn native_join_key_projection_maps_reordered_side_and_rejects_forged_suffix() {
+        use datafusion::physical_expr::expressions::Column;
+        let input = std::sync::Arc::new(ArroyoSchema::new_unkeyed(
+            std::sync::Arc::new(Schema::new(vec![
+                arrow_schema::Field::new("total", DataType::Int64, false),
+                arrow_schema::Field::new("k", DataType::Utf8, false),
+                schema().schema.field(1).clone(),
+            ])),
+            2,
+        ));
+        let make_projection = |suffix: &[usize]| {
+            let mut expressions: Vec<(std::sync::Arc<dyn PhysicalExpr>, String)> =
+                vec![(std::sync::Arc::new(Column::new("k", 1)), "_key_0".into())];
+            for (position, index) in suffix.iter().copied().enumerate() {
+                expressions.push((
+                    std::sync::Arc::new(Column::new(input.schema.field(index).name(), index)),
+                    input.schema.field(position).name().clone(),
+                ));
+            }
+            ProjectionExec::try_new(
+                expressions,
+                std::sync::Arc::new(crate::physical::ArroyoMemExec::new(
+                    "join-side".into(),
+                    input.schema.clone(),
+                )),
+            )
+            .unwrap()
+        };
+        let projection = make_projection(&[0, 1, 2]);
+        let output = std::sync::Arc::new(
+            ArroyoSchema::from_schema_keys(projection.schema(), vec![0]).unwrap(),
+        );
+        validate_join_key_projection(&projection, 1, &input, &output).unwrap();
+        for suffix in [&[1, 0, 2][..], &[0, 0, 2][..]] {
+            let projection = make_projection(suffix);
+            let output = std::sync::Arc::new(
+                ArroyoSchema::from_schema_keys(projection.schema(), vec![0]).unwrap(),
+            );
+            assert!(validate_join_key_projection(&projection, 1, &input, &output).is_err());
+        }
+        let expressions: Vec<(std::sync::Arc<dyn PhysicalExpr>, String)> = vec![
+            (std::sync::Arc::new(Column::new("k", 1)), "_key_0".into()),
+            (std::sync::Arc::new(Column::new("k", 1)), "k".into()),
+            (
+                std::sync::Arc::new(Column::new("_timestamp", 2)),
+                "_timestamp".into(),
+            ),
+        ];
+        let missing = ProjectionExec::try_new(
+            expressions,
+            std::sync::Arc::new(crate::physical::ArroyoMemExec::new(
+                "join-side".into(),
+                input.schema.clone(),
+            )),
+        )
+        .unwrap();
+        let output =
+            std::sync::Arc::new(ArroyoSchema::from_schema_keys(missing.schema(), vec![0]).unwrap());
+        assert!(validate_join_key_projection(&missing, 1, &input, &output).is_err());
+    }
+
+    #[test]
+    fn native_join_key_suffix_ordinals_are_checked_even_with_identical_types() {
+        use datafusion::physical_expr::expressions::Column;
+        let input = std::sync::Arc::new(ArroyoSchema::new_unkeyed(
+            std::sync::Arc::new(Schema::new(vec![
+                arrow_schema::Field::new("total", DataType::Int64, false),
+                arrow_schema::Field::new("k", DataType::Int64, false),
+                schema().schema.field(1).clone(),
+            ])),
+            2,
+        ));
+        let make_projection = |suffix: &[usize]| {
+            let mut expressions: Vec<(std::sync::Arc<dyn PhysicalExpr>, String)> =
+                vec![(std::sync::Arc::new(Column::new("k", 1)), "_key_0".into())];
+            for (position, index) in suffix.iter().copied().enumerate() {
+                expressions.push((
+                    std::sync::Arc::new(Column::new(input.schema.field(index).name(), index)),
+                    input.schema.field(position).name().clone(),
+                ));
+            }
+            ProjectionExec::try_new(
+                expressions,
+                std::sync::Arc::new(crate::physical::ArroyoMemExec::new(
+                    "same-type-join-side".into(),
+                    input.schema.clone(),
+                )),
+            )
+            .unwrap()
+        };
+        let valid = make_projection(&[0, 1, 2]);
+        let output =
+            std::sync::Arc::new(ArroyoSchema::from_schema_keys(valid.schema(), vec![0]).unwrap());
+        validate_join_key_projection(&valid, 1, &input, &output).unwrap();
+        for suffix in [&[1, 0, 2][..], &[0, 0, 2][..]] {
+            let forged = make_projection(suffix);
+            assert_eq!(forged.schema(), valid.schema());
+            assert_eq!(
+                validate_join_key_projection(&forged, 1, &input, &output)
+                    .expect_err("schema-identical forged suffix must reject")
+                    .to_string(),
+                reject("native JOIN key adapter suffix must copy each input column exactly once in order").to_string()
+            );
+        }
+    }
+
+    #[test]
+    fn native_join_key_adapter_requires_complete_ordered_output_keys() {
+        let output = std::sync::Arc::new(
+            ArroyoSchema::from_schema_keys(schema().schema.clone(), vec![0]).unwrap(),
+        );
+        let mut plan = KeyPlanOperator {
+            key_fields: vec![0],
+            ..Default::default()
+        };
+        validate_join_key_fields(&plan, &output).unwrap();
+        plan.key_fields = vec![1];
+        assert!(validate_join_key_fields(&plan, &output).is_err());
+        plan.key_fields.clear();
+        assert!(validate_join_key_fields(&plan, &output).is_err());
+        plan.key_fields = vec![0, 1];
+        assert!(validate_join_key_fields(&plan, &output).is_err());
+        plan.key_fields = vec![0];
+        assert!(validate_join_key_fields(&plan, &std::sync::Arc::new(schema())).is_err());
+    }
+
+    #[test]
+    fn ordinary_join_is_not_a_serial_owner_input_boundary() {
+        let mut graph = LogicalGraph::new();
+        let source = graph.add_node(node(
+            0,
+            OperatorName::Join,
+            JoinOperator::default().encode_to_vec(),
+        ));
+        let target = graph.add_node(access(1, "target", false));
+        forward(&mut graph, source, target);
+        assert!(
+            analyze(&graph, &AdmitTestScalar)
+                .expect_err("ordinary JOIN must retain its rejection")
+                .to_string()
+                .contains("unsupported Join between related state accesses")
+        );
+    }
+
+    #[test]
+    fn incomplete_accepted_join_cannot_be_an_owner_boundary() {
+        let mut graph = LogicalGraph::new();
+        let join = JoinOperator {
+            accepted_output_schema: Some(schema().into()),
+            ..Default::default()
+        };
+        let source = graph.add_node(node(0, OperatorName::Join, join.encode_to_vec()));
+        let target = graph.add_node(access(1, "target", false));
+        forward(&mut graph, source, target);
+        assert!(
+            analyze(&graph, &AdmitTestScalar)
+                .expect_err("accepted schema alone is not an admission proof")
+                .to_string()
+                .contains("accepted JOIN boundary has no response root")
         );
     }
 

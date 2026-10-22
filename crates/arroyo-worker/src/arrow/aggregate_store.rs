@@ -3,6 +3,8 @@
 //! The operator supplies versioned keys and values. This module owns only the
 //! admission, read-your-writes overlay, prefix cursor, and ordered write batch.
 use anyhow::{Context, Result, ensure};
+#[path = "aggregate_scan_diagnostics.rs"]
+pub(super) mod scan_diagnostics;
 use arroyo_state::live::{
     LiveStateBackend, ReadOptions, ScanRange, ScanRequest, StateKey, StateNamespace, StateSnapshot,
     checkpoint::checkpoint_decoded_reservation,
@@ -81,6 +83,8 @@ pub(crate) struct AggregateScope<'a> {
     overlay_bytes: usize,
     member_progress: Option<AggregateMemberProgress>,
     _decoded_permit: ResourcePermit,
+    // Last field: prior ownership/permit fields release before this marker.
+    diagnostic: Option<scan_diagnostics::ScopeProbe>,
 }
 
 /// Maximum zero-escaped key framing, using the backend's namespace codec.
@@ -264,6 +268,8 @@ impl AggregateStore {
         } else {
             None
         };
+        let diagnostic =
+            scan_diagnostics::ScopeProbe::new(self.table.namespace(), snapshot.as_ref());
         Ok(AggregateScope {
             store: self,
             snapshot,
@@ -272,6 +278,7 @@ impl AggregateStore {
             overlay_bytes: 0,
             member_progress: None,
             _decoded_permit: decoded,
+            diagnostic,
         })
     }
 
@@ -430,7 +437,14 @@ impl AggregateScope<'_> {
                 key.len() == prefix.len().saturating_add(8) && key.starts_with(prefix)
             })
         });
-        self.first_from(prefix, after).await
+        self.first_from_bounded_entries(
+            prefix,
+            after,
+            None,
+            self.store.limits.page_entries,
+            "retraction_R",
+        )
+        .await
     }
 
     /// Stage only a successfully validated pair of primary/secondary deletes.
@@ -454,6 +468,18 @@ impl AggregateScope<'_> {
         self.first_from(prefix, None).await
     }
 
+    pub async fn first_tagged(
+        &self,
+        prefix: &[u8],
+        reason: &'static str,
+    ) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+        self.first_from_bounded_entries(prefix, None, None, self.store.limits.page_entries, reason)
+            .await
+    }
+    pub fn diagnostic_scope_id(&self) -> Option<u64> {
+        self.diagnostic.as_ref().map(|probe| probe.id)
+    }
+
     pub async fn first_from(
         &self,
         prefix: &[u8],
@@ -469,7 +495,7 @@ impl AggregateScope<'_> {
         after: Option<&[u8]>,
         end: Option<&[u8]>,
     ) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
-        self.first_from_bounded_entries(prefix, after, end, self.store.limits.page_entries)
+        self.first_from_bounded_entries(prefix, after, end, self.store.limits.page_entries, "other")
             .await
     }
 
@@ -480,8 +506,14 @@ impl AggregateScope<'_> {
         &self,
         after: Option<&[u8]>,
     ) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
-        self.first_from_bounded_entries(b"D", after, None, 1 + usize::from(after.is_some()))
-            .await
+        self.first_from_bounded_entries(
+            b"D",
+            after,
+            None,
+            1 + usize::from(after.is_some()),
+            "dirty",
+        )
+        .await
     }
 
     async fn first_from_bounded_entries(
@@ -490,7 +522,11 @@ impl AggregateScope<'_> {
         after: Option<&[u8]>,
         end: Option<&[u8]>,
         entries: usize,
+        reason: &'static str,
     ) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+        if let Some(probe) = &self.diagnostic {
+            probe.first(reason, prefix, after, end);
+        }
         let snapshot = self
             .snapshot
             .as_ref()
@@ -639,7 +675,23 @@ impl AggregateScope<'_> {
     }
 
     pub async fn commit(self) -> Result<()> {
-        self.store.backend.write_admitted(self.writes).await?;
+        if let Some(probe) = &self.diagnostic {
+            probe.event("commit_begin");
+        }
+        let result = self.store.backend.write_admitted(self.writes).await;
+        if let Some(probe) = &self.diagnostic {
+            probe.event(if result.is_ok() {
+                "commit_success"
+            } else {
+                "commit_error"
+            });
+            if result.is_ok() {
+                for (key, value) in &self.overlay {
+                    probe.mutation(key, value.is_some());
+                }
+            }
+        }
+        result?;
         Ok(())
     }
 }

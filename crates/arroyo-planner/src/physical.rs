@@ -55,6 +55,50 @@ use std::fmt::Debug;
 use tokio::sync::mpsc::{Receiver, UnboundedReceiver};
 use tokio_stream::wrappers::{ReceiverStream, UnboundedReceiverStream};
 
+/// Prove one complete source batch survives this private CDC segment. No
+/// repartitioner/coalescer/expander may participate, even behind scalar labels.
+pub(crate) fn validate_complete_source_batch(plan: &dyn ExecutionPlan) -> Result<()> {
+    if plan.as_any().is::<ArroyoMemExec>() {
+        if !plan.children().is_empty() {
+            return plan_err!("source batch reader must be a leaf");
+        }
+        return Ok(());
+    }
+    let projection = plan
+        .as_any()
+        .downcast_ref::<datafusion::physical_plan::projection::ProjectionExec>();
+    if projection.is_none()
+        && !plan
+            .as_any()
+            .is::<datafusion::physical_plan::filter::FilterExec>()
+        && !plan.as_any().is::<DebeziumUnrollingExec>()
+    {
+        return plan_err!(
+            "per-event correction requires batch-preserving Projection/Filter/source unrolling, found {}",
+            plan.name()
+        );
+    }
+    let children = plan.children();
+    if children.len() != 1 {
+        return plan_err!("per-event correction requires one physical batch input");
+    }
+    if let Some(projection) = projection {
+        let input = children[0].schema();
+        if let Ok(input_index) = input.index_of(arroyo_rpc::SOURCE_ENVELOPE_FIELD) {
+            let output = projection.schema();
+            let output_index = output.index_of(arroyo_rpc::SOURCE_ENVELOPE_FIELD)?;
+            let column = projection.expr()[output_index]
+                .0
+                .as_any()
+                .downcast_ref::<datafusion::physical_expr::expressions::Column>();
+            if column.is_none_or(|column| column.index() != input_index) {
+                return plan_err!("per-event correction projection replaces the source envelope");
+            }
+        }
+    }
+    validate_complete_source_batch(children[0].as_ref())
+}
+
 #[derive(Debug)]
 pub struct WindowFunctionUdf {
     signature: Signature,
@@ -615,6 +659,13 @@ impl PhysicalExtensionCodec for ArroyoPhysicalExtensionCodec {
             )))
         }
     }
+}
+
+/// Identify the concrete one-batch reader installed when an existing MemExec
+/// is decoded with `SingleLockedBatch`. Keep its implementation private: route
+/// admission must not accept arbitrary leaf plans or rely on a display name.
+pub fn is_single_locked_batch_reader(plan: &dyn ExecutionPlan) -> bool {
+    plan.as_any().is::<RwLockRecordBatchReader>()
 }
 
 #[derive(Debug)]
@@ -1719,6 +1770,59 @@ mod debezium_declared_schema_tests {
     use arrow::array::new_empty_array;
     use arrow_schema::Field;
     use std::collections::HashMap;
+
+    #[test]
+    fn complete_source_batch_whitelist_checks_actual_nodes_and_marker_ordinals() {
+        use datafusion::physical_expr::expressions::{Column, Literal};
+        use datafusion::physical_plan::{
+            coalesce_batches::CoalesceBatchesExec, projection::ProjectionExec,
+        };
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            arroyo_rpc::SOURCE_ENVELOPE_FIELD,
+            DataType::UInt64,
+            false,
+        )]));
+        let input = Arc::new(ArroyoMemExec::new("batch".into(), schema));
+        let valid = ProjectionExec::try_new(
+            vec![(
+                Arc::new(Column::new(arroyo_rpc::SOURCE_ENVELOPE_FIELD, 0)),
+                arroyo_rpc::SOURCE_ENVELOPE_FIELD.into(),
+            )],
+            input.clone(),
+        )
+        .unwrap();
+        validate_complete_source_batch(&valid).unwrap();
+        let replaced = ProjectionExec::try_new(
+            vec![(
+                Arc::new(Literal::new(ScalarValue::UInt64(Some(0)))),
+                arroyo_rpc::SOURCE_ENVELOPE_FIELD.into(),
+            )],
+            input.clone(),
+        )
+        .unwrap();
+        assert!(
+            validate_complete_source_batch(&replaced)
+                .unwrap_err()
+                .to_string()
+                .contains("replaces the source envelope")
+        );
+        let dropped = ProjectionExec::try_new(
+            vec![(
+                Arc::new(Column::new(arroyo_rpc::SOURCE_ENVELOPE_FIELD, 0)),
+                "other".into(),
+            )],
+            input.clone(),
+        )
+        .unwrap();
+        assert!(validate_complete_source_batch(&dropped).is_err());
+        let coalesced = CoalesceBatchesExec::new(input, 8);
+        assert!(
+            validate_complete_source_batch(&coalesced)
+                .unwrap_err()
+                .to_string()
+                .contains("batch-preserving")
+        );
+    }
 
     #[test]
     fn source_unrolling_marks_envelopes_independently_of_primary_key() {

@@ -189,3 +189,6 @@ impl RateLimiter {
         }
     }
 }
+
+#[cfg(test)]
+mod event_transport_tests;

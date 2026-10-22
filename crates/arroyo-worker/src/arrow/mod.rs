@@ -2,14 +2,16 @@ use arrow::datatypes::SchemaRef;
 use arrow_array::RecordBatch;
 use arroyo_operator::context::{Collector, OperatorContext};
 use arroyo_operator::operator::{
-    ArrowOperator, AsDisplayable, ConstructedOperator, DisplayableOperator, OperatorConstructor,
-    Registry,
+    ArrowOperator, AsDisplayable, ConstructedOperator, DisplayableOperator, EventResponseRole,
+    OperatorConstructor, Registry,
 };
 use arroyo_planner::physical::ArroyoPhysicalExtensionCodec;
 use arroyo_planner::physical::DecodingContext;
 use arroyo_rpc::df::ArroyoSchema;
-use arroyo_rpc::errors::DataflowResult;
+use arroyo_rpc::errors::{DataflowError, DataflowResult};
 use arroyo_rpc::grpc::api;
+use arroyo_types::event_edge::EventEdgeSpec;
+use arroyo_types::event_response::EventResponse;
 use datafusion::common::Result as DFResult;
 use datafusion::common::internal_err;
 use datafusion::execution::context::SessionContext;
@@ -59,6 +61,7 @@ mod window_native;
 mod window_store;
 
 pub struct ValueExecutionOperator {
+    event_output: Option<Arc<EventEdgeSpec>>,
     name: String,
     executor: StatelessPhysicalExecutor,
 }
@@ -74,6 +77,7 @@ impl OperatorConstructor for ValueExecutionConstructor {
         let executor = StatelessPhysicalExecutor::new(&config.physical_plan, &registry)?;
         Ok(ConstructedOperator::from_operator(Box::new(
             ValueExecutionOperator {
+                event_output: None,
                 name: config.name,
                 executor,
             },
@@ -83,6 +87,58 @@ impl OperatorConstructor for ValueExecutionConstructor {
 
 #[async_trait::async_trait]
 impl ArrowOperator for ValueExecutionOperator {
+    fn event_response_role(&self) -> EventResponseRole {
+        EventResponseRole::Scalar
+    }
+    fn event_response_output(&self) -> Option<Arc<EventEdgeSpec>> {
+        self.event_output.clone()
+    }
+    fn bind_event_response(
+        &mut self,
+        inputs: &[Arc<EventEdgeSpec>],
+        context: &OperatorContext,
+    ) -> DataflowResult<Option<Arc<EventEdgeSpec>>> {
+        let output = context.out_schema.as_deref().ok_or_else(|| {
+            arroyo_rpc::errors::DataflowError::ArgumentError(
+                "response operator output schema missing".into(),
+            )
+        })?;
+        if inputs.len() != 1 || output.schema != self.executor.plan.schema() {
+            return Err(DataflowError::ArgumentError(
+                "scalar event binding schema/input mismatch".into(),
+            ));
+        }
+        validate_response_physical(self.executor.plan.as_ref(), false)?;
+        let next = Arc::new(EventEdgeSpec {
+            schema: output.schema.clone(),
+            ..inputs[0].as_ref().clone()
+        });
+        self.register_response_output(next.clone())
+            .map_err(|error| DataflowError::ArgumentError(error.to_string()))?;
+        Ok(Some(next))
+    }
+    fn validate_event_source_plumbing(&self) -> DataflowResult<()> {
+        validate_response_physical(self.executor.plan.as_ref(), true)
+    }
+
+    async fn process_response_index(
+        &mut self,
+        _index: usize,
+        _partitions: usize,
+        response: EventResponse,
+        _: &mut OperatorContext,
+        collector: &mut dyn Collector,
+    ) -> DataflowResult<()> {
+        let spec = self.event_output.as_deref().ok_or_else(|| {
+            DataflowError::ArgumentError(
+                "scalar response output descriptor was not explicitly registered".into(),
+            )
+        })?;
+        let output = execute_scalar_response(&mut self.executor, &response, spec).await?;
+        drop(response);
+        collector.collect_response(output).await
+    }
+
     fn name(&self) -> String {
         self.name.clone()
     }
@@ -110,6 +166,7 @@ impl ArrowOperator for ValueExecutionOperator {
 }
 
 pub struct ProjectionOperator {
+    event_output: Option<Arc<EventEdgeSpec>>,
     name: String,
     output_schema: ArroyoSchema,
     exprs: Vec<Arc<dyn PhysicalExpr>>,
@@ -142,6 +199,7 @@ impl OperatorConstructor for ProjectionConstructor {
 
         Ok(ConstructedOperator::from_operator(Box::new(
             ProjectionOperator {
+                event_output: None,
                 name: config.name,
                 output_schema,
                 exprs: exprs?,
@@ -152,6 +210,75 @@ impl OperatorConstructor for ProjectionConstructor {
 
 #[async_trait::async_trait]
 impl ArrowOperator for ProjectionOperator {
+    fn event_response_role(&self) -> EventResponseRole {
+        EventResponseRole::Scalar
+    }
+    fn event_response_output(&self) -> Option<Arc<EventEdgeSpec>> {
+        self.event_output.clone()
+    }
+    fn bind_event_response(
+        &mut self,
+        inputs: &[Arc<EventEdgeSpec>],
+        context: &OperatorContext,
+    ) -> DataflowResult<Option<Arc<EventEdgeSpec>>> {
+        let output = context.out_schema.as_deref().ok_or_else(|| {
+            arroyo_rpc::errors::DataflowError::ArgumentError(
+                "response operator output schema missing".into(),
+            )
+        })?;
+        if inputs.len() != 1 || output.schema != self.output_schema.schema.clone() {
+            return Err(DataflowError::ArgumentError(
+                "scalar event binding schema/input mismatch".into(),
+            ));
+        }
+
+        let next = Arc::new(EventEdgeSpec {
+            schema: output.schema.clone(),
+            ..inputs[0].as_ref().clone()
+        });
+        self.register_response_output(next.clone())
+            .map_err(|error| DataflowError::ArgumentError(error.to_string()))?;
+        Ok(Some(next))
+    }
+    fn validate_event_source_plumbing(&self) -> DataflowResult<()> {
+        Ok(())
+    }
+
+    async fn process_response_index(
+        &mut self,
+        _index: usize,
+        _partitions: usize,
+        response: EventResponse,
+        _: &mut OperatorContext,
+        collector: &mut dyn Collector,
+    ) -> DataflowResult<()> {
+        let spec = self.event_output.as_deref().ok_or_else(|| {
+            DataflowError::ArgumentError(
+                "scalar response output descriptor was not explicitly registered".into(),
+            )
+        })?;
+        let rows = response
+            .rows
+            .as_ref()
+            .map(|input| -> DataflowResult<RecordBatch> {
+                validate_scalar_packet_rows(input.num_rows())?;
+                let arrays = self
+                    .exprs
+                    .iter()
+                    .map(|expression| expression.evaluate(input)?.into_array(input.num_rows()))
+                    .collect::<DFResult<Vec<_>>>()?;
+                Ok(RecordBatch::try_new(
+                    self.output_schema.schema.clone(),
+                    arrays,
+                )?)
+            })
+            .transpose()?;
+        let output = crate::event_response_codec::rebind_response_rows(&response, rows, spec)
+            .map_err(|error| DataflowError::ArgumentError(error.to_string()))?;
+        drop(response);
+        collector.collect_response(output).await
+    }
+
     fn name(&self) -> String {
         self.name.clone()
     }
@@ -187,6 +314,7 @@ impl ArrowOperator for ProjectionOperator {
 }
 
 pub struct KeyExecutionOperator {
+    event_output: Option<Arc<EventEdgeSpec>>,
     name: String,
     executor: StatelessPhysicalExecutor,
     #[allow(unused)]
@@ -207,6 +335,7 @@ impl OperatorConstructor for KeyExecutionConstructor {
 
         Ok(ConstructedOperator::from_operator(Box::new(
             KeyExecutionOperator {
+                event_output: None,
                 name: config.name,
                 executor,
                 key_fields: config
@@ -221,6 +350,58 @@ impl OperatorConstructor for KeyExecutionConstructor {
 
 #[async_trait::async_trait]
 impl ArrowOperator for KeyExecutionOperator {
+    fn event_response_role(&self) -> EventResponseRole {
+        EventResponseRole::Scalar
+    }
+    fn event_response_output(&self) -> Option<Arc<EventEdgeSpec>> {
+        self.event_output.clone()
+    }
+    fn bind_event_response(
+        &mut self,
+        inputs: &[Arc<EventEdgeSpec>],
+        context: &OperatorContext,
+    ) -> DataflowResult<Option<Arc<EventEdgeSpec>>> {
+        let output = context.out_schema.as_deref().ok_or_else(|| {
+            arroyo_rpc::errors::DataflowError::ArgumentError(
+                "response operator output schema missing".into(),
+            )
+        })?;
+        if inputs.len() != 1 || output.schema != self.executor.plan.schema() {
+            return Err(DataflowError::ArgumentError(
+                "scalar event binding schema/input mismatch".into(),
+            ));
+        }
+        validate_response_physical(self.executor.plan.as_ref(), false)?;
+        let next = Arc::new(EventEdgeSpec {
+            schema: output.schema.clone(),
+            ..inputs[0].as_ref().clone()
+        });
+        self.register_response_output(next.clone())
+            .map_err(|error| DataflowError::ArgumentError(error.to_string()))?;
+        Ok(Some(next))
+    }
+    fn validate_event_source_plumbing(&self) -> DataflowResult<()> {
+        validate_response_physical(self.executor.plan.as_ref(), true)
+    }
+
+    async fn process_response_index(
+        &mut self,
+        _index: usize,
+        _partitions: usize,
+        response: EventResponse,
+        _: &mut OperatorContext,
+        collector: &mut dyn Collector,
+    ) -> DataflowResult<()> {
+        let spec = self.event_output.as_deref().ok_or_else(|| {
+            DataflowError::ArgumentError(
+                "scalar response output descriptor was not explicitly registered".into(),
+            )
+        })?;
+        let output = execute_scalar_response(&mut self.executor, &response, spec).await?;
+        drop(response);
+        collector.collect_response(output).await
+    }
+
     fn name(&self) -> String {
         self.name.clone()
     }
@@ -486,3 +667,140 @@ pub fn decode_aggregate(
 
 #[cfg(test)]
 mod json_table_tests;
+
+/// The response carrier admits <=2 raw images or <=4 native changes. Scalar
+/// plans may filter/project those rows, never expand an original event here.
+fn validate_scalar_packet_rows(rows: usize) -> DataflowResult<()> {
+    if !(1..=4).contains(&rows) {
+        return Err(DataflowError::ArgumentError(
+            "scalar response requires one admitted bounded event packet".into(),
+        ));
+    }
+    Ok(())
+}
+
+async fn execute_scalar_response(
+    executor: &mut StatelessPhysicalExecutor,
+    response: &EventResponse,
+    next: &EventEdgeSpec,
+) -> DataflowResult<EventResponse> {
+    let rows = if let Some(input) = &response.rows {
+        validate_scalar_packet_rows(input.num_rows())?;
+        let limit = input.num_rows();
+        let mut stream = executor.process_batch(input.clone()).await;
+        let mut output: Option<RecordBatch> = None;
+        let mut count = 0usize;
+        while let Some(batch) = stream.next().await {
+            let batch = batch?;
+            if batch.num_rows() == 0 {
+                continue;
+            }
+            count = count.checked_add(batch.num_rows()).ok_or_else(|| {
+                DataflowError::ArgumentError("scalar response row count overflow".into())
+            })?;
+            if count > limit {
+                return Err(DataflowError::ArgumentError(
+                    "scalar response plan expanded an original event packet".into(),
+                ));
+            }
+            output = Some(match output {
+                None => batch,
+                Some(previous) => {
+                    let schema = batch.schema();
+                    arrow::compute::concat_batches(&schema, &[previous, batch])?
+                }
+            });
+        }
+        // Release the executor input/active guard before public output awaits.
+        drop(stream);
+        output
+    } else {
+        // Empty completion is NOT a SQL NULL row; no physical execution.
+        None
+    };
+    crate::event_response_codec::rebind_response_rows(response, rows, next)
+        .map_err(|error| DataflowError::ArgumentError(error.to_string()))
+}
+
+// Engine passes the same constructed descriptor to scalars/collector/wire.
+fn register_scalar_response_output(
+    slot: &mut Option<Arc<EventEdgeSpec>>,
+    spec: Arc<EventEdgeSpec>,
+    schema: &SchemaRef,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        slot.is_none(),
+        "duplicate scalar response output registration"
+    );
+    anyhow::ensure!(
+        spec.schema == *schema,
+        "scalar response output schema mismatch"
+    );
+    crate::event_response_codec::ResponseSpec::from_edge(&spec)?;
+    *slot = Some(spec);
+    Ok(())
+}
+impl ValueExecutionOperator {
+    fn register_response_output(&mut self, spec: Arc<EventEdgeSpec>) -> anyhow::Result<()> {
+        register_scalar_response_output(&mut self.event_output, spec, &self.executor.plan.schema())
+    }
+}
+impl KeyExecutionOperator {
+    fn register_response_output(&mut self, spec: Arc<EventEdgeSpec>) -> anyhow::Result<()> {
+        register_scalar_response_output(&mut self.event_output, spec, &self.executor.plan.schema())
+    }
+}
+impl ProjectionOperator {
+    fn register_response_output(&mut self, spec: Arc<EventEdgeSpec>) -> anyhow::Result<()> {
+        register_scalar_response_output(&mut self.event_output, spec, &self.output_schema.schema)
+    }
+}
+
+fn validate_response_physical(plan: &dyn ExecutionPlan, source: bool) -> DataflowResult<()> {
+    fn visit(plan: &dyn ExecutionPlan, source: bool, leaves: &mut usize) -> DataflowResult<()> {
+        if plan
+            .as_any()
+            .is::<arroyo_planner::physical::ArroyoMemExec>()
+            || arroyo_planner::physical::is_single_locked_batch_reader(plan)
+        {
+            if !plan.children().is_empty() {
+                return Err(DataflowError::ArgumentError(
+                    "event scalar reader has children".into(),
+                ));
+            }
+            *leaves += 1;
+            return Ok(());
+        }
+        let allowed = plan
+            .as_any()
+            .is::<datafusion::physical_plan::projection::ProjectionExec>()
+            || (!source
+                && plan
+                    .as_any()
+                    .is::<datafusion::physical_plan::filter::FilterExec>())
+            || (source
+                && plan
+                    .as_any()
+                    .is::<arroyo_planner::physical::DebeziumUnrollingExec>());
+        if !allowed || plan.children().len() != 1 {
+            return Err(DataflowError::ArgumentError(format!(
+                "event route has unsupported physical scalar/source plumbing: node={}, source={}, children={}",
+                plan.name(),
+                source,
+                plan.children().len(),
+            )));
+        }
+        visit(plan.children()[0].as_ref(), source, leaves)
+    }
+    let mut leaves = 0;
+    visit(plan, source, &mut leaves)?;
+    if leaves != 1 {
+        return Err(DataflowError::ArgumentError(
+            "event scalar requires one source reader".into(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod scalar_response_tests;
