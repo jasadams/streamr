@@ -8,8 +8,10 @@ use arroyo_operator::operator::{
 use arroyo_planner::physical::ArroyoPhysicalExtensionCodec;
 use arroyo_planner::physical::DecodingContext;
 use arroyo_rpc::df::ArroyoSchema;
-use arroyo_rpc::errors::DataflowResult;
+use arroyo_rpc::errors::{DataflowError, DataflowResult};
 use arroyo_rpc::grpc::api;
+use arroyo_types::event_edge::EventEdgeSpec;
+use arroyo_types::event_response::EventResponse;
 use datafusion::common::Result as DFResult;
 use datafusion::common::internal_err;
 use datafusion::execution::context::SessionContext;
@@ -59,6 +61,7 @@ mod window_native;
 mod window_store;
 
 pub struct ValueExecutionOperator {
+    event_output: Option<Arc<EventEdgeSpec>>,
     name: String,
     executor: StatelessPhysicalExecutor,
 }
@@ -74,6 +77,7 @@ impl OperatorConstructor for ValueExecutionConstructor {
         let executor = StatelessPhysicalExecutor::new(&config.physical_plan, &registry)?;
         Ok(ConstructedOperator::from_operator(Box::new(
             ValueExecutionOperator {
+                event_output: None,
                 name: config.name,
                 executor,
             },
@@ -83,6 +87,24 @@ impl OperatorConstructor for ValueExecutionConstructor {
 
 #[async_trait::async_trait]
 impl ArrowOperator for ValueExecutionOperator {
+    async fn process_response_index(
+        &mut self,
+        _index: usize,
+        _partitions: usize,
+        response: EventResponse,
+        _: &mut OperatorContext,
+        collector: &mut dyn Collector,
+    ) -> DataflowResult<()> {
+        let spec = self.event_output.as_deref().ok_or_else(|| {
+            DataflowError::ArgumentError(
+                "scalar response output descriptor was not explicitly registered".into(),
+            )
+        })?;
+        let output = execute_scalar_response(&mut self.executor, &response, spec).await?;
+        drop(response);
+        collector.collect_response(output).await
+    }
+
     fn name(&self) -> String {
         self.name.clone()
     }
@@ -110,6 +132,7 @@ impl ArrowOperator for ValueExecutionOperator {
 }
 
 pub struct ProjectionOperator {
+    event_output: Option<Arc<EventEdgeSpec>>,
     name: String,
     output_schema: ArroyoSchema,
     exprs: Vec<Arc<dyn PhysicalExpr>>,
@@ -142,6 +165,7 @@ impl OperatorConstructor for ProjectionConstructor {
 
         Ok(ConstructedOperator::from_operator(Box::new(
             ProjectionOperator {
+                event_output: None,
                 name: config.name,
                 output_schema,
                 exprs: exprs?,
@@ -152,6 +176,41 @@ impl OperatorConstructor for ProjectionConstructor {
 
 #[async_trait::async_trait]
 impl ArrowOperator for ProjectionOperator {
+    async fn process_response_index(
+        &mut self,
+        _index: usize,
+        _partitions: usize,
+        response: EventResponse,
+        _: &mut OperatorContext,
+        collector: &mut dyn Collector,
+    ) -> DataflowResult<()> {
+        let spec = self.event_output.as_deref().ok_or_else(|| {
+            DataflowError::ArgumentError(
+                "scalar response output descriptor was not explicitly registered".into(),
+            )
+        })?;
+        let rows = response
+            .rows
+            .as_ref()
+            .map(|input| -> DataflowResult<RecordBatch> {
+                validate_scalar_packet_rows(input.num_rows())?;
+                let arrays = self
+                    .exprs
+                    .iter()
+                    .map(|expression| expression.evaluate(input)?.into_array(input.num_rows()))
+                    .collect::<DFResult<Vec<_>>>()?;
+                Ok(RecordBatch::try_new(
+                    self.output_schema.schema.clone(),
+                    arrays,
+                )?)
+            })
+            .transpose()?;
+        let output = crate::event_response_codec::rebind_response_rows(&response, rows, spec)
+            .map_err(|error| DataflowError::ArgumentError(error.to_string()))?;
+        drop(response);
+        collector.collect_response(output).await
+    }
+
     fn name(&self) -> String {
         self.name.clone()
     }
@@ -187,6 +246,7 @@ impl ArrowOperator for ProjectionOperator {
 }
 
 pub struct KeyExecutionOperator {
+    event_output: Option<Arc<EventEdgeSpec>>,
     name: String,
     executor: StatelessPhysicalExecutor,
     #[allow(unused)]
@@ -207,6 +267,7 @@ impl OperatorConstructor for KeyExecutionConstructor {
 
         Ok(ConstructedOperator::from_operator(Box::new(
             KeyExecutionOperator {
+                event_output: None,
                 name: config.name,
                 executor,
                 key_fields: config
@@ -221,6 +282,24 @@ impl OperatorConstructor for KeyExecutionConstructor {
 
 #[async_trait::async_trait]
 impl ArrowOperator for KeyExecutionOperator {
+    async fn process_response_index(
+        &mut self,
+        _index: usize,
+        _partitions: usize,
+        response: EventResponse,
+        _: &mut OperatorContext,
+        collector: &mut dyn Collector,
+    ) -> DataflowResult<()> {
+        let spec = self.event_output.as_deref().ok_or_else(|| {
+            DataflowError::ArgumentError(
+                "scalar response output descriptor was not explicitly registered".into(),
+            )
+        })?;
+        let output = execute_scalar_response(&mut self.executor, &response, spec).await?;
+        drop(response);
+        collector.collect_response(output).await
+    }
+
     fn name(&self) -> String {
         self.name.clone()
     }
@@ -486,3 +565,99 @@ pub fn decode_aggregate(
 
 #[cfg(test)]
 mod json_table_tests;
+
+/// The response carrier admits <=2 raw images or <=4 native changes. Scalar
+/// plans may filter/project those rows, never expand an original event here.
+fn validate_scalar_packet_rows(rows: usize) -> DataflowResult<()> {
+    if !(1..=4).contains(&rows) {
+        return Err(DataflowError::ArgumentError(
+            "scalar response requires one admitted bounded event packet".into(),
+        ));
+    }
+    Ok(())
+}
+
+async fn execute_scalar_response(
+    executor: &mut StatelessPhysicalExecutor,
+    response: &EventResponse,
+    next: &EventEdgeSpec,
+) -> DataflowResult<EventResponse> {
+    let rows = if let Some(input) = &response.rows {
+        validate_scalar_packet_rows(input.num_rows())?;
+        let limit = input.num_rows();
+        let mut stream = executor.process_batch(input.clone()).await;
+        let mut output: Option<RecordBatch> = None;
+        let mut count = 0usize;
+        while let Some(batch) = stream.next().await {
+            let batch = batch?;
+            if batch.num_rows() == 0 {
+                continue;
+            }
+            count = count.checked_add(batch.num_rows()).ok_or_else(|| {
+                DataflowError::ArgumentError("scalar response row count overflow".into())
+            })?;
+            if count > limit {
+                return Err(DataflowError::ArgumentError(
+                    "scalar response plan expanded an original event packet".into(),
+                ));
+            }
+            output = Some(match output {
+                None => batch,
+                Some(previous) => {
+                    let schema = batch.schema();
+                    arrow::compute::concat_batches(&schema, &[previous, batch])?
+                }
+            });
+        }
+        // Release the executor input/active guard before public output awaits.
+        drop(stream);
+        output
+    } else {
+        // Empty completion is NOT a SQL NULL row; no physical execution.
+        None
+    };
+    crate::event_response_codec::rebind_response_rows(response, rows, next)
+        .map_err(|error| DataflowError::ArgumentError(error.to_string()))
+}
+
+// Disabled proof increment: only tests can register a descriptor until future
+// Engine construction supplies the SAME planned output spec as collector/wire.
+#[cfg(test)]
+fn register_scalar_response_output(
+    slot: &mut Option<Arc<EventEdgeSpec>>,
+    spec: Arc<EventEdgeSpec>,
+    schema: &SchemaRef,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        slot.is_none(),
+        "duplicate scalar response output registration"
+    );
+    anyhow::ensure!(
+        spec.schema == *schema,
+        "scalar response output schema mismatch"
+    );
+    crate::event_response_codec::ResponseSpec::from_edge(&spec)?;
+    *slot = Some(spec);
+    Ok(())
+}
+#[cfg(test)]
+impl ValueExecutionOperator {
+    fn register_response_output(&mut self, spec: Arc<EventEdgeSpec>) -> anyhow::Result<()> {
+        register_scalar_response_output(&mut self.event_output, spec, &self.executor.plan.schema())
+    }
+}
+#[cfg(test)]
+impl KeyExecutionOperator {
+    fn register_response_output(&mut self, spec: Arc<EventEdgeSpec>) -> anyhow::Result<()> {
+        register_scalar_response_output(&mut self.event_output, spec, &self.executor.plan.schema())
+    }
+}
+#[cfg(test)]
+impl ProjectionOperator {
+    fn register_response_output(&mut self, spec: Arc<EventEdgeSpec>) -> anyhow::Result<()> {
+        register_scalar_response_output(&mut self.event_output, spec, &self.output_schema.schema)
+    }
+}
+
+#[cfg(test)]
+mod scalar_response_tests;

@@ -72,7 +72,6 @@ use tonic::codegen::InterceptedService;
 use uuid::Uuid;
 
 pub mod arrow;
-#[cfg(test)]
 mod event_response_codec;
 
 pub mod engine;
@@ -1973,3 +1972,8 @@ mod udf_shadowing_tests {
         initialize_inner_rejects(None, Some("json_query")).await;
     }
 }
+
+pub mod event_transport;
+
+#[cfg(test)]
+mod event_pair;

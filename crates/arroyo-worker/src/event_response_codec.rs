@@ -1,5 +1,5 @@
-//! Disabled proof candidate: registered response framing and IPC validation.
-//! Parent registration is #[cfg(test)]; no message type or socket dispatch.
+//! Registered response framing and IPC validation for private response edges.
+//! Transport registration is explicit; no planner/Engine producer is enabled.
 use anyhow::{Context, Result, bail, ensure};
 use arrow::array::Array;
 use arrow::buffer::MutableBuffer;
@@ -13,9 +13,9 @@ use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Arc;
 
-const ALIGNMENT: usize = 8;
+const ALIGNMENT: usize = arroyo_types::event_edge::NATIVE_IPC_ALIGNMENT;
 const CONTEXT_BYTES: usize = 44;
-const EXTENSION_BYTES: usize = CONTEXT_BYTES + 4;
+pub(crate) const EXTENSION_BYTES: usize = CONTEXT_BYTES + 4;
 const IPC_LENGTH_BYTES: usize = 4;
 const MAX_KEYS: usize = 2;
 const MAX_NATIVE_ROWS: usize = 4;
@@ -200,10 +200,15 @@ impl FrameSpec {
     fn body_bound(&self) -> Result<usize> {
         let unpadded = match self.policy {
             Policy::Raw => bail!("raw ordinary decoding has no native-owner body bound"),
-            Policy::Native { owner_output_bytes } => add(
-                owner_output_bytes,
-                mul(self.nodes.len(), bitmap(self.max_rows)?)?,
-            )?,
+            Policy::Native { owner_output_bytes } => {
+                return arroyo_types::event_edge::native_body_bound(
+                    owner_output_bytes,
+                    self.max_rows,
+                    self.nodes.len(),
+                    self.buffers,
+                )
+                .map_err(anyhow::Error::msg);
+            }
             Policy::Keys { encoded_key_bytes } => add(
                 add(
                     mul(self.max_rows, encoded_key_bytes)?,
@@ -239,6 +244,13 @@ impl FrameSpec {
         })
     }
     fn encode(&self, batch: &RecordBatch) -> Result<Vec<u8>> {
+        self.encode_with_ownership(batch, true)
+    }
+    fn encode_with_ownership(
+        &self,
+        batch: &RecordBatch,
+        admit_original_owner: bool,
+    ) -> Result<Vec<u8>> {
         ensure!(
             batch.schema() == self.schema,
             "response registered schema mismatch"
@@ -247,7 +259,9 @@ impl FrameSpec {
             batch.num_rows() > 0 && batch.num_rows() <= self.max_rows,
             "response row count outside registered stage"
         );
-        if let Policy::Native { owner_output_bytes } = self.policy {
+        if let Policy::Native { owner_output_bytes } = self.policy
+            && admit_original_owner
+        {
             ensure!(
                 batch.get_array_memory_size() <= owner_output_bytes,
                 "native sender exceeds its existing output allowance"
@@ -265,6 +279,17 @@ impl FrameSpec {
                         .iter()
                         .all(|k| k.is_some_and(|key| key.len() <= encoded_key_bytes)),
                 "touched key exceeds existing key allowance"
+            );
+        }
+        if matches!(self.policy, Policy::Native { .. }) && !admit_original_owner {
+            // Immutable backing can be shared by repeated projection columns.
+            // IPC must copy each occurrence: prove that expanded body BEFORE
+            // the canonical writer allocates any payload representation.
+            let actual = arroyo_types::event_edge::native_canonical_body_len(batch)
+                .map_err(anyhow::Error::msg)?;
+            ensure!(
+                actual <= self.body_bound()?,
+                "native canonical body exceeds registered proof before encoding"
             );
         }
         let (dictionaries, data) = IpcDataGenerator {}.encoded_batch(
@@ -504,11 +529,19 @@ impl FrameSpec {
         })
     }
     fn decode(&self, frame: &[u8]) -> Result<(RecordBatch, Option<DecodeShape>)> {
+        let (batch, shape, _) = self.decode_with_body(frame)?;
+        Ok((batch, shape))
+    }
+    fn decode_with_body(
+        &self,
+        frame: &[u8],
+    ) -> Result<(RecordBatch, Option<DecodeShape>, arrow::buffer::Buffer)> {
         let validated = self.validate(frame)?;
         let mut buffer = MutableBuffer::from_len_zeroed(validated.body.len());
         buffer.copy_from_slice(validated.body);
+        let body: arrow::buffer::Buffer = buffer.into();
         let batch = read_record_batch(
-            &buffer.into(),
+            &body,
             validated
                 .message
                 .header_as_record_batch()
@@ -518,7 +551,7 @@ impl FrameSpec {
             None,
             &validated.message.version(),
         )?;
-        Ok((batch, validated.shape))
+        Ok((batch, validated.shape, body))
     }
 }
 #[derive(Debug)]
@@ -549,18 +582,40 @@ fn metadata_ranges(
 }
 
 #[derive(Clone)]
-struct ResponseSpec {
+pub(crate) struct ResponseSpec {
     root_operator: u32,
     root_subtask: u32,
     rows: FrameSpec,
     keys: Option<FrameSpec>,
 }
-struct EncodedResponse {
-    extension: [u8; EXTENSION_BYTES],
-    rows: Vec<u8>,
-    keys: Vec<u8>,
+pub(crate) struct EncodedResponse {
+    pub(crate) extension: [u8; EXTENSION_BYTES],
+    pub(crate) rows: Vec<u8>,
+    pub(crate) keys: Vec<u8>,
 }
 impl ResponseSpec {
+    pub(crate) fn from_edge(edge: &arroyo_types::event_edge::EventEdgeSpec) -> Result<Self> {
+        use arroyo_types::event_edge::EventLayout;
+        match edge.layout {
+            EventLayout::Raw => Ok(Self::raw(
+                edge.root_operator,
+                edge.root_subtask,
+                edge.schema.clone(),
+            )),
+            EventLayout::Native {
+                max_rows,
+                owner_output_bytes,
+                encoded_key_bytes,
+            } => Self::native(
+                edge.root_operator,
+                edge.root_subtask,
+                edge.schema.clone(),
+                max_rows,
+                owner_output_bytes,
+                encoded_key_bytes,
+            ),
+        }
+    }
     fn raw(root_operator: u32, root_subtask: u32, schema: SchemaRef) -> Self {
         Self {
             root_operator,
@@ -586,7 +641,11 @@ impl ResponseSpec {
     }
     /// Pure preallocation check: caller must consult registered Quad/type first.
     /// Context/keys extension is OUTSIDE Header.len, which remains rows length.
-    fn preflight(&self, extension: &[u8], row_bytes: u32) -> Result<(EventContext, usize)> {
+    pub(crate) fn preflight(
+        &self,
+        extension: &[u8],
+        row_bytes: u32,
+    ) -> Result<(EventContext, usize)> {
         ensure!(
             extension.len() == EXTENSION_BYTES,
             "response extension length mismatch"
@@ -623,11 +682,33 @@ impl ResponseSpec {
         add(EXTENSION_BYTES, add(row_bytes as usize, keys)?)?;
         Ok((context, keys))
     }
-    fn encode(&self, response: &EventResponse) -> Result<EncodedResponse> {
+    fn edge_spec(&self) -> arroyo_types::event_edge::EventEdgeSpec {
+        use arroyo_types::event_edge::{EventEdgeSpec, EventLayout};
+        let layout = match self.rows.policy {
+            Policy::Raw => EventLayout::Raw,
+            Policy::Native { owner_output_bytes } => EventLayout::Native {
+                max_rows: self.rows.max_rows,
+                owner_output_bytes,
+                encoded_key_bytes: match self.keys.as_ref().map(|keys| &keys.policy) {
+                    Some(Policy::Keys { encoded_key_bytes }) => *encoded_key_bytes,
+                    _ => 0,
+                },
+            },
+            Policy::Keys { .. } => unreachable!("response rows cannot use key policy"),
+        };
+        EventEdgeSpec {
+            root_operator: self.root_operator,
+            root_subtask: self.root_subtask,
+            schema: self.rows.schema.clone(),
+            layout,
+        }
+    }
+    pub(crate) fn encode(&self, response: &EventResponse) -> Result<EncodedResponse> {
+        let admit_original_owner = !response.is_native_forward(&self.edge_spec());
         let rows = response
             .rows
             .as_ref()
-            .map(|b| self.rows.encode(b))
+            .map(|b| self.rows.encode_with_ownership(b, admit_original_owner))
             .transpose()?
             .unwrap_or_default();
         let keys = match (&self.keys, &response.touched_keys) {
@@ -651,18 +732,19 @@ impl ResponseSpec {
             keys,
         })
     }
-    fn decode(&self, encoded: &EncodedResponse) -> Result<EventResponse> {
+    pub(crate) fn decode(&self, encoded: &EncodedResponse) -> Result<EventResponse> {
         let (context, key_bytes) =
             self.preflight(&encoded.extension, u32::try_from(encoded.rows.len())?)?;
         ensure!(
             encoded.keys.len() == key_bytes,
             "response key frame length mismatch"
         );
-        let rows = if encoded.rows.is_empty() {
+        let decoded = if encoded.rows.is_empty() {
             None
         } else {
-            Some(self.rows.decode(&encoded.rows)?.0)
+            Some(self.rows.decode_with_body(&encoded.rows)?)
         };
+        let rows = decoded.as_ref().map(|(batch, _, _)| batch.clone());
         let touched_keys = if encoded.keys.is_empty() {
             None
         } else {
@@ -674,12 +756,64 @@ impl ResponseSpec {
                     .0,
             )
         };
-        Ok(EventResponse {
+        let response = EventResponse {
+            native_body: None,
             context,
             rows,
             touched_keys,
-        })
+        };
+        if matches!(self.rows.policy, Policy::Native { .. })
+            && let Some((_, _, body)) = decoded
+        {
+            response
+                .with_native_body(&self.edge_spec(), body)
+                .map_err(anyhow::Error::msg)
+        } else {
+            Ok(response)
+        }
     }
+}
+
+/// Rebind native scalar column forwarding without double-counting IPC backing.
+/// If the retained original body cannot fit the new stage, compact through the
+/// SAME validated canonical encoder/decoder after exact body-size preflight.
+pub(crate) fn rebind_response_rows(
+    response: &EventResponse,
+    rows: Option<RecordBatch>,
+    next: &arroyo_types::event_edge::EventEdgeSpec,
+) -> Result<EventResponse> {
+    if let Ok(rebound) = response.try_rebind_native_rows(next, rows.clone()) {
+        return Ok(rebound);
+    }
+    let rows = rows.context("native row rebind requires rows")?;
+    next.validate_shape(&EventResponse {
+        context: response.context,
+        rows: Some(rows.clone()),
+        touched_keys: response.touched_keys.clone(),
+        native_body: None,
+    })
+    .map_err(anyhow::Error::msg)?;
+    ensure!(
+        response.proves_native_projection(next, &rows),
+        "native row change requires original owner admission"
+    );
+    let next_codec = ResponseSpec::from_edge(next)?;
+    let actual =
+        arroyo_types::event_edge::native_canonical_body_len(&rows).map_err(anyhow::Error::msg)?;
+    ensure!(
+        actual <= next_codec.rows.body_bound()?,
+        "native projected body exceeds registered proof"
+    );
+    let encoded = next_codec.rows.encode_with_ownership(&rows, false)?;
+    let (rows, _, body) = next_codec.rows.decode_with_body(&encoded)?;
+    EventResponse {
+        context: response.context,
+        rows: Some(rows),
+        touched_keys: response.touched_keys.clone(),
+        native_body: None,
+    }
+    .with_native_body(next, body)
+    .map_err(anyhow::Error::msg)
 }
 
 #[cfg(test)]
@@ -798,6 +932,111 @@ mod tests {
             .offset() as usize
     }
     #[test]
+    fn event_transport_body_preflight_matches_wide_canonical_writer_nulls_and_slices() -> Result<()>
+    {
+        for nulls in 0..16 {
+            let batch = mixed(4, nulls);
+            for (offset, rows) in [(0, 4), (1, 3), (2, 1)] {
+                let batch = batch.slice(offset, rows);
+                let encoded = spec(&batch).rows.encode(&batch)?;
+                assert_eq!(
+                    encoded.len() - body_start(&encoded),
+                    arroyo_types::event_edge::native_canonical_body_len(&batch)
+                        .map_err(anyhow::Error::msg)?
+                );
+            }
+        }
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(arrow_array::Int8Array::from(vec![
+                Some(i8::MIN),
+                None,
+                Some(i8::MAX),
+                Some(0),
+            ])),
+            Arc::new(arrow_array::UInt8Array::from(vec![
+                Some(u8::MIN),
+                None,
+                Some(u8::MAX),
+                Some(0),
+            ])),
+            Arc::new(arrow_array::Int16Array::from(vec![
+                Some(i16::MIN),
+                None,
+                Some(i16::MAX),
+                Some(0),
+            ])),
+            Arc::new(arrow_array::UInt16Array::from(vec![
+                Some(u16::MIN),
+                None,
+                Some(u16::MAX),
+                Some(0),
+            ])),
+            Arc::new(arrow_array::Int32Array::from(vec![
+                Some(i32::MIN),
+                None,
+                Some(i32::MAX),
+                Some(0),
+            ])),
+            Arc::new(arrow_array::UInt32Array::from(vec![
+                Some(u32::MIN),
+                None,
+                Some(u32::MAX),
+                Some(0),
+            ])),
+            Arc::new(arrow_array::UInt64Array::from(vec![
+                Some(u64::MIN),
+                None,
+                Some(u64::MAX),
+                Some(0),
+            ])),
+            Arc::new(arrow_array::Float32Array::from(vec![
+                Some(f32::MIN),
+                None,
+                Some(f32::MAX),
+                Some(0.0),
+            ])),
+            Arc::new(arrow_array::Float64Array::from(vec![
+                Some(f64::MIN),
+                None,
+                Some(f64::MAX),
+                Some(0.0),
+            ])),
+            Arc::new(BooleanArray::from(vec![
+                Some(true),
+                None,
+                Some(false),
+                Some(true),
+            ])),
+            Arc::new(FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+                [
+                    Some(&[1u8, 2, 3][..]),
+                    None,
+                    Some(&[0u8, 0, 0][..]),
+                    Some(&[255u8, 255, 255][..]),
+                ]
+                .into_iter(),
+                3,
+            )?),
+        ];
+        let fields = columns
+            .iter()
+            .enumerate()
+            .map(|(i, column)| Field::new(format!("v{i}"), column.data_type().clone(), true))
+            .collect::<Vec<_>>();
+        let wide = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)?;
+        for (offset, rows) in [(0, 4), (1, 3), (2, 1)] {
+            let wide = wide.slice(offset, rows);
+            let encoded = spec(&wide).rows.encode(&wide)?;
+            assert_eq!(
+                encoded.len() - body_start(&encoded),
+                arroyo_types::event_edge::native_canonical_body_len(&wide)
+                    .map_err(anyhow::Error::msg)?
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn event_response_codec_accepts_only_exact_canonical_metadata_fields() -> Result<()> {
         let canonical = arroyo_rpc::updating_meta_field();
         assert!(
@@ -912,6 +1151,7 @@ mod tests {
                 let batch = mixed(rows, nulls);
                 let spec = spec(&batch);
                 let response = EventResponse {
+                    native_body: None,
                     context: context(),
                     rows: Some(batch.clone()),
                     touched_keys: Some(keys(512)),
@@ -931,6 +1171,7 @@ mod tests {
         let batch = mixed(4, 0b1010).slice(1, 2);
         let spec = spec(&batch);
         let response = EventResponse {
+            native_body: None,
             context: context(),
             rows: Some(batch),
             touched_keys: Some(keys(512).slice(1, 1)),
@@ -1003,16 +1244,19 @@ mod tests {
         let spec = spec(&batch);
         for response in [
             EventResponse {
+                native_body: None,
                 context: context(),
                 rows: None,
                 touched_keys: None,
             },
             EventResponse {
+                native_body: None,
                 context: context(),
                 rows: None,
                 touched_keys: Some(keys(512)),
             },
             EventResponse {
+                native_body: None,
                 context: context(),
                 rows: Some(batch),
                 touched_keys: Some(keys(512)),
@@ -1028,6 +1272,7 @@ mod tests {
         let batch = mixed(2, 0);
         let raw = ResponseSpec::raw(17, 0, batch.schema());
         let response = EventResponse {
+            native_body: None,
             context: context(),
             rows: Some(batch),
             touched_keys: None,
@@ -1048,6 +1293,7 @@ mod tests {
         let batch = mixed(4, 0);
         let spec = spec(&batch);
         let wire = spec.encode(&EventResponse {
+            native_body: None,
             context: context(),
             rows: Some(batch),
             touched_keys: Some(keys(512)),
@@ -1094,6 +1340,7 @@ mod tests {
         assert!(too_small.encode(&batch).is_err());
         assert!(FrameSpec::keys(511)?.encode(&keys(512)).is_err());
         let mut wire = spec.encode(&EventResponse {
+            native_body: None,
             context: context(),
             rows: Some(batch),
             touched_keys: Some(keys(512)),

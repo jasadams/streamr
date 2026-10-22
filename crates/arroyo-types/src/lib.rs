@@ -184,6 +184,7 @@ pub enum Watermark {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ArrowMessage {
     Data(RecordBatch),
+    Event(event_response::EventResponse),
     Signal(SignalMessage),
 }
 
@@ -717,3 +718,5 @@ mod tests {
         );
     }
 }
+
+pub mod event_edge;

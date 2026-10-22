@@ -1,4 +1,5 @@
 #![allow(clippy::redundant_slicing)]
+use crate::event_transport::EventWireSpec;
 use anyhow::{Context, anyhow, bail};
 use arrow::buffer::MutableBuffer;
 use arrow::ipc::reader::read_record_batch;
@@ -7,6 +8,7 @@ use arrow_array::RecordBatch;
 use arrow_schema::{ArrowError, SchemaRef};
 use arroyo_rpc::ControlResp;
 use arroyo_rpc::errors::{DataflowError, DataflowResult};
+use arroyo_types::event_response::EventResponse;
 use arroyo_types::{ArrowMessage, SignalMessage};
 use bincode::config;
 use std::net::SocketAddr;
@@ -185,6 +187,7 @@ struct NetworkSender {
     tx: BatchSender,
     schema: SchemaRef,
     failure: Option<NetworkFailureReporter>,
+    response: Option<Arc<EventWireSpec>>,
 }
 
 #[derive(Clone)]
@@ -216,6 +219,7 @@ impl Senders {
                 tx,
                 schema,
                 failure: None,
+                response: None,
             },
         );
     }
@@ -233,8 +237,34 @@ impl Senders {
                 tx,
                 schema,
                 failure: Some(failure),
+                response: None,
             },
         );
+    }
+
+    pub(crate) fn add_response(
+        &mut self,
+        quad: Quad,
+        spec: Arc<EventWireSpec>,
+        tx: BatchSender,
+        failure: Option<NetworkFailureReporter>,
+    ) -> anyhow::Result<()> {
+        spec.require_quad(quad)?;
+        anyhow::ensure!(tx.size() > 0, "response queue capacity must be positive");
+        anyhow::ensure!(
+            !self.senders.contains_key(&quad),
+            "duplicate response network registration"
+        );
+        Arc::make_mut(&mut self.senders).insert(
+            quad,
+            NetworkSender {
+                tx,
+                schema: spec.schema(),
+                failure,
+                response: Some(spec),
+            },
+        );
+        Ok(())
     }
 
     async fn send(&mut self, header: Header, data: Vec<u8>) -> DataflowResult<()> {
@@ -244,17 +274,39 @@ impl Senders {
             .ok_or_else(|| DataflowError::ArgumentError("unknown network destination".into()))?;
         let message = match header.message_type {
             MessageType::Data => {
+                if sender.response.is_some() {
+                    return Err(DataflowError::ArgumentError(
+                        "ordinary Data on response edge".into(),
+                    ));
+                }
                 let batch = read_message(sender.schema.clone(), data)?;
                 ArrowMessage::Data(batch)
             }
-            MessageType::Signal => ArrowMessage::Signal(
-                bincode::decode_from_slice(&data, config::standard())
-                    .map_err(|error| DataflowError::DataError {
-                        details: error.to_string(),
-                        count: 1,
-                    })?
-                    .0,
-            ),
+            MessageType::Signal => {
+                if sender.response.is_some() {
+                    return Err(DataflowError::ArgumentError(
+                        "unbound Signal on response edge".into(),
+                    ));
+                }
+                ArrowMessage::Signal(
+                    bincode::decode_from_slice(&data, config::standard())
+                        .map_err(|error| DataflowError::DataError {
+                            details: error.to_string(),
+                            count: 1,
+                        })?
+                        .0,
+                )
+            }
+            MessageType::ResponseSignal => {
+                return Err(DataflowError::ArgumentError(
+                    "response Signal requires registered identity decoding".into(),
+                ));
+            }
+            MessageType::Event => {
+                return Err(DataflowError::ArgumentError(
+                    "response requires registered fixed-header decoding".into(),
+                ));
+            }
         };
         let end = message.is_end();
         let result =
@@ -291,6 +343,8 @@ pub struct InNetworkLink {
 pub enum MessageType {
     Data,
     Signal,
+    Event,
+    ResponseSignal,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -334,6 +388,8 @@ impl Header {
             message_type: match bytes.get_u32_le() {
                 0 => MessageType::Data,
                 1 => MessageType::Signal,
+                2 => MessageType::Event,
+                3 => MessageType::ResponseSignal,
                 b => panic!("invalid message type: {b}"),
             },
         }
@@ -353,6 +409,8 @@ impl Header {
         buf.put_u32_le(match self.message_type {
             MessageType::Data => 0,
             MessageType::Signal => 1,
+            MessageType::Event => 2,
+            MessageType::ResponseSignal => 3,
         });
 
         writer.write_all(&bytes).await
@@ -375,6 +433,77 @@ impl InNetworkLink {
             .map_err(network_io_error)?;
         let header = Header::from_bytes(&header_buf[..]);
         let result = async {
+            if header.message_type == MessageType::ResponseSignal {
+                let sender = self.senders.senders.get(&header.as_quad()).ok_or_else(|| {
+                    DataflowError::ArgumentError("unknown network response destination".into())
+                })?;
+                let spec = sender.response.as_ref().ok_or_else(|| {
+                    DataflowError::ArgumentError("unregistered response Signal edge".into())
+                })?;
+                let signal = spec
+                    .read_signal_payload(&mut self.stream, header.len)
+                    .await
+                    .map_err(|error| DataflowError::DataError {
+                        details: error.to_string(),
+                        count: 1,
+                    })?;
+                let end = matches!(signal, SignalMessage::Stop | SignalMessage::EndOfData);
+                let delivered = sender
+                    .tx
+                    .send(ArrowMessage::Signal(signal))
+                    .await
+                    .map_err(|_| DataflowError::InternalOperatorError {
+                        error: "downstream graph queue closed",
+                        message: "could not deliver network Signal".into(),
+                    });
+                return match delivered {
+                    Err(error) if end => {
+                        warn!("couldn't send end message: {error}");
+                        Ok(())
+                    }
+                    result => result,
+                };
+            }
+            if header.message_type == MessageType::Event {
+                // Registration lookup precedes fixed payload read and ALL
+                // variable allocation. A raw packet cannot opt itself in.
+                let sender = self.senders.senders.get(&header.as_quad()).ok_or_else(|| {
+                    DataflowError::ArgumentError("unknown network response destination".into())
+                })?;
+                let spec = sender.response.as_ref().ok_or_else(|| {
+                    DataflowError::ArgumentError("unregistered network response edge".into())
+                })?;
+                let response = spec
+                    .read_payload(
+                        &mut self.stream,
+                        u32::try_from(header.len)
+                            .map_err(|error| DataflowError::ArgumentError(error.to_string()))?,
+                    )
+                    .await
+                    .map_err(|error| DataflowError::DataError {
+                        details: error.to_string(),
+                        count: 1,
+                    })?;
+                return sender
+                    .tx
+                    .send(ArrowMessage::Event(response))
+                    .await
+                    .map_err(|_| DataflowError::InternalOperatorError {
+                        error: "downstream graph queue closed",
+                        message: "could not deliver network response".into(),
+                    });
+            }
+            if matches!(header.message_type, MessageType::Data | MessageType::Signal)
+                && self
+                    .senders
+                    .senders
+                    .get(&header.as_quad())
+                    .is_some_and(|s| s.response.is_some())
+            {
+                return Err(DataflowError::ArgumentError(
+                    "unbound Data/Signal on response edge".into(),
+                ));
+            }
             let mut buf = vec![0; header.len];
             self.stream
                 .read_exact(&mut buf)
@@ -424,6 +553,7 @@ struct NetworkReceiver {
     rx: BatchReceiver,
     dictionary_tracker: Arc<Mutex<DictionaryTracker>>,
     failure: Option<NetworkFailureReporter>,
+    response: Option<Arc<EventWireSpec>>,
 }
 
 struct OutNetworkLink {
@@ -509,6 +639,23 @@ impl OutNetworkLink {
             rx,
             dictionary_tracker: Arc::new(Mutex::new(DictionaryTracker::new(true))),
             failure,
+            response: None,
+        });
+    }
+
+    async fn add_response_receiver(
+        &mut self,
+        quad: Quad,
+        rx: BatchReceiver,
+        failure: Option<NetworkFailureReporter>,
+        response: Arc<EventWireSpec>,
+    ) {
+        self.receivers.push(NetworkReceiver {
+            quad,
+            rx,
+            failure,
+            response: Some(response),
+            dictionary_tracker: Arc::new(Mutex::new(DictionaryTracker::new(true))),
         });
     }
 
@@ -521,11 +668,12 @@ impl OutNetworkLink {
                 mut rx,
                 dictionary_tracker,
                 failure,
+                response,
             } in self.receivers
             {
                 let stream = async_stream::stream! {
                     while let Some(item) = rx.recv().await {
-                        yield (quad, dictionary_tracker.clone(), failure.clone(), item);
+                        yield (quad, dictionary_tracker.clone(), failure.clone(), response.clone(), item);
                     }
                 };
                 sel.push(Box::pin(stream));
@@ -534,7 +682,7 @@ impl OutNetworkLink {
             loop {
                 select! {
                     next = sel.next() => {
-                        let Some(((quad, dictionary_tracker, failure, msg), s)) = next else {
+                        let Some(((quad, dictionary_tracker, failure, response, msg), s)) = next else {
                             if let Err(error) = self.stream.flush().await {
                                 if let Some(failure) = failures.first() { failure.report(network_io_error(error)).await; }
                                 else { warn!("Network output final flush failed: {error}"); }
@@ -544,10 +692,19 @@ impl OutNetworkLink {
                         let result: DataflowResult<()> = async {
                             match msg {
                                 ArrowMessage::Signal(signal) => {
-                                    write_signal(&mut Pin::new(&mut self.stream), quad, &signal).await?;
+                                    if let Some(spec) = &response {
+                                        write_response_signal(&mut Pin::new(&mut self.stream), quad, &signal, spec).await?;
+                                    } else {
+                                        write_signal(&mut Pin::new(&mut self.stream), quad, &signal).await?;
+                                    }
                                 }
                                 ArrowMessage::Data(data) => {
+                                    if response.is_some() { return Err(DataflowError::ArgumentError("ordinary Data on response edge".into())); }
                                     write_batch(&mut Pin::new(&mut self.stream), quad, &data, &dictionary_tracker).await?;
+                                }
+                                ArrowMessage::Event(event) => {
+                                    let spec = response.as_ref().ok_or_else(|| DataflowError::ArgumentError("unregistered network response output".into()))?;
+                                    write_response(&mut Pin::new(&mut self.stream), quad, &event, spec).await?;
                                 }
                             }
                             Ok(())
@@ -696,6 +853,50 @@ impl NetworkManager {
         self.connect_reported(addr, quad, rx, None).await;
     }
 
+    pub(crate) async fn connect_response_reported(
+        &self,
+        addr: &str,
+        quad: Quad,
+        rx: BatchReceiver,
+        failure: Option<NetworkFailureReporter>,
+        response: Arc<EventWireSpec>,
+    ) {
+        let reporter = failure.clone();
+        let result: DataflowResult<()> = async {
+            response
+                .require_quad(quad)
+                .map_err(|error| DataflowError::ArgumentError(error.to_string()))?;
+            if rx.size() == 0 {
+                return Err(DataflowError::ArgumentError(
+                    "response queue capacity must be positive".into(),
+                ));
+            }
+            let mut link = OutNetworkLink::connect(addr).await?;
+            link.add_response_receiver(quad, rx, failure, response)
+                .await;
+            let mut streams = self.out_streams.lock().await;
+            if streams.contains_key(&quad) {
+                return Err(DataflowError::ArgumentError(
+                    "duplicate response network registration".into(),
+                ));
+            }
+            streams.insert(quad, link);
+            Ok(())
+        }
+        .await;
+        if let Err(error) = result {
+            if let Some(failure) = reporter {
+                // Same owned/cancellable deferred reporting as ordinary setup:
+                // startup must not block waiting for its control consumer.
+                self.tasks.register(
+                    tokio::spawn(async move { failure.report(error).await }).abort_handle(),
+                );
+            } else {
+                warn!("Network response connection failed: {error}");
+            }
+        }
+    }
+
     pub(crate) async fn connect_reported(
         &self,
         addr: &str,
@@ -748,6 +949,50 @@ async fn write_signal<W: AsyncWrite + AsyncWriteExt>(
     header.write(writer).await.map_err(network_io_error)?;
     writer.write_all(&data).await.map_err(network_io_error)?;
     Ok(())
+}
+
+async fn write_response_signal<W: AsyncWrite + AsyncWriteExt + Unpin>(
+    writer: &mut Pin<&mut W>,
+    quad: Quad,
+    signal: &SignalMessage,
+    spec: &EventWireSpec,
+) -> DataflowResult<()> {
+    let data = spec
+        .encode_signal(signal)
+        .map_err(|error| DataflowError::DataError {
+            details: error.to_string(),
+            count: 1,
+        })?;
+    Header::from_quad(quad, data.len(), MessageType::ResponseSignal)
+        .write(writer)
+        .await
+        .map_err(network_io_error)?;
+    spec.write_identity(writer)
+        .await
+        .map_err(|error| DataflowError::ExternalError(error.to_string()))?;
+    writer.write_all(&data).await.map_err(network_io_error)?;
+    Ok(())
+}
+
+async fn write_response<W: AsyncWrite + AsyncWriteExt + Unpin>(
+    writer: &mut Pin<&mut W>,
+    quad: Quad,
+    response: &EventResponse,
+    spec: &EventWireSpec,
+) -> DataflowResult<()> {
+    let encoded = spec
+        .encode(response)
+        .map_err(|error| DataflowError::DataError {
+            details: error.to_string(),
+            count: 1,
+        })?;
+    Header::from_quad(quad, encoded.rows.len(), MessageType::Event)
+        .write(writer)
+        .await
+        .map_err(network_io_error)?;
+    spec.write_payload(writer, &encoded)
+        .await
+        .map_err(|error| DataflowError::ExternalError(error.to_string()))
 }
 
 async fn write_batch<W: AsyncWrite + AsyncWriteExt>(
@@ -1142,3 +1387,7 @@ mod test {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "event_network_tests.rs"]
+mod response_transport_tests;
