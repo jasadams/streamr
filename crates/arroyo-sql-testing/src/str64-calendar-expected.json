@@ -1,0 +1,93 @@
+{
+  "a": [
+    {
+      "tenant": "t",
+      "k": "a",
+      "source_total": 1,
+      "old_total": null,
+      "new_total": 1,
+      "action": "insert",
+      "trigger_time": "2026-10-20T12:00:10"
+    },
+    {
+      "tenant": "t",
+      "k": "a",
+      "source_total": 0,
+      "old_total": 1,
+      "new_total": 0,
+      "action": "update",
+      "trigger_time": "2026-10-20T12:00:10"
+    }
+  ],
+  "b": [
+    {
+      "tenant": "t",
+      "k": "b",
+      "source_total": 1,
+      "old_total": null,
+      "new_total": 1,
+      "action": "insert",
+      "trigger_time": "2026-10-20T12:00:20"
+    },
+    {
+      "tenant": "t",
+      "k": "b",
+      "source_total": 0,
+      "old_total": 1,
+      "new_total": 0,
+      "action": "update",
+      "trigger_time": "2026-10-20T12:00:20"
+    }
+  ],
+  "c": [
+    {
+      "tenant": "t",
+      "k": "c",
+      "source_total": 1,
+      "old_total": null,
+      "new_total": 1,
+      "action": "insert",
+      "trigger_time": "2026-10-20T12:00:30"
+    },
+    {
+      "tenant": "t",
+      "k": "c",
+      "source_total": 0,
+      "old_total": 1,
+      "new_total": 0,
+      "action": "update",
+      "trigger_time": "2026-10-20T12:00:30"
+    }
+  ],
+  "d": [
+    {
+      "tenant": "t",
+      "k": "d",
+      "source_total": 1,
+      "old_total": null,
+      "new_total": 1,
+      "action": "insert",
+      "trigger_time": "2026-10-21T00:00:10"
+    },
+    {
+      "tenant": "t",
+      "k": "d",
+      "source_total": 0,
+      "old_total": 1,
+      "new_total": 0,
+      "action": "update",
+      "trigger_time": "2026-10-21T00:00:10"
+    }
+  ],
+  "e": [
+    {
+      "tenant": "t",
+      "k": "e",
+      "source_total": 1,
+      "old_total": null,
+      "new_total": 1,
+      "action": "insert",
+      "trigger_time": "2026-10-23T00:00:10"
+    }
+  ]
+}

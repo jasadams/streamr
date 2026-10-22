@@ -159,6 +159,11 @@ fn validate_scalars(plan: &LogicalPlan) -> Result<()> {
 }
 
 fn grouped_source_columns(aggregate: &UpdatingAggregateExtension) -> Result<Vec<usize>> {
+    // Direct calendar maintenance has unbounded quiet-key fanout across bounded
+    // Data batches. It is not the two-key/four-delta-row response branch mode.
+    if !aggregate.calendar_aggregates.is_empty() {
+        return plan_err!("response branch requires no calendar aggregates");
+    }
     crate::continuous_merge::event_source::validate(aggregate)?;
     let LogicalPlan::Aggregate(plan) = &aggregate.aggregate else {
         return plan_err!("response branch lacks its native aggregate");
@@ -1244,5 +1249,17 @@ mod tests {
             "FROM events WHERE eligible GROUP BY k HAVING MAX(v)>0",
         );
         verify(&compile(&max_having).await, 1);
+    }
+
+    #[tokio::test]
+    async fn calendar_branch_rejects_unbounded_quiet_fanout_before_capped_response_mode() {
+        reject(
+            &query("", "WHERE eligible").replace(
+                "COUNT(*)",
+                "COUNT(*) FILTER (WHERE CAST(event_time AS DATE)=EVENT_DATE())",
+            ),
+            "response branch requires no calendar aggregates",
+        )
+        .await;
     }
 }

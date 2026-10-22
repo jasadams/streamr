@@ -2061,13 +2061,15 @@ impl IncrementalAggregatingFunc {
                 .collect::<Vec<_>>(),
         )?;
         let inputs = self.compute_inputs(batch)?;
+        let calendar_inputs = self.calendar_inputs(batch)?;
+        self.validate_calendar_inputs(&calendar_inputs).await?;
         let configured = self
             .native_config
             .context("per-event aggregate requires native limits")?;
         let limits = store.limits();
-        // Retain ordinary append processing's conservative three-operation
-        // allowance. Output has an independent admitted bound below.
-        let operations = 3;
+        // Reuse ordinary native admission, including calendar bucket, identity
+        // and due writes. Output has an independent admitted bound below.
+        let operations = self.native_operations_per_image()?;
         let chunk_rows = (limits.write_operations / operations)
             .min(configured.max_pending_output_rows)
             .min(limits.write_bytes / store.max_encoded_entry_bytes().saturating_mul(operations))
@@ -2091,7 +2093,11 @@ impl IncrementalAggregatingFunc {
                 .map_err(anyhow::Error::from)?;
             let mut end = batch.num_rows().min(start.saturating_add(chunk_rows));
             loop {
-                let mut scope = store.begin_point().await?;
+                let mut scope = if self.calendars.is_empty() {
+                    store.begin_point().await?
+                } else {
+                    store.begin().await?
+                };
                 let mut output = Vec::new();
                 let mut output_bytes = 0usize;
                 let mut shorter = None;
@@ -2105,7 +2111,7 @@ impl IncrementalAggregatingFunc {
                             row,
                             retract: false,
                             row_id: None,
-                            calendar_inputs: &[],
+                            calendar_inputs: &calendar_inputs,
                         },
                         &mut None,
                     )
@@ -2114,12 +2120,24 @@ impl IncrementalAggregatingFunc {
                         .get(&native_group_key(b'G', key.as_ref())?)
                         .await?
                         .context("per-event aggregate lost its accepted group")?;
-                    let group = self
+                    let mut group = self
                         .native_group_codec()?
                         .decode(&bytes, limits.value_bytes)?;
                     let mut values = self
                         .native_accepted_values(&scope, key.as_ref(), &group)
                         .await?;
+                    if !self.calendars.is_empty() {
+                        // Maintenance compares native relation values (including
+                        // its stored clock); the public event clock below is a
+                        // separate, original-operation projection.
+                        group.last_emitted = Some(values.clone());
+                        scope.put(
+                            &native_group_key(b'G', key.as_ref())?,
+                            &self
+                                .native_group_codec()?
+                                .encode(&group, limits.value_bytes)?,
+                        )?;
+                    }
                     // The injected MAX remains native state, but it is not this
                     // event's clock. User-declared MAX columns remain untouched.
                     *values
@@ -2205,16 +2223,11 @@ impl IncrementalAggregatingFunc {
                 .collect::<Vec<_>>(),
         )?;
         let inputs = self.compute_inputs(batch)?;
-        let fallback = self
-            .aggregates
-            .iter()
-            .filter(|aggregate| aggregate.accumulator_type == AccumulatorType::Batch)
-            .count();
+        let calendar_inputs = self.calendar_inputs(batch)?;
+        self.validate_calendar_inputs(&calendar_inputs).await?;
         // Admission covers the WHOLE operation, including both keys of a move.
         // It never falls back to admitting just the before image.
-        let operations_per_image = 3usize
-            .checked_add(fallback.saturating_mul(2))
-            .context("per-event operation count overflow")?;
+        let operations_per_image = self.native_operations_per_image()?;
         for range in ranges {
             let operations = operations_per_image
                 .checked_mul(range.len())
@@ -2255,7 +2268,7 @@ impl IncrementalAggregatingFunc {
                         row,
                         retract: retracts.value(row),
                         row_id: Some(ids.value(row)),
-                        calendar_inputs: &[],
+                        calendar_inputs: &calendar_inputs,
                     },
                     &mut None,
                 )
@@ -2271,14 +2284,24 @@ impl IncrementalAggregatingFunc {
                     .get(&storage_key)
                     .await?
                     .context("per-event aggregate lost its accepted group")?;
-                let group = self
+                let mut group = self
                     .native_group_codec()?
                     .decode(&encoded, limits.value_bytes)?;
                 if group.live_rows == 0 {
-                    // Exact native retractions have already verified that all
-                    // member/identity entries are gone. No dirty/TTL state is
-                    // created on this route, so remove the empty group too.
-                    scope.delete(&storage_key)?;
+                    // Noncalendar retractions have no deferred lifecycle state.
+                    // Calendar generations retire through ordinary B/J/U/H
+                    // cleanup; absence still emits no implicit target DELETE.
+                    if self.calendars.is_empty() {
+                        scope.delete(&storage_key)?;
+                    } else {
+                        self.retire_native_group(&mut scope, key.as_ref(), &mut group)?;
+                        scope.put(
+                            &storage_key,
+                            &self
+                                .native_group_codec()?
+                                .encode(&group, limits.value_bytes)?,
+                        )?;
+                    }
                     continue;
                 }
                 if output.len() >= configured.max_pending_output_rows {
@@ -2287,6 +2310,15 @@ impl IncrementalAggregatingFunc {
                 let mut values = self
                     .native_accepted_values(&scope, key.as_ref(), &group)
                     .await?;
+                if !self.calendars.is_empty() {
+                    group.last_emitted = Some(values.clone());
+                    scope.put(
+                        &storage_key,
+                        &self
+                            .native_group_codec()?
+                            .encode(&group, limits.value_bytes)?,
+                    )?;
+                }
                 *values
                     .last_mut()
                     .context("per-event aggregate has no timestamp")? =
@@ -2587,6 +2619,27 @@ impl IncrementalAggregatingFunc {
         })
     }
 
+    fn native_operations_per_image(&self) -> Result<usize> {
+        let fallback = self
+            .aggregates
+            .iter()
+            .filter(|aggregate| aggregate.accumulator_type == AccumulatorType::Batch)
+            .count();
+        let collections = self
+            .aggregates
+            .iter()
+            .filter(|aggregate| aggregate.replay_members)
+            .count();
+        // Share the existing conservative admission across ordinary and
+        // accepted-output execution, including calendar identity/due writes.
+        (2 + usize::from(self.native_has_group_keys()))
+            .checked_add(fallback.saturating_mul(2))
+            .and_then(|value| value.checked_add(collections.saturating_mul(2)))
+            .and_then(|value| value.checked_add(3 * usize::from(!self.retain_indefinitely)))
+            .and_then(|value| value.checked_add(self.calendar_write_operations()))
+            .context("native aggregate operation count overflow")
+    }
+
     async fn process_native_batch(
         &self,
         batch: &RecordBatch,
@@ -2632,19 +2685,9 @@ impl IncrementalAggregatingFunc {
             .iter()
             .filter(|aggregate| aggregate.accumulator_type == AccumulatorType::Batch)
             .count();
-        let collections = self
-            .aggregates
-            .iter()
-            .filter(|aggregate| aggregate.replay_members)
-            .count();
         // Retain the conservative keyed workspace allowance so membership
         // co-location does not change admitted chunk/commit boundaries.
-        let worst_operations = (2 + usize::from(self.native_has_group_keys()))
-            .checked_add(fallback.saturating_mul(2))
-            .and_then(|value| value.checked_add(collections.saturating_mul(2)))
-            .and_then(|value| value.checked_add(3 * usize::from(!self.retain_indefinitely)))
-            .and_then(|value| value.checked_add(self.calendar_write_operations()))
-            .ok_or_else(|| anyhow!("native aggregate operation count overflow"))?;
+        let worst_operations = self.native_operations_per_image()?;
         let worst_overlay_bytes = worst_operations
             .checked_mul(limits.key_bytes.saturating_add(limits.value_bytes))
             .ok_or_else(|| anyhow!("native aggregate byte budget overflow"))?;
@@ -3040,7 +3083,9 @@ impl IncrementalAggregatingFunc {
         ctx: &mut OperatorContext,
         collector: &mut dyn Collector,
     ) -> DataflowResult<()> {
-        if self.emit_per_event || self.response_root_operator.is_some() {
+        if (self.emit_per_event && self.calendars.is_empty())
+            || self.response_root_operator.is_some()
+        {
             return Ok(());
         }
         self.prune_calendar_buckets().await?;
@@ -3176,6 +3221,22 @@ impl IncrementalAggregatingFunc {
             record_batch.get_array_memory_size() <= configured.max_pending_output_bytes,
             "native aggregate output exceeds configured pending-output budget"
         );
+        if self.emit_per_event {
+            // This private direct boundary publishes accepted snapshots. Native
+            // maintenance still computes/commits its ordinary replacement, but
+            // only the final present relation is a MERGE USING row. Absence
+            // never implicitly deletes the target. Keep its stored native clock.
+            let accepted = arrow::compute::filter_record_batch(
+                &record_batch,
+                &BooleanArray::from(
+                    is_retracts
+                        .iter()
+                        .map(|retract| !retract)
+                        .collect::<Vec<_>>(),
+                ),
+            )?;
+            return Ok((accepted.num_rows() != 0).then_some(accepted));
+        }
         let metadata = self
             .metadata_expr
             .evaluate(&record_batch)?
@@ -3295,23 +3356,7 @@ impl IncrementalAggregatingFunc {
                         &mut is_retracts,
                     );
                     if !append && self.native_has_group_keys() {
-                        // Retain an empty tombstone only while the old member
-                        // generation is being cleaned. A reinsert gets the new
-                        // generation and cannot be erased by that cleanup.
-                        let old_generation = group.generation;
-                        group.generation = group
-                            .generation
-                            .checked_add(1)
-                            .context("aggregate generation overflow")?;
-                        group.next_ordinal = 0;
-                        group.calendar_references.clear();
-                        scope.put(&native_cleanup_key(&group_key, old_generation)?, b"M")?;
-                        if !self.retain_indefinitely {
-                            let deadline = group
-                                .last_update_nanos
-                                .saturating_add(i64::try_from(self.ttl.as_nanos())?);
-                            scope.delete(&native_expiry_key(deadline, &group_key)?)?;
-                        }
+                        self.retire_native_group(&mut scope, &group_key, &mut group)?;
                     }
                     scope.put(
                         &group_storage,
@@ -3337,6 +3382,32 @@ impl IncrementalAggregatingFunc {
                 return Ok(());
             }
         }
+    }
+
+    fn retire_native_group(
+        &self,
+        scope: &mut AggregateScope<'_>,
+        key: &[u8],
+        group: &mut EncodedGroup,
+    ) -> Result<()> {
+        // Share ordinary retirement, including calendar B/J/U/H cleanup. A
+        // recreate uses a new generation and cannot be erased by old cleanup.
+        let old_generation = group.generation;
+        group.generation = group
+            .generation
+            .checked_add(1)
+            .context("aggregate generation overflow")?;
+        group.next_ordinal = 0;
+        group.calendar_references.clear();
+        group.last_emitted = None;
+        scope.put(&native_cleanup_key(key, old_generation)?, b"M")?;
+        if !self.retain_indefinitely {
+            let deadline = group
+                .last_update_nanos
+                .saturating_add(i64::try_from(self.ttl.as_nanos())?);
+            scope.delete(&native_expiry_key(deadline, key)?)?;
+        }
+        Ok(())
     }
 
     async fn initialize_native(&mut self, ctx: &mut OperatorContext) -> Result<()> {
@@ -4396,8 +4467,9 @@ impl ArrowOperator for IncrementalAggregatingFunc {
     }
 
     fn tick_interval(&self) -> Option<Duration> {
-        (!self.emit_per_event && self.response_root_operator.is_none())
-            .then_some(self.flush_interval)
+        ((!self.emit_per_event || !self.calendars.is_empty())
+            && self.response_root_operator.is_none())
+        .then_some(self.flush_interval)
     }
 
     async fn handle_tick(
@@ -4593,10 +4665,8 @@ impl IncrementalAggregatingConstructor {
         );
         ensure!(
             !emit_per_event
-                || (native_config.is_some()
-                    && config.retain_indefinitely == Some(true)
-                    && config.calendar_aggregates.is_empty()),
-            "per-event aggregate MERGE requires native state, indefinite retention and no calendar aggregates"
+                || (native_config.is_some() && config.retain_indefinitely == Some(true)),
+            "per-event aggregate MERGE requires native state and indefinite retention"
         );
         if config.retain_indefinitely == Some(true) && native_config.is_none() {
             bail!("SET updating_ttl = NULL requires worker.aggregate-state native backend limits");
@@ -4941,18 +5011,24 @@ impl IncrementalAggregatingConstructor {
                 !key_fields.is_empty()
                     && final_schema.schema.fields().len() == key_fields.len() + aggregates.len()
                     && final_schema.timestamp_index + 1 == final_schema.schema.fields().len()
-                    && aggregates.iter().all(|(agg, kind, _, _, _, _, _, _, _)| {
-                        let selector = classify(agg.fun()).is_some();
-                        !agg.is_distinct()
-                            && if selector {
-                                *kind == AccumulatorType::Batch
-                                    && selector_spec(agg, &expression_schema).is_ok()
-                            } else {
-                                matches!(agg.fun().name(), "count" | "max")
-                                    && (*kind != AccumulatorType::Batch || !native_append_only)
-                                    && agg.order_bys().is_none()
-                            }
-                    }),
+                    && aggregates.iter().enumerate().all(
+                        |(index, (agg, kind, _, _, _, _, _, _, _))| {
+                            let selector = classify(agg.fun()).is_some();
+                            !agg.is_distinct()
+                                && if selector {
+                                    *kind == AccumulatorType::Batch
+                                        && selector_spec(agg, &expression_schema).is_ok()
+                                } else {
+                                    (matches!(agg.fun().name(), "count" | "max")
+                                        || (agg.fun().name() == "sum"
+                                            && config.calendar_aggregates.iter().any(|calendar| {
+                                                calendar.aggregate_index as usize == index
+                                            })))
+                                        && (*kind != AccumulatorType::Batch || !native_append_only)
+                                        && agg.order_bys().is_none()
+                                }
+                        }
+                    ),
                 "per-event aggregate MERGE requires keyed native COUNT/MAX or grouped selector snapshots"
             );
             let (clock, _, _, _, arguments, filter, _, _, _) = aggregates
@@ -15249,5 +15325,8 @@ mod tests {
                 std::fs::remove_dir_all(root).unwrap();
             }
         }
+    }
+    mod calendar_merge_tests {
+        include!("calendar_merge_tests.rs");
     }
 }

@@ -3168,3 +3168,6 @@ mod smoke_str64_selectors;
 
 #[path = "smoke_str64_branch_lifecycle.rs"]
 mod smoke_str64_branch_lifecycle;
+
+#[path = "smoke_str64_calendar.rs"]
+mod smoke_str64_calendar;
