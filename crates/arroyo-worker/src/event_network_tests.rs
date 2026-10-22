@@ -36,6 +36,7 @@ fn spec(generation: u64) -> Arc<EventWireSpec> {
             [1, 2],
             &tasks(),
             Arc::new(EventEdgeSpec {
+                maintenance: false,
                 root_operator: 7,
                 root_subtask: 0,
                 schema: Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, true)])),

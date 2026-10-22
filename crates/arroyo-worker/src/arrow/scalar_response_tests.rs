@@ -53,6 +53,7 @@ fn response(rows: Option<RecordBatch>, keys: Option<RecordBatch>) -> EventRespon
 }
 fn raw(schema: SchemaRef) -> Arc<EventEdgeSpec> {
     Arc::new(EventEdgeSpec {
+        maintenance: false,
         root_operator: 7,
         root_subtask: 0,
         schema,
@@ -61,6 +62,7 @@ fn raw(schema: SchemaRef) -> Arc<EventEdgeSpec> {
 }
 fn native(schema: SchemaRef, allowance: usize) -> Arc<EventEdgeSpec> {
     Arc::new(EventEdgeSpec {
+        maintenance: false,
         root_operator: 7,
         root_subtask: 0,
         schema,
@@ -90,6 +92,9 @@ fn executor(plan: Arc<dyn ExecutionPlan>) -> StatelessPhysicalExecutor {
 }
 fn value(plan: Arc<dyn ExecutionPlan>, spec: Arc<EventEdgeSpec>) -> ValueExecutionOperator {
     let mut operator = ValueExecutionOperator {
+        response_union_inputs: 0,
+        response_alignment: None,
+        maintenance_inputs: vec![],
         name: "value-response-test".into(),
         executor: executor(plan),
         event_output: None,
@@ -476,6 +481,9 @@ async fn scalar_response_registration_is_explicit_schema_checked_and_ordinary_da
         let input = integers(vec![Some(10)]);
         let plan = source(input.schema());
         let mut operator = ValueExecutionOperator {
+            response_union_inputs: 0,
+            response_alignment: None,
+            maintenance_inputs: vec![],
             name: "ordinary-value".into(),
             executor: executor(plan),
             event_output: None,
@@ -732,6 +740,8 @@ fn constructed_scalar(plan: Arc<dyn ExecutionPlan>, keyed: bool) -> Box<dyn Arro
         ValueExecutionConstructor
             .with_config(
                 api::ValuePlanOperator {
+                    response_union_inputs: 0,
+                    accepted_result: None,
                     name: "runtime-reader-value".into(),
                     physical_plan: bytes,
                 },
@@ -832,4 +842,101 @@ async fn scalar_response_constructor_rejects_coalescing_with_concrete_diagnostic
         assert!(diagnostic.contains("source=false"), "{diagnostic}");
         assert!(operator.event_response_output().is_none());
     }
+}
+
+#[tokio::test]
+async fn scalar_response_union_maintenance_drains_after_other_inputs_close() {
+    let input = integers(vec![Some(10)]);
+    let mut operator = value(source(input.schema()), native(input.schema(), 4096));
+    operator.response_union_inputs = 3;
+    operator.response_alignment =
+        Some(crate::event_pair::EventPairState::with_inputs(7, 0, 3).unwrap());
+    operator.maintenance_inputs = vec![true, false, false];
+    let mut counter = arroyo_operator::CheckpointCounter::new(3);
+    let closed = std::collections::HashSet::from([1, 2]);
+    // Optional branches have forwarded EndOfData and EOF. The core's earlier
+    // watermark/close replacement still precedes its own terminal control.
+    operator
+        .check_event_input_eof(1, &counter, &closed)
+        .unwrap();
+    operator
+        .check_event_maintenance_input(0, &counter, &closed)
+        .unwrap();
+    let mut output = Captured::default();
+    operator
+        .process_batch_index(
+            0,
+            3,
+            input.clone(),
+            &mut operator_context().await,
+            &mut output,
+        )
+        .await
+        .unwrap();
+    assert_eq!(output.data, vec![input]);
+    assert!(output.responses.is_empty());
+    assert!(
+        operator
+            .check_event_maintenance_input(1, &counter, &closed)
+            .is_err()
+    );
+    assert!(
+        operator
+            .check_event_response_input(0, &counter, &closed)
+            .is_err()
+    );
+    let barrier = arroyo_types::CheckpointBarrier {
+        epoch: 1,
+        min_epoch: 0,
+        timestamp: std::time::SystemTime::UNIX_EPOCH,
+        then_stop: false,
+    };
+    assert!(
+        operator
+            .check_event_control_input(
+                0,
+                &arroyo_types::SignalMessage::Barrier(barrier),
+                &counter,
+                &closed
+            )
+            .is_err()
+    );
+    assert!(!counter.mark(0, &barrier));
+    assert!(
+        operator
+            .check_event_maintenance_input(0, &counter, &closed)
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn scalar_response_union_schema_exec_preserves_complete_replacement() {
+    let original = cdc(10, 20);
+    let physical_schema = Arc::new(Schema::new(vec![
+        Arc::new(Field::new("v", DataType::Int64, false)),
+        Arc::new(
+            arroyo_rpc::updating_meta_field()
+                .as_ref()
+                .clone()
+                .with_nullable(true),
+        ),
+    ]));
+    let input = RecordBatch::try_new(physical_schema.clone(), original.columns().to_vec()).unwrap();
+    let declared = original.schema();
+    let plan: Arc<dyn ExecutionPlan> = Arc::new(
+        arroyo_planner::physical::UnionSchemaExec::try_new(
+            source(physical_schema),
+            declared.clone(),
+        )
+        .unwrap(),
+    );
+    validate_response_physical(plan.as_ref(), false).unwrap();
+    assert!(validate_response_physical(plan.as_ref(), true).is_err());
+    let spec = native(declared, 1024 * 1024);
+    let mut operator = value(plan, spec);
+    let keys = touched();
+    let output = callback(&mut operator, response(Some(input), Some(keys.clone()))).await;
+    assert_eq!(output.responses[0].context, context());
+    assert_eq!(output.responses[0].rows.as_ref(), Some(&original));
+    assert_eq!(output.responses[0].touched_keys.as_ref(), Some(&keys));
 }

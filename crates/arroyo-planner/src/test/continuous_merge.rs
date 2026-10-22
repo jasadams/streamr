@@ -160,13 +160,69 @@ async fn maintained_merge_uses_native_capabilities_and_rejects_unresolved_retent
 }
 
 #[test(tokio::test)]
+async fn maintained_merge_nested_result_uses_one_root_and_terminal_accepted_policy() {
+    let base = aggregate_merge("SET updating_ttl = NULL;", "COUNT(*)");
+    let sql = base.replace(
+        "CREATE VIEW counts AS SELECT counter, COUNT(*) AS quantity FROM events GROUP BY counter;",
+        "CREATE VIEW inner_counts AS SELECT counter, COUNT(*) AS n FROM events GROUP BY counter; CREATE VIEW counts AS SELECT counter, COUNT(*) AS quantity FROM inner_counts GROUP BY counter;",
+    );
+    let compiled = plan(&sql).await;
+    let aggregates = compiled
+        .program
+        .graph
+        .node_weights()
+        .flat_map(|node| node.operator_chain.iter())
+        .filter(|(op, _)| op.operator_name == OperatorName::UpdatingAggregate)
+        .map(|(op, _)| {
+            arroyo_rpc::grpc::api::UpdatingAggregateOperator::decode(op.operator_config.as_slice())
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(aggregates.len(), 2);
+    assert!(aggregates.iter().all(|config| config.response_root_operator
+        == aggregates[0].response_root_operator
+        && config.response_root_operator.is_some()
+        && !config.emit_per_event));
+    assert_eq!(
+        aggregates
+            .iter()
+            .filter(|config| config.accepted_output_schema.is_some())
+            .count(),
+        1
+    );
+}
+
+#[test(tokio::test)]
+async fn maintained_merge_nested_canonical_virtual_source_requires_repeatability() {
+    let query = "SET updating_ttl = NULL;
+        CREATE TABLE events (counter BIGINT NOT NULL,event_time TEXT NOT NULL,
+          event_ts TIMESTAMP GENERATED ALWAYS AS (CAST(event_time AS TIMESTAMP)) STORED,
+          event_ms BIGINT GENERATED ALWAYS AS (CAST(CAST(event_time AS TIMESTAMP(3)) AS BIGINT)) STORED,
+          WATERMARK FOR event_ts AS CAST(event_time AS TIMESTAMP)-INTERVAL '5 seconds')
+          WITH(connector='single_file',path='/tmp/str64-native-source.jsonl',format='json',type='source');
+        CREATE VIEW first_level AS SELECT counter,MAX(event_ms) AS latest FROM events GROUP BY counter;
+        CREATE VIEW counts AS SELECT counter,MAX(latest) AS quantity FROM first_level GROUP BY counter;
+        CREATE STATE TABLE inventory (counter BIGINT PRIMARY KEY,quantity BIGINT) PARTITION BY counter;
+        CREATE VIEW applied AS MERGE INTO inventory AS old USING counts AS incoming ON old.counter=incoming.counter
+        WHEN MATCHED THEN UPDATE SET quantity=incoming.quantity
+        WHEN NOT MATCHED THEN INSERT(counter,quantity) VALUES(incoming.counter,incoming.quantity)
+        RETURNING source AS source,old AS old,new AS new,action AS action;
+        SELECT source.quantity,EVENT_TIMESTAMP() AS original_trigger FROM applied;";
+    plan(query).await;
+    let volatile = query.replace(
+        "CAST(CAST(event_time AS TIMESTAMP(3)) AS BIGINT)",
+        "CAST(random()*1000 AS BIGINT)",
+    );
+    reject(&volatile, "repeatable source expressions").await;
+}
+
+#[test(tokio::test)]
 async fn maintained_merge_rejects_unsupported_event_lineage_and_ordering() {
     let base = aggregate_merge("SET updating_ttl = NULL;", "COUNT(*)");
     let view =
         "CREATE VIEW counts AS SELECT counter, COUNT(*) AS quantity FROM events GROUP BY counter;";
     let cases = [
         ("join", base.replace(view, "CREATE VIEW counts AS SELECT a.counter, COUNT(*) AS quantity FROM events a JOIN events b ON a.counter=b.counter GROUP BY a.counter;")),
-        ("nested", base.replace(view, "CREATE VIEW inner_counts AS SELECT counter, COUNT(*) AS n FROM events GROUP BY counter; CREATE VIEW counts AS SELECT counter, COUNT(*) AS quantity FROM inner_counts GROUP BY counter;")),
     ];
     for (case, sql) in cases {
         let result = parse_and_get_program(

@@ -520,6 +520,7 @@ impl ResponseRoot {
         Self {
             input_schema,
             spec: Arc::new(EventEdgeSpec {
+                maintenance: false,
                 root_operator: root,
                 root_subtask: 0,
                 schema,

@@ -42,7 +42,7 @@ fn is_timestamp_column(mut expression: &Expr) -> bool {
     matches!(expression, Expr::Column(column) if column.name == TIMESTAMP_FIELD)
 }
 
-pub(crate) fn validate(aggregate: &UpdatingAggregateExtension) -> Result<()> {
+pub(crate) fn validate_aggregate(aggregate: &UpdatingAggregateExtension) -> Result<()> {
     if aggregate.ttl.is_some() {
         return plan_err!("per-event aggregate MERGE requires SET updating_ttl = NULL");
     }
@@ -180,6 +180,18 @@ pub(crate) fn validate(aggregate: &UpdatingAggregateExtension) -> Result<()> {
             }
         }
     }
+    Ok(())
+}
+
+pub(crate) fn validate(aggregate: &UpdatingAggregateExtension) -> Result<()> {
+    validate_aggregate(aggregate)?;
+    let LogicalPlan::Aggregate(plan) = &aggregate.aggregate else {
+        unreachable!("native aggregate validated")
+    };
+    let corrections = plan
+        .input
+        .schema()
+        .has_column_with_unqualified_name(UPDATING_META_FIELD);
     let mut sources = 0;
     plan.input.apply(|node| {
         match node {
@@ -428,6 +440,9 @@ pub(super) fn resolve_with_slot(slot: u32, input: LogicalPlan) -> Result<Logical
         .has_column_with_unqualified_name(UPDATING_META_FIELD)
     {
         return Ok(input);
+    }
+    if let Some(result) = crate::merge_event_results::resolve(&input, slot)? {
+        return Ok(result);
     }
     let input = crate::merge_event_branches::resolve(input, slot)?;
     if !input

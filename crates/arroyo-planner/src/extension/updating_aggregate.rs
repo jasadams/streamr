@@ -23,7 +23,7 @@ use std::time::Duration;
 
 pub(crate) const UPDATING_AGGREGATE_EXTENSION_NAME: &str = "UpdatingAggregateExtension";
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct UpdatingAggregateExtension {
     pub(crate) aggregate: LogicalPlan,
     pub(crate) key_fields: Vec<usize>,
@@ -33,6 +33,40 @@ pub(crate) struct UpdatingAggregateExtension {
     pub(crate) calendar_aggregates: Vec<crate::plan::CalendarAggregate>,
     pub(crate) emit_per_event: bool,
     pub(crate) response_route: Option<crate::merge_event_branches::ResponseRoute>,
+    pub(crate) accepted_schema: Option<DFSchemaRef>,
+    pub(crate) response_key_fields: Vec<usize>,
+}
+
+// DFSchema has exact equality/hash but no ordering. Different accepted schema
+// contracts are incomparable; never report Equal after omitting that proof.
+impl PartialOrd for UpdatingAggregateExtension {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        if self.accepted_schema != other.accepted_schema {
+            return None;
+        }
+        (
+            &self.aggregate,
+            &self.key_fields,
+            &self.final_calculation,
+            &self.timestamp_qualifier,
+            &self.ttl,
+            &self.calendar_aggregates,
+            &self.emit_per_event,
+            &self.response_route,
+            &self.response_key_fields,
+        )
+            .partial_cmp(&(
+                &other.aggregate,
+                &other.key_fields,
+                &other.final_calculation,
+                &other.timestamp_qualifier,
+                &other.ttl,
+                &other.calendar_aggregates,
+                &other.emit_per_event,
+                &other.response_route,
+                &other.response_key_fields,
+            ))
+    }
 }
 
 impl UpdatingAggregateExtension {
@@ -59,6 +93,8 @@ impl UpdatingAggregateExtension {
             calendar_aggregates,
             emit_per_event: false,
             response_route: None,
+            accepted_schema: None,
+            response_key_fields: vec![],
         })
     }
 }
@@ -73,7 +109,9 @@ impl UserDefinedLogicalNodeCore for UpdatingAggregateExtension {
     }
 
     fn schema(&self) -> &DFSchemaRef {
-        self.final_calculation.schema()
+        self.accepted_schema
+            .as_ref()
+            .unwrap_or_else(|| self.final_calculation.schema())
     }
 
     fn expressions(&self) -> Vec<datafusion::prelude::Expr> {
@@ -119,6 +157,8 @@ impl UserDefinedLogicalNodeCore for UpdatingAggregateExtension {
             next.final_calculation = next.aggregate.clone();
         }
         next.response_route = self.response_route;
+        next.accepted_schema = self.accepted_schema.clone();
+        next.response_key_fields = self.response_key_fields.clone();
         Ok(next)
     }
 }
@@ -319,7 +359,25 @@ impl ArroyoExtension for UpdatingAggregateExtension {
             collection_output_limits,
             name: "UpdatingAggregate".to_string(),
             input_schema: Some((*input_schema).clone().into()),
-            final_schema: Some(self.output_schema().into()),
+            final_schema: Some(
+                ArroyoSchema::from_schema_unkeyed(Arc::new(
+                    self.final_calculation.schema().as_ref().into(),
+                ))?
+                .into(),
+            ),
+            accepted_output_schema: self
+                .accepted_schema
+                .as_ref()
+                .map(|schema| {
+                    ArroyoSchema::from_schema_unkeyed(Arc::new(schema.as_ref().into()))
+                        .map(Into::into)
+                })
+                .transpose()?,
+            response_key_fields: self
+                .response_key_fields
+                .iter()
+                .map(|index| *index as u64)
+                .collect(),
             aggregate_exec: aggregate_exec.encode_to_vec(),
             metadata_expr: planner
                 .serialize_as_physical_expr(&updating_meta_expr, &input_dfschema)?,

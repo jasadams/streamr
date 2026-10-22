@@ -1,3 +1,7 @@
+#[path = "union_schema.rs"]
+mod union_schema;
+pub use union_schema::UnionSchemaExec;
+
 use arrow::{
     array::{AsArray, BooleanBuilder, TimestampNanosecondBuilder, UInt32Builder, UInt64Builder},
     buffer::NullBuffer,
@@ -518,6 +522,18 @@ impl PhysicalExtensionCodec for ArroyoPhysicalExtensionCodec {
             .node
             .ok_or_else(|| DataFusionError::Internal("exec node is empty".to_string()))?
         {
+            Node::UnionSchema(node) => {
+                if inputs.len() != 1 {
+                    return plan_err!("native UNION schema node requires one input");
+                }
+                let schema = serde_json::from_str::<Schema>(&node.schema).map_err(|error| {
+                    DataFusionError::Plan(format!("invalid native UNION schema: {error}"))
+                })?;
+                Ok(Arc::new(UnionSchemaExec::try_new(
+                    inputs[0].clone(),
+                    Arc::new(schema),
+                )?))
+            }
             Node::MemExec(mem_exec) => {
                 let schema: Schema = serde_json::from_str(&mem_exec.schema).map_err(|e| {
                     DataFusionError::Internal(format!("invalid schema in exec codec: {e:?}"))
@@ -618,6 +634,17 @@ impl PhysicalExtensionCodec for ArroyoPhysicalExtensionCodec {
         buf: &mut Vec<u8>,
     ) -> datafusion::common::Result<()> {
         let mut proto = None;
+        if let Some(union) = node.as_any().downcast_ref::<UnionSchemaExec>() {
+            proto = Some(ArroyoExecNode {
+                node: Some(Node::UnionSchema(arroyo_rpc::grpc::api::UnionSchemaNode {
+                    schema: serde_json::to_string(&union.schema()).map_err(|error| {
+                        DataFusionError::Plan(format!(
+                            "native UNION schema encoding failed: {error}"
+                        ))
+                    })?,
+                })),
+            });
+        }
 
         let mem_table: Option<&ArroyoMemExec> = node.as_any().downcast_ref();
         if let Some(table) = mem_table {

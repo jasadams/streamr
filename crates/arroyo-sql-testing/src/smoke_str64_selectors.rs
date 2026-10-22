@@ -86,7 +86,7 @@ async fn native_selector_packet_exact_outputs() {
         config::config().pipeline.source_batch_size
     );
     let udfs = get_udfs();
-    let logical = match get_graph(query, &udfs).await {
+    let logical = Arc::new(match get_graph(query, &udfs).await {
         Ok(logical) => logical,
         Err(error) => {
             tokio::fs::write(
@@ -97,7 +97,7 @@ async fn native_selector_packet_exact_outputs() {
             .unwrap();
             panic!("unchanged native SQL packet must plan: {error:?}");
         }
-    };
+    });
     let mut sources = Vec::new();
     let mut sinks = Vec::new();
     let mut operator_counts = std::collections::BTreeMap::<String, usize>::new();
@@ -135,7 +135,14 @@ async fn native_selector_packet_exact_outputs() {
         "source_paths":sources,"sink_paths":sinks,
         "backend":format!("{:?}",config::config().worker.sql_state_backend),
         "source_batch_max":config::config().pipeline.source_batch_size,
-        "oracle_rows":expected.len()
+        "oracle_rows":expected.len(),
+        "typed_state_limits":config::config().worker.typed_sql_state.as_ref().map(|limits| serde_json::json!({
+            "decoded_bytes":limits.decoded_bytes,"row_bytes":limits.row_bytes,
+            "page_entries":limits.page_entries,"page_bytes":limits.page_bytes,
+            "scope_bytes":limits.scope_bytes,"scope_operations":limits.scope_operations,
+            "max_working_event_bytes":limits.max_working_event_bytes,
+            "max_captured_event_bytes":limits.max_captured_event_bytes
+        }))
     });
     tokio::fs::write(
         evidence.join("planned-graph.json"),
@@ -200,15 +207,113 @@ async fn native_selector_packet_exact_outputs() {
             ),
         }
     }
-    let (tx, mut rx) = channel(128);
-    let program = local_program(&job, &logical.graph, &udfs, None, tx).await;
-    let running = Engine::for_local(program, "pipe-test".into(), job)
-        .await
-        .unwrap()
-        .start()
-        .await;
-    run_until_finished(&running, &mut rx).await;
-    wait_for_capture_state_cleanup().await;
+    let checkpoint = packet.get("checkpoint").map(|checkpoint| {
+        let input_rows = checkpoint["input_rows"].as_u64().unwrap();
+        let output_rows = usize::try_from(checkpoint["output_rows"].as_u64().unwrap()).unwrap();
+        assert!(
+            input_rows > 0
+                && input_rows
+                    < input_bytes
+                        .split(|b| *b == b'\n')
+                        .filter(|row| !row.is_empty())
+                        .count() as u64
+        );
+        assert!(output_rows > 0 && output_rows <= expected.len());
+        (i32::try_from(input_rows).unwrap(), output_rows)
+    });
+    for attempt in 0..=usize::from(checkpoint.is_some()) {
+        let (tx, mut rx) = channel(128);
+        let program =
+            local_program(&job, &logical.graph, &udfs, (attempt == 1).then_some(1), tx).await;
+        let batches = super::smoke_str64::observe_source_batches(&program);
+        let running = Engine::for_local(program, "pipe-test".into(), job.clone())
+            .await
+            .unwrap()
+            .start()
+            .await;
+        let abort = AbortPacketAttempt(&running);
+        if let Some((input_rows, output_rows)) = checkpoint.filter(|_| attempt == 0) {
+            assert_eq!(running.source_controls().len(), 1);
+            // Controlled single-file sources read the first row immediately.
+            // The stopping barrier flushes the remaining partial source batch.
+            advance(&running, input_rows - 1).await;
+            let mut finished = HashSet::new();
+            let bytes = checkpoint_with_stop(
+                &mut SmokeTestContext {
+                    job_id: Arc::new(job.clone()),
+                    engine: &running,
+                    control_rx: &mut rx,
+                    program: logical.clone(),
+                },
+                1,
+                true,
+                &mut finished,
+            )
+            .await;
+            let tasks: usize = running.operator_controls().values().map(Vec::len).sum();
+            tokio::time::timeout(test_runtime_timeout(), async {
+                while finished.len() < tasks {
+                    match rx.recv().await {
+                        Some(ControlResp::TaskFinished {
+                            task_id,
+                            subtask_idx,
+                        }) => {
+                            finished.insert((task_id, subtask_idx));
+                        }
+                        Some(ControlResp::TaskFailed { error, .. }) => {
+                            panic!("packet checkpoint attempt failed: {error:?}")
+                        }
+                        Some(_) => {}
+                        None => panic!("packet attempt closed before every task stopped"),
+                    }
+                }
+            })
+            .await
+            .expect("packet checkpoint-stop tasks did not finish");
+            drop(abort);
+            drop(running);
+            wait_for_capture_state_cleanup().await;
+            let expected_prefix =
+                normalize_packet_rows(expected[..output_rows].to_vec(), &timestamp_paths);
+            for (index, output) in outputs.iter().enumerate() {
+                let captured = tokio::fs::read(output).await.unwrap();
+                tokio::fs::write(
+                    evidence.join(format!("checkpoint-consumer-{index}.jsonl")),
+                    &captured,
+                )
+                .await
+                .unwrap();
+                assert_eq!(
+                    normalize_packet_rows(packet_rows(&captured), &timestamp_paths),
+                    expected_prefix,
+                    "completed checkpoint must contain exactly the declared literal prefix"
+                );
+            }
+            let observed_batches = batches.lock().unwrap().clone();
+            assert_eq!(
+                observed_batches.iter().sum::<usize>(),
+                usize::try_from(input_rows).unwrap(),
+                "checkpoint must stop at the declared raw prefix"
+            );
+            tokio::fs::write(evidence.join("checkpoint-receipt.json"), serde_json::to_vec_pretty(&serde_json::json!({
+                "epoch":1,"checkpoint_bytes":bytes,"all_tasks_stopped":finished.len(),
+                "input_rows":input_rows,"output_rows":output_rows,"source_batches":observed_batches,
+                "restore":"fresh local program and owners in the same process",
+            })).unwrap()).await.unwrap();
+        } else {
+            run_until_finished(&running, &mut rx).await;
+            drop(abort);
+            drop(running);
+            wait_for_capture_state_cleanup().await;
+            let observed_batches = batches.lock().unwrap().clone();
+            tokio::fs::write(
+                evidence.join(format!("attempt-{attempt}-batches.json")),
+                serde_json::to_vec_pretty(&observed_batches).unwrap(),
+            )
+            .await
+            .unwrap();
+        }
+    }
     let expected = normalize_packet_rows(expected, &timestamp_paths);
     for (index, output) in outputs.iter().enumerate() {
         let bytes = tokio::fs::read(output).await.unwrap();
@@ -226,6 +331,13 @@ async fn native_selector_packet_exact_outputs() {
         expected.len()
     );
 }
+struct AbortPacketAttempt<'a>(&'a RunningEngine);
+impl Drop for AbortPacketAttempt<'_> {
+    fn drop(&mut self) {
+        self.0.abort_workers();
+    }
+}
+
 fn packet_path_field(packet: &Value, name: &str) -> PathBuf {
     let path = PathBuf::from(packet[name].as_str().unwrap());
     assert!(path.is_absolute(), "packet {name} must be absolute");

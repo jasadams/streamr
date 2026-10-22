@@ -560,6 +560,79 @@ struct BatchObserver {
 }
 #[async_trait::async_trait]
 impl ArrowOperator for BatchObserver {
+    fn event_response_role(&self) -> arroyo_operator::operator::EventResponseRole {
+        self.inner.event_response_role()
+    }
+    fn event_response_output(&self) -> Option<Arc<arroyo_types::event_edge::EventEdgeSpec>> {
+        self.inner.event_response_output()
+    }
+    fn event_response_key_types(&self) -> Option<Vec<arrow::datatypes::DataType>> {
+        self.inner.event_response_key_types()
+    }
+    fn bind_event_response_key_types(
+        &self,
+        inputs: &[Option<Vec<arrow::datatypes::DataType>>],
+    ) -> DataflowResult<()> {
+        self.inner.bind_event_response_key_types(inputs)
+    }
+    fn bind_event_response(
+        &mut self,
+        inputs: &[Arc<arroyo_types::event_edge::EventEdgeSpec>],
+        context: &OperatorContext,
+    ) -> DataflowResult<Option<Arc<arroyo_types::event_edge::EventEdgeSpec>>> {
+        self.inner.bind_event_response(inputs, context)
+    }
+    fn validate_event_source_plumbing(&self) -> DataflowResult<()> {
+        self.inner.validate_event_source_plumbing()
+    }
+    fn event_pair_mode(&self) -> bool {
+        self.inner.event_pair_mode()
+    }
+    fn event_input_count(&self) -> Option<usize> {
+        self.inner.event_input_count()
+    }
+    fn event_input_blocked(&self, index: usize) -> bool {
+        self.inner.event_input_blocked(index)
+    }
+    fn check_event_maintenance_input(
+        &self,
+        index: usize,
+        counter: &arroyo_operator::CheckpointCounter,
+        closed: &std::collections::HashSet<usize>,
+    ) -> DataflowResult<()> {
+        self.inner
+            .check_event_maintenance_input(index, counter, closed)
+    }
+    fn check_event_response_input(
+        &self,
+        index: usize,
+        counter: &arroyo_operator::CheckpointCounter,
+        closed: &std::collections::HashSet<usize>,
+    ) -> DataflowResult<()> {
+        self.inner
+            .check_event_response_input(index, counter, closed)
+    }
+    fn check_event_control_input(
+        &self,
+        index: usize,
+        signal: &SignalMessage,
+        counter: &arroyo_operator::CheckpointCounter,
+        closed: &std::collections::HashSet<usize>,
+    ) -> DataflowResult<()> {
+        self.inner
+            .check_event_control_input(index, signal, counter, closed)
+    }
+    fn check_event_input_eof(
+        &self,
+        index: usize,
+        counter: &arroyo_operator::CheckpointCounter,
+        closed: &std::collections::HashSet<usize>,
+    ) -> DataflowResult<()> {
+        self.inner.check_event_input_eof(index, counter, closed)
+    }
+    fn is_committing(&self) -> bool {
+        self.inner.is_committing()
+    }
     fn name(&self) -> String {
         self.inner.name()
     }
@@ -593,6 +666,26 @@ impl ArrowOperator for BatchObserver {
         } else {
             self.inner.process_batch(batch, ctx, collector).await
         }
+    }
+    async fn process_response_index(
+        &mut self,
+        index: usize,
+        partitions: usize,
+        response: arroyo_types::event_response::EventResponse,
+        ctx: &mut OperatorContext,
+        collector: &mut dyn Collector,
+    ) -> DataflowResult<()> {
+        self.inner
+            .process_response_index(index, partitions, response, ctx, collector)
+            .await
+    }
+    async fn handle_watermark(
+        &mut self,
+        watermark: arroyo_types::Watermark,
+        ctx: &mut OperatorContext,
+        collector: &mut dyn Collector,
+    ) -> DataflowResult<Option<arroyo_types::Watermark>> {
+        self.inner.handle_watermark(watermark, ctx, collector).await
     }
     async fn handle_checkpoint(
         &mut self,
@@ -826,4 +919,137 @@ pub(super) async fn fail_after_live_commit(
     println!(
         "STR64_FAULT observed_real_output_block=true observed_task_failure=true whole_attempt_drained=true checkpoint2_source_acknowledged=true blocked_owner_checkpoint2_completed=false boundary={blocked_name}"
     );
+}
+
+#[tokio::test]
+#[ignore = "explicit native aggregate/typed limits and five-owner resources; run configured before three-branch packets"]
+async fn source_batch_observer_preserves_native_root_three_way_ordered_delivery() {
+    use arrow::array::{ArrayRef, StringArray, TimestampNanosecondArray};
+    use arrow::datatypes::DataType;
+    use arroyo_operator::context::{ArrowCollector, batch_bounded};
+    use arroyo_operator::operator::{EventResponseRole, OperatorNode};
+    use arroyo_types::{ArrowMessage, ChainInfo};
+    use arroyo_worker::engine::SubtaskOrQueueNode;
+
+    configure_test_worker();
+    let sql = include_str!("str64-calendar-composed-query.sql")
+        .replace("$input", "/tmp/str64-observer-input.jsonl")
+        .replace("$output", "/tmp/str64-observer-output.jsonl")
+        .replace("$mirror", "/tmp/str64-observer-mirror.jsonl");
+    let udfs = get_udfs();
+    let logical = get_graph(sql, &udfs).await.unwrap();
+    let (tx, _rx) = channel(128);
+    let program = local_program("str64-observer-root", &logical.graph, &udfs, None, tx).await;
+    let observed = observe_source_batches(&program);
+    let mut node = {
+        let mut graph = program.graph.write().unwrap();
+        let root_chain = graph
+            .node_indices()
+            .find(|index| {
+                matches!(&graph[*index], SubtaskOrQueueNode::SubtaskNode(node)
+                if matches!(&node.node, OperatorNode::Chained(chain)
+                    if chain.iter().any(|(op, _)| op.name()=="expression_watermark_generator")))
+            })
+            .unwrap();
+        assert_eq!(
+            graph
+                .edges_directed(root_chain, Direction::Outgoing)
+                .count(),
+            3
+        );
+        let (node, _commands) = graph[root_chain].take_subtask();
+        match node.node {
+            OperatorNode::Chained(chain) => chain,
+            _ => panic!("root must be a native chained operator"),
+        }
+    };
+    while node.operator.name() != "expression_watermark_generator" {
+        node = *node
+            .next
+            .take()
+            .expect("native root must follow source projection");
+    }
+    assert!(node.next.is_none(), "shared root must end its fanout chain");
+    let spec = node
+        .operator
+        .event_response_output()
+        .expect("observer must preserve registered native root output");
+    assert_eq!(
+        node.operator.event_response_role(),
+        EventResponseRole::Root(spec.root_operator)
+    );
+    assert_eq!(
+        node.operator
+            .bind_event_response(&[], &node.context)
+            .unwrap()
+            .as_ref(),
+        Some(&spec)
+    );
+    let schema = node.context.in_schemas[0].schema.clone();
+    let clocks = vec![10_000_000_000i64, 20_000_000_000i64];
+    let arrays: Vec<ArrayRef> = schema
+        .fields()
+        .iter()
+        .map(|field| match field.data_type() {
+            DataType::Utf8 => Arc::new(StringArray::from(if field.name() == "event_time" {
+                vec!["1970-01-01T00:00:10Z", "1970-01-01T00:00:20Z"]
+            } else {
+                vec!["group", "group"]
+            })) as ArrayRef,
+            DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None) => {
+                Arc::new(TimestampNanosecondArray::from(clocks.clone())) as ArrayRef
+            }
+            unexpected => panic!("unexpected generic fixture root field: {unexpected:?}"),
+        })
+        .collect();
+    let input = RecordBatch::try_new(schema, arrays).unwrap();
+    let mut queues = Vec::new();
+    let mut receivers = Vec::new();
+    for _ in 0..3 {
+        let (tx, rx) = batch_bounded(8);
+        queues.push(vec![tx]);
+        receivers.push(rx);
+    }
+    let mut collector = ArrowCollector::new(
+        Arc::new(ChainInfo {
+            job_id: "str64-observer-root".into(),
+            task_id: node.context.task_info.operator_idx,
+            description: "native observed root fanout".into(),
+            task_index: 0,
+        }),
+        node.context.out_schema.clone(),
+        queues,
+    );
+    // Exactly the startup registration used by OperatorNode::start, after
+    // instrumentation has wrapped the actual native root.
+    collector.register_event_output(spec).unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        node.operator
+            .process_batch(input.clone(), &mut node.context, &mut collector),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(*observed.lock().unwrap(), vec![2]);
+    let mut branch_outputs = Vec::new();
+    for mut receiver in receivers {
+        let mut packets = Vec::new();
+        for (index, clock) in clocks.iter().enumerate() {
+            let message = tokio::time::timeout(Duration::from_secs(10), receiver.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let ArrowMessage::Event(response) = message else {
+                panic!("expected complete event before watermark")
+            };
+            assert_eq!(response.context.sequence, index as u64 + 1);
+            assert_eq!(response.context.trigger_nanos, *clock);
+            assert_eq!(response.rows.as_ref(), Some(&input.slice(index, 1)));
+            packets.push(response);
+        }
+        branch_outputs.push(packets);
+    }
+    assert_eq!(branch_outputs[0], branch_outputs[1]);
+    assert_eq!(branch_outputs[0], branch_outputs[2]);
 }

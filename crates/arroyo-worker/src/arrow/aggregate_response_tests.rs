@@ -70,7 +70,7 @@ fn branch_response_aggregate_serialized_constructor_keeps_clock_and_mode_guards(
         });
         bad.final_schema=Some(ArroyoSchema::from_schema_unkeyed(Arc::new(Schema::new(fields))).unwrap().into());
         let error=IncrementalAggregatingConstructor::build_with_native_config(bad,registry,Some(native_test_config())).err().unwrap();
-        assert!(error.to_string().contains("COUNT/MAX changelog output"),"{error}");
+        assert!(error.to_string().contains("verified native changelog output"),"{error}");
     }
     let (mut bad,registry)=config(true,false);bad.emit_per_event=true;
     assert!(IncrementalAggregatingConstructor::build_with_native_config(bad,registry,Some(native_test_config())).err().unwrap().to_string().contains("branch response aggregate requires"));
@@ -215,7 +215,8 @@ async fn branch_response_aggregate_output_guard_lives_through_success_error_and_
 #[tokio::test]
 async fn branch_response_aggregate_binding_preserves_all_serialized_schema_metadata() {
     let (mut operator,ctx)=owner(false,false).await;
-    let raw=Arc::new(EventEdgeSpec {root_operator:7,root_subtask:0,schema:ctx.in_schemas[0].schema.clone(),layout:EventLayout::Raw});
+    let raw=Arc::new(EventEdgeSpec {
+            maintenance: false,root_operator:7,root_subtask:0,schema:ctx.in_schemas[0].schema.clone(),layout:EventLayout::Raw});
     let output=operator.bind_event_response(std::slice::from_ref(&raw),&ctx).unwrap().unwrap();
     assert_eq!(output.schema,ctx.out_schema.as_ref().unwrap().schema);
     for output_side in [false,true] {for kind in [0,1,2] {
@@ -230,7 +231,8 @@ async fn branch_response_aggregate_binding_preserves_all_serialized_schema_metad
         }
         let forged:ArroyoSchema=serialized.try_into().unwrap();
         assert_eq!(forged.schema,original.schema,"only Arroyo key/routing/clock metadata changed");assert_ne!(&forged,original);
-        let raw=Arc::new(EventEdgeSpec {root_operator:7,root_subtask:0,schema:ctx.in_schemas[0].schema.clone(),layout:EventLayout::Raw});
+        let raw=Arc::new(EventEdgeSpec {
+            maintenance: false,root_operator:7,root_subtask:0,schema:ctx.in_schemas[0].schema.clone(),layout:EventLayout::Raw});
         if output_side {ctx.out_schema=Some(Arc::new(forged));} else {ctx.in_schemas[0]=Arc::new(forged);}
         let error=operator.bind_event_response(std::slice::from_ref(&raw),&ctx).unwrap_err();
         assert!(error.to_string().contains("graph schema differs from actual constructed native owner"),"{error}");

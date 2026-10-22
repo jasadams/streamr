@@ -134,6 +134,18 @@ impl StateTableAccess {
         let mut related = vec![];
         input.apply(|node| {
             if let LogicalPlan::Extension(e) = node {
+                if let Some(remote) = e
+                    .node
+                    .as_any()
+                    .downcast_ref::<super::remote_table::RemoteTableExtension>()
+                    && let Some(route) = remote.accepted_result
+                {
+                    source_names.push(
+                        crate::merge_event_results::accepted_source(&remote.input, route.slot)?
+                            .to_string(),
+                    );
+                    return Ok(TreeNodeRecursion::Jump);
+                }
                 if let Some(join) = e.node.as_any().downcast_ref::<super::join::JoinExtension>()
                     && (join.response_route.is_some() || join.accepted_schema.is_some())
                 {

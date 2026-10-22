@@ -16,10 +16,21 @@ message ConnectorOp {
   string description = 3;
 }
 
+// Native SELECT is evaluated before the serial MERGE region. The planner
+// proves this cut's complete schemas and concrete native producer ancestry.
+message AcceptedResultBoundary {
+  uint32 root_operator = 1;
+  ArroyoSchema input_schema = 2;
+  ArroyoSchema output_schema = 3;
+}
+
 /// Deprecated -- use ProjectionOperator instead
 message ValuePlanOperator {
   string name = 1;
   bytes physical_plan = 2;
+  // Finite, planner-proven reconvergence of complete branch responses.
+  uint32 response_union_inputs = 3;
+  AcceptedResultBoundary accepted_result = 4;
 }
 
 /// Deprecated -- use ProjectionOperator instead
@@ -142,6 +153,12 @@ message UpdatingAggregateOperator {
   // Private graph-proven branch-response mode; original root is a planned node id.
   // Distinct from accepted snapshots: output remains native relation changelog.
   optional uint32 response_root_operator = 13;
+  // Terminal native result policy. The native final_schema remains unchanged;
+  // this append boundary removes only the canonical changelog metadata.
+  ArroyoSchema accepted_output_schema = 14;
+  // Native grouping ordinals projected to the downstream aggregate grouping
+  // tuple. Empty means the complete native grouping tuple (e.g. native JOIN).
+  repeated uint64 response_key_fields = 15;
 }
 
 // A maintained inclusive UTC calendar FILTER, indexed by aggregate ordinal.
@@ -320,11 +337,17 @@ message DebeziumEncodeNode {
   string schema = 1;
 }
 
+// Canonical UNION branch schema, without changing any SELECT calculation.
+message UnionSchemaNode {
+  string schema = 1;
+}
+
 message ArroyoExecNode {
   oneof node {
     MemExecNode mem_exec = 1;
     DebeziumDecodeNode debezium_decode = 3;
     DebeziumEncodeNode debezium_encode = 4;
+    UnionSchemaNode union_schema = 5;
   }
 }
 

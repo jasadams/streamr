@@ -3068,6 +3068,30 @@ fn configure_test_worker() {
                 count
             })
         };
+        if let Some(decoded_bytes) = positive_limit("STREAMR_TEST_TYPED_DECODED_BYTES") {
+            let typed = c
+                .worker
+                .typed_sql_state
+                .as_mut()
+                .expect("explicit typed decoded allowance requires typed SQL state");
+            typed.decoded_bytes = decoded_bytes;
+            typed
+                .validate()
+                .expect("invalid explicit typed decoded allowance");
+            println!("\nTYPED_SQL_DECODED_LIMIT decoded_bytes={decoded_bytes}");
+        }
+        if let Some(page_entries) = positive_limit("STREAMR_TEST_TYPED_PAGE_ENTRIES") {
+            let typed = c
+                .worker
+                .typed_sql_state
+                .as_mut()
+                .expect("explicit typed page entries require typed SQL state");
+            typed.page_entries = page_entries;
+            typed
+                .validate()
+                .expect("invalid explicit typed page entries");
+            println!("\nTYPED_SQL_PAGE_LIMIT page_entries={page_entries}");
+        }
         let databases = positive_limit("STREAMR_TEST_MAX_OPEN_DATABASES");
         let snapshots = positive_limit("STREAMR_TEST_MAX_SNAPSHOTS");
         let scan_page_bytes = positive_limit("STREAMR_TEST_SCAN_PAGE_BYTES");

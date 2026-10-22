@@ -98,6 +98,8 @@ impl SinkExtension {
             }
         }
         let remote_table_extension = RemoteTableExtension {
+            accepted_result: None,
+            union_schema: false,
             input: input.as_ref().clone(),
             name: TableReference::bare("sink projection"),
             schema: schema.clone(),

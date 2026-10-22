@@ -22,12 +22,12 @@ pub(crate) struct ResponseRoute {
     pub operator: Option<u32>,
 }
 
-fn column_at(plan: &LogicalPlan, index: usize) -> Column {
+pub(super) fn column_at(plan: &LogicalPlan, index: usize) -> Column {
     let (qualifier, field) = plan.schema().qualified_field(index);
     Column::new(qualifier.cloned(), field.name())
 }
 
-fn bare_column(mut expression: &Expr) -> Result<&Column> {
+pub(super) fn bare_column(mut expression: &Expr) -> Result<&Column> {
     while let Expr::Alias(alias) = expression {
         expression = &alias.expr;
     }
@@ -37,7 +37,7 @@ fn bare_column(mut expression: &Expr) -> Result<&Column> {
     }
 }
 
-fn scalar_input(plan: &LogicalPlan) -> Result<&LogicalPlan> {
+pub(super) fn scalar_input(plan: &LogicalPlan) -> Result<&LogicalPlan> {
     match plan {
         LogicalPlan::Projection(projection) => Ok(&projection.input),
         LogicalPlan::Filter(filter) => Ok(&filter.input),
@@ -66,7 +66,7 @@ fn scalar_input(plan: &LogicalPlan) -> Result<&LogicalPlan> {
     }
 }
 
-fn aggregate(plan: &LogicalPlan) -> Result<&UpdatingAggregateExtension> {
+pub(super) fn aggregate(plan: &LogicalPlan) -> Result<&UpdatingAggregateExtension> {
     if let LogicalPlan::Extension(extension) = plan
         && let Some(aggregate) = extension
             .node
@@ -75,6 +75,11 @@ fn aggregate(plan: &LogicalPlan) -> Result<&UpdatingAggregateExtension> {
     {
         return Ok(aggregate);
     }
+    validate_scalar_step(plan)?;
+    aggregate(scalar_input(plan)?)
+}
+
+pub(super) fn validate_scalar_step(plan: &LogicalPlan) -> Result<()> {
     if let LogicalPlan::Projection(projection) = plan {
         for (index, expression) in projection.expr.iter().enumerate() {
             if projection.schema.field(index).name() == TIMESTAMP_FIELD {
@@ -97,12 +102,16 @@ fn aggregate(plan: &LogicalPlan) -> Result<&UpdatingAggregateExtension> {
             filter.input.schema(),
         )?;
     }
-    aggregate(scalar_input(plan)?)
+    Ok(())
 }
 
 /// Follow only identity/alias projections. Computed, cast and reordered key
 /// equivalences are deliberately outside this first admitted shape.
-fn trace_column(plan: &LogicalPlan, column: &Column, stop: &LogicalPlan) -> Result<usize> {
+pub(super) fn trace_column(
+    plan: &LogicalPlan,
+    column: &Column,
+    stop: &LogicalPlan,
+) -> Result<usize> {
     let index = plan.schema().index_of_column(column)?;
     if plan == stop {
         return Ok(index);
@@ -130,7 +139,7 @@ fn trace_column(plan: &LogicalPlan, column: &Column, stop: &LogicalPlan) -> Resu
     }
 }
 
-fn validate_scalars(plan: &LogicalPlan) -> Result<()> {
+pub(super) fn validate_scalars(plan: &LogicalPlan) -> Result<()> {
     if crate::event_response_root::source_projection(plan).is_some() {
         return Ok(());
     }
@@ -279,7 +288,7 @@ pub(crate) fn memo_slot(plan: &LogicalPlan) -> Result<Option<u32>> {
     Ok(slots.pop_first())
 }
 
-fn replace_aggregate(
+pub(super) fn replace_aggregate(
     plan: LogicalPlan,
     old: &UpdatingAggregateExtension,
     input: LogicalPlan,
@@ -373,7 +382,7 @@ pub(crate) fn resolve_join(join: &JoinExtension, slot: u32) -> Result<JoinExtens
         return plan_err!("missing right native aggregate");
     };
     let shared = crate::event_response_root::extract_shared_source_root(
-        [&left_native.input, &right_native.input],
+        [left_native.input.as_ref(), right_native.input.as_ref()],
         slot,
     )?;
     if !matches!(&shared.root, LogicalPlan::Extension(extension)
@@ -414,7 +423,7 @@ pub(crate) fn resolve_join(join: &JoinExtension, slot: u32) -> Result<JoinExtens
     Ok(next)
 }
 
-fn branch_admission(plan: &LogicalPlan, slot: u32) -> Result<&WatermarkNode> {
+pub(super) fn branch_admission(plan: &LogicalPlan, slot: u32) -> Result<&WatermarkNode> {
     if let LogicalPlan::Extension(extension) = plan
         && let Some(root) = extension.node.as_any().downcast_ref::<WatermarkNode>()
     {
@@ -518,7 +527,7 @@ pub(crate) fn accepted_join_source(
     )
 }
 
-fn without_meta(schema: &DFSchemaRef) -> Result<DFSchemaRef> {
+pub(super) fn without_meta(schema: &DFSchemaRef) -> Result<DFSchemaRef> {
     let indices = schema
         .fields()
         .iter()
@@ -636,6 +645,8 @@ fn validate_graph_configs(graph: &arroyo_datastream::logical::LogicalGraph) -> R
     let mut roots = Vec::new();
     let mut aggregates = Vec::new();
     let mut joins = Vec::new();
+    let mut results = Vec::new();
+    let mut unions = 0usize;
     for node in graph.node_weights() {
         for (operator, _) in node.operator_chain.iter() {
             let root = match operator.operator_name {
@@ -669,7 +680,11 @@ fn validate_graph_configs(graph: &arroyo_datastream::logical::LogicalGraph) -> R
                                 "response aggregate must retain its indefinite native changelog mode"
                             );
                         }
-                        aggregates.push(root);
+                        if config.accepted_output_schema.is_some() {
+                            results.push(root);
+                        } else {
+                            aggregates.push(root);
+                        }
                     }
                     config.response_root_operator
                 }
@@ -725,6 +740,28 @@ fn validate_graph_configs(graph: &arroyo_datastream::logical::LogicalGraph) -> R
                     }
                     config.response_root_operator
                 }
+                OperatorName::ArrowValue => {
+                    let config = arroyo_rpc::grpc::api::ValuePlanOperator::decode(
+                        operator.operator_config.as_slice(),
+                    )
+                    .map_err(|error| {
+                        datafusion::common::plan_datafusion_err!(
+                            "invalid native SELECT config: {error}"
+                        )
+                    })?;
+                    if config.response_union_inputs != 0 {
+                        if !(2..=3).contains(&config.response_union_inputs) || node.parallelism != 1
+                        {
+                            return plan_err!(
+                                "finite response UNION requires two or three singleton branch inputs"
+                            );
+                        }
+                        unions += 1;
+                    }
+                    config
+                        .accepted_result
+                        .map(|boundary| boundary.root_operator)
+                }
                 _ => None,
             };
             if root.is_some() && node.parallelism != 1 {
@@ -732,18 +769,27 @@ fn validate_graph_configs(graph: &arroyo_datastream::logical::LogicalGraph) -> R
             }
         }
     }
-    if roots.is_empty() && aggregates.is_empty() && joins.is_empty() {
+    if roots.is_empty()
+        && aggregates.is_empty()
+        && joins.is_empty()
+        && results.is_empty()
+        && unions == 0
+    {
         return Ok(());
     }
     if roots.len() > 1 {
         return plan_err!("only one private response route per job is currently supported");
     }
     if roots.len() != 1
-        || aggregates.len() != 2
-        || joins.len() != 1
+        || !((aggregates.len() == 2 && joins.len() == 1 && results.is_empty() && unions == 0)
+            || ((1..=3).contains(&aggregates.len())
+                && joins.is_empty()
+                && results.len() == 1
+                && unions == usize::from(aggregates.len() > 1)))
         || aggregates
             .iter()
             .chain(joins.iter())
+            .chain(results.iter())
             .any(|root| *root != roots[0])
     {
         return plan_err!(

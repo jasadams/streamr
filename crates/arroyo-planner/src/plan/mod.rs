@@ -600,6 +600,8 @@ impl TreeNodeRewriter for ArroyoRewriter<'_> {
                         }
                     }
                     let remote_table_extension = Arc::new(RemoteTableExtension {
+                        accepted_result: None,
+                        union_schema: true,
                         input: input.as_ref().clone(),
                         name: TableReference::bare("union_input"),
                         schema: union.schema.clone(),
@@ -619,6 +621,8 @@ impl TreeNodeRewriter for ArroyoRewriter<'_> {
                 let schema = union.schema().clone();
                 return Ok(Transformed::yes(LogicalPlan::Extension(Extension {
                     node: Arc::new(RemoteTableExtension {
+                        accepted_result: None,
+                        union_schema: false,
                         input: union,
                         name: TableReference::bare("union_output"),
                         schema,

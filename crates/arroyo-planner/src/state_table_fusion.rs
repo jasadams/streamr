@@ -2,6 +2,7 @@
 //! owner. The SQL planner lowers each proven region to one fused runtime owner
 //! with captured exit branches.
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::sync::Arc;
 
 use arrow_schema::{DataType, Schema, SchemaRef};
 use arroyo_datastream::logical::{
@@ -80,6 +81,16 @@ pub(crate) trait ScalarPlanAdmission {
         input: &ArroyoSchemaRef,
         output: &ArroyoSchemaRef,
     ) -> Result<()>;
+    fn admit_result_plan(
+        &self,
+        _plan: &ValuePlanOperator,
+        _input: &ArroyoSchemaRef,
+        _output: &ArroyoSchemaRef,
+    ) -> Result<()> {
+        Err(reject(
+            "accepted native SELECT requires concrete physical admission",
+        ))
+    }
     fn admit_scalar_plan(
         &self,
         plan: &ValuePlanOperator,
@@ -441,6 +452,36 @@ impl ScalarPlanAdmission for BoundedScalarAdmission<'_> {
         Ok(())
     }
 
+    fn admit_result_plan(
+        &self,
+        plan: &ValuePlanOperator,
+        input: &ArroyoSchemaRef,
+        output: &ArroyoSchemaRef,
+    ) -> Result<()> {
+        let proto = PhysicalPlanNode::decode(plan.physical_plan.as_slice())
+            .map_err(|error| reject(format!("invalid native result physical plan: {error}")))?;
+        let runtime = RuntimeEnvBuilder::new().build_arc()?;
+        let physical = proto.try_into_physical_plan(
+            self.registry,
+            &runtime,
+            &crate::physical::ArroyoPhysicalExtensionCodec {
+                context: crate::physical::DecodingContext::Planning,
+            },
+        )?;
+        if !scalar_schema_compatible(physical.schema().as_ref(), &output.schema) {
+            return Err(reject(
+                "accepted native SELECT output differs from its graph schema",
+            ));
+        }
+        let mut count = 0;
+        admit_native_key_plan(physical.as_ref(), &mut count, &input.schema)?;
+        if count != 1 {
+            return Err(reject(
+                "accepted native SELECT must have one native result reader",
+            ));
+        }
+        Ok(())
+    }
     fn admit_scalar_plan(
         &self,
         plan: &ValuePlanOperator,
@@ -896,6 +937,93 @@ fn is_valid_input_boundary(
     admission: &dyn ScalarPlanAdmission,
 ) -> Result<bool> {
     let operator = single_operator(graph, boundary)?;
+    if operator.operator_name == OperatorName::ArrowValue {
+        let value = ValuePlanOperator::decode(operator.operator_config.as_slice())
+            .map_err(|error| reject(format!("invalid accepted native SELECT boundary: {error}")))?;
+        if let Some(boundary_config) = &value.accepted_result {
+            let input = Arc::new(ArroyoSchema::try_from(
+                boundary_config
+                    .input_schema
+                    .clone()
+                    .ok_or_else(|| reject("accepted native SELECT input schema missing"))?,
+            )?);
+            let output = Arc::new(ArroyoSchema::try_from(
+                boundary_config
+                    .output_schema
+                    .clone()
+                    .ok_or_else(|| reject("accepted native SELECT output schema missing"))?,
+            )?);
+            let (mut parent, edge) = only_parent(graph, boundary)?;
+            if graph[boundary].parallelism != 1
+                || edge.schema != input
+                || step_output_schema(graph, boundary)? != output
+            {
+                return Err(reject(
+                    "accepted native SELECT boundary disagrees with full graph schemas",
+                ));
+            }
+            admission.admit_result_plan(&value, &input, &output)?;
+            let mut visited = BTreeSet::new();
+            loop {
+                if !visited.insert(parent.index()) || graph[parent].parallelism != 1 {
+                    return Err(reject(
+                        "accepted native SELECT ancestry is not acyclic singleton work",
+                    ));
+                }
+                let producer = single_operator(graph, parent)?;
+                if producer.operator_name == OperatorName::UpdatingAggregate {
+                    let config =
+                        UpdatingAggregateOperator::decode(producer.operator_config.as_slice())
+                            .map_err(|error| {
+                                reject(format!("invalid terminal native result: {error}"))
+                            })?;
+                    let native: ArroyoSchema = config
+                        .final_schema
+                        .ok_or_else(|| reject("terminal native result schema missing"))?
+                        .try_into()?;
+                    let accepted: ArroyoSchema = config
+                        .accepted_output_schema
+                        .ok_or_else(|| reject("native producer has no accepted result policy"))?
+                        .try_into()?;
+                    let mut fields = native.schema.fields().to_vec();
+                    let meta = native.schema.index_of(arroyo_rpc::UPDATING_META_FIELD)?;
+                    if native.schema.field(meta) != arroyo_rpc::updating_meta_field().as_ref() {
+                        return Err(reject("terminal native metadata is not canonical"));
+                    }
+                    fields.remove(meta);
+                    let expected = ArroyoSchema::from_schema_unkeyed(Arc::new(
+                        Schema::new_with_metadata(fields, native.schema.metadata().clone()),
+                    ))?;
+                    if config.response_root_operator != Some(boundary_config.root_operator)
+                        || config.emit_per_event
+                        || config.retain_indefinitely != Some(true)
+                        || accepted != expected
+                        || step_output_schema(graph, parent)?.as_ref() != &accepted
+                    {
+                        return Err(reject(
+                            "accepted SELECT does not belong to its exact native producer/root/schema",
+                        ));
+                    }
+                    return Ok(true);
+                }
+                let (next, incoming) = only_parent(graph, parent)?;
+                let output = step_output_schema(graph, parent)?;
+                if producer.operator_name != OperatorName::ArrowValue {
+                    return Err(reject(
+                        "accepted native result ancestry requires native SELECT work",
+                    ));
+                }
+                let plan = ValuePlanOperator::decode(producer.operator_config.as_slice()).map_err(
+                    |error| reject(format!("invalid post-result native SELECT: {error}")),
+                )?;
+                if plan.accepted_result.is_some() || plan.response_union_inputs != 0 {
+                    return Err(reject("accepted result crossed another response boundary"));
+                }
+                admission.admit_result_plan(&plan, &incoming.schema, &output)?;
+                parent = next;
+            }
+        }
+    }
     if operator.operator_name == OperatorName::Join {
         let join = JoinOperator::decode(operator.operator_config.as_slice())
             .map_err(|error| reject(format!("invalid JOIN input boundary: {error}")))?;

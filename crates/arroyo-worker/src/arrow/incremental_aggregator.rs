@@ -552,7 +552,11 @@ pub struct IncrementalAggregatingFunc {
     response_root_operator: Option<u32>,
     response_previous: Option<EventContext>,
     event_output: Option<Arc<EventEdgeSpec>>,
+    event_input: Option<Arc<EventEdgeSpec>>,
     response_schemas: Option<(ArroyoSchema, ArroyoSchema)>,
+    accepted_output_schema: Option<ArroyoSchema>,
+    response_key_fields: Vec<usize>,
+    response_key_converter: Option<RowConverter>,
     calendars: Vec<CalendarAggregate>,
 }
 
@@ -2441,6 +2445,7 @@ impl IncrementalAggregatingFunc {
         }
         let input = &ctx.in_schemas[0];
         let raw = EventEdgeSpec {
+            maintenance: false,
             root_operator: root,
             root_subtask: 0,
             schema: input.schema.clone(),
@@ -2503,6 +2508,26 @@ impl IncrementalAggregatingFunc {
                 .collect::<Vec<_>>(),
         )?;
         let inputs = self.compute_inputs(batch)?;
+        let calendar_inputs = self.calendar_inputs(batch)?;
+        self.validate_calendar_inputs(&calendar_inputs).await?;
+        let projected = self
+            .response_key_converter
+            .as_ref()
+            .map(|converter| {
+                let columns = input
+                    .sort_columns(batch, false)
+                    .into_iter()
+                    .map(|column| column.values)
+                    .collect::<Vec<_>>();
+                converter.convert_columns(
+                    &self
+                        .response_key_fields
+                        .iter()
+                        .map(|index| columns[*index].clone())
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .transpose()?;
         let mut affected = Vec::new();
         for row in 0..batch.num_rows() {
             if !affected
@@ -2547,7 +2572,7 @@ impl IncrementalAggregatingFunc {
                 &mut scope,
                 &keys,
                 &inputs,
-                &[],
+                &calendar_inputs,
                 0..batch.num_rows(),
                 changes,
             )
@@ -2557,6 +2582,7 @@ impl IncrementalAggregatingFunc {
         let mut retracts = Vec::new();
         let mut retained = 0usize;
         let mut touched = BinaryBuilder::new();
+        let mut projected_keys: Vec<Vec<u8>> = Vec::new();
         for row in affected {
             let key = keys.row(row);
             let key = key.as_ref();
@@ -2564,7 +2590,16 @@ impl IncrementalAggregatingFunc {
                 key.len() <= limits.key_bytes,
                 "branch response touched key exceeds native key allowance"
             );
-            touched.append_value(key);
+            let projected_key = projected.as_ref().map(|keys| keys.row(row));
+            let touched_key = projected_key.as_ref().map_or(key, |key| key.as_ref());
+            ensure!(
+                touched_key.len() <= limits.key_bytes,
+                "projected touched key exceeds native key allowance"
+            );
+            if !projected_keys.iter().any(|known| known == touched_key) {
+                touched.append_value(touched_key);
+                projected_keys.push(touched_key.to_vec());
+            }
             let storage = native_group_key(b'G', key)?;
             let (mut group, values) = self.native_prepare_group_result(&scope, key).await?;
             let delta = Self::native_group_delta_from_values(key, &group, values)?;
@@ -2588,9 +2623,17 @@ impl IncrementalAggregatingFunc {
                 "one branch response exceeds native pending-output row allowance"
             );
             if group.live_rows == 0 {
-                // Restricted indefinite COUNT/MAX mode has no calendar/TTL
-                // state. The native retraction verified empty M/R membership.
-                scope.delete(&storage)?;
+                if self.calendars.is_empty() {
+                    scope.delete(&storage)?;
+                } else {
+                    self.retire_native_group(&mut scope, key, &mut group)?;
+                    scope.put(
+                        &storage,
+                        &self
+                            .native_group_codec()?
+                            .encode(&group, limits.value_bytes)?,
+                    )?;
+                }
             } else {
                 scope.put(
                     &storage,
@@ -2613,6 +2656,7 @@ impl IncrementalAggregatingFunc {
             touched_keys: Some(keys),
         };
         EventEdgeSpec {
+            maintenance: false,
             root_operator: root,
             root_subtask: 0,
             schema: ctx
@@ -2635,6 +2679,234 @@ impl IncrementalAggregatingFunc {
             response: result,
             _output: Some(output_permit),
         })
+    }
+
+    /// Publish final native results only after a whole response has been applied.
+    /// The same kernel prepares ordinary and accepted results; only this delivery
+    /// policy restores the original operation clock. Maintenance retains the
+    /// producer's stored per-key clock and never acquires a synthetic event id.
+    async fn prepare_terminal_result(
+        &mut self,
+        response: Option<&EventResponse>,
+        batch: Option<&RecordBatch>,
+        ctx: &mut OperatorContext,
+    ) -> Result<(
+        Option<RecordBatch>,
+        arroyo_state::live::resources::ResourcePermit,
+    )> {
+        let root = self
+            .response_root_operator
+            .context("terminal result root missing")?;
+        let configured = self
+            .native_config
+            .context("terminal result native limits missing")?;
+        let store = self
+            .native_store
+            .as_ref()
+            .context("terminal result native store missing")?;
+        let limits = store.limits();
+        if let Some(response) = response {
+            ensure!(
+                response.context.version == EVENT_RESPONSE_VERSION
+                    && response.context.root_operator == root
+                    && response.context.root_subtask == 0,
+                "terminal result context differs from constructed root"
+            );
+            if let Some(previous) = self.response_previous {
+                ensure!(
+                    previous.attempt_nonce == response.context.attempt_nonce
+                        && previous.sequence.checked_add(1) == Some(response.context.sequence),
+                    "terminal result skips or repeats an original operation"
+                );
+            } else {
+                ensure!(
+                    response.context.sequence == 1,
+                    "terminal result must begin at operation one"
+                );
+            }
+        }
+        if let Some(spec) = &self.event_input {
+            if let Some(response) = response {
+                spec.validate(response).map_err(anyhow::Error::msg)?;
+            } else {
+                ensure!(
+                    spec.maintenance,
+                    "terminal result received unregistered maintenance Data"
+                );
+            }
+        }
+        let mut affected: Vec<(Vec<u8>, i64)> = Vec::new();
+        if let Some(response) = response
+            && let Some(touched) = &response.touched_keys
+        {
+            ensure!(
+                touched.schema() == EventEdgeSpec::keys_schema()
+                    && (1..=2).contains(&touched.num_rows()),
+                "terminal touched keys differ from registered full-key layout"
+            );
+            let touched = touched
+                .column(0)
+                .as_any()
+                .downcast_ref::<arrow_array::BinaryArray>()
+                .context("terminal touched key array is not Binary")?;
+            for key in touched.iter() {
+                let key = key.context("terminal touched key is NULL")?;
+                ensure!(
+                    key.len() <= limits.key_bytes,
+                    "terminal touched key exceeds native key allowance"
+                );
+                ensure!(
+                    !affected.iter().any(|(known, _)| known == key),
+                    "terminal repeats a touched key"
+                );
+                affected.push((key.to_vec(), response.context.trigger_nanos));
+            }
+        }
+        let keys = batch
+            .map(|batch| {
+                self.key_converter.convert_columns(
+                    &ctx.in_schemas[0]
+                        .sort_columns(batch, false)
+                        .into_iter()
+                        .map(|column| column.values)
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .transpose()?;
+        if let (Some(batch), Some(keys)) = (batch, &keys) {
+            ensure!(
+                batch.num_rows() > 0 && batch.num_rows() <= configured.max_pending_output_rows,
+                "complete native replacement exceeds receiver row allowance"
+            );
+            let clocks = batch
+                .column(ctx.in_schemas[0].timestamp_index)
+                .as_any()
+                .downcast_ref::<arrow_array::TimestampNanosecondArray>()
+                .context("native replacement clock is not TimestampNanosecond")?;
+            ensure!(clocks.null_count() == 0, "native replacement clock is NULL");
+            for row in 0..batch.num_rows() {
+                let key = keys.row(row);
+                if response.is_some() {
+                    ensure!(
+                        affected
+                            .iter()
+                            .any(|(known, _)| known.as_slice() == key.as_ref()),
+                        "native replacement contains an untouched terminal grouping key"
+                    );
+                } else if let Some((_, clock)) = affected
+                    .iter_mut()
+                    .find(|(known, _)| known.as_slice() == key.as_ref())
+                {
+                    *clock = clocks.value(row);
+                } else {
+                    affected.push((key.as_ref().to_vec(), clocks.value(row)));
+                }
+            }
+        }
+        if response.is_none() {
+            let batch = batch.context("maintenance replacement missing")?;
+            let (flags, _) = native_changelog_columns(batch)?;
+            ensure!(
+                (1..=2).contains(&batch.num_rows())
+                    && affected.len() == 1
+                    && (batch.num_rows() == 1 || (flags.value(0) && !flags.value(1))),
+                "maintenance callback must own one complete native per-key replacement"
+            );
+        }
+        // The whole original operation must fit one bounded native scope.
+        // Ordinary batching uses maximum-sized writes to choose chunk sizes;
+        // multiplying that envelope across all tagged rows would reject valid
+        // FILTER-disjoint replacements. The already-reserved AggregateScope
+        // admits each actual encoded write and overlay update before cloning,
+        // and any refusal drops the entire uncommitted operation.
+        let permit = store
+            .resources()
+            .try_decoded_value(
+                configured
+                    .max_pending_output_bytes
+                    .checked_mul(3)
+                    .context("terminal output workspace overflow")?,
+            )
+            .map_err(anyhow::Error::from)?;
+        let mut scope = store.begin().await?;
+        if let (Some(batch), Some(keys)) = (batch, &keys) {
+            let changes = native_changelog_columns(batch)?;
+            let inputs = self.compute_inputs(batch)?;
+            let calendar = self.calendar_inputs(batch)?;
+            self.validate_calendar_inputs(&calendar).await?;
+            self.native_apply_operation(
+                &mut scope,
+                keys,
+                &inputs,
+                &calendar,
+                0..batch.num_rows(),
+                Some(changes),
+            )
+            .await?;
+        }
+        let mut output_keys = Vec::new();
+        let mut output_values = vec![Vec::new(); self.aggregates.len()];
+        let mut bytes = 0usize;
+        for (key, clock) in affected {
+            let storage = native_group_key(b'G', &key)?;
+            // An absent untouched relation contributes no USING row. Decode row
+            // keys only after this owner's native G establishes their provenance.
+            if scope.get(&storage).await?.is_none() {
+                continue;
+            }
+            let (mut group, values) = self.native_prepare_group_result(&scope, &key).await?;
+            if let Some(mut values) = values {
+                group.last_emitted = Some(values.clone());
+                *values.last_mut().context("terminal result clock missing")? =
+                    ScalarValue::TimestampNanosecond(Some(clock), None);
+                bytes = bytes
+                    .checked_add(values.iter().map(ScalarValue::size).sum::<usize>())
+                    .and_then(|n| n.checked_add(key.len()))
+                    .context("terminal result size overflow")?;
+                ensure!(
+                    bytes <= configured.max_pending_output_bytes / 3
+                        && output_keys.len() < configured.max_pending_output_rows,
+                    "one complete native result exceeds pending-output allowance"
+                );
+                output_keys.push(key.clone());
+                for (column, value) in output_values.iter_mut().zip(values) {
+                    column.push(value);
+                }
+            }
+            if group.live_rows == 0 && self.calendars.is_empty() {
+                scope.delete(&storage)?;
+            } else {
+                scope.put(
+                    &storage,
+                    &self
+                        .native_group_codec()?
+                        .encode(&group, limits.value_bytes)?,
+                )?;
+            }
+            scope.delete(&native_group_key(b'D', &key)?)?;
+        }
+        let accepted = if output_keys.is_empty() {
+            None
+        } else {
+            let parser = self.key_converter.parser();
+            let mut columns = self
+                .key_converter
+                .convert_rows(output_keys.iter().map(|key| parser.parse(key)))?;
+            for values in output_values {
+                columns.push(ScalarValue::iter_to_array(values)?);
+            }
+            let output = RecordBatch::try_new(self.schema_without_metadata.clone(), columns)?;
+            ensure!(
+                output.get_array_memory_size() <= configured.max_pending_output_bytes,
+                "terminal native result exceeds decoded output allowance"
+            );
+            Some(output)
+        };
+        scope.commit().await?;
+        if let Some(response) = response {
+            self.response_previous = Some(response.context);
+        }
+        Ok((accepted, permit))
     }
 
     fn native_operations_per_image(&self) -> Result<usize> {
@@ -3102,7 +3374,7 @@ impl IncrementalAggregatingFunc {
         collector: &mut dyn Collector,
     ) -> DataflowResult<()> {
         if (self.emit_per_event && self.calendars.is_empty())
-            || self.response_root_operator.is_some()
+            || (self.response_root_operator.is_some() && self.calendars.is_empty())
         {
             return Ok(());
         }
@@ -3312,7 +3584,15 @@ impl IncrementalAggregatingFunc {
         let writes_per_group = 2
             + usize::from(self.native_has_group_keys())
             + usize::from(self.native_has_group_keys() && !self.retain_indefinitely);
+        // On response routes each ordinary maintenance callback owns one full
+        // native per-key replacement. It is not a multi-key source event.
+        let group_limit = if self.response_root_operator.is_some() {
+            1
+        } else {
+            usize::MAX
+        };
         let max_dirty_groups = (configured.max_pending_output_rows / 2)
+            .min(group_limit)
             .min(store_limits.write_operations / writes_per_group)
             .min(
                 store_limits.write_bytes
@@ -4269,10 +4549,55 @@ impl IncrementalAggregatingFunc {
 impl ArrowOperator for IncrementalAggregatingFunc {
     fn event_response_role(&self) -> EventResponseRole {
         self.response_root_operator
-            .map_or(EventResponseRole::Ordinary, EventResponseRole::Aggregate)
+            .map_or(EventResponseRole::Ordinary, |root| {
+                if self.accepted_output_schema.is_some() {
+                    EventResponseRole::Result(root)
+                } else {
+                    EventResponseRole::Aggregate(root)
+                }
+            })
     }
     fn event_response_output(&self) -> Option<Arc<EventEdgeSpec>> {
         self.event_output.clone()
+    }
+    fn event_response_key_types(&self) -> Option<Vec<DataType>> {
+        let (input, _) = self.response_schemas.as_ref()?;
+        let keys = input.storage_keys()?;
+        let indices = if self.response_key_fields.is_empty() {
+            (0..keys.len()).collect::<Vec<_>>()
+        } else {
+            self.response_key_fields.clone()
+        };
+        Some(
+            indices
+                .into_iter()
+                .map(|index| input.schema.field(keys[index]).data_type().clone())
+                .collect(),
+        )
+    }
+    fn bind_event_response_key_types(
+        &self,
+        inputs: &[Option<Vec<DataType>>],
+    ) -> DataflowResult<()> {
+        if self.accepted_output_schema.is_some() {
+            let (input, _) = self
+                .response_schemas
+                .as_ref()
+                .context("terminal constructed schema missing")?;
+            let expected = input
+                .storage_keys()
+                .context("terminal native grouping missing")?
+                .iter()
+                .map(|index| input.schema.field(*index).data_type().clone())
+                .collect::<Vec<_>>();
+            if inputs.len() != 1 || inputs[0].as_ref() != Some(&expected) {
+                return Err(anyhow!(
+                    "terminal touched key encoding differs from actual native grouping tuple"
+                )
+                .into());
+            }
+        }
+        Ok(())
     }
     fn bind_event_response(
         &mut self,
@@ -4290,7 +4615,8 @@ impl ArrowOperator for IncrementalAggregatingFunc {
         if inputs.len() != 1
             || inputs[0].root_operator != root
             || inputs[0].root_subtask != 0
-            || !matches!(inputs[0].layout, EventLayout::Raw)
+            || (self.accepted_output_schema.is_none()
+                && !matches!(inputs[0].layout, EventLayout::Raw))
             || self.event_output.is_some()
         {
             return Err(
@@ -4303,17 +4629,32 @@ impl ArrowOperator for IncrementalAggregatingFunc {
             .context("response aggregate constructed schemas missing")?;
         if context.in_schemas.len() != 1
             || context.in_schemas[0].as_ref() != native_input
-            || output != native_output
+            || output
+                != self
+                    .accepted_output_schema
+                    .as_ref()
+                    .unwrap_or(native_output)
         {
             return Err(anyhow!(
                 "response aggregate graph schema differs from actual constructed native owner"
             )
             .into());
         }
+        if self.accepted_output_schema.is_some() {
+            if !matches!(inputs[0].layout, EventLayout::Native { .. }) {
+                return Err(anyhow!(
+                    "terminal native result requires complete native replacements"
+                )
+                .into());
+            }
+            self.event_input = Some(inputs[0].clone());
+            return Ok(None);
+        }
         let limits = self
             .native_config
             .context("aggregate response native limits missing")?;
         let spec = Arc::new(EventEdgeSpec {
+            maintenance: !self.calendars.is_empty(),
             root_operator: root,
             root_subtask: 0,
             schema: output.schema.clone(),
@@ -4364,6 +4705,19 @@ impl ArrowOperator for IncrementalAggregatingFunc {
         if index != 0 || in_partitions != 1 || ctx.in_schemas.len() != 1 {
             return Err(anyhow!("branch response aggregate requires one input partition").into());
         }
+        if self.accepted_output_schema.is_some() {
+            let (rows, permit) = self
+                .prepare_terminal_result(Some(&response), response.rows.as_ref(), ctx)
+                .await?;
+            drop(response);
+            let delivered = if let Some(rows) = rows {
+                collector.collect(rows).await
+            } else {
+                Ok(())
+            };
+            drop(permit);
+            return delivered;
+        }
         let prepared = self.prepare_native_response(response, ctx).await?;
         // Preserve typed collector errors and retain output ownership while
         // publication awaits. Native working scope/snapshot already dropped.
@@ -4378,6 +4732,20 @@ impl ArrowOperator for IncrementalAggregatingFunc {
         ctx: &mut OperatorContext,
         collector: &mut dyn Collector,
     ) -> DataflowResult<()> {
+        if self.accepted_output_schema.is_some() {
+            // A bounded complete native maintenance replacement, not a raw E.
+            let (rows, permit) = self
+                .prepare_terminal_result(None, Some(&batch), ctx)
+                .await?;
+            drop(batch);
+            let delivered = if let Some(rows) = rows {
+                collector.collect(rows).await
+            } else {
+                Ok(())
+            };
+            drop(permit);
+            return delivered;
+        }
         if self.response_root_operator.is_some() {
             return Err(anyhow!("ordinary Data on response aggregate input").into());
         }
@@ -4670,6 +5038,20 @@ impl IncrementalAggregatingConstructor {
         native_config: Option<AggregateStateConfig>,
     ) -> Result<IncrementalAggregatingFunc> {
         let emit_per_event = config.emit_per_event;
+        let accepted_output_schema = config
+            .accepted_output_schema
+            .clone()
+            .map(ArroyoSchema::try_from)
+            .transpose()?;
+        ensure!(
+            accepted_output_schema.is_none() || config.response_root_operator.is_some(),
+            "accepted native result requires an explicit original-event response root"
+        );
+        let response_key_fields = config
+            .response_key_fields
+            .iter()
+            .map(|index| usize::try_from(*index))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
         let response_root_operator = config.response_root_operator;
         let response_schemas = if response_root_operator.is_some() {
             let input: ArroyoSchema = config
@@ -4690,9 +5072,8 @@ impl IncrementalAggregatingConstructor {
             response_root_operator.is_none()
                 || (!emit_per_event
                     && native_config.is_some()
-                    && config.retain_indefinitely == Some(true)
-                    && config.calendar_aggregates.is_empty()),
-            "branch response aggregate requires native state, indefinite retention, no calendar and no accepted-snapshot mode"
+                    && config.retain_indefinitely == Some(true)),
+            "branch response aggregate requires native state, indefinite retention and no direct snapshot mode"
         );
         ensure!(
             !emit_per_event
@@ -4752,6 +5133,27 @@ impl IncrementalAggregatingConstructor {
         let native_append_only =
             native_config.is_some() && input_schema.schema.index_of(UPDATING_META_FIELD).is_err();
         let final_schema: ArroyoSchema = config.final_schema.unwrap().try_into()?;
+        if let Some(accepted) = &accepted_output_schema {
+            ensure!(
+                final_schema.timestamp_index < final_schema.schema.fields().len(),
+                "native result clock index is out of bounds"
+            );
+            let meta = final_schema.schema.index_of(UPDATING_META_FIELD)?;
+            ensure!(
+                final_schema.schema.field(meta) == arroyo_rpc::updating_meta_field().as_ref(),
+                "native result metadata is not canonical"
+            );
+            let mut fields = final_schema.schema.fields().to_vec();
+            fields.remove(meta);
+            let expected = ArroyoSchema::from_schema_unkeyed(Arc::new(Schema::new_with_metadata(
+                fields,
+                final_schema.schema.metadata().clone(),
+            )))?;
+            ensure!(
+                *accepted == expected,
+                "accepted native result schema must remove only canonical metadata"
+            );
+        }
         let mut schema_without_metadata = SchemaBuilder::from((*final_schema.schema).clone());
         if emit_per_event {
             ensure!(
@@ -5065,6 +5467,12 @@ impl IncrementalAggregatingConstructor {
         }
 
         if response_root_operator.is_some() {
+            for (aggregate, _, _, _, _, _, _, _, _) in &aggregates {
+                ensure!(
+                    supports_native_result(aggregate, &expression_schema)?,
+                    "branch response aggregate requires a verified native result capability"
+                );
+            }
             ensure!(
                 !key_fields.is_empty()
                     && final_schema.schema.fields().len()
@@ -5073,14 +5481,8 @@ impl IncrementalAggregatingConstructor {
                     && final_schema
                         .schema
                         .field(final_schema.schema.fields().len() - 1)
-                        == arroyo_rpc::updating_meta_field().as_ref()
-                    && aggregates.iter().all(|(agg, kind, _, _, _, _, _, _, _)| {
-                        !agg.is_distinct()
-                            && matches!(agg.fun().name(), "count" | "max")
-                            && agg.order_bys().is_none()
-                            && (*kind != AccumulatorType::Batch || !native_append_only)
-                    }),
-                "branch response aggregate requires keyed native COUNT/MAX changelog output"
+                        == arroyo_rpc::updating_meta_field().as_ref(),
+                "branch response aggregate requires keyed verified native changelog output"
             );
             let (clock, _, _, _, arguments, filter, _, _, _) = aggregates
                 .last()
@@ -5356,9 +5758,32 @@ impl IncrementalAggregatingConstructor {
             timestamp_index,
             Some(storage_key_fields),
             // only include the actual keys in the routing keys
-            Some(key_fields),
+            Some(key_fields.clone()),
         ));
 
+        ensure!(
+            response_key_fields
+                .iter()
+                .all(|index| *index < key_fields.len()),
+            "response key projection exceeds native grouping tuple"
+        );
+        ensure!(
+            response_key_fields
+                .iter()
+                .enumerate()
+                .all(|(i, key)| !response_key_fields[..i].contains(key)),
+            "response key projection repeats a grouping column"
+        );
+        let response_key_converter = if response_key_fields.is_empty() {
+            None
+        } else {
+            Some(RowConverter::new(
+                response_key_fields
+                    .iter()
+                    .map(|index| input_schema.sort_fields(false)[*index].clone())
+                    .collect(),
+            )?)
+        };
         let mut operator = IncrementalAggregatingFunc {
             flush_interval: Duration::from_micros(config.flush_interval_micros),
             metadata_expr,
@@ -5381,7 +5806,11 @@ impl IncrementalAggregatingConstructor {
             response_root_operator,
             response_previous: None,
             event_output: None,
+            event_input: None,
             response_schemas,
+            accepted_output_schema,
+            response_key_fields,
+            response_key_converter,
             calendars,
         };
         operator.native_codec = Some(GroupCodec::with_calendar_layout(
@@ -5647,6 +6076,8 @@ mod tests {
                 calendar_aggregates: Vec::new(),
                 emit_per_event: false,
                 response_root_operator: None,
+                accepted_output_schema: None,
+                response_key_fields: vec![],
             },
             Arc::new(registry),
         )
@@ -6411,6 +6842,8 @@ mod tests {
             calendar_aggregates: Vec::new(),
             emit_per_event: false,
             response_root_operator: None,
+            accepted_output_schema: None,
+            response_key_fields: vec![],
         };
         IncrementalAggregatingConstructor::build_with_native_config(
             config,

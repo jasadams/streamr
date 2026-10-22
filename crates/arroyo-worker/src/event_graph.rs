@@ -46,24 +46,51 @@ pub(super) fn bind_constructed_graph(graph: &mut Graph) -> Result<()> {
             _ => None,
         })
         .collect();
-    if roots.is_empty() && aggregate_roots.is_empty() && join_roots.is_empty() {
+    let result_roots = roles
+        .iter()
+        .filter_map(|role| match role {
+            EventResponseRole::Result(root) => Some(*root),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let unions = roles
+        .iter()
+        .filter(|role| matches!(role, EventResponseRole::Union))
+        .count();
+    if roots.is_empty()
+        && aggregate_roots.is_empty()
+        && join_roots.is_empty()
+        && result_roots.is_empty()
+        && unions == 0
+    {
         return Ok(());
     }
     ensure!(
-        roots.len() == 1 && aggregate_roots.len() == 2 && join_roots.len() == 1,
-        "initial response wiring requires one private root, two private aggregates and one private JOIN; independent ordinary components are unrestricted"
+        roots.len() == 1
+            && ((aggregate_roots.len() == 2
+                && join_roots.len() == 1
+                && result_roots.is_empty()
+                && unions == 0)
+                || ((1..=3).contains(&aggregate_roots.len())
+                    && join_roots.is_empty()
+                    && result_roots.len() == 1
+                    && unions == usize::from(aggregate_roots.len() > 1))),
+        "response wiring requires one shared root and a proven native JOIN or finite aggregate-result topology; independent ordinary components are unrestricted"
     );
     let root = roots[0];
     ensure!(
         aggregate_roots
             .iter()
             .chain(&join_roots)
+            .chain(&result_roots)
             .all(|id| *id == root),
         "private response roles disagree on planned root id"
     );
     let order = petgraph::algo::toposort(&*graph, None)
         .map_err(|_| anyhow::anyhow!("response graph must be acyclic"))?;
     let mut root_location = None;
+    let mut key_outputs =
+        std::collections::HashMap::<NodeIndex, Option<Vec<arrow::datatypes::DataType>>>::new();
     for index in order {
         // Use exactly the queue input ordering in Engine::run_locally.
         let mut incoming = graph
@@ -88,6 +115,20 @@ pub(super) fn bind_constructed_graph(graph: &mut Graph) -> Result<()> {
         let mut current = incoming
             .iter()
             .filter_map(|(_, spec, _)| spec.clone())
+            .collect::<Vec<_>>();
+        let mut key_edges = graph
+            .edges_directed(index, Direction::Incoming)
+            .map(|edge| {
+                (
+                    (edge.weight().edge, edge.weight().in_logical_idx),
+                    key_outputs.get(&edge.source()).cloned().flatten(),
+                )
+            })
+            .collect::<Vec<_>>();
+        key_edges.sort_by_key(|(key, _)| *key);
+        let mut current_keys = key_edges
+            .into_iter()
+            .map(|(_, keys)| keys)
             .collect::<Vec<_>>();
         let outgoing = graph
             .edges_directed(index, Direction::Outgoing)
@@ -114,6 +155,8 @@ pub(super) fn bind_constructed_graph(graph: &mut Graph) -> Result<()> {
                         EventResponseRole::Root(_)
                             | EventResponseRole::Aggregate(_)
                             | EventResponseRole::Join(_)
+                            | EventResponseRole::Result(_)
+                            | EventResponseRole::Union
                     );
                     if !current.is_empty() || private {
                         ensure!(
@@ -124,7 +167,9 @@ pub(super) fn bind_constructed_graph(graph: &mut Graph) -> Result<()> {
                         );
                         if !matches!(
                             role,
-                            EventResponseRole::Root(_) | EventResponseRole::Join(_)
+                            EventResponseRole::Root(_)
+                                | EventResponseRole::Join(_)
+                                | EventResponseRole::Union
                         ) {
                             ensure!(
                                 current.len() == 1
@@ -137,6 +182,16 @@ pub(super) fn bind_constructed_graph(graph: &mut Graph) -> Result<()> {
                             ensure!(
                                 root_location.replace((index, position)).is_none(),
                                 "duplicate response root"
+                            );
+                        }
+                        if matches!(role, EventResponseRole::Union) {
+                            ensure!(
+                                position == 0
+                                    && (2..=3).contains(&incoming.len())
+                                    && incoming
+                                        .iter()
+                                        .all(|(key, _, _)| key.0 == LogicalEdgeType::Forward),
+                                "finite UNION must be a singleton chain head with registered Forward inputs"
                             );
                         }
                         if matches!(role, EventResponseRole::Join(_)) {
@@ -153,10 +208,26 @@ pub(super) fn bind_constructed_graph(graph: &mut Graph) -> Result<()> {
                                 "configured response operator has no response input"
                             );
                         }
+                        operator.bind_event_response_key_types(&current_keys)?;
+                        if matches!(role, EventResponseRole::Union) {
+                            ensure!(
+                                current_keys.iter().all(|keys| keys == &current_keys[0])
+                                    && current_keys[0].is_some(),
+                                "UNION touched-key native layouts differ"
+                            );
+                        }
+                        let keys = operator
+                            .event_response_key_types()
+                            .or_else(|| current_keys.first().cloned().flatten());
                         current = operator
                             .bind_event_response(&current, context)?
                             .into_iter()
                             .collect();
+                        current_keys = if current.is_empty() {
+                            Vec::new()
+                        } else {
+                            vec![keys]
+                        };
                         if matches!(role, EventResponseRole::Root(_)) {
                             ensure!(
                                 matches!(
@@ -170,6 +241,7 @@ pub(super) fn bind_constructed_graph(graph: &mut Graph) -> Result<()> {
                 }
             }
         }
+        key_outputs.insert(index, current_keys.first().cloned().flatten());
         if let Some(spec) = current.first() {
             ensure!(
                 current.len() == 1 && !outgoing.is_empty(),

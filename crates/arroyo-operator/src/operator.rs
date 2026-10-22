@@ -482,7 +482,12 @@ where
     }
 
     async fn collect_response(&mut self, response: EventResponse) -> DataflowResult<()> {
-        if self.cur.operator.event_pair_mode() && self.in_partitions != 2 {
+        if self
+            .cur
+            .operator
+            .event_input_count()
+            .is_some_and(|count| self.in_partitions != count)
+        {
             return Err(anyhow!("event pair callback bypassed indexed two-input run loop").into());
         }
         if let Some(next) = &mut self.cur.next {
@@ -1029,7 +1034,11 @@ async fn operator_run_behavior(
     {
         return Err(anyhow!("event pair operator must be the physical chain head").into());
     }
-    if this.operator.event_pair_mode() && in_qs.len() != 2 {
+    if this
+        .operator
+        .event_input_count()
+        .is_some_and(|count| in_qs.len() != count)
+    {
         return Err(anyhow!("event pair route requires exactly two physical inputs").into());
     }
     this.on_start().await?;
@@ -1121,7 +1130,7 @@ async fn operator_run_behavior(
                         match message {
                             ArrowMessage::Data(record) => {
                                 if this.operator.event_pair_mode() {
-                                    return Err(anyhow!("event pair route received ordinary Data").into());
+                                    this.operator.check_event_maintenance_input(idx, &counter, &closed)?;
                                 }
                                 TaskCounters::BatchesReceived.for_task(chain_info, |c| c.inc());
                                 TaskCounters::MessagesReceived.for_task(chain_info, |c| c.inc_by(record.num_rows() as u64));
@@ -1290,6 +1299,8 @@ pub enum EventResponseRole {
     Root(u32),
     Aggregate(u32),
     Join(u32),
+    Result(u32),
+    Union,
 }
 
 #[async_trait::async_trait]
@@ -1300,6 +1311,17 @@ pub trait ArrowOperator: Send + 'static {
     }
     fn event_response_output(&self) -> Option<Arc<EventEdgeSpec>> {
         None
+    }
+    /// Constructed native key encoding carried by touched-key packets. Scalars
+    /// preserve it; native owners export their actual copied grouping tuple.
+    fn event_response_key_types(&self) -> Option<Vec<DataType>> {
+        None
+    }
+    fn bind_event_response_key_types(
+        &self,
+        _inputs: &[Option<Vec<DataType>>],
+    ) -> DataflowResult<()> {
+        Ok(())
     }
     fn bind_event_response(
         &mut self,
@@ -1343,6 +1365,17 @@ pub trait ArrowOperator: Send + 'static {
     /// Private event-pair route only. Ordinary operators retain existing polling.
     fn event_pair_mode(&self) -> bool {
         false
+    }
+    fn event_input_count(&self) -> Option<usize> {
+        self.event_pair_mode().then_some(2)
+    }
+    fn check_event_maintenance_input(
+        &self,
+        _index: usize,
+        _counter: &CheckpointCounter,
+        _closed: &HashSet<usize>,
+    ) -> DataflowResult<()> {
+        Err(anyhow!("event pair route received ordinary Data").into())
     }
     fn event_input_blocked(&self, _index: usize) -> bool {
         false
@@ -2056,6 +2089,7 @@ mod event_pair_input_tests {
             ),
         ]));
         let edge = Arc::new(EventEdgeSpec {
+            maintenance: false,
             root_operator: 7,
             root_subtask: 0,
             schema: schema.clone(),

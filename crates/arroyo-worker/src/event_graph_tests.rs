@@ -61,6 +61,7 @@ fn registration_program(
         }))
     });
     let spec = Arc::new(EventEdgeSpec {
+        maintenance: false,
         root_operator: 7,
         root_subtask: 0,
         schema: schema().schema.clone(),
@@ -290,8 +291,15 @@ async fn native_program() -> Result<(Program, Vec<TaskAssignment>)> {
             && config().worker.typed_sql_state.is_some(),
         "explicit native aggregate/JOIN/state-table limits required"
     );
+    native_program_for_sql(SQL).await
+}
+async fn native_program_for_sql(sql: &str) -> Result<(Program, Vec<TaskAssignment>)> {
+    ensure!(
+        config().worker.aggregate_state.is_some() && config().worker.typed_sql_state.is_some(),
+        "explicit native aggregate and state-table limits required"
+    );
     let compiled = arroyo_planner::parse_and_get_program(
-        SQL,
+        sql,
         arroyo_planner::ArroyoSchemaProvider::new(),
         arroyo_planner::SqlConfig {
             default_parallelism: 1,
@@ -319,6 +327,14 @@ async fn native_program() -> Result<(Program, Vec<TaskAssignment>)> {
                     )?;
                     if let Some(id) = &mut cfg.response_root_operator {
                         *id += 1000;
+                    }
+                    operator.operator_config = cfg.encode_to_vec();
+                }
+                OperatorName::ArrowValue => {
+                    let mut cfg =
+                        api::ValuePlanOperator::decode(operator.operator_config.as_slice())?;
+                    if let Some(boundary) = &mut cfg.accepted_result {
+                        boundary.root_operator += 1000;
                     }
                     operator.operator_config = cfg.encode_to_vec();
                 }
@@ -370,6 +386,93 @@ async fn event_engine_actual_native_local_graph_binds_root_scalars_owners_and_jo
     assert_native_bound(&engine);
     Ok(())
 }
+#[tokio::test]
+#[ignore = "explicit native aggregate/typed limits, five live-state owners and adequate scan pages"]
+async fn event_engine_actual_native_three_branch_union_binds_every_scalar_and_terminal_schema()
+-> Result<()> {
+    ensure!(
+        config()
+            .worker
+            .live_state_resources
+            .as_ref()
+            .is_some_and(|limits| limits.max_open_databases >= 5),
+        "three-branch construction requires explicit five-owner resources"
+    );
+    // The same generic fixture as actual quiet-rollover integration; no private
+    // schema/descriptor stand-in and no source/task execution in this check.
+    let sql = include_str!("../../arroyo-sql-testing/src/str64-calendar-composed-query.sql")
+        .replace("$input", "/tmp/event-three-branch-input.jsonl")
+        .replace("$output", "/tmp/event-three-branch-output.jsonl")
+        .replace("$mirror", "/tmp/event-three-branch-mirror.jsonl");
+    let (program, assignments) = native_program_for_sql(&sql).await?;
+    let engine = Engine::new(
+        program,
+        context(),
+        NetworkManager::new(0).await?,
+        assignments,
+    )?;
+    let graph = engine.program.graph.read().unwrap();
+    let mut roles = Vec::new();
+    for node in graph.node_weights() {
+        if let SubtaskOrQueueNode::SubtaskNode(node) = node
+            && let OperatorNode::Chained(chain) = &node.node
+        {
+            roles.extend(
+                chain
+                    .iter()
+                    .map(|(operator, _)| operator.event_response_role()),
+            );
+        }
+    }
+    assert_eq!(
+        roles
+            .iter()
+            .filter(|role| matches!(role, EventResponseRole::Root(_)))
+            .count(),
+        1
+    );
+    assert_eq!(
+        roles
+            .iter()
+            .filter(|role| matches!(role, EventResponseRole::Aggregate(_)))
+            .count(),
+        3
+    );
+    assert_eq!(
+        roles
+            .iter()
+            .filter(|role| matches!(role, EventResponseRole::Result(_)))
+            .count(),
+        1
+    );
+    assert_eq!(
+        roles
+            .iter()
+            .filter(|role| matches!(role, EventResponseRole::Union))
+            .count(),
+        1
+    );
+    assert!(
+        !roles
+            .iter()
+            .any(|role| matches!(role, EventResponseRole::Join(_)))
+    );
+    assert!(
+        graph
+            .edge_weights()
+            .filter_map(|edge| edge.response.as_ref())
+            .all(|spec| {
+                !matches!(spec.layout, EventLayout::Native { .. })
+                    || spec
+                        .schema
+                        .fields()
+                        .iter()
+                        .all(|field| !matches!(field.data_type(), DataType::List(_)))
+            })
+    );
+    Ok(())
+}
+
 #[tokio::test]
 #[ignore = "explicit native SQL-state limits; run through maintained configured SQL qualification"]
 async fn event_engine_actual_native_rejects_cross_worker_private_edge_before_tasks() -> Result<()> {

@@ -229,6 +229,7 @@ mod tests {
     }
     fn edge() -> Arc<EventEdgeSpec> {
         Arc::new(EventEdgeSpec {
+            maintenance: false,
             root_operator: 7,
             root_subtask: 0,
             schema: Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, true)])),
@@ -367,6 +368,7 @@ mod repaired_tests {
             [1, 2],
             &tasks(),
             Arc::new(EventEdgeSpec {
+                maintenance: false,
                 root_operator: 7,
                 root_subtask: 0,
                 schema: Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, true)])),
@@ -395,6 +397,7 @@ mod repaired_tests {
             let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)?;
             let allowance = batch.get_array_memory_size();
             let edge = Arc::new(EventEdgeSpec {
+                maintenance: false,
                 root_operator: 7,
                 root_subtask: 0,
                 schema: batch.schema(),
@@ -492,6 +495,7 @@ mod repaired_tests {
         )?;
         let allowance = owned.get_array_memory_size();
         let edge = Arc::new(EventEdgeSpec {
+            maintenance: false,
             root_operator: 7,
             root_subtask: 0,
             schema: owned.schema(),
@@ -650,6 +654,7 @@ mod repaired_tests {
         )?;
         let allowance = batch.get_array_memory_size();
         let edge = Arc::new(EventEdgeSpec {
+            maintenance: false,
             root_operator: 7,
             root_subtask: 0,
             schema: batch.schema(),

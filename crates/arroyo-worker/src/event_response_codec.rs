@@ -18,7 +18,6 @@ const CONTEXT_BYTES: usize = 44;
 pub(crate) const EXTENSION_BYTES: usize = CONTEXT_BYTES + 4;
 const IPC_LENGTH_BYTES: usize = 4;
 const MAX_KEYS: usize = 2;
-const MAX_NATIVE_ROWS: usize = 4;
 
 fn add(a: usize, b: usize) -> Result<usize> {
     a.checked_add(b).context("response size overflow")
@@ -147,10 +146,7 @@ struct DecodeShape {
 }
 impl FrameSpec {
     fn native(schema: SchemaRef, max_rows: usize, owner_output_bytes: usize) -> Result<Self> {
-        ensure!(
-            (1..=MAX_NATIVE_ROWS).contains(&max_rows),
-            "invalid native response row count"
-        );
+        ensure!(max_rows > 0, "invalid native response row count");
         Self::planned(schema, max_rows, Policy::Native { owner_output_bytes })
     }
     fn keys(encoded_key_bytes: usize) -> Result<Self> {
@@ -585,6 +581,7 @@ fn metadata_ranges(
 pub(crate) struct ResponseSpec {
     root_operator: u32,
     root_subtask: u32,
+    maintenance: bool,
     rows: FrameSpec,
     keys: Option<FrameSpec>,
 }
@@ -596,7 +593,7 @@ pub(crate) struct EncodedResponse {
 impl ResponseSpec {
     pub(crate) fn from_edge(edge: &arroyo_types::event_edge::EventEdgeSpec) -> Result<Self> {
         use arroyo_types::event_edge::EventLayout;
-        match edge.layout {
+        let mut spec = match edge.layout {
             EventLayout::Raw => Ok(Self::raw(
                 edge.root_operator,
                 edge.root_subtask,
@@ -614,12 +611,15 @@ impl ResponseSpec {
                 owner_output_bytes,
                 encoded_key_bytes,
             ),
-        }
+        }?;
+        spec.maintenance = edge.maintenance;
+        Ok(spec)
     }
     fn raw(root_operator: u32, root_subtask: u32, schema: SchemaRef) -> Self {
         Self {
             root_operator,
             root_subtask,
+            maintenance: false,
             rows: FrameSpec::raw(schema),
             keys: None,
         }
@@ -635,6 +635,7 @@ impl ResponseSpec {
         Ok(Self {
             root_operator,
             root_subtask,
+            maintenance: false,
             rows: FrameSpec::native(schema, rows, owner_output_bytes)?,
             keys: Some(FrameSpec::keys(key_bytes)?),
         })
@@ -697,6 +698,7 @@ impl ResponseSpec {
             Policy::Keys { .. } => unreachable!("response rows cannot use key policy"),
         };
         EventEdgeSpec {
+            maintenance: self.maintenance,
             root_operator: self.root_operator,
             root_subtask: self.root_subtask,
             schema: self.rows.schema.clone(),
@@ -906,12 +908,14 @@ mod tests {
         )
         .unwrap()
     }
+    // Exhaustive nullable-pattern fixture size, not a protocol row cap.
+    const ROUNDTRIP_ROWS: usize = 4;
     fn spec(batch: &RecordBatch) -> ResponseSpec {
         ResponseSpec::native(
             17,
             0,
             batch.schema(),
-            MAX_NATIVE_ROWS,
+            ROUNDTRIP_ROWS,
             batch.get_array_memory_size(),
             512,
         )
@@ -1146,7 +1150,7 @@ mod tests {
 
     #[test]
     fn event_response_codec_roundtrips_all_native_row_null_patterns_and_slices() -> Result<()> {
-        for rows in 1..=MAX_NATIVE_ROWS {
+        for rows in 1..=ROUNDTRIP_ROWS {
             for nulls in 0..1usize << rows {
                 let batch = mixed(rows, nulls);
                 let spec = spec(&batch);
@@ -1330,7 +1334,22 @@ mod tests {
         }
         let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, true)]));
         assert!(FrameSpec::native(schema.clone(), 4, usize::MAX).is_err());
-        assert!(FrameSpec::native(schema, 5, 1024).is_err());
+        assert!(FrameSpec::native(schema.clone(), 0, 1024).is_err());
+        assert!(FrameSpec::native(schema, usize::MAX, 1024).is_err());
+    }
+    #[test]
+    fn event_response_codec_registered_combined_rows_use_the_same_scalar_bounds() -> Result<()> {
+        let batch = mixed(12, 0);
+        let spec = FrameSpec::native(batch.schema(), 12, batch.get_array_memory_size())?;
+        let encoded = spec.encode(&batch)?;
+        let decoded = spec.decode(&encoded)?.0;
+        assert_eq!(decoded, batch);
+        assert!(
+            FrameSpec::native(batch.schema(), 4, batch.get_array_memory_size())?
+                .encode(&batch)
+                .is_err()
+        );
+        Ok(())
     }
     #[test]
     fn event_response_codec_rejects_owner_key_and_output_limit_violations() -> Result<()> {
