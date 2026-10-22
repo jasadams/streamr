@@ -4,23 +4,7 @@ use arrow_schema::{Field, Schema, SchemaRef};
 use datafusion::common::{DFSchema, DFSchemaRef, Result as DFResult, TableReference};
 use std::{collections::HashMap, sync::Arc};
 
-pub fn window_arrow_struct() -> DataType {
-    DataType::Struct(
-        vec![
-            Arc::new(arrow::datatypes::Field::new(
-                "start",
-                DataType::Timestamp(TimeUnit::Nanosecond, None),
-                false,
-            )),
-            Arc::new(arrow::datatypes::Field::new(
-                "end",
-                DataType::Timestamp(TimeUnit::Nanosecond, None),
-                false,
-            )),
-        ]
-        .into(),
-    )
-}
+pub use arroyo_rpc::df::window_arrow_struct;
 
 pub(crate) fn add_timestamp_field(
     schema: DFSchemaRef,

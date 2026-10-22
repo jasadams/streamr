@@ -4,7 +4,29 @@ use super::*;
 #[test_log(tokio::test)]
 #[ignore = "run explicitly with native aggregates/typed state, backend memory or rocksdb, source max1 or8"]
 async fn calendar_merge_quiet_rollover_completed_checkpoint_fresh_restore() {
+    run_calendar_case(false).await;
+}
+
+#[test_log(tokio::test)]
+#[ignore = "run explicitly with native aggregates/typed state, five live-state databases and adequate scan pages"]
+async fn calendar_merge_composed_three_branch_quiet_rollover_completed_checkpoint_fresh_restore() {
+    run_calendar_case(true).await;
+}
+
+async fn run_calendar_case(composed: bool) {
     configure_test_worker();
+    if composed {
+        assert!(
+            config::config()
+                .worker
+                .live_state_resources
+                .as_ref()
+                .unwrap()
+                .max_open_databases
+                >= 5,
+            "composed calendar fixture requires explicit STREAMR_TEST_MAX_OPEN_DATABASES=5 and STREAMR_TEST_SCAN_PAGE_BYTES=16777216"
+        );
+    }
     assert!(config::config().worker.aggregate_state.is_some());
     assert!(config::config().worker.typed_sql_state.is_some());
     let batch_size = config::config().pipeline.source_batch_size;
@@ -29,7 +51,12 @@ async fn calendar_merge_quiet_rollover_completed_checkpoint_fresh_restore() {
     tokio::fs::write(&input, include_str!("str64-calendar-events.jsonl"))
         .await
         .unwrap();
-    let sql = include_str!("str64-calendar-query.sql")
+    let query = if composed {
+        include_str!("str64-calendar-composed-query.sql")
+    } else {
+        include_str!("str64-calendar-query.sql")
+    };
+    let sql = query
         .replace("$input", input.to_str().unwrap())
         .replace("$output", output.to_str().unwrap())
         .replace("$mirror", mirror.to_str().unwrap());
@@ -45,7 +72,7 @@ async fn calendar_merge_quiet_rollover_completed_checkpoint_fresh_restore() {
     tokio::fs::write(directory.join("runtime-config.json"), serde_json::to_vec_pretty(&serde_json::json!({
         "backend":format!("{:?}",config::config().worker.sql_state_backend), "source_max_rows":batch_size,
         "source_linger_seconds":3600,"checkpoint_mode":if leader_mode() { "leader" } else { "controller" },
-        "processed_raw_rows":5,"unread_sentinel_rows":1,
+        "processed_raw_rows":5,"unread_sentinel_rows":1,"composed_three_branches":composed,
     })).unwrap()).await.unwrap();
     let udfs = get_udfs();
     let logical = Arc::new(
@@ -61,7 +88,10 @@ async fn calendar_merge_quiet_rollover_completed_checkpoint_fresh_restore() {
         .collect();
     for (kind, count) in [
         (OperatorName::ConnectorSource, 1),
-        (OperatorName::UpdatingAggregate, 1),
+        (
+            OperatorName::UpdatingAggregate,
+            if composed { 4 } else { 1 },
+        ),
         (OperatorName::FusedStateTable, 1),
         (OperatorName::ConnectorSink, 2),
     ] {
@@ -157,8 +187,8 @@ async fn calendar_merge_quiet_rollover_completed_checkpoint_fresh_restore() {
         let expected_count = [3, 7, 9][(epoch - 1) as usize];
         let first = calendar_rows(&output).await;
         let second = calendar_rows(&mirror).await;
-        assert_calendar_rows(&first, epoch, expected_count);
-        assert_calendar_rows(&second, epoch, expected_count);
+        assert_calendar_rows(&first, epoch, expected_count, composed);
+        assert_calendar_rows(&second, epoch, expected_count, composed);
         assert_eq!(
             calendar_normalized_rows(&first),
             calendar_normalized_rows(&second),
@@ -246,7 +276,7 @@ fn calendar_per_key(rows: &[Value]) -> BTreeMap<String, Vec<Value>> {
     result
 }
 
-fn assert_calendar_rows(rows: &[Value], epoch: u32, expected_count: usize) {
+fn assert_calendar_rows(rows: &[Value], epoch: u32, expected_count: usize, composed: bool) {
     assert_eq!(
         rows.len(),
         expected_count,
@@ -266,9 +296,27 @@ fn assert_calendar_rows(rows: &[Value], epoch: u32, expected_count: usize) {
             Some((key, values))
         })
         .collect::<BTreeMap<_, _>>();
+    let mut actual = calendar_per_key(rows);
+    if composed {
+        // Independent literal optional-branch values remain unchanged during
+        // core quiet rollover and after both later raw events filter out.
+        for (key, values) in &mut actual {
+            let (a, b) = match key.as_str() {
+                "a" | "c" => (Value::from(1), Value::Null),
+                "b" => (Value::from(1), Value::from(1)),
+                "d" | "e" => (Value::Null, Value::Null),
+                other => panic!("unexpected composed calendar key {other}"),
+            };
+            for row in values {
+                assert_eq!(row.get("optional_a").unwrap_or(&Value::Null), &a);
+                assert_eq!(row.get("optional_b").unwrap_or(&Value::Null), &b);
+                row.as_object_mut().unwrap().remove("optional_a");
+                row.as_object_mut().unwrap().remove("optional_b");
+            }
+        }
+    }
     assert_eq!(
-        calendar_per_key(rows),
-        expected,
+        actual, expected,
         "CP{epoch} literal per-key captures; no global quiet-key ordering assumption"
     );
 }

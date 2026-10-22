@@ -329,6 +329,27 @@ impl ArrowOperator for ObservedOperator {
     fn event_response_output(&self) -> Option<Arc<EventEdgeSpec>> {
         self.inner.event_response_output()
     }
+    fn event_response_key_types(&self) -> Option<Vec<arrow::datatypes::DataType>> {
+        self.inner.event_response_key_types()
+    }
+    fn bind_event_response_key_types(
+        &self,
+        inputs: &[Option<Vec<arrow::datatypes::DataType>>],
+    ) -> DataflowResult<()> {
+        self.inner.bind_event_response_key_types(inputs)
+    }
+    fn event_input_count(&self) -> Option<usize> {
+        self.inner.event_input_count()
+    }
+    fn check_event_maintenance_input(
+        &self,
+        index: usize,
+        counter: &arroyo_operator::CheckpointCounter,
+        closed: &std::collections::HashSet<usize>,
+    ) -> DataflowResult<()> {
+        self.inner
+            .check_event_maintenance_input(index, counter, closed)
+    }
     fn bind_event_response(
         &mut self,
         inputs: &[Arc<EventEdgeSpec>],

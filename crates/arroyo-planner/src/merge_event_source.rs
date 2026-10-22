@@ -42,7 +42,7 @@ fn is_timestamp_column(mut expression: &Expr) -> bool {
     matches!(expression, Expr::Column(column) if column.name == TIMESTAMP_FIELD)
 }
 
-pub(crate) fn validate(aggregate: &UpdatingAggregateExtension) -> Result<()> {
+pub(crate) fn validate_aggregate(aggregate: &UpdatingAggregateExtension) -> Result<()> {
     if aggregate.ttl.is_some() {
         return plan_err!("per-event aggregate MERGE requires SET updating_ttl = NULL");
     }
@@ -76,18 +76,57 @@ pub(crate) fn validate(aggregate: &UpdatingAggregateExtension) -> Result<()> {
             return plan_err!("per-event aggregate MERGE supports native COUNT/MAX only");
         };
         let selector = crate::grouped_selector_udaf::classify(&function.func);
-        let calendar = aggregate
-            .calendar_aggregates
-            .iter()
-            .any(|calendar| calendar.aggregate_index == index);
-        if function.params.distinct
-            || (selector.is_none()
-                && (!(matches!(function.func.name(), "count" | "max")
-                    || (calendar && function.func.name() == "sum"))
-                    || function.params.order_by.is_some()))
-        {
+        if selector.is_none() {
+            use datafusion::physical_expr::{
+                LexOrdering, PhysicalSortExpr, aggregate::AggregateExprBuilder,
+            };
+            let properties = datafusion::logical_expr::execution_props::ExecutionProps::new();
+            let physical = |expr: &Expr| {
+                datafusion::physical_expr::create_physical_expr(
+                    expr,
+                    plan.input.schema(),
+                    &properties,
+                )
+            };
+            let arguments = function
+                .params
+                .args
+                .iter()
+                .map(physical)
+                .collect::<Result<Vec<_>>>()?;
+            let schema = Arc::new(arrow_schema::Schema::from(plan.input.schema().as_ref()));
+            let mut builder = AggregateExprBuilder::new(function.func.clone(), arguments)
+                .schema(schema.clone())
+                .alias(output.schema_name().to_string());
+            if function.params.distinct {
+                builder = builder.distinct();
+            }
+            if let Some(order) = &function.params.order_by {
+                let order = order
+                    .iter()
+                    .map(|sort| {
+                        Ok(PhysicalSortExpr::new(
+                            physical(&sort.expr)?,
+                            arrow::compute::SortOptions {
+                                descending: !sort.asc,
+                                nulls_first: sort.nulls_first,
+                            },
+                        ))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                if !order.is_empty() {
+                    builder = builder.order_by(LexOrdering::new(order));
+                }
+            }
+            let aggregate = builder.build()?;
+            if !crate::aggregate_capability::supports_native_result(&aggregate, &schema)? {
+                return plan_err!(
+                    "per-event aggregate MERGE requires a verified non-distinct native result capability"
+                );
+            }
+        } else if function.params.distinct {
             return plan_err!(
-                "per-event aggregate MERGE supports native non-distinct COUNT/MAX and grouped selectors only"
+                "per-event aggregate MERGE requires a verified non-distinct native result capability"
             );
         }
         if let Some((_, declared)) = selector {
@@ -141,6 +180,18 @@ pub(crate) fn validate(aggregate: &UpdatingAggregateExtension) -> Result<()> {
             }
         }
     }
+    Ok(())
+}
+
+pub(crate) fn validate(aggregate: &UpdatingAggregateExtension) -> Result<()> {
+    validate_aggregate(aggregate)?;
+    let LogicalPlan::Aggregate(plan) = &aggregate.aggregate else {
+        unreachable!("native aggregate validated")
+    };
+    let corrections = plan
+        .input
+        .schema()
+        .has_column_with_unqualified_name(UPDATING_META_FIELD);
     let mut sources = 0;
     plan.input.apply(|node| {
         match node {
@@ -384,11 +435,17 @@ impl TreeNodeRewriter for EventSourceRewriter {
 }
 
 pub(super) fn resolve_with_slot(slot: u32, input: LogicalPlan) -> Result<LogicalPlan> {
+    if let Some(result) = crate::finalized_result::resolve(&input)? {
+        return Ok(result);
+    }
     if !input
         .schema()
         .has_column_with_unqualified_name(UPDATING_META_FIELD)
     {
         return Ok(input);
+    }
+    if let Some(result) = crate::merge_event_results::resolve(&input, slot)? {
+        return Ok(result);
     }
     let input = crate::merge_event_branches::resolve(input, slot)?;
     if !input

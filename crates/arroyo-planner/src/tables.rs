@@ -944,6 +944,8 @@ impl Table {
                     )?;
                     let schema = rewritten_plan.schema().clone();
                     let remote_extension = RemoteTableExtension {
+                        accepted_result: None,
+                        union_schema: false,
                         input: rewritten_plan,
                         name: name.to_owned(),
                         schema,

@@ -30,11 +30,37 @@ pub(crate) struct RemoteTableExtension {
     pub(crate) name: TableReference,
     pub(crate) schema: DFSchemaRef,
     pub(crate) materialize: bool,
+    pub(crate) accepted_result: Option<crate::merge_event_results::AcceptedResultRoute>,
+    pub(crate) union_schema: bool,
 }
 
-multifield_partial_ord!(RemoteTableExtension, input, name, materialize);
+multifield_partial_ord!(
+    RemoteTableExtension,
+    input,
+    name,
+    materialize,
+    accepted_result,
+    union_schema
+);
 
 impl ArroyoExtension for RemoteTableExtension {
+    fn response_root_slot(&self) -> Option<u32> {
+        match self.accepted_result {
+            Some(crate::merge_event_results::AcceptedResultRoute::Response(route)) => {
+                Some(route.slot)
+            }
+            _ => None,
+        }
+    }
+    fn bind_response_root(&self, operator: u32) -> Result<Option<Box<dyn ArroyoExtension>>> {
+        let mut next = self.clone();
+        if let Some(crate::merge_event_results::AcceptedResultRoute::Response(route)) =
+            &mut next.accepted_result
+        {
+            route.operator = Some(operator);
+        }
+        Ok(Some(Box::new(next)))
+    }
     fn validate_response_scope(&self) -> Result<()> {
         crate::merge_event_branches::memo_slot(&self.input).map(|_| ())
     }
@@ -96,11 +122,55 @@ impl ArroyoExtension for RemoteTableExtension {
         } else {
             planner.sync_plan(&self.input)?
         };
+        let physical_plan = if self.union_schema {
+            if input_schemas.len() != 1 || self.accepted_result.is_some() {
+                return plan_err!("native UNION schema boundary requires one branch SELECT input");
+            }
+            Arc::new(crate::physical::UnionSchemaExec::try_new(
+                physical_plan,
+                self.output_schema().schema,
+            )?) as Arc<dyn datafusion::physical_plan::ExecutionPlan>
+        } else {
+            physical_plan
+        };
         let physical_plan_node = PhysicalPlanNode::try_from_physical_plan(
             physical_plan,
             &ArroyoPhysicalExtensionCodec::default(),
         )?;
+        let response_union_inputs = if let LogicalPlan::Union(union) = &self.input {
+            if crate::merge_event_branches::memo_slot(&self.input)?.is_some() {
+                u32::try_from(union.inputs.len()).map_err(|_| {
+                    datafusion::common::plan_datafusion_err!("too many response UNION inputs")
+                })?
+            } else {
+                0
+            }
+        } else {
+            0
+        };
+        let accepted_result = self
+            .accepted_result
+            .map(|route| {
+                route.source(&self.input)?;
+                if input_schemas.len() != 1 {
+                    return plan_err!("accepted native SELECT requires one result input");
+                }
+                Ok(arroyo_rpc::grpc::api::AcceptedResultBoundary {
+                    producer: Some(match route {
+                        crate::merge_event_results::AcceptedResultRoute::Response(route) =>
+                            arroyo_rpc::grpc::api::accepted_result_boundary::Producer::ResponseRootOperator(
+                                route.operator.ok_or_else(|| datafusion::common::plan_datafusion_err!("accepted result root is not bound"))?),
+                        crate::merge_event_results::AcceptedResultRoute::FinalizedAppend =>
+                            arroyo_rpc::grpc::api::accepted_result_boundary::Producer::FinalizedAppend(true),
+                    }),
+                    input_schema: Some(input_schemas[0].as_ref().clone().into()),
+                    output_schema: Some(self.output_schema().into()),
+                })
+            })
+            .transpose()?;
         let config = ValuePlanOperator {
+            accepted_result,
+            response_union_inputs,
             name: format!("value_calculation({})", self.name),
             physical_plan: physical_plan_node.encode_to_vec(),
         };
@@ -156,6 +226,8 @@ impl UserDefinedLogicalNodeCore for RemoteTableExtension {
             name: self.name.clone(),
             schema: self.schema.clone(),
             materialize: self.materialize,
+            accepted_result: self.accepted_result,
+            union_schema: self.union_schema,
         })
     }
 }

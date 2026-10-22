@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 pub(crate) struct SharedSourceRoot {
     pub root: LogicalPlan,
-    pub branches: [LogicalPlan; 2],
+    pub branches: Vec<LogicalPlan>,
     pub source_columns: Vec<usize>,
 }
 
@@ -74,7 +74,7 @@ pub(crate) fn find_source(plan: &LogicalPlan) -> Result<(&Projection, &TableSour
     }
     find_source(scalar_input(plan)?)
 }
-fn projection_columns(
+pub(crate) fn projection_columns(
     projection: &Projection,
     source: &TableSourceExtension,
 ) -> Result<Vec<usize>> {
@@ -100,6 +100,27 @@ fn projection_columns(
     }
     Ok(indices)
 }
+/// Canonical source-generated columns may be shared only when their native
+/// expression is repeatable. Source clock/watermark expressions retain their
+/// existing dedicated admission proof; branch expressions never move here.
+fn validate_source_virtuals(
+    source: &TableSourceExtension,
+    indices: impl IntoIterator<Item = usize>,
+) -> Result<()> {
+    for index in indices {
+        if let crate::tables::FieldSpec::Virtual { field, expression } = &source.table.fields[index]
+            && source.table.event_time_field.as_ref() != Some(field.name())
+            && source.table.watermark_field.as_ref() != Some(field.name())
+        {
+            crate::continuous_merge::event_source::validate_repeatable(
+                expression,
+                source.schema(),
+            )?;
+        }
+    }
+    Ok(())
+}
+
 fn replace_source(
     plan: &LogicalPlan,
     root: &LogicalPlan,
@@ -159,18 +180,23 @@ fn replace_source(
 /// route_slot is only a planner memoization key. The transport root_operator is
 /// the checked final graph node_id assigned by WatermarkNode::plan_node, never
 /// this slot and never a hash/parse of the runtime operator display string.
-pub(crate) fn extract_shared_source_root(
-    branches: [&LogicalPlan; 2],
+pub(crate) fn extract_shared_source_root<'a>(
+    branches: impl AsRef<[&'a LogicalPlan]>,
     route_slot: u32,
 ) -> Result<SharedSourceRoot> {
-    let (left_projection, left_source) = find_source(branches[0])?;
-    let (right_projection, right_source) = find_source(branches[1])?;
-    if left_source != right_source {
-        return plan_err!("response branches require the same physical source definition");
+    let branches = branches.as_ref();
+    if !(1..=3).contains(&branches.len()) {
+        return plan_err!("response extraction requires one to three native branches");
     }
+    let (_, left_source) = find_source(branches[0])?;
     let mut union = BTreeSet::new();
-    union.extend(projection_columns(left_projection, left_source)?);
-    union.extend(projection_columns(right_projection, right_source)?);
+    for branch in branches {
+        let (projection, source) = find_source(branch)?;
+        if source != left_source {
+            return plan_err!("response branches require the same physical source definition");
+        }
+        union.extend(projection_columns(projection, source)?);
+    }
     // Source watermark expressions may need a source-generated virtual column
     // even if neither branch projects it. It is source admission, not branch SQL.
     if let Some(name) = &left_source.table.watermark_field {
@@ -197,16 +223,7 @@ pub(crate) fn extract_shared_source_root(
             union.insert(index);
         }
     }
-    for index in &union {
-        if let crate::tables::FieldSpec::Virtual { field, .. } = &left_source.table.fields[*index]
-            && left_source.table.event_time_field.as_ref() != Some(field.name())
-            && left_source.table.watermark_field.as_ref() != Some(field.name())
-        {
-            return plan_err!(
-                "response root cannot evaluate a user virtual source expression before the branch"
-            );
-        }
-    }
+    validate_source_virtuals(left_source, union.iter().copied())?;
     let source_columns = union.into_iter().collect::<Vec<_>>();
     let source_projection = SourceRewriter::canonical_projection(
         &left_source.table,
@@ -215,6 +232,8 @@ pub(crate) fn extract_shared_source_root(
     )?;
     let source_calc = LogicalPlan::Extension(Extension {
         node: Arc::new(RemoteTableExtension {
+            accepted_result: None,
+            union_schema: false,
             schema: source_projection.schema().clone(),
             input: source_projection,
             name: left_source.name.clone(),
@@ -232,10 +251,10 @@ pub(crate) fn extract_shared_source_root(
         node: Arc::new(watermark),
     });
     let result = SharedSourceRoot {
-        branches: [
-            replace_source(branches[0], &root, left_source)?,
-            replace_source(branches[1], &root, left_source)?,
-        ],
+        branches: branches
+            .iter()
+            .map(|branch| replace_source(branch, &root, left_source))
+            .collect::<Result<Vec<_>>>()?,
         root,
         source_columns,
     };
@@ -291,19 +310,12 @@ pub(crate) fn source_for_response_admission(
         )
     })?;
     let indices = projection_columns(projection, source)?;
-    for index in &indices {
-        if let crate::tables::FieldSpec::Virtual { field, .. } = &source.table.fields[*index]
-            && source.table.event_time_field.as_ref() != Some(field.name())
-            && source.table.watermark_field.as_ref() != Some(field.name())
-        {
-            return plan_err!(
-                "accepted response boundary contains user source work below admission"
-            );
-        }
-    }
+    validate_source_virtuals(source, indices.iter().copied())?;
     let expected =
         SourceRewriter::canonical_projection(&source.table, &source.name, Some(indices))?;
     if remote.materialize
+        || remote.union_schema
+        || remote.accepted_result.is_some()
         || remote.name != source.name
         || &remote.schema != remote.input.schema()
         || remote.input != expected
@@ -416,6 +428,8 @@ mod tests {
         let filtered = LogicalPlan::Filter(Filter::try_new(predicate, Arc::new(base))?);
         let remote = LogicalPlan::Extension(Extension {
             node: Arc::new(RemoteTableExtension {
+                accepted_result: None,
+                union_schema: false,
                 schema: filtered.schema().clone(),
                 input: filtered,
                 name: source.name.clone(),
@@ -506,6 +520,8 @@ mod tests {
         for (i, branch) in root.branches.iter().enumerate() {
             visitor.add_plan(LogicalPlan::Extension(Extension {
                 node: Arc::new(RemoteTableExtension {
+                    accepted_result: None,
+                    union_schema: false,
                     input: branch.clone(),
                     schema: branch.schema().clone(),
                     name: TableReference::bare(format!("branch_{i}")),
@@ -620,6 +636,8 @@ mod tests {
         let input = branch(&source, vec![0, 1, 2], lit(true))?;
         let named = LogicalPlan::Extension(Extension {
             node: Arc::new(RemoteTableExtension {
+                accepted_result: None,
+                union_schema: false,
                 input: input.clone(),
                 schema: input.schema().clone(),
                 name: TableReference::bare("shared_projection"),
@@ -643,6 +661,8 @@ mod tests {
         for (i, branch) in root.branches.iter().enumerate() {
             visitor.add_plan(LogicalPlan::Extension(Extension {
                 node: Arc::new(RemoteTableExtension {
+                    accepted_result: None,
+                    union_schema: false,
                     input: branch.clone(),
                     schema: branch.schema().clone(),
                     name: TableReference::bare(format!("result_{i}")),

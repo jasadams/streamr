@@ -201,6 +201,8 @@ impl SourceRewriter<'_> {
         let schema = input.schema().clone();
         let remote = LogicalPlan::Extension(Extension {
             node: Arc::new(RemoteTableExtension {
+                accepted_result: None,
+                union_schema: false,
                 input,
                 name: table_scan.table_name.to_owned(),
                 schema,
@@ -621,6 +623,8 @@ impl TreeNodeRewriter for AsyncUdfRewriter<'_> {
 
             Arc::new(LogicalPlan::Extension(Extension {
                 node: Arc::new(RemoteTableExtension {
+                    accepted_result: None,
+                    union_schema: false,
                     input: (*projection.input).clone(),
                     name: TableReference::bare("subquery_projection"),
                     schema: projection.input.schema().clone(),
@@ -869,8 +873,15 @@ impl EventClockLineage {
                 .node
                 .as_any()
                 .downcast_ref::<crate::extension::updating_aggregate::UpdatingAggregateExtension>(
-            ) && updating.emit_per_event
+            ) && (updating.emit_per_event || updating.accepted_schema.is_some())
             {
+                if let Some(route) = updating.response_route
+                    && updating.accepted_schema.is_some()
+                {
+                    crate::merge_event_results::accepted_source(plan, route.slot)?;
+                    self.trigger_sources += 1;
+                    return Ok(());
+                }
                 let LogicalPlan::Aggregate(aggregate) = &updating.aggregate else {
                     return plan_err!("per-event aggregate clock has no native aggregate plan");
                 };

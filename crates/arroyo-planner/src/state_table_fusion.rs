@@ -2,6 +2,7 @@
 //! owner. The SQL planner lowers each proven region to one fused runtime owner
 //! with captured exit branches.
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::sync::Arc;
 
 use arrow_schema::{DataType, Schema, SchemaRef};
 use arroyo_datastream::logical::{
@@ -10,8 +11,8 @@ use arroyo_datastream::logical::{
 use arroyo_rpc::df::{ArroyoSchema, ArroyoSchemaRef};
 use arroyo_rpc::grpc::api::{
     FusedStateTableOperator, FusedStateTableStep, JoinOperator, KeyPlanOperator,
-    ProjectionOperator, StateTableCaptureOperator, StateTableDefinition, StateTableOperator,
-    UpdatingAggregateOperator, ValuePlanOperator,
+    ProjectionOperator, SessionWindowAggregateOperator, StateTableCaptureOperator,
+    StateTableDefinition, StateTableOperator, UpdatingAggregateOperator, ValuePlanOperator,
 };
 use datafusion::common::{DataFusionError, Result};
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
@@ -80,6 +81,36 @@ pub(crate) trait ScalarPlanAdmission {
         input: &ArroyoSchemaRef,
         output: &ArroyoSchemaRef,
     ) -> Result<()>;
+    fn admit_result_plan(
+        &self,
+        _plan: &ValuePlanOperator,
+        _input: &ArroyoSchemaRef,
+        _output: &ArroyoSchemaRef,
+    ) -> Result<()> {
+        Err(reject(
+            "accepted native SELECT requires concrete physical admission",
+        ))
+    }
+    fn admit_finalized_key(
+        &self,
+        _plan: &KeyPlanOperator,
+        _input: &ArroyoSchemaRef,
+        _output: &ArroyoSchemaRef,
+    ) -> Result<()> {
+        Err(reject(
+            "finalized source keys require concrete native admission",
+        ))
+    }
+    fn admit_finalized_session(
+        &self,
+        _config: &SessionWindowAggregateOperator,
+        _input: &ArroyoSchemaRef,
+        _output: &ArroyoSchemaRef,
+    ) -> Result<()> {
+        Err(reject(
+            "finalized SESSION requires concrete native physical admission",
+        ))
+    }
     fn admit_scalar_plan(
         &self,
         plan: &ValuePlanOperator,
@@ -372,6 +403,72 @@ fn admit_plan(
 }
 
 impl ScalarPlanAdmission for BoundedScalarAdmission<'_> {
+    fn admit_finalized_key(
+        &self,
+        plan: &KeyPlanOperator,
+        input: &ArroyoSchemaRef,
+        output: &ArroyoSchemaRef,
+    ) -> Result<()> {
+        let proto = PhysicalPlanNode::decode(plan.physical_plan.as_slice())
+            .map_err(|error| reject(format!("invalid finalized source key plan: {error}")))?;
+        let runtime = RuntimeEnvBuilder::new().build_arc()?;
+        let physical = proto.try_into_physical_plan(
+            self.registry,
+            &runtime,
+            &crate::physical::ArroyoPhysicalExtensionCodec {
+                context: crate::physical::DecodingContext::Planning,
+            },
+        )?;
+        validate_finalized_key_plan(physical.as_ref(), plan, input, output)
+    }
+    fn admit_finalized_session(
+        &self,
+        config: &SessionWindowAggregateOperator,
+        input: &ArroyoSchemaRef,
+        output: &ArroyoSchemaRef,
+    ) -> Result<()> {
+        let declared_input: ArroyoSchema = config
+            .input_schema
+            .clone()
+            .ok_or_else(|| reject("SESSION input descriptor missing"))?
+            .try_into()?;
+        let declared_output: ArroyoSchema = config
+            .output_schema
+            .clone()
+            .ok_or_else(|| reject("SESSION output descriptor missing"))?
+            .try_into()?;
+        if declared_input != **input || declared_output != **output || config.gap_micros == 0 {
+            return Err(reject(
+                "SESSION descriptor differs from actual graph schemas/gap",
+            ));
+        }
+        let proto = PhysicalPlanNode::decode(config.final_aggregation_plan.as_slice())
+            .map_err(|error| reject(format!("invalid SESSION aggregate plan: {error}")))?;
+        let runtime = RuntimeEnvBuilder::new().build_arc()?;
+        let physical = proto.try_into_physical_plan(
+            self.registry,
+            &runtime,
+            &crate::physical::ArroyoPhysicalExtensionCodec {
+                context: crate::physical::DecodingContext::Planning,
+            },
+        )?;
+        crate::physical::validate_session_result_plan(physical.as_ref(), &input.schema)?;
+        let expected = arroyo_rpc::df::session_output_schema(
+            input,
+            physical.schema().as_ref(),
+            &config.window_field_name,
+            usize::try_from(config.window_index)
+                .map_err(|_| reject("SESSION window index overflow"))?,
+            &declared_output,
+        )
+        .map_err(|error| reject(error.to_string()))?;
+        if expected != declared_output {
+            return Err(reject(
+                "SESSION descriptor differs from native physical layout",
+            ));
+        }
+        Ok(())
+    }
     fn admit_join_key(
         &self,
         plan: &KeyPlanOperator,
@@ -441,6 +538,36 @@ impl ScalarPlanAdmission for BoundedScalarAdmission<'_> {
         Ok(())
     }
 
+    fn admit_result_plan(
+        &self,
+        plan: &ValuePlanOperator,
+        input: &ArroyoSchemaRef,
+        output: &ArroyoSchemaRef,
+    ) -> Result<()> {
+        let proto = PhysicalPlanNode::decode(plan.physical_plan.as_slice())
+            .map_err(|error| reject(format!("invalid native result physical plan: {error}")))?;
+        let runtime = RuntimeEnvBuilder::new().build_arc()?;
+        let physical = proto.try_into_physical_plan(
+            self.registry,
+            &runtime,
+            &crate::physical::ArroyoPhysicalExtensionCodec {
+                context: crate::physical::DecodingContext::Planning,
+            },
+        )?;
+        if !scalar_schema_compatible(physical.schema().as_ref(), &output.schema) {
+            return Err(reject(
+                "accepted native SELECT output differs from its graph schema",
+            ));
+        }
+        let mut count = 0;
+        admit_native_key_plan(physical.as_ref(), &mut count, &input.schema)?;
+        if count != 1 {
+            return Err(reject(
+                "accepted native SELECT must have one native result reader",
+            ));
+        }
+        Ok(())
+    }
     fn admit_scalar_plan(
         &self,
         plan: &ValuePlanOperator,
@@ -680,7 +807,76 @@ fn admit_native_key_plan(
     admit_native_key_plan(children[0].as_ref(), input_count, expected_input)
 }
 
-fn validate_join_key_projection(
+// Ordinary native grouping projections have caller-derived key names and
+// permit SQL NULL groups. JOIN's private copied/non-null prefix proof is not
+// their contract. Keep the complete physical schema, key tuple and clock exact.
+fn validate_finalized_key_plan(
+    physical: &dyn ExecutionPlan,
+    plan: &KeyPlanOperator,
+    input: &ArroyoSchemaRef,
+    output: &ArroyoSchemaRef,
+) -> Result<()> {
+    let count = plan.key_fields.len();
+    if plan
+        .key_fields
+        .iter()
+        .copied()
+        .ne(0..u64::try_from(count).map_err(|_| reject("native key arity overflow"))?)
+        || count > output.schema.fields().len()
+        || physical.schema() != output.schema
+    {
+        return Err(reject(
+            "finalized source keys differ from native physical schema/ordered grouping tuple",
+        ));
+    }
+    let expected = ArroyoSchema::from_schema_keys(output.schema.clone(), (0..count).collect())?;
+    if output.as_ref() != &expected
+        || output.timestamp_index < count
+        || input.timestamp_index >= input.schema.fields().len()
+    {
+        return Err(reject(
+            "finalized source key metadata or clock differs from native output",
+        ));
+    }
+    let projection = physical
+        .as_any()
+        .downcast_ref::<ProjectionExec>()
+        .ok_or_else(|| {
+            reject("finalized native keys require the registered grouping projection")
+        })?;
+    validate_native_key_suffix(projection, count, input, output)?;
+    let mut readers = 0;
+    admit_native_key_plan(physical, &mut readers, &input.schema)?;
+    if readers != 1 {
+        return Err(reject("finalized source keys require one native reader"));
+    }
+    fn clock(plan: &dyn ExecutionPlan) -> Result<()> {
+        if let Some(projection) = plan.as_any().downcast_ref::<ProjectionExec>() {
+            let child = projection.input().schema();
+            let input_index = child.index_of(arroyo_rpc::TIMESTAMP_FIELD)?;
+            let schema = projection.schema();
+            let output_index = schema.index_of(arroyo_rpc::TIMESTAMP_FIELD)?;
+            let expression = &projection.expr()[output_index].0;
+            if expression
+                .as_any()
+                .downcast_ref::<datafusion::physical_expr::expressions::Column>()
+                .is_none_or(|column| column.index() != input_index)
+                || schema.field(output_index) != child.field(input_index)
+            {
+                return Err(reject(
+                    "finalized source key projection must preserve its native clock",
+                ));
+            }
+        }
+        for child in plan.children() {
+            clock(child.as_ref())?;
+        }
+        Ok(())
+    }
+    clock(physical)
+}
+
+fn validate_native_key_suffix(
     projection: &ProjectionExec,
     count: usize,
     input: &ArroyoSchemaRef,
@@ -718,6 +914,18 @@ fn validate_join_key_projection(
             ));
         }
     }
+    Ok(())
+}
+
+fn validate_join_key_projection(
+    projection: &ProjectionExec,
+    count: usize,
+    input: &ArroyoSchemaRef,
+    output: &ArroyoSchemaRef,
+) -> Result<()> {
+    use datafusion::physical_expr::expressions::Column;
+    validate_native_key_suffix(projection, count, input, output)?;
+    let width = input.schema.fields().len();
     let mut copied = BTreeSet::new();
     for index in 0..count {
         let (expression, _) = &projection.expr()[index];
@@ -890,12 +1098,240 @@ fn accepted_join_boundary(
     Ok(true)
 }
 
+// The native producer's own input distribution is outside the fused event
+// region. SESSION retains its established singleton Shuffle input; every edge
+// downstream within the serial MERGE scope still goes through only_parent.
+fn finalized_session_parent(
+    graph: &LogicalGraph,
+    producer: NodeIndex,
+) -> Result<(NodeIndex, LogicalEdge)> {
+    let incoming = graph.edges_directed(producer, Incoming).collect::<Vec<_>>();
+    if single_operator(graph, producer)?.operator_name != OperatorName::SessionWindowAggregate
+        || graph[producer].parallelism != 1
+        || incoming.len() != 1
+    {
+        return Err(reject(
+            "finalized SESSION requires one singleton native producer input",
+        ));
+    }
+    let edge = incoming[0];
+    if graph[edge.source()].parallelism != 1
+        || edge.weight().edge_type != LogicalEdgeType::Shuffle
+        || step_output_schema(graph, edge.source())? != edge.weight().schema
+    {
+        return Err(reject(
+            "finalized SESSION input must retain its singleton native Shuffle and exact schema",
+        ));
+    }
+    Ok((edge.source(), edge.weight().clone()))
+}
+
+fn finalized_session_source(
+    graph: &LogicalGraph,
+    producer: NodeIndex,
+    admission: &dyn ScalarPlanAdmission,
+) -> Result<()> {
+    let mut current = finalized_session_parent(graph, producer)?.0;
+    let mut seen = BTreeSet::new();
+    loop {
+        if !seen.insert(current.index()) || graph[current].parallelism != 1 {
+            return Err(reject(
+                "finalized SESSION requires acyclic singleton source ancestry",
+            ));
+        }
+        let operator = single_operator(graph, current)?;
+        if operator.operator_name == OperatorName::ConnectorSource {
+            if graph.edges_directed(current, Incoming).next().is_some() {
+                return Err(reject("SESSION source has upstream input"));
+            }
+            return Ok(());
+        }
+        let (parent, incoming) = only_parent(graph, current)?;
+        let output = step_output_schema(graph, current)?;
+        if incoming
+            .schema
+            .schema
+            .index_of(arroyo_rpc::UPDATING_META_FIELD)
+            .is_ok()
+            || output
+                .schema
+                .index_of(arroyo_rpc::UPDATING_META_FIELD)
+                .is_ok()
+        {
+            return Err(reject("finalized SESSION requires append source ancestry"));
+        }
+        match operator.operator_name {
+            OperatorName::ArrowValue => {
+                let plan = ValuePlanOperator::decode(operator.operator_config.as_slice()).map_err(
+                    |error| reject(format!("invalid SESSION source calculation: {error}")),
+                )?;
+                if plan.accepted_result.is_some() || plan.response_union_inputs != 0 {
+                    return Err(reject("SESSION source crosses another accepted producer"));
+                }
+                admission.admit_result_plan(&plan, &incoming.schema, &output)?;
+            }
+            OperatorName::ArrowKey => {
+                let plan = KeyPlanOperator::decode(operator.operator_config.as_slice())
+                    .map_err(|error| reject(format!("invalid SESSION source keys: {error}")))?;
+                admission.admit_finalized_key(&plan, &incoming.schema, &output)?;
+            }
+            OperatorName::Projection => {
+                let plan = ProjectionOperator::decode(operator.operator_config.as_slice())
+                    .map_err(|error| {
+                        reject(format!("invalid SESSION source projection: {error}"))
+                    })?;
+                admission.admit_projection(&plan, &incoming.schema, &output)?;
+            }
+            OperatorName::ExpressionWatermark => {
+                let plan = arroyo_rpc::grpc::api::ExpressionWatermarkConfig::decode(
+                    operator.operator_config.as_slice(),
+                )
+                .map_err(|error| reject(format!("invalid SESSION watermark: {error}")))?;
+                let declared: ArroyoSchema = plan
+                    .input_schema
+                    .as_ref()
+                    .ok_or_else(|| reject("SESSION watermark schema missing"))?
+                    .clone()
+                    .try_into()?;
+                let admitted = arroyo_rpc::df::source_admission_output_schema(
+                    &declared,
+                    plan.source_envelope_index.map(|index| index as usize),
+                    plan.preserve_source_envelope,
+                )
+                .map_err(|error| reject(format!("invalid SESSION source admission: {error}")))?;
+                if declared != *incoming.schema
+                    || admitted != *output
+                    || plan.response_root_operator.is_some()
+                    || plan.preserve_source_envelope
+                    || admitted
+                        .schema
+                        .index_of(arroyo_rpc::SOURCE_ENVELOPE_FIELD)
+                        .is_ok()
+                {
+                    return Err(reject("SESSION watermark is not ordinary append admission"));
+                }
+            }
+            _ => {
+                return Err(reject(
+                    "finalized SESSION hides state access or another producer",
+                ));
+            }
+        }
+        current = parent;
+    }
+}
+
 fn is_valid_input_boundary(
     graph: &LogicalGraph,
     boundary: NodeIndex,
     admission: &dyn ScalarPlanAdmission,
 ) -> Result<bool> {
     let operator = single_operator(graph, boundary)?;
+    if operator.operator_name == OperatorName::ArrowValue {
+        let value = ValuePlanOperator::decode(operator.operator_config.as_slice())
+            .map_err(|error| reject(format!("invalid accepted native SELECT boundary: {error}")))?;
+        if let Some(boundary_config) = &value.accepted_result {
+            let input = Arc::new(ArroyoSchema::try_from(
+                boundary_config
+                    .input_schema
+                    .clone()
+                    .ok_or_else(|| reject("accepted native SELECT input schema missing"))?,
+            )?);
+            let output = Arc::new(ArroyoSchema::try_from(
+                boundary_config
+                    .output_schema
+                    .clone()
+                    .ok_or_else(|| reject("accepted native SELECT output schema missing"))?,
+            )?);
+            let (mut parent, edge) = only_parent(graph, boundary)?;
+            if graph[boundary].parallelism != 1
+                || edge.schema != input
+                || step_output_schema(graph, boundary)? != output
+            {
+                return Err(reject(
+                    "accepted native SELECT boundary disagrees with full graph schemas",
+                ));
+            }
+            admission.admit_result_plan(&value, &input, &output)?;
+            let mut visited = BTreeSet::new();
+            loop {
+                if !visited.insert(parent.index()) || graph[parent].parallelism != 1 {
+                    return Err(reject(
+                        "accepted native SELECT ancestry is not acyclic singleton work",
+                    ));
+                }
+                let producer = single_operator(graph, parent)?;
+                if producer.operator_name == OperatorName::SessionWindowAggregate {
+                    if boundary_config.producer != Some(arroyo_rpc::grpc::api::accepted_result_boundary::Producer::FinalizedAppend(true)) {
+                        return Err(reject("SESSION accepted cut has an invalid producer identity"));
+                    }
+                    let config =
+                        SessionWindowAggregateOperator::decode(producer.operator_config.as_slice())
+                            .map_err(|error| {
+                                reject(format!("invalid finalized SESSION: {error}"))
+                            })?;
+                    let (_, incoming) = finalized_session_parent(graph, parent)?;
+                    let output = step_output_schema(graph, parent)?;
+                    admission.admit_finalized_session(&config, &incoming.schema, &output)?;
+                    finalized_session_source(graph, parent, admission)?;
+                    return Ok(true);
+                }
+                if producer.operator_name == OperatorName::UpdatingAggregate {
+                    let Some(arroyo_rpc::grpc::api::accepted_result_boundary::Producer::ResponseRootOperator(root)) = boundary_config.producer else {
+                        return Err(reject("accepted native result response root identity missing"));
+                    };
+                    let config =
+                        UpdatingAggregateOperator::decode(producer.operator_config.as_slice())
+                            .map_err(|error| {
+                                reject(format!("invalid terminal native result: {error}"))
+                            })?;
+                    let native: ArroyoSchema = config
+                        .final_schema
+                        .ok_or_else(|| reject("terminal native result schema missing"))?
+                        .try_into()?;
+                    let accepted: ArroyoSchema = config
+                        .accepted_output_schema
+                        .ok_or_else(|| reject("native producer has no accepted result policy"))?
+                        .try_into()?;
+                    let mut fields = native.schema.fields().to_vec();
+                    let meta = native.schema.index_of(arroyo_rpc::UPDATING_META_FIELD)?;
+                    if native.schema.field(meta) != arroyo_rpc::updating_meta_field().as_ref() {
+                        return Err(reject("terminal native metadata is not canonical"));
+                    }
+                    fields.remove(meta);
+                    let expected = ArroyoSchema::from_schema_unkeyed(Arc::new(
+                        Schema::new_with_metadata(fields, native.schema.metadata().clone()),
+                    ))?;
+                    if config.response_root_operator != Some(root)
+                        || config.emit_per_event
+                        || config.retain_indefinitely != Some(true)
+                        || accepted != expected
+                        || step_output_schema(graph, parent)?.as_ref() != &accepted
+                    {
+                        return Err(reject(
+                            "accepted SELECT does not belong to its exact native producer/root/schema",
+                        ));
+                    }
+                    return Ok(true);
+                }
+                let (next, incoming) = only_parent(graph, parent)?;
+                let output = step_output_schema(graph, parent)?;
+                if producer.operator_name != OperatorName::ArrowValue {
+                    return Err(reject(
+                        "accepted native result ancestry requires native SELECT work",
+                    ));
+                }
+                let plan = ValuePlanOperator::decode(producer.operator_config.as_slice()).map_err(
+                    |error| reject(format!("invalid post-result native SELECT: {error}")),
+                )?;
+                if plan.accepted_result.is_some() || plan.response_union_inputs != 0 {
+                    return Err(reject("accepted result crossed another response boundary"));
+                }
+                admission.admit_result_plan(&plan, &incoming.schema, &output)?;
+                parent = next;
+            }
+        }
+    }
     if operator.operator_name == OperatorName::Join {
         let join = JoinOperator::decode(operator.operator_config.as_slice())
             .map_err(|error| reject(format!("invalid JOIN input boundary: {error}")))?;
@@ -1812,6 +2248,63 @@ FROM applied r WHERE r.source.selected_for_output;
     }
 
     #[test]
+    fn finalized_native_keys_preserve_named_nullable_groups_and_reject_schema_clock_forgery() {
+        use datafusion::physical_expr::expressions::{Column, Literal};
+        let input = Arc::new(ArroyoSchema::new_unkeyed(
+            Arc::new(Schema::new(vec![
+                Field::new("t", DataType::Utf8, false),
+                Field::new("k", DataType::Utf8, true),
+                schema().schema.field(1).clone(),
+            ])),
+            2,
+        ));
+        let make = |replace_clock: bool| {
+            let mut exprs: Vec<(Arc<dyn PhysicalExpr>, String)> = vec![
+                (Arc::new(Column::new("t", 0)), "_key_t".into()),
+                (Arc::new(Column::new("k", 1)), "_key_k".into()),
+            ];
+            for index in 0..3 {
+                let expression: Arc<dyn PhysicalExpr> = if index == 2 && replace_clock {
+                    Arc::new(Literal::new(
+                        datafusion::common::ScalarValue::TimestampNanosecond(Some(55), None),
+                    ))
+                } else {
+                    Arc::new(Column::new(input.schema.field(index).name(), index))
+                };
+                exprs.push((expression, input.schema.field(index).name().clone()));
+            }
+            ProjectionExec::try_new(
+                exprs,
+                Arc::new(crate::physical::ArroyoMemExec::new(
+                    "session-input".into(),
+                    input.schema.clone(),
+                )),
+            )
+            .unwrap()
+        };
+        let projection = make(false);
+        let output =
+            Arc::new(ArroyoSchema::from_schema_keys(projection.schema(), vec![0, 1]).unwrap());
+        let plan = KeyPlanOperator {
+            name: "key".into(),
+            physical_plan: vec![],
+            key_fields: vec![0, 1],
+        };
+        validate_finalized_key_plan(&projection, &plan, &input, &output).unwrap();
+        assert!(
+            validate_join_key_projection(&projection, 2, &input, &output).is_err(),
+            "JOIN's private prefix remains restricted"
+        );
+        let mut reversed = plan.clone();
+        reversed.key_fields.reverse();
+        assert!(validate_finalized_key_plan(&projection, &reversed, &input, &output).is_err());
+        let mut wrong = output.as_ref().clone();
+        wrong.timestamp_index = 0;
+        assert!(validate_finalized_key_plan(&projection, &plan, &input, &Arc::new(wrong)).is_err());
+        assert!(validate_finalized_key_plan(&make(true), &plan, &input, &output).is_err());
+    }
+
+    #[test]
     fn native_join_key_projection_maps_reordered_side_and_rejects_forged_suffix() {
         use datafusion::physical_expr::expressions::Column;
         let input = std::sync::Arc::new(ArroyoSchema::new_unkeyed(
@@ -2140,6 +2633,28 @@ FROM applied r WHERE r.source.selected_for_output;
         assert!(rebuilt.node_weights().any(|node| node.node_id == 1));
         assert!(rebuilt.node_weights().any(|node| node.node_id == 2));
         assert!(!rebuilt.node_weights().any(|node| node.node_id == 3));
+    }
+
+    #[test]
+    fn finalized_session_native_shuffle_is_outside_the_forward_only_fused_scope() {
+        let mut graph = LogicalGraph::new();
+        let source = graph.add_node(node(0, OperatorName::ConnectorSource, vec![]));
+        let session = graph.add_node(node(1, OperatorName::SessionWindowAggregate, vec![]));
+        let edge = graph.add_edge(
+            source,
+            session,
+            LogicalEdge::project_all(LogicalEdgeType::Shuffle, schema()),
+        );
+        assert_eq!(finalized_session_parent(&graph, session).unwrap().0, source);
+        assert!(
+            only_parent(&graph, session).is_err(),
+            "generic fused guard must remain Forward-only"
+        );
+        graph[source].parallelism = 2;
+        assert!(finalized_session_parent(&graph, session).is_err());
+        graph[source].parallelism = 1;
+        graph[edge].edge_type = LogicalEdgeType::LeftJoin;
+        assert!(finalized_session_parent(&graph, session).is_err());
     }
 
     #[test]

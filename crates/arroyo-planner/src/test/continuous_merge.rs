@@ -145,22 +145,75 @@ async fn maintained_merge_event_clock_rejects_an_overwritten_input_clock() {
 }
 
 #[test(tokio::test)]
-async fn maintained_merge_rejects_unresolved_retention_and_other_aggregates() {
+async fn maintained_merge_uses_native_capabilities_and_rejects_unresolved_retention_or_distinct() {
     reject(
         &aggregate_merge("", "COUNT(*)"),
         "requires SET updating_ttl = NULL",
     )
     .await;
-    reject(
-        &aggregate_merge("SET updating_ttl = NULL;", "SUM(counter)"),
-        "COUNT/MAX and grouped selectors only",
-    )
-    .await;
+    plan(&aggregate_merge("SET updating_ttl = NULL;", "SUM(counter)")).await;
     reject(
         &aggregate_merge("SET updating_ttl = NULL;", "COUNT(DISTINCT counter)"),
-        "non-distinct COUNT/MAX",
+        "verified non-distinct native result capability",
     )
     .await;
+}
+
+#[test(tokio::test)]
+async fn maintained_merge_nested_result_uses_one_root_and_terminal_accepted_policy() {
+    let base = aggregate_merge("SET updating_ttl = NULL;", "COUNT(*)");
+    let sql = base.replace(
+        "CREATE VIEW counts AS SELECT counter, COUNT(*) AS quantity FROM events GROUP BY counter;",
+        "CREATE VIEW inner_counts AS SELECT counter, COUNT(*) AS n FROM events GROUP BY counter; CREATE VIEW counts AS SELECT counter, COUNT(*) AS quantity FROM inner_counts GROUP BY counter;",
+    );
+    let compiled = plan(&sql).await;
+    let aggregates = compiled
+        .program
+        .graph
+        .node_weights()
+        .flat_map(|node| node.operator_chain.iter())
+        .filter(|(op, _)| op.operator_name == OperatorName::UpdatingAggregate)
+        .map(|(op, _)| {
+            arroyo_rpc::grpc::api::UpdatingAggregateOperator::decode(op.operator_config.as_slice())
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(aggregates.len(), 2);
+    assert!(aggregates.iter().all(|config| config.response_root_operator
+        == aggregates[0].response_root_operator
+        && config.response_root_operator.is_some()
+        && !config.emit_per_event));
+    assert_eq!(
+        aggregates
+            .iter()
+            .filter(|config| config.accepted_output_schema.is_some())
+            .count(),
+        1
+    );
+}
+
+#[test(tokio::test)]
+async fn maintained_merge_nested_canonical_virtual_source_requires_repeatability() {
+    let query = "SET updating_ttl = NULL;
+        CREATE TABLE events (counter BIGINT NOT NULL,event_time TEXT NOT NULL,
+          event_ts TIMESTAMP GENERATED ALWAYS AS (CAST(event_time AS TIMESTAMP)) STORED,
+          event_ms BIGINT GENERATED ALWAYS AS (CAST(CAST(event_time AS TIMESTAMP(3)) AS BIGINT)) STORED,
+          WATERMARK FOR event_ts AS CAST(event_time AS TIMESTAMP)-INTERVAL '5 seconds')
+          WITH(connector='single_file',path='/tmp/str64-native-source.jsonl',format='json',type='source');
+        CREATE VIEW first_level AS SELECT counter,MAX(event_ms) AS latest FROM events GROUP BY counter;
+        CREATE VIEW counts AS SELECT counter,MAX(latest) AS quantity FROM first_level GROUP BY counter;
+        CREATE STATE TABLE inventory (counter BIGINT PRIMARY KEY,quantity BIGINT) PARTITION BY counter;
+        CREATE VIEW applied AS MERGE INTO inventory AS old USING counts AS incoming ON old.counter=incoming.counter
+        WHEN MATCHED THEN UPDATE SET quantity=incoming.quantity
+        WHEN NOT MATCHED THEN INSERT(counter,quantity) VALUES(incoming.counter,incoming.quantity)
+        RETURNING source AS source,old AS old,new AS new,action AS action;
+        SELECT source.quantity,EVENT_TIMESTAMP() AS original_trigger FROM applied;";
+    plan(query).await;
+    let volatile = query.replace(
+        "CAST(CAST(event_time AS TIMESTAMP(3)) AS BIGINT)",
+        "CAST(random()*1000 AS BIGINT)",
+    );
+    reject(&volatile, "repeatable source expressions").await;
 }
 
 #[test(tokio::test)]
@@ -170,7 +223,6 @@ async fn maintained_merge_rejects_unsupported_event_lineage_and_ordering() {
         "CREATE VIEW counts AS SELECT counter, COUNT(*) AS quantity FROM events GROUP BY counter;";
     let cases = [
         ("join", base.replace(view, "CREATE VIEW counts AS SELECT a.counter, COUNT(*) AS quantity FROM events a JOIN events b ON a.counter=b.counter GROUP BY a.counter;")),
-        ("nested", base.replace(view, "CREATE VIEW inner_counts AS SELECT counter, COUNT(*) AS n FROM events GROUP BY counter; CREATE VIEW counts AS SELECT counter, COUNT(*) AS quantity FROM inner_counts GROUP BY counter;")),
     ];
     for (case, sql) in cases {
         let result = parse_and_get_program(
@@ -1347,7 +1399,11 @@ async fn maintained_merge_count_ordering_reaches_the_route_guard() {
     let sql=aggregate_merge("SET updating_ttl = NULL;","COUNT(counter)").replace(
         "CREATE VIEW counts AS SELECT counter, COUNT(counter) AS quantity FROM events GROUP BY counter;",view);
     plan(&sql.replace("COUNT(counter ORDER BY counter)", "COUNT(counter)")).await;
-    reject(&sql,"per-event aggregate MERGE supports native non-distinct COUNT/MAX and grouped selectors only").await;
+    reject(
+        &sql,
+        "per-event aggregate MERGE requires a verified non-distinct native result capability",
+    )
+    .await;
 }
 
 #[test(tokio::test)]
@@ -1402,4 +1458,212 @@ async fn maintained_merge_accepts_native_calendar_sum_with_nullable_snapshot() {
     let quantity = public.field_with_name("quantity").unwrap();
     assert_eq!(quantity.data_type(), &arrow_schema::DataType::Int64);
     assert!(quantity.is_nullable());
+}
+
+#[test(tokio::test)]
+async fn maintained_merge_direct_array_retains_native_collection_result_and_public_source() {
+    let declarations = "CREATE TABLE events (counter BIGINT NOT NULL, item TEXT,
+        event_time TIMESTAMP NOT NULL, WATERMARK FOR event_time AS event_time - INTERVAL '1' DAY)
+        WITH (connector='single_file',path='/tmp/native-array-handoff.jsonl',format='json',type='source');
+        CREATE STATE TABLE inventory (counter BIGINT PRIMARY KEY, quantity BIGINT) PARTITION BY counter;";
+    let sql = aggregate_merge("SET updating_ttl = NULL;", "COUNT(*)")
+        .replace(DECLARATIONS, declarations)
+        .replace(
+            "COUNT(*) AS quantity",
+            "COUNT(*) AS quantity, ARRAY_AGG(item ORDER BY item) AS items",
+        )
+        .replace(
+            "SELECT new.quantity FROM applied",
+            "SELECT source.items, old.quantity, new.quantity, action FROM applied",
+        );
+    let compiled = plan(&sql).await;
+    let operations = compiled
+        .program
+        .graph
+        .node_weights()
+        .flat_map(|node| node.operator_chain.iter())
+        .collect::<Vec<_>>();
+    let aggregates = operations
+        .iter()
+        .filter(|(op, _)| op.operator_name == OperatorName::UpdatingAggregate)
+        .map(|(op, _)| {
+            arroyo_rpc::grpc::api::UpdatingAggregateOperator::decode(op.operator_config.as_slice())
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(aggregates.len(), 1);
+    assert!(aggregates[0].emit_per_event);
+    assert!(aggregates[0].response_root_operator.is_none());
+    let physical: arrow_schema::Schema =
+        serde_json::from_str(&aggregates[0].final_schema.as_ref().unwrap().arrow_schema).unwrap();
+    assert!(physical.fields().iter().any(|field| matches!(field.data_type(), arrow_schema::DataType::List(child) if child.data_type() == &arrow_schema::DataType::Utf8)));
+    let accesses = state_operators(&compiled);
+    assert_eq!(accesses.len(), 1);
+    let source: arrow_schema::Schema =
+        serde_json::from_str(&accesses[0].input_schema.as_ref().unwrap().arrow_schema).unwrap();
+    assert!(matches!(
+        source.field_with_name("items").unwrap().data_type(),
+        arrow_schema::DataType::List(_)
+    ));
+}
+
+fn finalized_session_merge() -> String {
+    "CREATE TABLE events(t TEXT NOT NULL,k TEXT NOT NULL,event_time TIMESTAMP NOT NULL,
+       WATERMARK FOR event_time AS event_time-INTERVAL '5 seconds')
+       WITH(connector='single_file',path='/tmp/str64-session-plan.jsonl',format='json',type='source');
+     CREATE VIEW computed AS SELECT t,k,SESSION(INTERVAL '30 minutes') AS window,COUNT(*) AS n
+       FROM events GROUP BY t,k,window;
+     CREATE STATE TABLE snapshots(t TEXT,k TEXT,n BIGINT,PRIMARY KEY(t,k)) PARTITION BY t;
+     CREATE VIEW applied AS MERGE INTO snapshots AS previous USING computed AS incoming
+       ON previous.t=incoming.t AND previous.k=incoming.k
+       WHEN MATCHED THEN UPDATE SET n=incoming.n
+       WHEN NOT MATCHED THEN INSERT(t,k,n) VALUES(incoming.t,incoming.k,incoming.n)
+       RETURNING source AS source,old AS old,new AS new,action AS action;
+     SELECT source.t,source.k,old.n AS previous_n,new.n AS n,action,
+       applied._timestamp AS finalized_at FROM applied;".into()
+}
+// Record the ordinary native producer before proving its MERGE consumer. This
+// keeps its actual admission/key/physical lowering visible when a proof fails.
+async fn record_ordinary_session_plan(sql: &str) {
+    use petgraph::visit::EdgeRef;
+    let declarations = sql.split("CREATE STATE TABLE snapshots").next().unwrap();
+    let ordinary = plan(&format!("{declarations} SELECT * FROM computed;")).await;
+    let nodes = ordinary.program.graph.node_indices().map(|index| {
+        let node = &ordinary.program.graph[index];
+        let operators = node.operator_chain.iter().map(|(operator, output)| {
+            let config = match operator.operator_name {
+                OperatorName::ExpressionWatermark => format!("{:#?}",
+                    arroyo_rpc::grpc::api::ExpressionWatermarkConfig::decode(operator.operator_config.as_slice()).unwrap()),
+                OperatorName::SessionWindowAggregate => format!("{:#?}",
+                    arroyo_rpc::grpc::api::SessionWindowAggregateOperator::decode(operator.operator_config.as_slice()).unwrap()),
+                OperatorName::ArrowValue => format!("{:#?}",
+                    arroyo_rpc::grpc::api::ValuePlanOperator::decode(operator.operator_config.as_slice()).unwrap()),
+                OperatorName::ArrowKey => format!("{:#?}",
+                    arroyo_rpc::grpc::api::KeyPlanOperator::decode(operator.operator_config.as_slice()).unwrap()),
+                _ => String::new(),
+            };
+            let physical = match operator.operator_name {
+                OperatorName::ArrowValue => Some(arroyo_rpc::grpc::api::ValuePlanOperator::decode(operator.operator_config.as_slice()).unwrap().physical_plan),
+                OperatorName::ArrowKey => Some(arroyo_rpc::grpc::api::KeyPlanOperator::decode(operator.operator_config.as_slice()).unwrap().physical_plan),
+                OperatorName::SessionWindowAggregate => Some(arroyo_rpc::grpc::api::SessionWindowAggregateOperator::decode(operator.operator_config.as_slice()).unwrap().final_aggregation_plan),
+                _ => None,
+            }.map(|bytes| format!("{:#?}", datafusion_proto::protobuf::PhysicalPlanNode::decode(bytes.as_slice()).unwrap()));
+            serde_json::json!({"id":operator.operator_id,"kind":format!("{:?}",operator.operator_name),
+                "config":config,"serialized_config":operator.operator_config,"physical_plan":physical,
+                "output":format!("{output:#?}")})
+        }).collect::<Vec<_>>();
+        serde_json::json!({"index":index.index(),"node_id":node.node_id,
+            "parallelism":node.parallelism,"operators":operators})
+    }).collect::<Vec<_>>();
+    let edges = ordinary
+        .program
+        .graph
+        .edge_references()
+        .map(|edge| {
+            serde_json::json!({
+                "source":edge.source().index(),"target":edge.target().index(),
+                "edge":format!("{:#?}", edge.weight())
+            })
+        })
+        .collect::<Vec<_>>();
+    let evidence = serde_json::json!({"sql":format!("{declarations} SELECT * FROM computed;"),"nodes":nodes,"edges":edges});
+    eprintln!(
+        "SESSION_ORDINARY_PLAN {}",
+        serde_json::to_string(&evidence).unwrap()
+    );
+    if let Ok(path) = std::env::var("STREAMR_TEST_SESSION_PLAN_EVIDENCE") {
+        let suffix = if sql.contains("GENERATED ALWAYS") {
+            "generated"
+        } else {
+            "declared"
+        };
+        std::fs::write(
+            format!("{path}-{suffix}.json"),
+            serde_json::to_vec_pretty(&evidence).unwrap(),
+        )
+        .unwrap();
+    }
+}
+
+#[test(tokio::test)]
+async fn finalized_session_merge_keeps_native_append_producer_and_shared_result_cut() {
+    let sql = finalized_session_merge();
+    record_ordinary_session_plan(&sql).await;
+    let compiled = plan(&sql).await;
+    let operators = compiled
+        .program
+        .graph
+        .node_weights()
+        .flat_map(|node| node.operator_chain.iter())
+        .map(|(operator, _)| operator)
+        .collect::<Vec<_>>();
+    for (kind, count) in [
+        (OperatorName::ConnectorSource, 1),
+        (OperatorName::SessionWindowAggregate, 1),
+        (OperatorName::FusedStateTable, 1),
+        (OperatorName::UpdatingAggregate, 0),
+    ] {
+        assert_eq!(
+            operators
+                .iter()
+                .filter(|operator| operator.operator_name == kind)
+                .count(),
+            count
+        );
+    }
+    let native = operators
+        .iter()
+        .find(|op| op.operator_name == OperatorName::SessionWindowAggregate)
+        .unwrap();
+    let native = arroyo_rpc::grpc::api::SessionWindowAggregateOperator::decode(
+        native.operator_config.as_slice(),
+    )
+    .unwrap();
+    let output: arroyo_rpc::df::ArroyoSchema = native.output_schema.unwrap().try_into().unwrap();
+    assert_eq!(output.schema.field(0).name(), "t");
+    assert_eq!(output.schema.field(1).name(), "k");
+    assert_eq!(output.timestamp_index, output.schema.fields().len() - 1);
+    assert_eq!(
+        output.schema.field(output.timestamp_index).data_type(),
+        &arrow_schema::DataType::Timestamp(arrow_schema::TimeUnit::Nanosecond, None)
+    );
+    assert!(
+        output
+            .schema
+            .index_of(arroyo_rpc::UPDATING_META_FIELD)
+            .is_err()
+    );
+    assert_eq!(state_operators(&compiled).len(), 1);
+}
+#[test(tokio::test)]
+async fn finalized_session_merge_rejects_replaced_result_clock_and_prior_state_access() {
+    let sql = finalized_session_merge();
+    let replaced=sql.replace("USING computed AS incoming", "USING replaced AS incoming")
+        .replace("CREATE STATE TABLE snapshots", "CREATE VIEW replaced AS SELECT t,k,n,TIMESTAMP '2000-01-01 00:00:00' AS _timestamp FROM computed; CREATE STATE TABLE snapshots");
+    reject(&replaced, "preserve the native producer clock").await;
+    let prior=sql.replace("CREATE VIEW computed AS", "CREATE STATE TABLE retained(t TEXT,k TEXT,n BIGINT,PRIMARY KEY(t,k)) PARTITION BY t; CREATE VIEW looked AS SELECT events.* FROM events LEFT JOIN retained ON events.t=retained.t AND events.k=retained.k; CREATE VIEW computed AS")
+        .replace("FROM events GROUP BY", "FROM looked GROUP BY");
+    reject(&prior, "finalized").await;
+}
+
+#[test(tokio::test)]
+async fn finalized_session_merge_preserves_exact_canonical_generated_source_clock() {
+    let sql = finalized_session_merge().replace(
+        "event_time TIMESTAMP NOT NULL,\n       WATERMARK FOR event_time AS event_time-INTERVAL '5 seconds'",
+        "event_time TEXT NOT NULL,event_ts TIMESTAMP GENERATED ALWAYS AS (CAST(event_time AS TIMESTAMP)) STORED,\n       WATERMARK FOR event_ts AS CAST(event_time AS TIMESTAMP)-INTERVAL '5 seconds'",
+    );
+    assert!(sql.contains("GENERATED ALWAYS"));
+    record_ordinary_session_plan(&sql).await;
+    let compiled = plan(&sql).await;
+    assert_eq!(
+        compiled
+            .program
+            .graph
+            .node_weights()
+            .flat_map(|node| node.operator_chain.iter())
+            .filter(|(operator, _)| operator.operator_name == OperatorName::SessionWindowAggregate)
+            .count(),
+        1
+    );
+    assert_eq!(state_operators(&compiled).len(), 1);
 }

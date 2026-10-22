@@ -19,6 +19,9 @@ pub struct EventEdgeSpec {
     pub root_subtask: u32,
     pub schema: SchemaRef,
     pub layout: EventLayout,
+    /// Only a constructed native calendar producer may originate ordinary
+    /// bounded per-key maintenance replacements on this local response route.
+    pub maintenance: bool,
 }
 impl EventEdgeSpec {
     pub fn keys_schema() -> SchemaRef {
@@ -52,7 +55,7 @@ impl EventEdgeSpec {
         }
         let max_rows = match self.layout {
             EventLayout::Raw => 2,
-            EventLayout::Native { max_rows, .. } if (1..=4).contains(&max_rows) => max_rows,
+            EventLayout::Native { max_rows, .. } if max_rows > 0 => max_rows,
             _ => return Err("invalid native response row count".into()),
         };
         if let Some(rows) = &response.rows
@@ -296,6 +299,7 @@ mod tests {
     #[test]
     fn event_transport_local_descriptor_rejects_wrong_root_schema_and_counts() {
         let spec = EventEdgeSpec {
+            maintenance: false,
             root_operator: 7,
             root_subtask: 0,
             schema: schema(),
@@ -351,6 +355,7 @@ mod tests {
         };
         let bytes = row.get_array_memory_size();
         let mut spec = EventEdgeSpec {
+            maintenance: false,
             root_operator: 7,
             root_subtask: 0,
             schema: schema(),

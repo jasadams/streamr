@@ -1,4 +1,4 @@
-//! Pairs original-event branch responses for the native updating JOIN.
+//! Align a finite set of original-event responses before native evaluation.
 use anyhow::{Result, ensure};
 use arroyo_operator::CheckpointCounter;
 use arroyo_types::SignalMessage;
@@ -6,39 +6,50 @@ use arroyo_types::event_response::{EVENT_RESPONSE_VERSION, EventContext, EventRe
 
 pub(crate) struct EventPair {
     pub(crate) context: EventContext,
-    pub(crate) branches: [EventResponse; 2],
+    pub(crate) branches: Vec<EventResponse>,
 }
 
 enum Phase {
     Empty,
-    Waiting {
-        side: usize,
-        response: EventResponse,
-    },
+    Waiting(Vec<Option<EventResponse>>),
     Processing(EventContext),
 }
 
-/// Exactly one unmatched response, then two caller-owned responses while the
-/// existing native JOIN scopes run. No map, scheduler, task or byte admission.
+/// One slot per registered input, then caller-owned complete responses during
+/// native evaluation and delivery. No map of events or additional admission.
 pub(crate) struct EventPairState {
     root: (u32, u32),
+    inputs: usize,
     nonce: Option<[u8; 16]>,
     next_sequence: Option<u64>,
     phase: Phase,
 }
 impl EventPairState {
     pub(crate) fn new(root_operator: u32, root_subtask: u32) -> Self {
-        Self {
+        Self::with_inputs(root_operator, root_subtask, 2)
+            .expect("two response inputs are supported")
+    }
+    pub(crate) fn with_inputs(
+        root_operator: u32,
+        root_subtask: u32,
+        inputs: usize,
+    ) -> Result<Self> {
+        ensure!(
+            inputs > 0,
+            "response alignment requires a positive registered input count"
+        );
+        Ok(Self {
             root: (root_operator, root_subtask),
+            inputs,
             nonce: None,
             next_sequence: Some(1),
             phase: Phase::Empty,
-        }
+        })
     }
     pub(crate) fn blocked(&self, side: usize) -> bool {
         match &self.phase {
             Phase::Empty => false,
-            Phase::Waiting { side: pending, .. } => *pending == side,
+            Phase::Waiting(slots) => slots.get(side).is_some_and(Option::is_some),
             Phase::Processing(_) => true,
         }
     }
@@ -53,7 +64,10 @@ impl EventPairState {
         side: usize,
         checkpoints: &CheckpointCounter,
     ) -> Result<()> {
-        ensure!(side < 2, "event JOIN requires exactly two sides");
+        ensure!(
+            side < self.inputs,
+            "event response input exceeds registered arity"
+        );
         ensure!(
             checkpoints.all_clear(),
             "event response crossed an unaligned checkpoint prefix"
@@ -82,7 +96,10 @@ impl EventPairState {
         checkpoints: &CheckpointCounter,
         _closed: &std::collections::HashSet<usize>,
     ) -> Result<()> {
-        ensure!(side < 2, "event JOIN requires exactly two sides");
+        ensure!(
+            side < self.inputs,
+            "event response input exceeds registered arity"
+        );
         ensure!(
             !self.pending(),
             "input {side} EOF before matching event completed"
@@ -118,7 +135,7 @@ impl EventPairState {
         control: &SignalMessage,
         checkpoints: &CheckpointCounter,
     ) -> Result<()> {
-        ensure!(side < 2, "event JOIN requires exactly two sides");
+        self.before_maintenance(side)?;
         ensure!(
             !checkpoints.is_blocked(side),
             "control entered a checkpoint-parked input"
@@ -126,8 +143,11 @@ impl EventPairState {
         match &self.phase {
             Phase::Empty => Ok(()),
             Phase::Processing(_) => anyhow::bail!("control reentered a processing event callback"),
-            Phase::Waiting { side: first, .. } => {
-                ensure!(side != *first, "control entered an event-parked input");
+            Phase::Waiting(slots) => {
+                ensure!(
+                    slots[side].is_none(),
+                    "control entered an event-parked input"
+                );
                 ensure!(
                     checkpoints.all_clear(),
                     "pending event crossed an earlier checkpoint prefix"
@@ -152,7 +172,10 @@ impl EventPairState {
         side: usize,
         response: EventResponse,
     ) -> Result<Option<EventPair>> {
-        ensure!(side < 2, "event JOIN requires exactly two sides");
+        ensure!(
+            side < self.inputs,
+            "event response input exceeds registered arity"
+        );
         let context = response.context;
         ensure!(
             context.version == EVENT_RESPONSE_VERSION,
@@ -176,38 +199,46 @@ impl EventPairState {
             Phase::Processing(_) => {
                 anyhow::bail!("event response arrived before prior delivery completed")
             }
-            Phase::Waiting {
-                side: first,
-                response: pending,
-            } => {
-                ensure!(*first != side, "duplicate branch response");
+            Phase::Waiting(slots) => {
+                ensure!(slots[side].is_none(), "duplicate branch response");
                 ensure!(
-                    pending.context == context,
+                    slots
+                        .iter()
+                        .flatten()
+                        .all(|pending| pending.context == context),
                     "branches disagree on original-event context/clock"
                 );
             }
             Phase::Empty => {}
         }
         self.nonce = Some(context.attempt_nonce);
-        let previous = std::mem::replace(&mut self.phase, Phase::Processing(context));
-        match previous {
-            Phase::Empty => {
-                self.phase = Phase::Waiting { side, response };
-                Ok(None)
-            }
-            Phase::Waiting {
-                side: first,
-                response: pending,
-            } => {
-                let branches = if first == 0 {
-                    [pending, response]
-                } else {
-                    [response, pending]
-                };
-                Ok(Some(EventPair { context, branches }))
-            }
+        let mut slots = match std::mem::replace(&mut self.phase, Phase::Processing(context)) {
+            Phase::Empty => (0..self.inputs).map(|_| None).collect::<Vec<_>>(),
+            Phase::Waiting(slots) => slots,
             Phase::Processing(_) => unreachable!("validated before replacement"),
+        };
+        slots[side] = Some(response);
+        if slots.iter().all(Option::is_some) {
+            Ok(Some(EventPair {
+                context,
+                branches: slots
+                    .into_iter()
+                    .map(|slot| slot.expect("all inputs complete"))
+                    .collect(),
+            }))
+        } else {
+            self.phase = Phase::Waiting(slots);
+            Ok(None)
         }
+    }
+    /// Maintenance on an unfilled input precedes that input's pending event.
+    /// Filled inputs are parked, and Processing remains parked through delivery.
+    pub(crate) fn before_maintenance(&self, side: usize) -> Result<()> {
+        ensure!(
+            side < self.inputs && !self.blocked(side),
+            "maintenance entered an event-parked input"
+        );
+        Ok(())
     }
     /// Call only AFTER native changes, final native probes and awaited output.
     /// If any step errors, fail the attempt; never finish and resume that owner.
@@ -268,6 +299,48 @@ mod tests {
             assert_eq!(pair.context.trigger_nanos, 5);
             state.finish(pair.context)?;
         }
+        Ok(())
+    }
+    #[test]
+    fn finite_responses_wait_for_three_inputs_and_preserve_prior_watermark_maintenance()
+    -> Result<()> {
+        let mut state = EventPairState::with_inputs(5, 0, 3)?;
+        let counter = CheckpointCounter::new(3);
+        let watermark = SignalMessage::Watermark(Watermark::Idle);
+        // Optional branches reach E+1 while core is still processing the prior W.
+        state.check_control(1, &watermark, &counter)?;
+        assert!(state.receive(1, response(1, 5))?.is_none());
+        assert!(state.receive(2, response(1, 5))?.is_none());
+        assert!(state.blocked(1) && state.blocked(2) && !state.blocked(0));
+        state.before_maintenance(0)?;
+        assert!(state.before_maintenance(1).is_err());
+        state.check_control(0, &watermark, &counter)?;
+        assert!(
+            state
+                .check_control(0, &SignalMessage::Barrier(barrier()), &counter)
+                .is_err()
+        );
+        let complete = state
+            .receive(0, response(1, 5))?
+            .context("missing third response")?;
+        assert_eq!(complete.branches.len(), 3);
+        assert!(
+            complete
+                .branches
+                .iter()
+                .all(|branch| branch.context == complete.context)
+        );
+        assert!((0..3).all(|side| state.blocked(side)));
+        assert!(state.before_maintenance(0).is_err());
+        state.finish(complete.context)?;
+        assert!((0..3).all(|side| !state.blocked(side)));
+        assert!(EventPairState::with_inputs(5, 0, 0).is_err());
+        assert!(EventPairState::with_inputs(5, 0, 4).is_ok());
+        let mut unary = EventPairState::with_inputs(5, 0, 1)?;
+        let complete = unary
+            .receive(0, response(1, 20))?
+            .context("unary completion")?;
+        unary.finish(complete.context)?;
         Ok(())
     }
     #[test]

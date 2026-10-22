@@ -14,6 +14,7 @@ use std::sync::{
 
 fn edge() -> Arc<EventEdgeSpec> {
     Arc::new(EventEdgeSpec {
+        maintenance: false,
         root_operator: 7,
         root_subtask: 0,
         schema: Arc::new(Schema::new(vec![

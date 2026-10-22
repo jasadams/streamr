@@ -93,6 +93,12 @@ impl Optimizer for ChainingOptimizer {
                 .operator_chain
                 .edges
                 .push(edge.weight().schema.clone());
+            // The successor may already be a chain. Its internal schema slots
+            // follow the bridge, in exactly the same order as its operators.
+            new_cur
+                .operator_chain
+                .edges
+                .extend(successor_node.operator_chain.edges.clone());
 
             mem::swap(&mut new_cur, plan.node_weight_mut(node_idx).unwrap());
 
@@ -108,6 +114,78 @@ impl Optimizer for ChainingOptimizer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chaining_prechained_successor_preserves_every_intermediate_schema() {
+        use crate::logical::{LogicalEdge, LogicalNode, OperatorName};
+        use arrow_schema::{DataType, Field, Schema, TimeUnit};
+        use arroyo_rpc::df::ArroyoSchema;
+        use std::sync::Arc;
+        let schema = |name: &str| {
+            ArroyoSchema::new_unkeyed(
+                Arc::new(Schema::new(vec![
+                    Field::new(name, DataType::Int64, false),
+                    Field::new(
+                        "_timestamp",
+                        DataType::Timestamp(TimeUnit::Nanosecond, None),
+                        false,
+                    ),
+                ])),
+                1,
+            )
+        };
+        let node = |id, name: &str| {
+            LogicalNode::single(
+                id,
+                name.into(),
+                OperatorName::ArrowValue,
+                vec![],
+                name.into(),
+                1,
+            )
+        };
+        let mut graph = LogicalGraph::new();
+        // Index order makes middle→tail chain first, then head absorbs that
+        // entire suffix. A simple head-first linear graph misses the defect.
+        let middle = graph.add_node(node(20, "middle"));
+        let tail = graph.add_node(node(30, "tail"));
+        let head = graph.add_node(node(10, "head"));
+        let first = Arc::new(schema("after_head"));
+        let second = Arc::new(schema("after_middle"));
+        graph.add_edge(
+            head,
+            middle,
+            LogicalEdge {
+                edge_type: LogicalEdgeType::Forward,
+                schema: first.clone(),
+            },
+        );
+        graph.add_edge(
+            middle,
+            tail,
+            LogicalEdge {
+                edge_type: LogicalEdgeType::Forward,
+                schema: second.clone(),
+            },
+        );
+        ChainingOptimizer {}.optimize(&mut graph);
+        assert_eq!(graph.node_count(), 1);
+        let chain = &graph.node_weights().next().unwrap().operator_chain;
+        assert_eq!(
+            chain
+                .iter()
+                .map(|(op, _)| op.operator_id.as_str())
+                .collect::<Vec<_>>(),
+            ["head", "middle", "tail"]
+        );
+        assert_eq!(
+            chain
+                .iter()
+                .map(|(_, edge)| edge.cloned())
+                .collect::<Vec<_>>(),
+            [Some(first), Some(second), None]
+        );
+    }
 
     #[test]
     fn removing_chained_fanout_preserves_every_successor_and_edge_weight() {

@@ -1410,4 +1410,6 @@ mod local_case_tests;
 
 // Private, validated shared-source response planning.
 mod event_response_root;
+mod finalized_result;
 mod merge_event_branches;
+mod merge_event_results;

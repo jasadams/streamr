@@ -14,6 +14,26 @@ use datafusion::functions_aggregate::{
 };
 use datafusion::{common::Result, physical_expr::aggregate::AggregateFunctionExpr};
 
+/// A result can use the common handoff only when its existing native kernel
+/// has a concrete lifecycle proof. Argument/state/type/ownership checks remain
+/// those of that kernel; a SQL function name is not an admission capability.
+pub fn supports_native_result(aggregate: &AggregateFunctionExpr, schema: &Schema) -> Result<bool> {
+    if aggregate.is_distinct() {
+        return Ok(false);
+    }
+    if crate::grouped_selector_udaf::classify(aggregate.fun()).is_some()
+        || is_extremum(aggregate)
+        || aggregate
+            .fun()
+            .inner()
+            .as_any()
+            .is::<datafusion::functions_aggregate::array_agg::ArrayAgg>()
+    {
+        return Ok(true);
+    }
+    Ok(aggregate_descriptor(aggregate, schema)?.is_some())
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AggregateCapability {
     Fixed { state_bytes: usize },
