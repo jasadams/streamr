@@ -292,6 +292,7 @@ impl ArroyoExtension for UpdatingAggregateExtension {
             .collect::<Result<Vec<_>>>()?;
         let config = UpdatingAggregateOperator {
             emit_per_event: self.emit_per_event,
+            response_root_operator: None,
             calendar_aggregates,
             collection_output_limits,
             name: "UpdatingAggregate".to_string(),

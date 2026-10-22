@@ -61,6 +61,8 @@ impl ArroyoExtension for JoinExtension {
             ttl_micros: self.ttl.map(|t| t.as_micros() as u64),
             updating: self.updating,
             left_outer: self.left_outer,
+            response_root_operator: None,
+            accepted_output_schema: None,
         };
 
         let logical_node = LogicalNode::single(

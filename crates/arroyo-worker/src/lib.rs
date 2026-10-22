@@ -1975,5 +1975,4 @@ mod udf_shadowing_tests {
 
 pub mod event_transport;
 
-#[cfg(test)]
 mod event_pair;

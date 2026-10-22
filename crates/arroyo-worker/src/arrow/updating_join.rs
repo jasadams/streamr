@@ -1,10 +1,12 @@
 //! Updating equijoins retain identity-indexed rows in one checkpoint namespace.
 //! Fanout is streamed one pair at a time; independent input branches are not atomic.
 use super::aggregate_store::{AggregateScope, AggregateStore, AggregateStoreLimits};
+use crate::event_pair::{EventPair, EventPairState};
 use anyhow::{Context, Result};
 use arrow::ipc::{reader::StreamReader, writer::StreamWriter};
 use arrow::row::{RowConverter, SortField};
 use arrow_array::{Array, BooleanArray, FixedSizeBinaryArray, RecordBatch, StructArray};
+use arroyo_operator::CheckpointCounter;
 use arroyo_operator::context::{Collector, OperatorContext};
 use arroyo_operator::operator::{ArrowOperator, ConstructedOperator, Registry};
 use arroyo_planner::physical::{ArroyoPhysicalExtensionCodec, DecodingContext};
@@ -16,15 +18,20 @@ use arroyo_rpc::grpc::{
     rpc::{DiskKeyedTableConfig, TableConfig, TableEnum},
 };
 use arroyo_rpc::{UPDATING_META_FIELD, updating_meta_fields};
+use arroyo_state::live::resources::ResourcePermit;
 use arroyo_state::live::worker::{
     ConfiguredBackendOwner, configured_worker_resources, construct_configured_backend,
 };
+use arroyo_types::event_edge::EventEdgeSpec;
+use arroyo_types::event_response::EventResponse;
+use arroyo_types::{CheckpointBarrier, SignalMessage};
 use datafusion::execution::{TaskContext, runtime_env::RuntimeEnv};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion_proto::{physical_plan::AsExecutionPlan, protobuf::PhysicalPlanNode};
 use futures::StreamExt;
 use prost::Message;
 use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 use std::{
     collections::HashMap,
     io::{Cursor, Write},
@@ -48,6 +55,52 @@ pub struct UpdatingJoin {
     left_outer: bool,
     schema_identity: Vec<u8>,
     store: Option<AggregateStore>,
+    response: Option<ResponseJoin>,
+}
+
+struct ResponseJoin {
+    pair: EventPairState,
+    accepted: ArroyoSchema,
+}
+/// Native emit executes its real physical pair plan into this bounded internal
+/// collector. It never awaits an external queue while a probe scope is held.
+struct FinalNativeRows {
+    batches: Vec<RecordBatch>,
+    rows: usize,
+    bytes: usize,
+    limit: usize,
+}
+#[async_trait::async_trait]
+impl Collector for FinalNativeRows {
+    async fn collect(&mut self, batch: RecordBatch) -> DataflowResult<()> {
+        join_ensure!(
+            self.rows
+                .checked_add(batch.num_rows())
+                .is_some_and(|rows| rows <= 2),
+            "event JOIN accepted native output exceeds two full keys"
+        );
+        let bytes = self
+            .bytes
+            .checked_add(batch.get_array_memory_size())
+            .context("event JOIN output size overflow")?;
+        join_ensure!(
+            bytes <= self.limit,
+            "event JOIN accepted native output exceeds max-pending-output-bytes"
+        );
+        self.rows += batch.num_rows();
+        self.bytes = bytes;
+        self.batches.push(batch);
+        Ok(())
+    }
+    async fn broadcast_watermark(&mut self, _: arroyo_types::Watermark) -> DataflowResult<()> {
+        Ok(())
+    }
+}
+struct PreparedAccepted {
+    batch: Option<RecordBatch>,
+    // Keep output ownership admitted through delivery/error/cancellation. This
+    // is NOT a backend snapshot, scan page or working-scope guard.
+    _output: Option<ResourcePermit>,
 }
 
 fn metadata(batch: &RecordBatch) -> Result<(&BooleanArray, &FixedSizeBinaryArray)> {
@@ -203,6 +256,18 @@ fn compact_array(array: Arc<dyn Array>) -> Result<Arc<dyn Array>> {
     }
 }
 
+fn compact_row(batch: &RecordBatch, row: usize) -> Result<RecordBatch> {
+    let index = arrow_array::UInt64Array::from(vec![
+        u64::try_from(row).context("updating join row index overflow")?,
+    ]);
+    let columns = batch
+        .columns()
+        .iter()
+        .map(|column| compact_array(arrow::compute::take(column.as_ref(), &index, None)?))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(RecordBatch::try_new(batch.schema(), columns)?)
+}
+
 struct Discard;
 #[async_trait::async_trait]
 impl Collector for Discard {
@@ -224,6 +289,237 @@ impl Drop for PairGuard<'_> {
 }
 
 impl UpdatingJoin {
+    fn response_keys(&self, response: &EventResponse) -> Result<Vec<Vec<u8>>> {
+        let Some(keys) = &response.touched_keys else {
+            return Ok(Vec::new());
+        };
+        join_ensure!(
+            keys.schema() == EventEdgeSpec::keys_schema() && (1..=2).contains(&keys.num_rows()),
+            "event JOIN touched keys differ from native full-key schema/count"
+        );
+        let keys = keys
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow_array::BinaryArray>()
+            .context("invalid event JOIN touched key type")?;
+        join_ensure!(keys.null_count() == 0, "event JOIN touched key is NULL");
+        let mut result = Vec::new();
+        for key in keys.iter() {
+            let key = key.context("event JOIN touched key is NULL")?;
+            // Same native R key: tag + side + u32 length + key + 16-byte id.
+            join_ensure!(
+                key.len()
+                    .checked_add(22)
+                    .is_some_and(|n| n <= self.limits.key_bytes),
+                "event JOIN touched key exceeds native indexed key allowance"
+            );
+            join_ensure!(
+                !result.iter().any(|old: &Vec<u8>| old.as_slice() == key),
+                "event JOIN repeats a touched full key"
+            );
+            result.push(key.to_vec());
+        }
+        Ok(result)
+    }
+    fn encoded_row_key(&self, side: usize, row: &RecordBatch) -> Result<Vec<u8>> {
+        let columns = self.schemas[side]
+            .storage_keys()
+            .context("event JOIN full key missing")?
+            .iter()
+            .map(|index| row.column(*index).clone())
+            .collect::<Vec<_>>();
+        Ok(self.converters[side]
+            .convert_columns(&columns)?
+            .row(0)
+            .as_ref()
+            .to_vec())
+    }
+    fn validate_branch_response(&self, side: usize, response: &EventResponse) -> Result<()> {
+        join_ensure!(
+            self.response.is_some() && side < 2,
+            "unregistered event JOIN response input"
+        );
+        let keys = self.response_keys(response)?;
+        if let Some(rows) = &response.rows {
+            join_ensure!(
+                rows.schema() == self.schemas[side].schema && (1..=4).contains(&rows.num_rows()),
+                "event JOIN branch rows differ from registered native schema/count"
+            );
+            metadata(rows)?;
+            join_ensure!(
+                !keys.is_empty(),
+                "event JOIN native delta has no affected full key"
+            );
+            for row in 0..rows.num_rows() {
+                // Existing native one-row compaction detaches IPC backing;
+                // change() retains its exact per-row value-bytes admission.
+                let row = compact_row(rows, row)?;
+                join_ensure!(
+                    row.get_array_memory_size() <= self.limits.value_bytes,
+                    "updating join decoded row exceeds value-bytes"
+                );
+                let key = self.encoded_row_key(side, &row)?;
+                join_ensure!(
+                    keys.contains(&key),
+                    "event JOIN delta lies outside branch touched full keys"
+                );
+            }
+        }
+        Ok(())
+    }
+    /// Existing native R index, at most two returned rows to prove uniqueness.
+    /// A valid grouped relation returns <=1; the second row fails immediately.
+    async fn final_native_row(
+        &self,
+        scope: &AggregateScope<'_>,
+        side: usize,
+        key: &[u8],
+    ) -> Result<Option<RecordBatch>> {
+        let prefix = row_prefix(side, key)?;
+        let mut found = None;
+        scope
+            .visit_prefix(&prefix, Some(2), |stored, bytes| {
+                join_ensure!(
+                    found.is_none(),
+                    "event JOIN full key is not unique on an input side"
+                );
+                let row = decode(bytes, &self.schemas[side])?;
+                join_ensure!(
+                    row.get_array_memory_size() <= self.limits.value_bytes,
+                    "updating join decoded probe row exceeds value-bytes"
+                );
+                let (_, ids) = metadata(&row)?;
+                join_ensure!(
+                    stored.len() == prefix.len() + 16
+                        && stored.starts_with(&prefix)
+                        && &stored[prefix.len()..] == ids.value(0)
+                        && self.encoded_row_key(side, &row)?.as_slice() == key,
+                    "event JOIN native full-key index disagrees with retained row"
+                );
+                found = Some(row);
+                Ok(())
+            })
+            .await?;
+        Ok(found)
+    }
+    async fn prepare_accepted_pair(
+        &self,
+        pair: EventPair,
+        ctx: &mut OperatorContext,
+    ) -> DataflowResult<PreparedAccepted> {
+        let mode = self.response.as_ref().context("event JOIN mode missing")?;
+        let mut touched = Vec::new();
+        for response in &pair.branches {
+            for key in self.response_keys(response)? {
+                if !touched.contains(&key) {
+                    touched.push(key);
+                }
+            }
+        }
+        join_ensure!(
+            touched.len() <= 2,
+            "event JOIN branches disagree on common original full keys"
+        );
+        if touched.is_empty() {
+            return Ok(PreparedAccepted {
+                batch: None,
+                _output: None,
+            });
+        }
+        let store = self
+            .store
+            .as_ref()
+            .context("updating join was not initialized")?;
+        let requested = self
+            .limits
+            .max_pending_output_bytes
+            .checked_mul(3)
+            .context("event JOIN output workspace overflow")?;
+        let output = store
+            .resources()
+            .try_decoded_value(requested)
+            .map_err(anyhow::Error::from)?;
+        // Preserve existing per-row native scopes and failure recovery. Native
+        // intermediate fanout runs into Discard, not a downstream SQL consumer.
+        let mut discard = Discard;
+        for (side, response) in pair.branches.iter().enumerate() {
+            if let Some(rows) = &response.rows {
+                for row in 0..rows.num_rows() {
+                    self.change(side, compact_row(rows, row)?, &mut discard)
+                        .await?;
+                }
+            }
+        }
+        let mut capture = FinalNativeRows {
+            batches: Vec::new(),
+            rows: 0,
+            bytes: 0,
+            limit: self.limits.max_pending_output_bytes,
+        };
+        if !touched.is_empty() {
+            let scope = store.begin().await?;
+            for key in touched {
+                let left = self.final_native_row(&scope, 0, &key).await?;
+                let right = self.final_native_row(&scope, 1, &key).await?;
+                if let Some(left) = left {
+                    // GROUP BY coalesces NULL keys, ON = must not match NULL.
+                    // Reuse the same logical-null test as ordinary native change
+                    // and native emit/physical join for LEFT/INNER absence.
+                    let null = self.schemas[0]
+                        .storage_keys()
+                        .context("event JOIN full key missing")?
+                        .iter()
+                        .any(|index| {
+                            left.column(*index)
+                                .logical_nulls()
+                                .is_some_and(|nulls| nulls.is_null(0))
+                        });
+                    self.emit(left, if null { None } else { right }, false, &mut capture)
+                        .await?;
+                }
+            }
+            drop(scope); // No final snapshot/scan/overlay guard enters public await.
+        }
+        join_ensure!(
+            self.passers
+                .iter()
+                .all(|passer| passer.read().unwrap().is_none()),
+            "event JOIN native physical input guard survived final emit"
+        );
+        let batch = if capture.batches.is_empty() {
+            None
+        } else {
+            let native_schema = self.plan.schema();
+            let native = arrow::compute::concat_batches(&native_schema, &capture.batches)?;
+            let meta = native.schema().index_of(UPDATING_META_FIELD)?;
+            let mut columns = native.columns().to_vec();
+            columns.remove(meta);
+            columns[mode.accepted.timestamp_index] =
+                Arc::new(arrow_array::TimestampNanosecondArray::from(
+                    vec![pair.context.trigger_nanos; native.num_rows()],
+                ));
+            let batch = RecordBatch::try_new(mode.accepted.schema.clone(), columns)?;
+            join_ensure!(
+                batch.num_rows() <= 2
+                    && batch.get_array_memory_size() <= self.limits.max_pending_output_bytes,
+                "event JOIN accepted output exceeds native pending-output allowance"
+            );
+            join_ensure!(
+                ctx.out_schema
+                    .as_ref()
+                    .is_some_and(|out| out.schema == mode.accepted.schema),
+                "event JOIN public output schema differs from registered accepted boundary"
+            );
+            Some(batch)
+        };
+        // Native stored clocks/beforeimages are untouched. Only this append
+        // accepted boundary carries root E even when its hidden clock is late.
+        Ok(PreparedAccepted {
+            batch,
+            _output: Some(output),
+        })
+    }
+
     async fn emit(
         &self,
         left: RecordBatch,
@@ -484,6 +780,99 @@ impl ArrowOperator for UpdatingJoin {
     fn name(&self) -> String {
         "UpdatingJoin".into()
     }
+    fn event_pair_mode(&self) -> bool {
+        self.response.is_some()
+    }
+    fn event_input_blocked(&self, index: usize) -> bool {
+        self.response
+            .as_ref()
+            .is_some_and(|mode| mode.pair.blocked(index))
+    }
+    fn check_event_response_input(
+        &self,
+        index: usize,
+        counter: &CheckpointCounter,
+        closed: &HashSet<usize>,
+    ) -> DataflowResult<()> {
+        if let Some(mode) = &self.response {
+            mode.pair
+                .before_response_with_closed(index, counter, closed)?;
+        }
+        Ok(())
+    }
+    fn check_event_control_input(
+        &self,
+        index: usize,
+        signal: &SignalMessage,
+        counter: &CheckpointCounter,
+        closed: &HashSet<usize>,
+    ) -> DataflowResult<()> {
+        if let Some(mode) = &self.response {
+            mode.pair
+                .check_control_with_closed(index, signal, counter, closed)?;
+        }
+        Ok(())
+    }
+    fn check_event_input_eof(
+        &self,
+        index: usize,
+        counter: &CheckpointCounter,
+        closed: &HashSet<usize>,
+    ) -> DataflowResult<()> {
+        if let Some(mode) = &self.response {
+            mode.pair.check_eof(index, counter, closed)?;
+        }
+        Ok(())
+    }
+    async fn process_response_index(
+        &mut self,
+        index: usize,
+        in_partitions: usize,
+        response: EventResponse,
+        ctx: &mut OperatorContext,
+        collector: &mut dyn Collector,
+    ) -> DataflowResult<()> {
+        join_ensure!(
+            in_partitions == 2 && index < 2 && ctx.in_schemas.len() == 2,
+            "event JOIN requires exactly two singleton inputs"
+        );
+        self.validate_branch_response(index, &response)?;
+        let pair = self
+            .response
+            .as_mut()
+            .context("JOIN is not configured for event responses")?
+            .pair
+            .receive(index, response)?;
+        let Some(pair) = pair else { return Ok(()) };
+        let context = pair.context;
+        let accepted = self.prepare_accepted_pair(pair, ctx).await?;
+        if let Some(batch) = accepted.batch {
+            collector.collect(batch).await?;
+        }
+        // Both inputs stay parked in Processing while output awaits. Errors or
+        // cancellation never finish; the attempt must fail and restore fresh.
+        self.response
+            .as_mut()
+            .context("event JOIN mode disappeared")?
+            .pair
+            .finish(context)?;
+        drop(accepted._output);
+        Ok(())
+    }
+    async fn handle_checkpoint(
+        &mut self,
+        _: CheckpointBarrier,
+        _: &mut OperatorContext,
+        _: &mut dyn Collector,
+    ) -> DataflowResult<()> {
+        join_ensure!(
+            self.response
+                .as_ref()
+                .is_none_or(|mode| !mode.pair.pending()),
+            "event JOIN checkpoint contains an unfinished pair"
+        );
+        Ok(())
+    }
     async fn process_batch(
         &mut self,
         _: RecordBatch,
@@ -500,6 +889,7 @@ impl ArrowOperator for UpdatingJoin {
         _: &mut OperatorContext,
         collector: &mut dyn Collector,
     ) -> DataflowResult<()> {
+        join_ensure!(self.response.is_none(), "ordinary Data on event JOIN input");
         join_ensure!(
             total_inputs >= 2 && total_inputs.is_multiple_of(2),
             "updating join requires two input sides"
@@ -507,15 +897,7 @@ impl ArrowOperator for UpdatingJoin {
         let side = index / (total_inputs / 2);
         join_ensure!(side < 2, "invalid updating join input");
         for row in 0..batch.num_rows() {
-            let index = arrow_array::UInt64Array::from(vec![
-                u64::try_from(row).context("updating join row index overflow")?,
-            ]);
-            let columns = batch
-                .columns()
-                .iter()
-                .map(|column| compact_array(arrow::compute::take(column.as_ref(), &index, None)?))
-                .collect::<Result<Vec<_>>>()?;
-            let row = RecordBatch::try_new(batch.schema(), columns)?;
+            let row = compact_row(&batch, row)?;
             self.change(side, row, collector).await?;
         }
         Ok(())
@@ -638,6 +1020,79 @@ fn build(
         .collect::<Result<Vec<_>>>()?;
     let mut converters = converters.into_iter();
     let converters = [converters.next().unwrap(), converters.next().unwrap()];
+    let response = match (
+        config.response_root_operator,
+        config.accepted_output_schema.clone(),
+    ) {
+        (None, None) => None,
+        (Some(root), Some(accepted)) => {
+            join_ensure!(config.updating, "event JOIN requires native updating mode");
+            let native: ArroyoSchema = config
+                .output_schema
+                .clone()
+                .context("event JOIN native output schema missing")?
+                .try_into()?;
+            let accepted: ArroyoSchema = accepted.try_into()?;
+            join_ensure!(
+                native.timestamp_index < native.schema.fields().len()
+                    && accepted.timestamp_index < accepted.schema.fields().len(),
+                "event JOIN timestamp ordinal outside configured schema"
+            );
+            let meta = native.schema.index_of(UPDATING_META_FIELD)?;
+            join_ensure!(
+                plan.schema() == native.schema
+                    && native.schema.field(meta) == arroyo_rpc::updating_meta_field().as_ref(),
+                "event JOIN requires canonical native output metadata and actual physical output schema"
+            );
+            let mut fields = native.schema.fields().to_vec();
+            fields.remove(meta);
+            let public =
+                arrow_schema::Schema::new_with_metadata(fields, native.schema.metadata().clone());
+            join_ensure!(
+                meta != native.timestamp_index
+                    && accepted.schema.as_ref() == &public
+                    && accepted.schema.index_of(UPDATING_META_FIELD).is_err()
+                    && accepted.timestamp_index
+                        == native.timestamp_index - usize::from(meta < native.timestamp_index)
+                    && accepted.schema.field(accepted.timestamp_index).name()
+                        == arroyo_rpc::TIMESTAMP_FIELD
+                    && accepted.schema.field(accepted.timestamp_index).data_type()
+                        == &arrow_schema::DataType::Timestamp(
+                            arrow_schema::TimeUnit::Nanosecond,
+                            None
+                        ),
+                "event JOIN accepted schema must remove only native metadata"
+            );
+            let left = schemas[0]
+                .storage_keys()
+                .context("event JOIN left full key missing")?;
+            let right = schemas[1]
+                .storage_keys()
+                .context("event JOIN right full key missing")?;
+            join_ensure!(
+                !left.is_empty()
+                    && left.len() == right.len()
+                    && left.iter().zip(right).all(|(left, right)| schemas[0]
+                        .schema
+                        .field(*left)
+                        .data_type()
+                        == schemas[1].schema.field(*right).data_type()),
+                "event JOIN requires equal full-key native encodings"
+            );
+            for schema in &schemas {
+                let meta = schema.schema.index_of(UPDATING_META_FIELD)?;
+                join_ensure!(
+                    schema.schema.field(meta) == arroyo_rpc::updating_meta_field().as_ref(),
+                    "event JOIN input metadata is not canonical"
+                );
+            }
+            Some(ResponseJoin {
+                pair: EventPairState::new(root, 0),
+                accepted,
+            })
+        }
+        _ => anyhow::bail!("event JOIN root and accepted schema must be configured together"),
+    };
     let mut hash = Sha256::new();
     hash.update(b"streamr.updating-join.v1");
     hash.update(config.encode_to_vec());
@@ -650,12 +1105,16 @@ fn build(
         left_outer: config.left_outer,
         schema_identity: hash.finalize().to_vec(),
         store: None,
+        response,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    mod response_tests {
+        include!("updating_join_response_tests.rs");
+    }
     use arrow_array::{Int64Array, TimestampNanosecondArray};
     use arrow_schema::DataType;
     use arroyo_state::live::{

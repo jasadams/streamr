@@ -108,6 +108,7 @@ impl ArroyoExtension for WatermarkNode {
             format!("watermark_{index}"),
             OperatorName::ExpressionWatermark,
             ExpressionWatermarkConfig {
+                response_root_operator: None,
                 preserve_source_envelope: self.preserve_source_envelope,
                 period_micros: 1_000_000,
                 idle_time_micros: None,

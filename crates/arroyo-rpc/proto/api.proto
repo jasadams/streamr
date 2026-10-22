@@ -79,6 +79,10 @@ message JoinOperator {
   optional uint64 ttl_micros = 6;
   bool updating = 7;
   bool left_outer = 8;
+  // Private graph-proven complete branch response mode. Existing join_plan
+  // and output_schema remain native changelog; only accepted output is append.
+  optional uint32 response_root_operator = 9;
+  ArroyoSchema accepted_output_schema = 10;
 }
 
 message LookupJoinCondition {
@@ -135,6 +139,9 @@ message UpdatingAggregateOperator {
   // Planner-proven COUNT/MAX input consumed as final accepted snapshots
   // per complete original operation by MERGE. Ordinary aggregate changelog emission is unchanged.
   bool emit_per_event = 12;
+  // Private graph-proven branch-response mode; original root is a planned node id.
+  // Distinct from accepted snapshots: output remains native relation changelog.
+  optional uint32 response_root_operator = 13;
 }
 
 // A maintained inclusive UTC calendar FILTER, indexed by aggregate ordinal.
@@ -266,6 +273,7 @@ message SessionWindow {
 }
 
 message ExpressionWatermarkConfig {
+  optional uint32 response_root_operator = 7;
   bool preserve_source_envelope = 6;
   optional uint32 source_envelope_index = 5;
   uint64 period_micros = 1;

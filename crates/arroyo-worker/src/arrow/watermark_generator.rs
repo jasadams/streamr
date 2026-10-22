@@ -1,6 +1,8 @@
 use arrow::compute::kernels;
 use arrow_array::{Array, BooleanArray, RecordBatch, TimestampNanosecondArray, UInt64Array};
 use arroyo_operator::context::{Collector, OperatorContext};
+use arroyo_types::event_edge::{EventEdgeSpec, EventLayout};
+use arroyo_types::event_response::{EVENT_RESPONSE_VERSION, EventContext, EventResponse};
 
 use arroyo_operator::operator::{
     ArrowOperator, AsDisplayable, ConstructedOperator, DisplayableOperator, OperatorConstructor,
@@ -47,6 +49,7 @@ pub struct WatermarkGenerator {
     timestamp_index: usize,
     source_envelope_index: Option<usize>,
     preserve_source_envelope: bool,
+    response_root: Option<ResponseRoot>,
 }
 
 impl WatermarkGenerator {
@@ -67,6 +70,7 @@ impl WatermarkGenerator {
             timestamp_index,
             source_envelope_index,
             preserve_source_envelope: false,
+            response_root: None,
         }
     }
 }
@@ -161,7 +165,22 @@ impl WatermarkGenerator {
         });
         // Validate even progress conversions before any data is forwarded.
         let finite_progress = progress.map(signed_timestamp).transpose()?;
-        collector.collect(output).await?;
+        if let Some(root) = &mut self.response_root {
+            if task_index != 0 {
+                return Err(admission_error(
+                    "response root requires singleton subtask zero",
+                ));
+            }
+            let clocks = admitted
+                .column(self.timestamp_index)
+                .as_any()
+                .downcast_ref::<TimestampNanosecondArray>()
+                .unwrap();
+            root.forward_admitted(output, representatives, clocks, collector)
+                .await?;
+        } else {
+            collector.collect(output).await?;
+        }
         self.last_event = SystemTime::now();
         let (Some(progress), Some(finite_progress), Some(max_timestamp)) =
             (progress, finite_progress, max_timestamp)
@@ -204,6 +223,12 @@ impl OperatorConstructor for WatermarkGeneratorConstructor {
         config: Self::ConfigT,
         registry: Arc<Registry>,
     ) -> anyhow::Result<ConstructedOperator> {
+        if config.response_root_operator.is_some() {
+            anyhow::ensure!(
+                config.input_schema.is_some(),
+                "response root requires planned input schema"
+            );
+        }
         let input_schema: ArroyoSchema = config.input_schema.unwrap().try_into()?;
         anyhow::ensure!(
             input_schema.timestamp_index < input_schema.schema.fields().len(),
@@ -223,6 +248,16 @@ impl OperatorConstructor for WatermarkGeneratorConstructor {
                     && field.data_type() == &arrow_schema::DataType::UInt64
                     && !field.is_nullable(),
                 "invalid source envelope marker schema"
+            );
+        }
+        if config.response_root_operator.is_some() {
+            anyhow::ensure!(
+                input_schema
+                    .schema
+                    .field(input_schema.timestamp_index)
+                    .data_type()
+                    == &arrow_schema::DataType::Timestamp(arrow_schema::TimeUnit::Nanosecond, None),
+                "response root FOR clock must be Timestamp(Nanosecond,None)"
             );
         }
         let expression = PhysicalExprNode::decode(&mut config.expression.as_slice())?;
@@ -245,6 +280,23 @@ impl OperatorConstructor for WatermarkGeneratorConstructor {
             config.source_envelope_index.map(|i| i as usize),
         );
         generator.preserve_source_envelope = config.preserve_source_envelope;
+        if let Some(root) = config.response_root_operator {
+            let schema = if let Some(marker) = generator.source_envelope_index
+                && !generator.preserve_source_envelope
+            {
+                Arc::new(
+                    input_schema.schema.project(
+                        &(0..input_schema.schema.fields().len())
+                            .filter(|index| *index != marker)
+                            .collect::<Vec<_>>(),
+                    )?,
+                )
+            } else {
+                input_schema.schema.clone()
+            };
+            generator.response_root =
+                Some(ResponseRoot::new(root, input_schema.schema.clone(), schema));
+        }
         Ok(ConstructedOperator::from_operator(Box::new(generator)))
     }
 }
@@ -275,6 +327,9 @@ impl ArrowOperator for WatermarkGenerator {
     }
 
     async fn on_start(&mut self, ctx: &mut OperatorContext) -> DataflowResult<()> {
+        if let Some(root) = &self.response_root {
+            root.validate_task(ctx)?;
+        }
         let gs = ctx
             .table_manager
             .get_global_keyed_state::<u32, WatermarkGeneratorState>("s")
@@ -413,6 +468,118 @@ fn signed_timestamp(nanos: i64) -> DataflowResult<SystemTime> {
             "timestamp {nanos}ns is outside the platform's SystemTime range"
         ))
     })
+}
+
+/// Per-attempt context only; checkpoint admission state remains unchanged.
+/// The root is planner-assigned logical identity, NOT physical chained task ID.
+struct ResponseRoot {
+    input_schema: arrow_schema::SchemaRef,
+    spec: Arc<EventEdgeSpec>,
+    nonce: [u8; 16],
+    next_sequence: Option<u64>,
+}
+impl ResponseRoot {
+    fn new(
+        root: u32,
+        input_schema: arrow_schema::SchemaRef,
+        schema: arrow_schema::SchemaRef,
+    ) -> Self {
+        Self {
+            input_schema,
+            spec: Arc::new(EventEdgeSpec {
+                root_operator: root,
+                root_subtask: 0,
+                schema,
+                layout: EventLayout::Raw,
+            }),
+            nonce: rand::random(),
+            next_sequence: Some(1),
+        }
+    }
+    fn validate_task(&self, ctx: &OperatorContext) -> DataflowResult<()> {
+        if ctx.task_info.parallelism != 1
+            || ctx.task_info.task_index != 0
+            || ctx.in_schemas.len() != 1
+        {
+            return Err(admission_error(
+                "response root requires one singleton input/subtask",
+            ));
+        }
+        if ctx.in_schemas[0].schema != self.input_schema {
+            return Err(admission_error(
+                "response root input differs from planned raw schema",
+            ));
+        }
+        if !matches!(self.spec.layout, EventLayout::Raw)
+            || self.spec.root_subtask != 0
+            || ctx
+                .out_schema
+                .as_ref()
+                .is_none_or(|output| output.schema != self.spec.schema)
+        {
+            return Err(admission_error(
+                "response root output differs from registered raw schema",
+            ));
+        }
+        // engine.rs supplies operator_idx=node_id to EVERY chained context;
+        // comparing it with logical root identity would reject valid chaining.
+        Ok(())
+    }
+    async fn forward_admitted(
+        &mut self,
+        rows: RecordBatch,
+        representatives: &BooleanArray,
+        clocks: &TimestampNanosecondArray,
+        collector: &mut dyn Collector,
+    ) -> DataflowResult<()> {
+        if rows.num_rows() != representatives.len() || rows.num_rows() != clocks.len() {
+            return Err(admission_error("response root admission arrays differ"));
+        }
+        let mut start = 0;
+        for end in 1..=rows.num_rows() {
+            if !representatives.value(end - 1) {
+                continue;
+            }
+            let length = end - start;
+            if length == 0 || length > 2 || clocks.is_null(end - 1) {
+                return Err(admission_error(
+                    "response root requires one complete source operation",
+                ));
+            }
+            let sequence = self
+                .next_sequence
+                .ok_or_else(|| admission_error("response root sequence exhausted"))?;
+            if sequence == 0 {
+                return Err(admission_error("response root sequence must start at one"));
+            }
+            let response = EventResponse {
+                context: EventContext {
+                    version: EVENT_RESPONSE_VERSION,
+                    root_operator: self.spec.root_operator,
+                    root_subtask: 0,
+                    attempt_nonce: self.nonce,
+                    sequence,
+                    trigger_nanos: clocks.value(end - 1),
+                },
+                rows: Some(rows.slice(start, length)),
+                touched_keys: None,
+                native_body: None,
+            };
+            self.spec
+                .validate(&response)
+                .map_err(|error| admission_error(&error))?;
+            // Collector awaits every branch before E+1; never await a mate.
+            collector.collect_response(response).await?;
+            self.next_sequence = sequence.checked_add(1);
+            start = end;
+        }
+        if start != rows.num_rows() {
+            return Err(admission_error(
+                "response root has an unfinished source operation",
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -620,3 +787,7 @@ mod signed_timestamp_tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "watermark_root_response_tests.rs"]
+mod root_response_tests;
