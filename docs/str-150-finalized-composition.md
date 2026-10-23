@@ -96,3 +96,46 @@ regression assertions. Fresh independent review approves this repair. Maintained
 regression gates and a new pin/Kafka run are in `attempt-2`; their pending outcomes
 are not represented as passes. Arcstream's 30 native Python tests and 10 API tests
 pass; these do not establish real Kafka application recovery or production readiness.
+
+
+## Final scoped application evidence
+
+Engine source `1314e702a955ad3f19c390b3f10c9d3ee1958d40`, clean compiled diff,
+normal dev/precompiled RocksDB pin `attempt-2/dev-pin`, binary SHA256
+`3e2594d62f6103501a84d17ff133032866d1929a0e84c42949ad3d7976b9d255`.
+All 1,343 compiled inputs and executable hashes independently rechecked.
+Arcstream query manifest records `8a7c78e`; unchanged literal application oracle.
+
+The exact maintained commands and logs are in `attempt-2/gates.json` and
+`attempt-2/integration.json`: format, 18 maintained MERGE cases, two routing-proof
+cases, strict planner/worker Clippy, CLI pin/source audit, full native graph fixture
+and ten API consumer tests all exit zero. The graph command uses
+`native_graph_fixture.py --case .../attempt-2/graph-2 --binary-pin .../attempt-2/dev-pin`
+with immutable runtime/broker images and the recorded config/helper/runtime paths.
+
+All 11 staged application histories pass: 13 complete 22-field profile snapshots,
+actual native create/update actions, all four event types, ranking changes,
+admitted out-of-order first/last values, rejected late event, tenant isolation,
+nullable completed average becoming 5.0 then 3.75 and quiet-key daily expiry.
+No committed records are filtered to reach those results. Profile and identity
+workers actually exit with OS wait status 9, restore checkpoints 6 and 16 with
+fresh process generations, preserve committed prefixes of 2 and 5 profile rows,
+and produce 11 and 8 fresh suffix rows. Recovered identity lookups succeed.
+Checkpoint metadata has exactly six native disk owners plus one typed profile
+owner and two typed identity owners; retained artifact sizes/hashes verify.
+Outer owned broker/network cleanup exits zero; runtime cleanup is complete.
+Independent evidence review approves this scoped graph result. Source offsets are
+strictly checked by the runtime harness; the independent host audit did not repeat
+Parquet decoding because its Python/pyarrow versions differ.
+
+Opt-in diagnostics preserve 889 parseable native pages (39 dirty-prefix pages),
+all successful and within configured row limits. Multiprocess log interleaving
+prevents complete counter accounting; raw logs and partial `scan-summary.json`
+are retained. This is neither a per-output cost proof nor throughput/capacity/RSS
+qualification. Reuse STR-126 engine qualification rather than repeat that campaign.
+
+This establishes the generic composition repair and scoped Kafka/RocksDB
+application recovery, not production cutover or complete application parity.
+Directed identity-merge behavior, browser/deployment and actual FlareDB ingestion
+are outside this fixture. A separate published FlareDB native List storage/HTTP
+codec gap is recorded as FLA-178; no serialization workaround is added here.

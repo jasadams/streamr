@@ -22,6 +22,14 @@
   or production-cutover claim. Original failures under
   `/home/jason/qa-evidence/arc18-core-release-20261023/graph-3/` and
   `lifecycle-join-merge-release-plan/`.
+- Final source1314e702 pin `3e2594d6…`: all11 native application stages and13
+  complete22-field snapshots PASS, two actual worker SIGKILL/checkpoint restores,
+  unchanged committed prefixes and fresh recovered outputs, exact6disk+1typed
+  profile/2typed identity owners; ten API tests PASS. Independent evidence audit
+  approves. Maintained18planner/2routing/strictlint gates and required CI PASS.
+  Exact evidence/report: `docs/str-150-finalized-composition.md` and
+  `/home/jason/qa-evidence/str150-composed-publication-20261023/attempt-2/`.
+  No FlareDB/browser/deployment/production parity claim; FLA-178 is separate.
 
 ## Active STR-60 — 2026-10-18
 
