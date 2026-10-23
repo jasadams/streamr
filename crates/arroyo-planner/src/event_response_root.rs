@@ -185,8 +185,8 @@ pub(crate) fn extract_shared_source_root<'a>(
     route_slot: u32,
 ) -> Result<SharedSourceRoot> {
     let branches = branches.as_ref();
-    if !(1..=3).contains(&branches.len()) {
-        return plan_err!("response extraction requires one to three native branches");
+    if !(1..=4).contains(&branches.len()) {
+        return plan_err!("response extraction requires one to four native branches");
     }
     let (_, left_source) = find_source(branches[0])?;
     let mut union = BTreeSet::new();

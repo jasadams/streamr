@@ -2545,6 +2545,234 @@ mod tests {
             backend.close().await.unwrap();
             restored_backend.close().await.unwrap();
             closing_backend.close().await.unwrap();
+
+            // Exercise the actual response-aware SESSION wrapper around the
+            // same native constructor/backend lifecycle, including a fresh
+            // checkpoint-restored owner and attempt-local response sequencing.
+            use super::super::session_aggregating_window::SessionAggregatingWindowFunc;
+            use arroyo_operator::operator::ArrowOperator;
+            use arroyo_types::event_edge::{EventEdgeSpec, EventLayout};
+            use arroyo_types::event_response::{
+                EVENT_RESPONSE_VERSION, EventContext, EventResponse,
+            };
+            #[derive(Default)]
+            struct ResponseCollector {
+                packets: Vec<EventResponse>,
+                rows: Vec<RecordBatch>,
+            }
+            #[async_trait::async_trait]
+            impl Collector for ResponseCollector {
+                async fn collect(
+                    &mut self,
+                    batch: RecordBatch,
+                ) -> arroyo_rpc::errors::DataflowResult<()> {
+                    self.rows.push(batch);
+                    Ok(())
+                }
+                async fn collect_response(
+                    &mut self,
+                    packet: EventResponse,
+                ) -> arroyo_rpc::errors::DataflowResult<()> {
+                    self.packets.push(packet);
+                    Ok(())
+                }
+                async fn broadcast_watermark(
+                    &mut self,
+                    _: arroyo_types::Watermark,
+                ) -> arroyo_rpc::errors::DataflowResult<()> {
+                    Ok(())
+                }
+            }
+            let packet = |sequence, nonce, time, rows| EventResponse {
+                context: EventContext {
+                    version: EVENT_RESPONSE_VERSION,
+                    root_operator: 7,
+                    root_subtask: 0,
+                    attempt_nonce: [nonce; 16],
+                    sequence,
+                    trigger_nanos: time,
+                },
+                rows,
+                touched_keys: None,
+                native_body: None,
+            };
+            let (native, mut response_ctx, converter) = start(&config, limits).await;
+            let first = input(&native, 0, 2);
+            let next = input(&native, SECOND, 3);
+            let response_backend = native.store().unwrap().testing_backend();
+            let mut response_owner =
+                SessionAggregatingWindowFunc::response_test_owner(native, &config, converter);
+            let raw = Arc::new(EventEdgeSpec {
+                root_operator: 7,
+                root_subtask: 0,
+                schema: response_ctx.in_schemas[0].schema.clone(),
+                layout: EventLayout::Raw,
+                maintenance: false,
+            });
+            let edge = response_owner
+                .bind_event_response(std::slice::from_ref(&raw), &response_ctx)
+                .unwrap()
+                .unwrap();
+            assert!(edge.maintenance);
+            let mut captured = ResponseCollector::default();
+            // A filtered-away source row still completes the original event.
+            response_owner
+                .process_response_index(
+                    0,
+                    1,
+                    packet(1, 4, 0, None),
+                    &mut response_ctx,
+                    &mut captured,
+                )
+                .await
+                .unwrap();
+            response_owner
+                .process_response_index(
+                    0,
+                    1,
+                    packet(2, 4, 0, Some(first)),
+                    &mut response_ctx,
+                    &mut captured,
+                )
+                .await
+                .unwrap();
+            for sequence in [2, 4] {
+                assert!(
+                    response_owner
+                        .process_response_index(
+                            0,
+                            1,
+                            packet(sequence, 4, 0, None),
+                            &mut response_ctx,
+                            &mut captured
+                        )
+                        .await
+                        .unwrap_err()
+                        .to_string()
+                        .contains("skips or repeats")
+                );
+            }
+            assert_eq!(captured.packets.len(), 2);
+            assert!(
+                captured.rows.is_empty(),
+                "SESSION must not finalize on original-event ACK"
+            );
+            response_owner
+                .handle_checkpoint(
+                    arroyo_types::CheckpointBarrier {
+                        epoch: 1,
+                        min_epoch: 0,
+                        timestamp: UNIX_EPOCH,
+                        then_stop: false,
+                    },
+                    &mut response_ctx,
+                    &mut captured,
+                )
+                .await
+                .unwrap();
+            let snapshot = response_backend.snapshot().await.unwrap();
+            let response_receipt = checkpoint::export(
+                &snapshot,
+                &namespace,
+                &disk_config,
+                &storage,
+                "checkpoint-response/session",
+                3,
+                0,
+                0,
+            )
+            .await
+            .unwrap();
+            drop(snapshot);
+            let (restored_native, mut fresh_ctx, fresh_converter) = start(&config, limits).await;
+            let fresh_backend = restored_native.store().unwrap().testing_backend();
+            checkpoint::restore(
+                fresh_backend.as_ref(),
+                &namespace,
+                &disk_config,
+                &response_receipt,
+                &storage,
+            )
+            .await
+            .unwrap();
+            let mut fresh = SessionAggregatingWindowFunc::response_test_owner(
+                restored_native,
+                &config,
+                fresh_converter,
+            );
+            fresh.bind_event_response(&[raw], &fresh_ctx).unwrap();
+            // Fresh attempt starts at one with a fresh nonce, while retained
+            // SESSION state still contains the pre-checkpoint event.
+            fresh
+                .process_response_index(
+                    0,
+                    1,
+                    packet(1, 8, SECOND, Some(next)),
+                    &mut fresh_ctx,
+                    &mut captured,
+                )
+                .await
+                .unwrap();
+            assert_eq!(captured.packets.len(), 3);
+            assert!(
+                captured
+                    .packets
+                    .iter()
+                    .all(|p| p.rows.is_none() && p.touched_keys.is_none())
+            );
+            assert_eq!(captured.packets[2].context.attempt_nonce, [8; 16]);
+            assert!(captured.rows.is_empty());
+            fresh_ctx.watermarks.set(
+                0,
+                arroyo_types::Watermark::EventTime(UNIX_EPOCH + Duration::from_secs(12)),
+            );
+            fresh
+                .handle_watermark(
+                    arroyo_types::Watermark::EventTime(UNIX_EPOCH + Duration::from_secs(12)),
+                    &mut fresh_ctx,
+                    &mut captured,
+                )
+                .await
+                .unwrap();
+            assert_eq!(captured.rows.len(), 1);
+            let closed = &captured.rows[0];
+            assert_eq!(
+                closed
+                    .column_by_name(&count_name)
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<arrow_array::Int64Array>()
+                    .unwrap()
+                    .value(0),
+                2
+            );
+            assert_eq!(
+                closed
+                    .column_by_name(&sum_name)
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<arrow_array::Int64Array>()
+                    .unwrap()
+                    .value(0),
+                5
+            );
+            assert_eq!(
+                closed
+                    .column(fresh_ctx.out_schema.as_ref().unwrap().timestamp_index)
+                    .as_any()
+                    .downcast_ref::<TimestampNanosecondArray>()
+                    .unwrap()
+                    .value(0),
+                11 * SECOND - 1
+            );
+            assert_eq!(
+                captured.packets.len(),
+                3,
+                "watermark closure must not fabricate an event response"
+            );
+            drop((response_owner, response_ctx, fresh, fresh_ctx));
+            response_backend.close().await.unwrap();
+            fresh_backend.close().await.unwrap();
         }
     }
     #[tokio::test]

@@ -550,6 +550,7 @@ pub struct IncrementalAggregatingFunc {
     native_append_only: bool,
     emit_per_event: bool,
     response_root_operator: Option<u32>,
+    response_finalized_append_input: bool,
     response_previous: Option<EventContext>,
     event_output: Option<Arc<EventEdgeSpec>>,
     event_input: Option<Arc<EventEdgeSpec>>,
@@ -2002,7 +2003,12 @@ impl IncrementalAggregatingFunc {
             .native_group_codec()?
             .encode(&next, scope.limits().value_bytes)?;
         scope.put(&storage_key, &encoded)?;
-        if !self.emit_per_event && self.response_root_operator.is_none() {
+        // Original-event response branches publish their touched groups in
+        // prepare_native_response. Finalized append maintenance instead uses
+        // the ordinary native dirty/delta delivery path after each closed row.
+        if !self.emit_per_event
+            && (self.response_root_operator.is_none() || self.response_finalized_append_input)
+        {
             scope.put(&native_group_key(b'D', group_key)?, &[1])?;
         }
         if !self.retain_indefinitely {
@@ -2452,6 +2458,10 @@ impl IncrementalAggregatingFunc {
             layout: EventLayout::Raw,
         };
         raw.validate(&response).map_err(anyhow::Error::msg)?;
+        ensure!(
+            !self.response_finalized_append_input || response.rows.is_none(),
+            "finalized append branch requires empty original-event responses"
+        );
         let Some(batch) = response.rows.as_ref() else {
             self.response_previous = Some(response.context);
             return Ok(PreparedNativeResponse {
@@ -4650,11 +4660,18 @@ impl ArrowOperator for IncrementalAggregatingFunc {
             self.event_input = Some(inputs[0].clone());
             return Ok(None);
         }
+        if inputs[0].maintenance != self.response_finalized_append_input {
+            return Err(anyhow!(
+                "append branch maintenance mode differs from its constructed producer"
+            )
+            .into());
+        }
+        self.event_input = Some(inputs[0].clone());
         let limits = self
             .native_config
             .context("aggregate response native limits missing")?;
         let spec = Arc::new(EventEdgeSpec {
-            maintenance: !self.calendars.is_empty(),
+            maintenance: !self.calendars.is_empty() || self.response_finalized_append_input,
             root_operator: root,
             root_subtask: 0,
             schema: output.schema.clone(),
@@ -4745,6 +4762,22 @@ impl ArrowOperator for IncrementalAggregatingFunc {
             };
             drop(permit);
             return delivered;
+        }
+        if self.response_finalized_append_input {
+            if batch.num_rows() != 1
+                || batch.column_by_name(UPDATING_META_FIELD).is_some()
+                || !self
+                    .event_input
+                    .as_ref()
+                    .is_some_and(|spec| spec.maintenance)
+            {
+                return Err(
+                    anyhow!("finalized append maintenance requires one native closed row").into(),
+                );
+            }
+            self.process_native_batch(&batch, ctx).await?;
+            self.drain_native_dirty(ctx, collector).await?;
+            return Ok(());
         }
         if self.response_root_operator.is_some() {
             return Err(anyhow!("ordinary Data on response aggregate input").into());
@@ -5038,6 +5071,14 @@ impl IncrementalAggregatingConstructor {
         native_config: Option<AggregateStateConfig>,
     ) -> Result<IncrementalAggregatingFunc> {
         let emit_per_event = config.emit_per_event;
+        let response_finalized_append_input = config.response_finalized_append_input;
+        ensure!(
+            !response_finalized_append_input
+                || (config.response_root_operator.is_some()
+                    && config.accepted_output_schema.is_none()
+                    && config.calendar_aggregates.is_empty()),
+            "finalized append response branch requires its own native root and no terminal/calendar mode"
+        );
         let accepted_output_schema = config
             .accepted_output_schema
             .clone()
@@ -5101,6 +5142,7 @@ impl IncrementalAggregatingConstructor {
             identity.update(b"\0event-branch-response.v1");
             identity.update(root.to_be_bytes());
         }
+        identity.update([u8::from(response_finalized_append_input)]);
         identity.update(config.ttl_micros.to_be_bytes());
         identity.update([u8::from(config.retain_indefinitely == Some(true))]);
         if let Some(schema) = &config.input_schema {
@@ -5132,6 +5174,10 @@ impl IncrementalAggregatingConstructor {
         let input_schema: ArroyoSchema = config.input_schema.unwrap().try_into()?;
         let native_append_only =
             native_config.is_some() && input_schema.schema.index_of(UPDATING_META_FIELD).is_err();
+        ensure!(
+            !response_finalized_append_input || native_append_only,
+            "finalized append response branch cannot consume changelog input"
+        );
         let final_schema: ArroyoSchema = config.final_schema.unwrap().try_into()?;
         if let Some(accepted) = &accepted_output_schema {
             ensure!(
@@ -5804,6 +5850,7 @@ impl IncrementalAggregatingConstructor {
             native_append_only,
             emit_per_event,
             response_root_operator,
+            response_finalized_append_input,
             response_previous: None,
             event_output: None,
             event_input: None,
@@ -6076,6 +6123,7 @@ mod tests {
                 calendar_aggregates: Vec::new(),
                 emit_per_event: false,
                 response_root_operator: None,
+                response_finalized_append_input: false,
                 accepted_output_schema: None,
                 response_key_fields: vec![],
             },
@@ -6842,6 +6890,7 @@ mod tests {
             calendar_aggregates: Vec::new(),
             emit_per_event: false,
             response_root_operator: None,
+            response_finalized_append_input: false,
             accepted_output_schema: None,
             response_key_fields: vec![],
         };

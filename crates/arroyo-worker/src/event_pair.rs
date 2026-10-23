@@ -302,6 +302,41 @@ mod tests {
         Ok(())
     }
     #[test]
+    fn four_responses_allow_independent_prior_maintenance_without_crossing_the_cut() -> Result<()> {
+        let mut state = EventPairState::with_inputs(5, 0, 4)?;
+        let counter = CheckpointCounter::new(4);
+        // Two ordinary branches finish while calendar and finalized-window
+        // branches are still delivering the previous watermark's native work.
+        for side in [1, 2] {
+            assert!(state.receive(side, response(1, 5))?.is_none());
+        }
+        for side in [0, 3] {
+            state.before_maintenance(side)?;
+            assert!(state.before_maintenance(1).is_err());
+            state.check_control(side, &SignalMessage::Watermark(Watermark::Idle), &counter)?;
+        }
+        assert!(state.receive(3, response(1, 5))?.is_none());
+        assert!(state.before_maintenance(3).is_err());
+        let complete = state
+            .receive(0, response(1, 5))?
+            .context("missing fourth response")?;
+        assert_eq!(complete.branches.len(), 4);
+        for side in 0..4 {
+            assert!(state.before_maintenance(side).is_err());
+            assert!(
+                state
+                    .check_control(side, &SignalMessage::Barrier(barrier()), &counter)
+                    .is_err()
+            );
+        }
+        state.finish(complete.context)?;
+        for side in 0..4 {
+            state.before_maintenance(side)?;
+        }
+        Ok(())
+    }
+
+    #[test]
     fn finite_responses_wait_for_three_inputs_and_preserve_prior_watermark_maintenance()
     -> Result<()> {
         let mut state = EventPairState::with_inputs(5, 0, 3)?;

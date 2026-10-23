@@ -1,3 +1,36 @@
+## Active STR-150 — coherent finalized-result composition — 2026-10-23
+
+- User directed fixing the captured native publication failure before finishing
+  application recovery/deployment. Fresh fetched default base
+  `a5d28ad868f8e64cd3d2daa158b12e11b52e3c03`; worktree
+  `str-150-composed-publication-20261023`. Guidance: `AGENTS.md`,
+  `.claude/build-test.md`, `.claude/team.md`, current ledger/feature plan and STR-150.
+- Ordinary JOIN differential c/d/c is established behavior and stays unchanged.
+  Repair extends existing native MERGE accepted-result composition to four
+  aggregate branches, including one finalized native SESSION producer.
+  Raw-event acknowledgements carry no synthetic session result; actual window
+  closures retain native clocks and arrive as bounded append maintenance.
+- Acceptance: explicit generic coherent values, calendar and closed-window
+  replacements, unchanged admission, memory/RocksDB checkpoints and actual
+  external Kafka/profile/identity SIGKILL recovery. Existing application-owned
+  input and literal expected output stay in Arcstream. No UDF/filter workaround.
+- Implementation and independent source review complete; focused planner/worker,
+  both-backend lifecycle recovery and strict lint pass. First pinned real graph
+  exposed response SESSION Shuffle routing before input; the independently
+  reviewed Forward fix and physical-edge regressions are under fresh maintained
+  gates, CLI pin and Kafka validation in one shared queue reservation. No throughput
+  or production-cutover claim. Original failures under
+  `/home/jason/qa-evidence/arc18-core-release-20261023/graph-3/` and
+  `lifecycle-join-merge-release-plan/`.
+- Final source1314e702 pin `3e2594d6…`: all11 native application stages and13
+  complete22-field snapshots PASS, two actual worker SIGKILL/checkpoint restores,
+  unchanged committed prefixes and fresh recovered outputs, exact6disk+1typed
+  profile/2typed identity owners; ten API tests PASS. Independent evidence audit
+  approves. Maintained18planner/2routing/strictlint gates and required CI PASS.
+  Exact evidence/report: `docs/str-150-finalized-composition.md` and
+  `/home/jason/qa-evidence/str150-composed-publication-20261023/attempt-2/`.
+  No FlareDB/browser/deployment/production parity claim; FLA-178 is separate.
+
 ## Active STR-60 — 2026-10-18
 
 - Branch `jason/str-60-selectors-20261018`; initial base14353046, integrated8f937aa9 then current main eb5127db. Guidance reread; unrelated ledger entries and old transferred tree preserved. Staged only, no commits/PR.

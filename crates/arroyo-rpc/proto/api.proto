@@ -83,6 +83,9 @@ message SessionWindowAggregateOperator {
   bytes partial_aggregation_plan = 7;
   bytes final_aggregation_plan = 8;
   ArroyoSchema output_schema = 9;
+  // Native finalized-result branch: acknowledge admitted source operations
+  // separately from ordinary watermark-finalized append rows.
+  optional uint32 response_root_operator = 10;
 }
 
 message JoinOperator {
@@ -163,6 +166,8 @@ message UpdatingAggregateOperator {
   // Native grouping ordinals projected to the downstream aggregate grouping
   // tuple. Empty means the complete native grouping tuple (e.g. native JOIN).
   repeated uint64 response_key_fields = 15;
+  // Planner-proven finalized native append maintenance, never a raw event.
+  bool response_finalized_append_input = 16;
 }
 
 // A maintained inclusive UTC calendar FILTER, indexed by aggregate ordinal.

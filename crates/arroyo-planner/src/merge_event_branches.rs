@@ -639,12 +639,15 @@ pub(crate) fn validate_graph(graph: &arroyo_datastream::logical::LogicalGraph) -
 fn validate_graph_configs(graph: &arroyo_datastream::logical::LogicalGraph) -> Result<()> {
     use arroyo_datastream::logical::OperatorName;
     use arroyo_rpc::grpc::api::{
-        ExpressionWatermarkConfig, JoinOperator, UpdatingAggregateOperator,
+        ExpressionWatermarkConfig, JoinOperator, SessionWindowAggregateOperator,
+        UpdatingAggregateOperator,
     };
     use prost::Message;
     let mut roots = Vec::new();
     let mut aggregates = Vec::new();
     let mut joins = Vec::new();
+    let mut finalized = Vec::new();
+    let mut finalized_aggregates = Vec::new();
     let mut results = Vec::new();
     let mut unions = 0usize;
     for node in graph.node_weights() {
@@ -672,6 +675,16 @@ fn validate_graph_configs(graph: &arroyo_datastream::logical::LogicalGraph) -> R
                                 )
                             })?;
                     if let Some(root) = config.response_root_operator {
+                        if config.response_finalized_append_input {
+                            if config.accepted_output_schema.is_some()
+                                || !config.calendar_aggregates.is_empty()
+                            {
+                                return plan_err!(
+                                    "finalized append response owner must be a native non-calendar branch"
+                                );
+                            }
+                            finalized_aggregates.push(root);
+                        }
                         if config.emit_per_event
                             || config.retain_indefinitely != Some(true)
                             || config.ttl_micros != 0
@@ -685,6 +698,19 @@ fn validate_graph_configs(graph: &arroyo_datastream::logical::LogicalGraph) -> R
                         } else {
                             aggregates.push(root);
                         }
+                    }
+                    config.response_root_operator
+                }
+                OperatorName::SessionWindowAggregate => {
+                    let config =
+                        SessionWindowAggregateOperator::decode(operator.operator_config.as_slice())
+                            .map_err(|error| {
+                                datafusion::common::plan_datafusion_err!(
+                                    "invalid response SESSION config: {error}"
+                                )
+                            })?;
+                    if let Some(root) = config.response_root_operator {
+                        finalized.push(root);
                     }
                     config.response_root_operator
                 }
@@ -750,10 +776,10 @@ fn validate_graph_configs(graph: &arroyo_datastream::logical::LogicalGraph) -> R
                         )
                     })?;
                     if config.response_union_inputs != 0 {
-                        if !(2..=3).contains(&config.response_union_inputs) || node.parallelism != 1
+                        if !(2..=4).contains(&config.response_union_inputs) || node.parallelism != 1
                         {
                             return plan_err!(
-                                "finite response UNION requires two or three singleton branch inputs"
+                                "finite response UNION requires two to four singleton branch inputs"
                             );
                         }
                         unions += 1;
@@ -775,6 +801,7 @@ fn validate_graph_configs(graph: &arroyo_datastream::logical::LogicalGraph) -> R
     if roots.is_empty()
         && aggregates.is_empty()
         && joins.is_empty()
+        && finalized.is_empty()
         && results.is_empty()
         && unions == 0
     {
@@ -785,18 +812,21 @@ fn validate_graph_configs(graph: &arroyo_datastream::logical::LogicalGraph) -> R
     }
     if roots.len() != 1
         || !((aggregates.len() == 2 && joins.len() == 1 && results.is_empty() && unions == 0)
-            || ((1..=3).contains(&aggregates.len())
+            || ((1..=4).contains(&aggregates.len())
                 && joins.is_empty()
                 && results.len() == 1
                 && unions == usize::from(aggregates.len() > 1)))
+        || finalized.len() > 1
+        || finalized != finalized_aggregates
         || aggregates
             .iter()
             .chain(joins.iter())
             .chain(results.iter())
+            .chain(finalized.iter())
             .any(|root| *root != roots[0])
     {
         return plan_err!(
-            "response route requires one root, two aggregate branches and one matching native JOIN"
+            "response route requires one root and either two aggregate branches with a JOIN or one to four branches with a terminal result; one finalized producer requires its matching append aggregate"
         );
     }
     Ok(())

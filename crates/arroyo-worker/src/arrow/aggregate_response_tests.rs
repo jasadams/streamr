@@ -238,3 +238,58 @@ async fn branch_response_aggregate_binding_preserves_all_serialized_schema_metad
         assert!(error.to_string().contains("graph schema differs from actual constructed native owner"),"{error}");
     }}
 }
+
+
+#[tokio::test]
+async fn finalized_append_branch_keeps_empty_completions_and_complete_native_replacements() {
+    let (mut config, registry) = config(false, false);
+    config.response_finalized_append_input = true;
+    let mut ctx = native_event_context(&config).await;
+    ctx.out_schema = Some(Arc::new(config.final_schema.clone().unwrap().try_into().unwrap()));
+    let mut operator = IncrementalAggregatingConstructor::build_with_native_config(
+        config, registry, Some(native_test_config())).unwrap();
+    operator.native_store = Some(native_test_store());
+    let input = Arc::new(EventEdgeSpec {
+        root_operator: 7, root_subtask: 0, schema: ctx.in_schemas[0].schema.clone(),
+        layout: EventLayout::Raw, maintenance: true,
+    });
+    let output = operator.bind_event_response(&[input], &ctx).unwrap().unwrap();
+    assert!(output.maintenance);
+    let mut responses = Responses::default();
+    send(&mut operator, &mut ctx, &mut responses, response(1, 100, None)).await;
+    assert!(correction_inventory(operator.native_store.as_ref().unwrap()).await.is_empty());
+    let mut collector = AggregateCollector::default();
+    for (value, time) in [(4, 10), (2, 20)] {
+        operator.process_batch(batch_at(&[Some("a")], &[value], &[time]),
+            &mut ctx, &mut collector).await.unwrap();
+    }
+    assert_eq!(collector.batches.len(), 2);
+    assert_eq!(native_changelog_columns(&collector.batches[0]).unwrap().0.values().iter().collect::<Vec<_>>(), vec![false]);
+    let replacement = &collector.batches[1];
+    assert_eq!(native_changelog_columns(replacement).unwrap().0.values().iter().collect::<Vec<_>>(), vec![true, false]);
+    assert_eq!(replacement.column(1).as_primitive::<arrow_array::types::Int64Type>().values().as_ref(), &[1, 2]);
+    assert_eq!(replacement.column(ctx.out_schema.as_ref().unwrap().timestamp_index)
+        .as_primitive::<arrow_array::types::TimestampNanosecondType>().values().as_ref(), &[10, 20]);
+    send(&mut operator, &mut ctx, &mut responses, response(2, 5, None)).await;
+    assert_eq!(responses.packets.len(), 2);
+    assert!(responses.packets.iter().all(|packet| packet.rows.is_none() && packet.touched_keys.is_none()));
+    // A finalized result is maintenance, never another raw event payload.
+    let before = correction_inventory(operator.native_store.as_ref().unwrap()).await;
+    assert!(operator.process_response_index(0, 1,
+        response(3, 20, Some(batch_at(&[Some("a")], &[9], &[20]))),
+        &mut ctx, &mut responses).await.unwrap_err().to_string().contains("empty original-event"));
+    assert!(operator.process_batch(batch_at(&[Some("a"), Some("a")], &[1, 2], &[30, 31]),
+        &mut ctx, &mut collector).await.is_err());
+    assert_eq!(correction_inventory(operator.native_store.as_ref().unwrap()).await, before);
+}
+
+#[test]
+fn finalized_append_branch_rejects_changelog_and_missing_response_root() {
+    for changelog in [false, true] {
+        let (mut config, registry) = config(changelog, false);
+        config.response_finalized_append_input = true;
+        if !changelog { config.response_root_operator = None; }
+        assert!(IncrementalAggregatingConstructor::build_with_native_config(
+            config, registry, Some(native_test_config())).is_err());
+    }
+}

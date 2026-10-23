@@ -1667,3 +1667,166 @@ async fn finalized_session_merge_preserves_exact_canonical_generated_source_cloc
     );
     assert_eq!(state_operators(&compiled).len(), 1);
 }
+
+fn finalized_four_branch_merge() -> String {
+    "SET updating_ttl = NULL;
+    CREATE TABLE measurements (counter BIGINT NOT NULL, session_key TEXT NOT NULL,
+      value BIGINT NOT NULL, event_time TIMESTAMP NOT NULL,
+      WATERMARK FOR event_time AS event_time - INTERVAL '5 seconds')
+      WITH(connector='single_file',path='/tmp/composed-finalized-input.jsonl',format='json',type='source');
+    CREATE VIEW a AS SELECT counter,COUNT(*) AS n FROM measurements GROUP BY counter;
+    CREATE VIEW b AS SELECT counter,value,COUNT(*) AS n FROM measurements GROUP BY counter,value;
+    CREATE VIEW c AS SELECT counter,COUNT(*) AS n FROM measurements WHERE value>0 GROUP BY counter;
+    CREATE VIEW completed AS SELECT session_key,SESSION(INTERVAL '30 minutes') AS window,
+      FIRST_VALUE(counter) AS counter,MAX(value) AS amount
+      FROM measurements GROUP BY session_key,window;
+    CREATE VIEW completed_values AS SELECT counter,amount FROM completed;
+    CREATE VIEW d AS SELECT counter,CAST(SUM(amount) AS DOUBLE)/CAST(COUNT(*) AS DOUBLE) AS n
+      FROM completed_values GROUP BY counter;
+    CREATE VIEW tagged AS
+      SELECT counter,CAST(n AS DOUBLE) AS n FROM a UNION ALL
+      SELECT counter,CAST(n AS DOUBLE) AS n FROM b UNION ALL
+      SELECT counter,CAST(n AS DOUBLE) AS n FROM c UNION ALL
+      SELECT counter,n FROM d;
+    CREATE VIEW result AS SELECT counter,MAX(n) AS quantity FROM tagged GROUP BY counter;
+    CREATE STATE TABLE inventory(counter BIGINT PRIMARY KEY,quantity DOUBLE) PARTITION BY counter;
+    CREATE VIEW applied AS MERGE INTO inventory AS target USING result AS source
+      ON target.counter=source.counter
+      WHEN MATCHED THEN UPDATE SET quantity=source.quantity
+      WHEN NOT MATCHED THEN INSERT(counter,quantity) VALUES(source.counter,source.quantity)
+      RETURNING source AS source,old AS old,new AS new,action AS action;
+    SELECT new.quantity,action FROM applied;".to_owned()
+}
+
+#[test(tokio::test)]
+async fn maintained_merge_composes_four_branches_with_native_finalized_session() {
+    use arroyo_rpc::grpc::api::{SessionWindowAggregateOperator, UpdatingAggregateOperator};
+    let compiled = plan(&finalized_four_branch_merge()).await;
+    let operators = compiled
+        .program
+        .graph
+        .node_weights()
+        .flat_map(|node| node.operator_chain.iter())
+        .map(|(operator, _)| operator)
+        .collect::<Vec<_>>();
+    let aggregates = operators
+        .iter()
+        .filter(|operator| operator.operator_name == OperatorName::UpdatingAggregate)
+        .map(|operator| {
+            UpdatingAggregateOperator::decode(operator.operator_config.as_slice()).unwrap()
+        })
+        .collect::<Vec<_>>();
+    let sessions = operators
+        .iter()
+        .filter(|operator| operator.operator_name == OperatorName::SessionWindowAggregate)
+        .map(|operator| {
+            SessionWindowAggregateOperator::decode(operator.operator_config.as_slice()).unwrap()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(aggregates.len(), 5);
+    assert_eq!(sessions.len(), 1);
+    // This topology mirrors native raw branches plus finalized-SESSION average.
+    // Actual runtime response binding rejects even singleton Shuffle edges.
+    use petgraph::Direction::Incoming;
+    let session_node = compiled
+        .program
+        .graph
+        .node_indices()
+        .find(|index| {
+            compiled.program.graph[*index]
+                .operator_chain
+                .iter()
+                .any(|(operator, _)| operator.operator_name == OperatorName::SessionWindowAggregate)
+        })
+        .unwrap();
+    let inputs = compiled
+        .program
+        .graph
+        .edges_directed(session_node, Incoming)
+        .collect::<Vec<_>>();
+    assert_eq!(inputs.len(), 1);
+    assert_eq!(
+        inputs[0].weight().edge_type,
+        arroyo_datastream::logical::LogicalEdgeType::Forward
+    );
+    let root = sessions[0]
+        .response_root_operator
+        .expect("SESSION shares original admission root");
+    assert!(aggregates.iter().all(
+        |aggregate| aggregate.response_root_operator == Some(root) && !aggregate.emit_per_event
+    ));
+    assert_eq!(
+        aggregates
+            .iter()
+            .filter(|aggregate| aggregate.response_finalized_append_input)
+            .count(),
+        1
+    );
+    assert_eq!(
+        aggregates
+            .iter()
+            .filter(|aggregate| aggregate.accepted_output_schema.is_some())
+            .count(),
+        1
+    );
+    let finalized = aggregates
+        .iter()
+        .find(|aggregate| aggregate.response_finalized_append_input)
+        .unwrap();
+    assert_eq!(finalized.response_key_fields, vec![0]);
+    let input =
+        arroyo_rpc::df::ArroyoSchema::try_from(finalized.input_schema.clone().unwrap()).unwrap();
+    assert!(
+        input
+            .schema
+            .index_of(arroyo_rpc::UPDATING_META_FIELD)
+            .is_err(),
+        "SESSION retains append closure layout"
+    );
+}
+
+#[test(tokio::test)]
+async fn maintained_merge_finalized_branch_rejects_a_different_original_source() {
+    let sql = finalized_four_branch_merge().replace("CREATE VIEW completed AS", "CREATE TABLE other_measurements(counter BIGINT NOT NULL,session_key TEXT NOT NULL,value BIGINT NOT NULL,event_time TIMESTAMP NOT NULL,WATERMARK FOR event_time AS event_time - INTERVAL '5 seconds') WITH(connector='single_file',path='/tmp/other-composed-input.jsonl',format='json',type='source'); CREATE VIEW completed AS")
+        .replace("FROM measurements GROUP BY session_key,window", "FROM other_measurements GROUP BY session_key,window");
+    reject(&sql, "same physical source definition").await;
+}
+
+#[test(tokio::test)]
+async fn maintained_merge_rejects_two_finalized_response_producers() {
+    let sql = finalized_four_branch_merge().replace(
+        "SELECT counter,CAST(n AS DOUBLE) AS n FROM c UNION ALL",
+        "SELECT counter,n FROM d UNION ALL",
+    );
+    reject(&sql, "one finalized native producer").await;
+}
+
+#[test(tokio::test)]
+async fn maintained_merge_session_route_keeps_ordinary_window_shuffle() {
+    let query = finalized_four_branch_merge();
+    let ordinary = query.split("CREATE VIEW d AS").next().unwrap().to_owned()
+        + "SELECT counter,amount FROM completed_values;";
+    let compiled = plan(&ordinary).await;
+    use petgraph::Direction::Incoming;
+    let node = compiled
+        .program
+        .graph
+        .node_indices()
+        .find(|index| {
+            compiled.program.graph[*index]
+                .operator_chain
+                .iter()
+                .any(|(operator, _)| operator.operator_name == OperatorName::SessionWindowAggregate)
+        })
+        .unwrap();
+    let inputs = compiled
+        .program
+        .graph
+        .edges_directed(node, Incoming)
+        .collect::<Vec<_>>();
+    assert_eq!(inputs.len(), 1);
+    assert_eq!(
+        inputs[0].weight().edge_type,
+        arroyo_datastream::logical::LogicalEdgeType::Shuffle
+    );
+}

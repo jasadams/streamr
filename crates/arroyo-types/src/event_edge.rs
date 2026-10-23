@@ -19,8 +19,9 @@ pub struct EventEdgeSpec {
     pub root_subtask: u32,
     pub schema: SchemaRef,
     pub layout: EventLayout,
-    /// Only a constructed native calendar producer may originate ordinary
-    /// bounded per-key maintenance replacements on this local response route.
+    /// Constructed native calendar/finalized producers may originate ordinary
+    /// bounded maintenance units on this local response route. Finalized append
+    /// rows retain their window clock and do not acquire original-event context.
     pub maintenance: bool,
 }
 impl EventEdgeSpec {
