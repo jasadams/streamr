@@ -35,13 +35,16 @@ pub(crate) struct UpdatingAggregateExtension {
     pub(crate) response_route: Option<crate::merge_event_branches::ResponseRoute>,
     pub(crate) accepted_schema: Option<DFSchemaRef>,
     pub(crate) response_key_fields: Vec<usize>,
+    pub(crate) response_finalized_append_input: bool,
 }
 
 // DFSchema has exact equality/hash but no ordering. Different accepted schema
 // contracts are incomparable; never report Equal after omitting that proof.
 impl PartialOrd for UpdatingAggregateExtension {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        if self.accepted_schema != other.accepted_schema {
+        if self.accepted_schema != other.accepted_schema
+            || self.response_finalized_append_input != other.response_finalized_append_input
+        {
             return None;
         }
         (
@@ -95,6 +98,7 @@ impl UpdatingAggregateExtension {
             response_route: None,
             accepted_schema: None,
             response_key_fields: vec![],
+            response_finalized_append_input: false,
         })
     }
 }
@@ -159,6 +163,7 @@ impl UserDefinedLogicalNodeCore for UpdatingAggregateExtension {
         next.response_route = self.response_route;
         next.accepted_schema = self.accepted_schema.clone();
         next.response_key_fields = self.response_key_fields.clone();
+        next.response_finalized_append_input = self.response_finalized_append_input;
         Ok(next)
     }
 }
@@ -344,6 +349,7 @@ impl ArroyoExtension for UpdatingAggregateExtension {
             })
             .collect::<Result<Vec<_>>>()?;
         let config = UpdatingAggregateOperator {
+            response_finalized_append_input: self.response_finalized_append_input,
             response_root_operator: self
                 .response_route
                 .map(|route| {

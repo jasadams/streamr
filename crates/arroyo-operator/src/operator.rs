@@ -1298,6 +1298,7 @@ pub enum EventResponseRole {
     Scalar,
     Root(u32),
     Aggregate(u32),
+    Finalized(u32),
     Join(u32),
     Result(u32),
     Union,

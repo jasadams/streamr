@@ -46,6 +46,13 @@ pub(super) fn bind_constructed_graph(graph: &mut Graph) -> Result<()> {
             _ => None,
         })
         .collect();
+    let finalized_roots = roles
+        .iter()
+        .filter_map(|role| match role {
+            EventResponseRole::Finalized(root) => Some(*root),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
     let result_roots = roles
         .iter()
         .filter_map(|role| match role {
@@ -61,6 +68,7 @@ pub(super) fn bind_constructed_graph(graph: &mut Graph) -> Result<()> {
         && aggregate_roots.is_empty()
         && join_roots.is_empty()
         && result_roots.is_empty()
+        && finalized_roots.is_empty()
         && unions == 0
     {
         return Ok(());
@@ -70,8 +78,10 @@ pub(super) fn bind_constructed_graph(graph: &mut Graph) -> Result<()> {
             && ((aggregate_roots.len() == 2
                 && join_roots.len() == 1
                 && result_roots.is_empty()
+                && finalized_roots.is_empty()
                 && unions == 0)
-                || ((1..=3).contains(&aggregate_roots.len())
+                || ((1..=4).contains(&aggregate_roots.len())
+                    && finalized_roots.len() <= 1
                     && join_roots.is_empty()
                     && result_roots.len() == 1
                     && unions == usize::from(aggregate_roots.len() > 1))),
@@ -83,6 +93,7 @@ pub(super) fn bind_constructed_graph(graph: &mut Graph) -> Result<()> {
             .iter()
             .chain(&join_roots)
             .chain(&result_roots)
+            .chain(&finalized_roots)
             .all(|id| *id == root),
         "private response roles disagree on planned root id"
     );
@@ -154,6 +165,7 @@ pub(super) fn bind_constructed_graph(graph: &mut Graph) -> Result<()> {
                         role,
                         EventResponseRole::Root(_)
                             | EventResponseRole::Aggregate(_)
+                            | EventResponseRole::Finalized(_)
                             | EventResponseRole::Join(_)
                             | EventResponseRole::Result(_)
                             | EventResponseRole::Union
@@ -187,7 +199,7 @@ pub(super) fn bind_constructed_graph(graph: &mut Graph) -> Result<()> {
                         if matches!(role, EventResponseRole::Union) {
                             ensure!(
                                 position == 0
-                                    && (2..=3).contains(&incoming.len())
+                                    && (2..=4).contains(&incoming.len())
                                     && incoming
                                         .iter()
                                         .all(|(key, _, _)| key.0 == LogicalEdgeType::Forward),

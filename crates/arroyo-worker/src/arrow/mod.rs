@@ -122,7 +122,7 @@ impl ArrowOperator for ValueExecutionOperator {
         if self.response_union_inputs != 0 {
             response_ensure!(
                 self.response_alignment.is_none()
-                    && (2..=3).contains(&self.response_union_inputs)
+                    && (2..=4).contains(&self.response_union_inputs)
                     && inputs.len() == self.response_union_inputs
                     && context.in_schemas.len() == inputs.len()
                     && output.schema == self.executor.plan.schema(),
@@ -147,10 +147,9 @@ impl ArrowOperator for ValueExecutionOperator {
             let mut bytes = 0usize;
             let mut key_bytes = 0usize;
             let maintenance = inputs.iter().filter(|input| input.maintenance).count();
-            response_ensure!(
-                maintenance <= 1,
-                "finite UNION supports one native maintenance producer"
-            );
+            // Calendar and finalized-window owners deliver separate complete
+            // per-key units. The existing input alignment parks each producer
+            // until its current source response/control callback completes.
             for (input, schema) in inputs.iter().zip(&context.in_schemas) {
                 response_ensure!(
                     input.root_operator == first.root_operator

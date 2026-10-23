@@ -1,10 +1,11 @@
 //! Native aggregate composition: complete internal changes, one accepted SELECT cut.
+use crate::extension::aggregate::AggregateExtension;
 use crate::extension::remote_table::RemoteTableExtension;
 use crate::extension::updating_aggregate::UpdatingAggregateExtension;
 use crate::merge_event_branches::{self as branches, ResponseRoute};
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion, TreeNodeRewriter};
 use datafusion::common::{Result, TableReference, plan_err};
-use datafusion::logical_expr::{Aggregate, Extension, LogicalPlan};
+use datafusion::logical_expr::{Aggregate, Extension, LogicalPlan, UserDefinedLogicalNodeCore};
 use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd)]
@@ -97,6 +98,100 @@ fn grouped_inputs<'a>(
         .collect::<Result<Vec<_>>>()?;
     grouped_inputs(input, &next, out)
 }
+/// A finalized producer remains a native append stream. Its raw response carries
+/// no contribution; only its separately delivered closure rows change this owner.
+fn finalized_parent(plan: &LogicalPlan) -> Result<Option<&AggregateExtension>> {
+    if let LogicalPlan::Extension(extension) = plan
+        && let Some(session) = extension.node.as_any().downcast_ref::<AggregateExtension>()
+    {
+        if !matches!(
+            session.window_behavior,
+            crate::WindowBehavior::FromOperator {
+                window: crate::WindowType::Session { .. },
+                is_nested: false,
+                ..
+            }
+        ) {
+            return plan_err!("composed finalized branch requires native SESSION");
+        }
+        return Ok(Some(session));
+    }
+    // Updating aggregates and joins are not transparent finalized producers.
+    if as_aggregate(plan).is_some() || matches!(plan, LogicalPlan::Union(_)) {
+        return Ok(None);
+    }
+    let Ok(input) = branches::scalar_input(plan) else {
+        return Ok(None);
+    };
+    let found = finalized_parent(input)?;
+    if found.is_some() {
+        branches::validate_scalar_step(plan)?;
+    }
+    Ok(found)
+}
+
+fn branch_source_input(aggregate: &UpdatingAggregateExtension) -> Result<&LogicalPlan> {
+    let LogicalPlan::Aggregate(native) = &aggregate.aggregate else {
+        return plan_err!("native branch aggregate missing");
+    };
+    if let Some(session) = finalized_parent(&native.input)? {
+        if !aggregate.calendar_aggregates.is_empty() {
+            return plan_err!(
+                "finalized composed branch cannot use an original-event calendar clock"
+            );
+        }
+        crate::continuous_merge::event_source::validate_aggregate(aggregate)?;
+        crate::finalized_result::accepted_source(&native.input)?;
+        let LogicalPlan::Aggregate(window) = &session.aggregate else {
+            return plan_err!("finalized producer aggregate missing");
+        };
+        Ok(&window.input)
+    } else {
+        Ok(&native.input)
+    }
+}
+
+fn replace_finalized_parent(
+    plan: LogicalPlan,
+    input: LogicalPlan,
+    slot: u32,
+) -> Result<LogicalPlan> {
+    let session = finalized_parent(&plan)?
+        .ok_or_else(|| datafusion::common::plan_datafusion_err!("finalized producer missing"))?
+        .clone();
+    let LogicalPlan::Aggregate(native) = &session.aggregate else {
+        return plan_err!("finalized producer aggregate missing");
+    };
+    let aggregate = LogicalPlan::Aggregate(Aggregate::try_new_with_schema(
+        Arc::new(input),
+        native.group_expr.clone(),
+        native.aggr_expr.clone(),
+        native.schema.clone(),
+    )?);
+    let mut replacement = session.with_exprs_and_inputs(vec![], vec![aggregate])?;
+    replacement.response_route = Some(ResponseRoute {
+        slot,
+        operator: None,
+    });
+    Ok(plan
+        .transform_down(|node| {
+            if matches!(&node, LogicalPlan::Extension(extension)
+            if extension.node.as_any().downcast_ref::<AggregateExtension>() == Some(&session))
+            {
+                Ok(Transformed::new(
+                    LogicalPlan::Extension(Extension {
+                        node: Arc::new(replacement.clone()),
+                    }),
+                    true,
+                    TreeNodeRecursion::Jump,
+                ))
+            } else {
+                Ok(Transformed::no(node))
+            }
+        })?
+        .data)
+}
+
 fn source_keys(aggregate: &UpdatingAggregateExtension, fields: &[usize]) -> Result<Vec<usize>> {
     crate::continuous_merge::event_source::validate(aggregate)?;
     let LogicalPlan::Aggregate(native) = &aggregate.aggregate else {
@@ -207,16 +302,46 @@ pub(crate) fn resolve(input: &LogicalPlan, slot: u32) -> Result<Option<LogicalPl
     grouped_inputs(&native.input, &indices, &mut leaves)?;
     // This initial proved topology is finite native aggregate branches feeding
     // one terminal owner. It is not an SQL function/arithmetic limitation.
-    if !(1..=3).contains(&leaves.len()) {
+    if !(1..=4).contains(&leaves.len()) {
         return plan_err!(
-            "composed result supports one to three registered native aggregate branches"
+            "composed result supports one to four registered native aggregate branches"
         );
     }
-    let expected_keys = source_keys(leaves[0].0, &leaves[0].1)?;
+    let direct = leaves
+        .iter()
+        .filter_map(|(aggregate, fields)| {
+            let LogicalPlan::Aggregate(native) = &aggregate.aggregate else {
+                return None;
+            };
+            match finalized_parent(&native.input) {
+                Ok(None) => Some(source_keys(aggregate, fields)),
+                Ok(Some(_)) => None,
+                Err(error) => Some(Err(error)),
+            }
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let Some(expected_keys) = direct.first() else {
+        return plan_err!("composed result requires an original-event aggregate branch");
+    };
     let mut maintenance = 0;
+    let mut finalized_count = 0;
     for (aggregate, fields) in &leaves {
-        if source_keys(aggregate, fields)? != expected_keys {
+        let LogicalPlan::Aggregate(branch_native) = &aggregate.aggregate else {
+            unreachable!()
+        };
+        if finalized_parent(&branch_native.input)?.is_none()
+            && &source_keys(aggregate, fields)? != expected_keys
+        {
             return plan_err!("composed branches require the same copied source grouping tuple");
+        }
+        if finalized_parent(&branch_native.input)?.is_some() {
+            finalized_count += 1;
+        }
+        if finalized_parent(&branch_native.input)?.is_some()
+            && (fields.len() != branch_native.group_expr.len()
+                || fields.iter().copied().ne(0..fields.len()))
+        {
+            return plan_err!("finalized branch must expose its complete ordered grouping tuple");
         }
         if !aggregate.calendar_aggregates.is_empty() {
             maintenance += 1;
@@ -230,18 +355,16 @@ pub(crate) fn resolve(input: &LogicalPlan, slot: u32) -> Result<Option<LogicalPl
             }
         }
     }
+    if finalized_count > 1 {
+        return plan_err!("composed result supports one finalized native producer");
+    }
     if maintenance > 1 {
         return plan_err!("composed result supports one native maintenance producer");
     }
     let source_inputs = leaves
         .iter()
-        .map(|(aggregate, _)| {
-            let LogicalPlan::Aggregate(native) = &aggregate.aggregate else {
-                unreachable!()
-            };
-            native.input.as_ref()
-        })
-        .collect::<Vec<_>>();
+        .map(|(aggregate, _)| branch_source_input(aggregate))
+        .collect::<Result<Vec<_>>>()?;
     let shared = crate::event_response_root::extract_shared_source_root(source_inputs, slot)?;
     let mut rewritten = native.input.as_ref().clone();
     for ((old, key_fields), source_input) in leaves.iter().zip(shared.branches) {
@@ -249,6 +372,13 @@ pub(crate) fn resolve(input: &LogicalPlan, slot: u32) -> Result<Option<LogicalPl
             unreachable!()
         };
         let mut next = (*old).clone();
+        let finalized = finalized_parent(&old_native.input)?.is_some();
+        let source_input = if finalized {
+            replace_finalized_parent(old_native.input.as_ref().clone(), source_input, slot)?
+        } else {
+            source_input
+        };
+        next.response_finalized_append_input = finalized;
         next.aggregate = LogicalPlan::Aggregate(Aggregate::try_new_with_schema(
             Arc::new(source_input),
             old_native.group_expr.clone(),
@@ -267,7 +397,14 @@ pub(crate) fn resolve(input: &LogicalPlan, slot: u32) -> Result<Option<LogicalPl
             slot,
             operator: None,
         });
-        next.response_key_fields = key_fields.clone();
+        // Finalized rows may select a grouping value (e.g. FIRST_VALUE) that
+        // differs from the raw SESSION tuple. Empty raw responses have no keys;
+        // closure maintenance uses the complete actual output grouping tuple.
+        next.response_key_fields = if finalized {
+            (0..old_native.group_expr.len()).collect()
+        } else {
+            key_fields.clone()
+        };
         rewritten = rewritten
             .transform_down(|node| {
                 if as_aggregate(&node) == Some(*old) {
@@ -345,7 +482,22 @@ pub(crate) fn accepted_source(plan: &LogicalPlan, slot: u32) -> Result<TableRefe
             let LogicalPlan::Aggregate(native) = &aggregate.aggregate else {
                 return plan_err!("native branch plan missing");
             };
-            let root = branches::branch_admission(&native.input, slot)?;
+            let root = if aggregate.response_finalized_append_input {
+                let session = finalized_parent(&native.input)?.ok_or_else(|| {
+                    datafusion::common::plan_datafusion_err!(
+                        "finalized response branch missing SESSION"
+                    )
+                })?;
+                if session.response_route.map(|route| route.slot) != Some(slot) {
+                    return plan_err!("finalized SESSION belongs to another response root");
+                }
+                let LogicalPlan::Aggregate(window) = &session.aggregate else {
+                    unreachable!()
+                };
+                branches::branch_admission(&window.input, slot)?
+            } else {
+                branches::branch_admission(&native.input, slot)?
+            };
             sources.push(crate::event_response_root::source_for_response_admission(
                 root,
             )?);

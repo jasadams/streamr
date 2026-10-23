@@ -47,9 +47,16 @@ pub(crate) struct AggregateExtension {
     pub(crate) schema: DFSchemaRef,
     pub(crate) key_fields: Vec<usize>,
     pub(crate) final_calculation: LogicalPlan,
+    pub(crate) response_route: Option<crate::merge_event_branches::ResponseRoute>,
 }
 
-multifield_partial_ord!(AggregateExtension, aggregate, key_fields, final_calculation);
+multifield_partial_ord!(
+    AggregateExtension,
+    aggregate,
+    key_fields,
+    final_calculation,
+    response_route
+);
 
 impl AggregateExtension {
     pub fn new(
@@ -66,6 +73,7 @@ impl AggregateExtension {
             schema: final_calculation.schema().clone(),
             key_fields,
             final_calculation,
+            response_route: None,
         }
     }
 
@@ -229,6 +237,16 @@ impl AggregateExtension {
         )?;
 
         let config = SessionWindowAggregateOperator {
+            response_root_operator: self
+                .response_route
+                .map(|route| {
+                    route.operator.ok_or_else(|| {
+                        datafusion::common::plan_datafusion_err!(
+                            "response SESSION has no bound graph root"
+                        )
+                    })
+                })
+                .transpose()?,
             name: format!("session_window_{index}"),
             gap_micros: gap.as_micros() as u64,
             window_field_name: window_field.name().to_string(),
@@ -524,15 +542,27 @@ impl UserDefinedLogicalNodeCore for AggregateExtension {
             return internal_err!("input size inconsistent");
         }
 
-        Ok(Self::new(
+        let mut next = Self::new(
             self.window_behavior.clone(),
             inputs[0].clone(),
             self.key_fields.clone(),
-        ))
+        );
+        next.response_route = self.response_route;
+        Ok(next)
     }
 }
 
 impl ArroyoExtension for AggregateExtension {
+    fn response_root_slot(&self) -> Option<u32> {
+        self.response_route.map(|route| route.slot)
+    }
+    fn bind_response_root(&self, operator: u32) -> Result<Option<Box<dyn ArroyoExtension>>> {
+        let mut next = self.clone();
+        if let Some(route) = &mut next.response_route {
+            route.operator = Some(operator);
+        }
+        Ok(Some(Box::new(next)))
+    }
     fn node_name(&self) -> Option<NamedNode> {
         None
     }
@@ -585,7 +615,25 @@ impl ArroyoExtension for AggregateExtension {
                 .instant_window_config(planner, index, input_df_schema, false)
                 .map_err(|e| e.context("instant window"))?,
         };
-        let edge = LogicalEdge::project_all(LogicalEdgeType::Shuffle, (*input_schema).clone());
+        // A private response route is already proven singleton at its root.
+        // Preserve its ordered local context through SESSION; repartitioning a
+        // private response is forbidden. Ordinary window consumers still shuffle.
+        let edge_type = if self.response_route.is_some() {
+            if !matches!(
+                self.window_behavior,
+                WindowBehavior::FromOperator {
+                    window: WindowType::Session { .. },
+                    is_nested: false,
+                    ..
+                }
+            ) {
+                return plan_err!("response window route requires native finalized SESSION");
+            }
+            LogicalEdgeType::Forward
+        } else {
+            LogicalEdgeType::Shuffle
+        };
+        let edge = LogicalEdge::project_all(edge_type, (*input_schema).clone());
         Ok(NodeWithIncomingEdges {
             node: logical_node,
             edges: vec![edge],

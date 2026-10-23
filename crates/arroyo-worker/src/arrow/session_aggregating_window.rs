@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use arrow::{
     compute::{
         SortColumn, concat_batches, filter_record_batch, kernels::cmp::gt_eq, lexsort_to_indices,
@@ -11,6 +11,7 @@ use arrow_array::{
     types::TimestampNanosecondType,
 };
 use arrow_schema::{DataType, Field, FieldRef};
+use arroyo_operator::operator::EventResponseRole;
 use arroyo_operator::{
     context::OperatorContext,
     operator::{ArrowOperator, ConstructedOperator, OperatorConstructor},
@@ -24,6 +25,8 @@ use arroyo_rpc::{
 use arroyo_state::{
     global_table_config, tables::global_keyed_map::GlobalKeyedView, timestamp_table_config,
 };
+use arroyo_types::event_edge::{EventEdgeSpec, EventLayout};
+use arroyo_types::event_response::{EventContext, EventResponse};
 use arroyo_types::{CheckpointBarrier, Watermark, from_nanos, print_time, to_nanos};
 use datafusion::{execution::context::SessionContext, physical_plan::ExecutionPlan};
 use std::borrow::Cow;
@@ -51,6 +54,10 @@ use tracing::{debug, warn};
 
 pub struct SessionAggregatingWindowFunc {
     native: Option<NativeSession>,
+    response_root_operator: Option<u32>,
+    response_previous: Option<EventContext>,
+    event_input: Option<Arc<EventEdgeSpec>>,
+    event_output: Option<Arc<EventEdgeSpec>>,
     config: Arc<SessionWindowConfig>,
     keys_by_next_watermark_action: BTreeMap<SystemTime, HashSet<Vec<u8>>>,
     key_computations: HashMap<Vec<u8>, KeyComputingHolder>,
@@ -60,7 +67,61 @@ pub struct SessionAggregatingWindowFunc {
 
 const GLOBAL_KEY: Vec<u8> = vec![];
 
+fn require_response(condition: bool, message: &str) -> Result<()> {
+    ensure!(condition, "{message}");
+    Ok(())
+}
+
 impl SessionAggregatingWindowFunc {
+    #[cfg(test)]
+    pub(super) fn response_test_owner(
+        native: NativeSession,
+        declared: &api::SessionWindowAggregateOperator,
+        row_converter: Converter,
+    ) -> Self {
+        let receiver = Arc::new(RwLock::new(None));
+        let codec = ArroyoPhysicalExtensionCodec {
+            context: DecodingContext::UnboundedBatchStream(receiver.clone()),
+        };
+        let final_physical_exec =
+            PhysicalPlanNode::decode(declared.final_aggregation_plan.as_slice())
+                .unwrap()
+                .try_into_physical_plan(
+                    &arroyo_planner::physical::new_registry(),
+                    &RuntimeEnvBuilder::new().build().unwrap(),
+                    &codec,
+                )
+                .unwrap();
+        Self {
+            native: Some(native),
+            response_root_operator: Some(7),
+            response_previous: None,
+            event_input: None,
+            event_output: None,
+            config: Arc::new(SessionWindowConfig {
+                gap: Duration::from_micros(declared.gap_micros),
+                window_field: Arc::new(Field::new(
+                    &declared.window_field_name,
+                    window_arrow_struct(),
+                    true,
+                )),
+                window_index: declared.window_index as usize,
+                input_schema_ref: Arc::new(
+                    declared.input_schema.clone().unwrap().try_into().unwrap(),
+                ),
+                output_schema_ref: Arc::new(
+                    declared.output_schema.clone().unwrap().try_into().unwrap(),
+                ),
+                final_physical_exec,
+                receiver,
+            }),
+            keys_by_next_watermark_action: BTreeMap::new(),
+            key_computations: HashMap::new(),
+            keys_by_start_time: BTreeMap::new(),
+            row_converter,
+        }
+    }
+
     fn should_advance(&self, watermark: SystemTime) -> bool {
         let result = self
             .keys_by_next_watermark_action
@@ -704,11 +765,16 @@ impl OperatorConstructor for SessionAggregatingWindowConstructor {
         config: Self::ConfigT,
         registry: Arc<Registry>,
     ) -> anyhow::Result<ConstructedOperator> {
+        let response_root_operator = config.response_root_operator;
         let native = worker_config()
             .worker
             .window_state
             .map(|limits| NativeSession::new(&config, registry.clone(), limits))
             .transpose()?;
+        ensure!(
+            response_root_operator.is_none() || native.is_some(),
+            "SESSION responses require the configured native backend"
+        );
         let window_field = Arc::new(Field::new(
             config.window_field_name,
             window_arrow_struct(),
@@ -787,6 +853,10 @@ impl OperatorConstructor for SessionAggregatingWindowConstructor {
         Ok(ConstructedOperator::from_operator(Box::new(
             SessionAggregatingWindowFunc {
                 native,
+                response_root_operator,
+                response_previous: None,
+                event_input: None,
+                event_output: None,
                 config: Arc::new(config),
                 keys_by_next_watermark_action: BTreeMap::new(),
                 keys_by_start_time: BTreeMap::new(),
@@ -800,6 +870,117 @@ impl OperatorConstructor for SessionAggregatingWindowConstructor {
 #[async_trait::async_trait]
 
 impl ArrowOperator for SessionAggregatingWindowFunc {
+    fn event_response_role(&self) -> EventResponseRole {
+        self.response_root_operator
+            .map_or(EventResponseRole::Ordinary, EventResponseRole::Finalized)
+    }
+
+    fn event_response_output(&self) -> Option<Arc<EventEdgeSpec>> {
+        self.event_output.clone()
+    }
+
+    fn bind_event_response(
+        &mut self,
+        inputs: &[Arc<EventEdgeSpec>],
+        ctx: &OperatorContext,
+    ) -> DataflowResult<Option<Arc<EventEdgeSpec>>> {
+        let root = self
+            .response_root_operator
+            .context("SESSION response root missing")?;
+        require_response(
+            inputs.len() == 1
+                && inputs[0].root_operator == root
+                && inputs[0].root_subtask == 0
+                && matches!(inputs[0].layout, EventLayout::Raw)
+                && !inputs[0].maintenance
+                && self.event_output.is_none()
+                && inputs[0].schema == self.config.input_schema_ref.schema
+                && ctx.in_schemas.len() == 1
+                && ctx.in_schemas[0] == self.config.input_schema_ref
+                && ctx.out_schema.as_ref() == Some(&self.config.output_schema_ref),
+            "SESSION response binding requires its exact original append source",
+        )?;
+        let output = Arc::new(EventEdgeSpec {
+            root_operator: root,
+            root_subtask: 0,
+            schema: self.config.output_schema_ref.schema.clone(),
+            layout: EventLayout::Raw,
+            maintenance: true,
+        });
+        self.event_input = Some(inputs[0].clone());
+        self.event_output = Some(output.clone());
+        Ok(Some(output))
+    }
+
+    async fn process_response_index(
+        &mut self,
+        index: usize,
+        in_partitions: usize,
+        response: EventResponse,
+        ctx: &mut OperatorContext,
+        collector: &mut dyn Collector,
+    ) -> DataflowResult<()> {
+        require_response(
+            index == 0 && in_partitions == 1,
+            "SESSION response requires one input partition",
+        )?;
+        self.event_input
+            .as_ref()
+            .context("SESSION response input is not bound")?
+            .validate(&response)
+            .map_err(anyhow::Error::msg)?;
+        require_response(
+            response.touched_keys.is_none() && response.native_body.is_none(),
+            "SESSION response requires original append rows",
+        )?;
+        if let Some(previous) = self.response_previous {
+            require_response(
+                previous.attempt_nonce == response.context.attempt_nonce
+                    && previous.sequence.checked_add(1) == Some(response.context.sequence),
+                "SESSION response skips or repeats an original operation",
+            )?;
+        } else {
+            require_response(
+                response.context.sequence == 1,
+                "SESSION response must begin at operation one",
+            )?;
+        }
+        if let Some(batch) = response.rows {
+            require_response(
+                batch.num_rows() == 1
+                    && batch
+                        .column_by_name(arroyo_rpc::UPDATING_META_FIELD)
+                        .is_none(),
+                "SESSION response requires one append row",
+            )?;
+            let stamps = batch
+                .column(self.config.input_schema_ref.timestamp_index)
+                .as_any()
+                .downcast_ref::<TimestampNanosecondArray>()
+                .context("SESSION response clock is not a timestamp")?;
+            require_response(
+                stamps.null_count() == 0 && stamps.value(0) == response.context.trigger_nanos,
+                "SESSION response clock differs from original operation",
+            )?;
+            self.native
+                .as_mut()
+                .context("SESSION response native owner missing")?
+                .process_batch(batch, ctx, &self.row_converter)
+                .await?;
+        }
+        let context = response.context;
+        collector
+            .collect_response(EventResponse {
+                context,
+                rows: None,
+                touched_keys: None,
+                native_body: None,
+            })
+            .await?;
+        self.response_previous = Some(context);
+        Ok(())
+    }
+
     fn name(&self) -> String {
         "session_window".to_string()
     }
@@ -889,6 +1070,10 @@ impl ArrowOperator for SessionAggregatingWindowFunc {
         ctx: &mut OperatorContext,
         _: &mut dyn Collector,
     ) -> DataflowResult<()> {
+        require_response(
+            self.response_root_operator.is_none(),
+            "ordinary Data on SESSION response input",
+        )?;
         if let Some(native) = self.native.as_mut() {
             native
                 .process_batch(batch, ctx, &self.row_converter)
