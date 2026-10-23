@@ -36,6 +36,7 @@ COPY Cargo.toml Cargo.toml
 COPY Cargo.lock Cargo.lock
 
 COPY crates crates
+COPY vendor vendor
 COPY webui webui
 
 # set git hash
