@@ -761,6 +761,18 @@ impl StorageProvider {
         Ok(list)
     }
 
+    /// Recursively list a prefix relative to this provider's configured key.
+    /// Returned paths include the configured key, matching [`Self::list`].
+    pub async fn list_prefix(
+        &self,
+        prefix: Path,
+    ) -> Result<impl Stream<Item = Result<Path, object_store::Error>> + '_, StorageError> {
+        Ok(self
+            .object_store
+            .list(Some(self.qualify_path(&prefix).as_ref()))
+            .map(|result| result.map(|metadata| metadata.location)))
+    }
+
     pub async fn get(&self, path: impl Into<Path>) -> Result<Bytes, StorageError> {
         let path = path.into();
         let bytes = self
@@ -1032,6 +1044,96 @@ mod tests {
     use std::time::SystemTime;
 
     use crate::{BackendConfig, StorageProvider, matchers};
+
+    #[tokio::test]
+    async fn recursive_prefix_listing_qualifies_once_and_keeps_segment_boundaries() {
+        use futures::TryStreamExt;
+        use std::collections::BTreeSet;
+
+        // A private local provider with a configured key also exercises the
+        // qualified-key convention used by the cloud providers.
+        let root = std::env::temp_dir().join(format!(
+            "arroyo-prefix-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let storage = StorageProvider::construct_local(crate::LocalConfig {
+            path: root.to_str().unwrap().to_owned(),
+            key: Some("tenant".into()),
+        })
+        .await
+        .unwrap();
+        let owned = "J/checkpoints/checkpoint-1/operator-o/table-t/disk-a";
+        let nested = "J/checkpoints/nested/deeper/object";
+        let neighbor = "J/checkpoints-extra/object";
+        let other = "J-other/checkpoints/object";
+        for key in [owned, nested, neighbor, other] {
+            storage.put(key, vec![7]).await.unwrap();
+        }
+        let listed: BTreeSet<String> = storage
+            .list_prefix("J/checkpoints".into())
+            .await
+            .unwrap()
+            .map_ok(|path| path.to_string())
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(
+            listed,
+            BTreeSet::from([format!("tenant/{owned}"), format!("tenant/{nested}")])
+        );
+        assert!(
+            storage
+                .list_prefix("absent".into())
+                .await
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let all = storage
+            .list_prefix("".into())
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(all.len(), 4);
+        assert!(
+            all.iter()
+                .all(|path| path.to_string().starts_with("tenant/"))
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn recursive_prefix_listing_propagates_walk_errors() {
+        use futures::TryStreamExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "arroyo-prefix-error-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let storage = StorageProvider::for_url(&format!("file://{}", root.display()))
+            .await
+            .unwrap();
+        std::fs::create_dir(root.join("target")).unwrap();
+        std::os::unix::fs::symlink(root.join("target"), root.join("target/loop")).unwrap();
+        let result = storage
+            .list_prefix("target".into())
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await;
+        std::fs::remove_dir_all(root).unwrap();
+        assert!(
+            result.is_err(),
+            "the underlying walk error must reach the caller"
+        );
+    }
 
     #[test]
     fn test_regex_compilation() {
