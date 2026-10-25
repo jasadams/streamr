@@ -1,3 +1,42 @@
+## Active STR-154 — shared RocksDB write-buffer progress — 2026-10-25
+
+- Recovery worker `codex-01a171dc-905e-70a3-8190-3436e44aaa47`; branch
+  `jason/str-154-wbm-20261025`, fetched base `ac15b4e9`. Read current
+  `AGENTS.md`, `.claude/build-test.md`, `.claude/team.md`, this ledger/feature
+  plan and current STR-154. Previous dirty test tree and evidence preserved.
+- Fresh old-code regression reaches native shared WBM4200448B above4194304B;
+  four contributor writes return, then empty C's native write stalls until the
+  30s parent kills/reaps it (exit101). Same inputs/budgets/peak observer with
+  minimal successful-write pressure flush pass all513 point readbacks/cleanup.
+  Independent observer/plan and backend source reviews approve. No new scans,
+  resource pools, SQL semantics or checkpoint protocol changes.
+- Evidence: `/home/jason/qa-evidence/str154-wbm-20261025/`; old/fixed logs,
+  patches, receipts and ELFs retained outside caches in their build reservations.
+  Check/strict Clippy/fmt pass; state tests84 pass/4 existing diagnostics ignored.
+  Independently audited dev/prebuilt CLI `c6540750…` matches reviewed backend
+  `a1791474…`; native/linkage/startup/owned cleanup receipts pass. Approved
+  67-event Kafka/SIGKILL case independently passes: CP2/source64 and unchanged
+  physical64-record prefix, generation1→2 restoreCP2, fresh3 inputs,
+  CP4/source67/exact131 outputs. This is not WBM pressure proof.
+- Frozen3DB Kafka control: OLD NOT_REPRODUCED (retained2627584B below4MiB;
+  15s sampled predicate, no continuous/peak claim); FIXED513-record correctness
+  PASS. Exact3DB/PID/FD/native-generation0 and cleanup audited. Prior fixture/
+  verifier failures retained; inline-USING lowering defect is separate STR-157.
+- Frozen7DB Kafka control also terminates: OLD NOT_REPRODUCED and FIXED
+  correctness PASS, each513 exact outputs/source513CP2 after emptyCP1. Same
+  worker/PIDFD/native-generation0/sevenDB/shared-WBM ownership independently
+  audited. Thirteen retained resource samples reach3160064B (not peak proof);
+  no native stack request was triggered. All owned resources cleaned up.
+- Real-Kafka pressure causality remains open. Reviewed source increment is
+  PR84, reviewed source931f11d. User authorized merge and ticket closure on
+  2026-10-26 with the remaining causal qualification gap recorded. Native
+  61-input fixed control separately passed; OLD diagnostic attempt reached
+  pressure but failed before stack capture. No causal Kafka proof is claimed.
+  Snapshot restore uses16-row decoded batches;
+  it does not establish a larger-write pressure reproduction.
+  No production mutation, deployed-stack proof, performance/parity/deployment
+  or completion claim.
+
 ## Active STR-155 — SESSION aggregate CAST/CSE registration — 2026-10-25
 
 - Worker `codex-01a171e2-f826-7683-b478-f9b11f250e10`; branch
