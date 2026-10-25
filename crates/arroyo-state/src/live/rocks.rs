@@ -7,7 +7,9 @@ use super::{
     *,
 };
 use async_trait::async_trait;
-use rocksdb::{BlockBasedIndexType, BlockBasedOptions, DB, DBRecoveryMode, Options, WriteOptions};
+use rocksdb::{
+    BlockBasedIndexType, BlockBasedOptions, DB, DBRecoveryMode, FlushOptions, Options, WriteOptions,
+};
 use std::path::PathBuf;
 use std::sync::{
     Arc, Mutex,
@@ -17,6 +19,11 @@ use tokio::sync::oneshot;
 
 #[path = "scan_diagnostics.rs"]
 mod scan_diagnostics;
+
+// Each pressure-test child is a fresh process; unrelated tests never sample this.
+#[cfg(test)]
+static NATIVE_PRESSURE_PEAK: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 pub struct RocksLiveState {
     db: Arc<NativeDb>,
@@ -234,7 +241,42 @@ impl RocksLiveState {
                     }
                 }
                 let options = durability.options();
-                let result = db.write_opt(native, &options).map_err(backend);
+                #[cfg(test)]
+                if std::env::var_os("STREAMR_STR154_NATIVE_PRESSURE_CHILD").is_some() {
+                    eprintln!("STR154 native_write_opt_enter path={}", path.display());
+                }
+                let mut result = db.write_opt(native, &options).map_err(backend);
+                // Observe pressure before any subsequent flush can reclaim it.
+                #[cfg(test)]
+                if result.is_ok()
+                    && std::env::var_os("STREAMR_STR154_NATIVE_PRESSURE_CHILD").is_some()
+                {
+                    NATIVE_PRESSURE_PEAK.fetch_max(
+                        resources.write_buffer_manager().get_usage(),
+                        Ordering::Relaxed,
+                    );
+                }
+                #[cfg(test)]
+                if std::env::var_os("STREAMR_STR154_NATIVE_PRESSURE_CHILD").is_some() {
+                    eprintln!("STR154 native_write_opt_exit path={}", path.display());
+                }
+                if result.is_ok()
+                    && resources.write_buffer_manager().get_usage()
+                        >= resources.config().memtable_bytes
+                {
+                    // Shared pressure may come from DBs whose writers are now idle.
+                    // Flush this successful contributor before a later write to an
+                    // empty DB stalls with nothing of its own to flush.
+                    // Scheduling can wait on native write/flush conditions; retain
+                    // the write lock, DB owner and existing permits until it returns.
+                    let mut flush = FlushOptions::default();
+                    flush.set_wait(false);
+                    result = db.flush_opt(&flush).map_err(|error| {
+                        backend(format!(
+                            "native write already applied; shared-pressure flush scheduling failed: {error}"
+                        ))
+                    });
+                }
                 if let Some(health) = &db.health {
                     health.sample_native(&db, &path);
                 }
@@ -3018,5 +3060,105 @@ mod tests {
             .await
             .unwrap();
         std::fs::remove_dir_all(config.root).unwrap();
+    }
+
+    #[test]
+    fn shared_wbm_idle_contributors_do_not_stall_empty_database() {
+        const CHILD: &str = "STREAMR_STR154_NATIVE_PRESSURE_CHILD";
+        if let Ok(directory) = std::env::var(CHILD) {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let resources = WorkerStateResources::new(ResourceConfig {
+                    block_cache_bytes: 8 * 1024 * 1024,
+                    memtable_bytes: 4 * 1024 * 1024,
+                    queued_write_bytes: 96 * 1024 * 1024,
+                    decoded_value_bytes: 32 * 1024 * 1024,
+                    scan_page_bytes: 8 * 1024 * 1024,
+                    max_blocking_operations: 2,
+                    max_snapshots: 4,
+                    max_open_databases: 8,
+                    disk_reserve_bytes: 64 * 1024 * 1024,
+                }).unwrap();
+                let mut states = Vec::new();
+                for index in 0..3 {
+                    let mut cfg = config();
+                    cfg.root = PathBuf::from(&directory).join(format!("database-{index}"));
+                    let permit = resources.try_database().unwrap();
+                    states.push(RocksLiveState::open_mode(cfg, resources.clone(), false, permit,
+                        WriteDurability::Checkpoint).await.unwrap());
+                }
+                let value = vec![37; 8000];
+                // Two idle contributors each retain <4MiB. One contributor alone
+                // could trigger its own per-DB flush instead of the shared stall.
+                for (database, state) in states.iter().take(2).enumerate() {
+                    for batch_index in 0..2u32 {
+                        let mut admitted = state.admitted_batch(2 * 1024 * 1024, 128).await.unwrap();
+                        for index in 0..128u32 {
+                            let mut item = key();
+                            item.key = (batch_index * 128 + index).to_be_bytes().to_vec();
+                            admitted.put(&item, &value).unwrap();
+                        }
+                        eprintln!("STR154 contributor_write_begin database={database} batch={batch_index} wb_memory={}", resources.write_buffer_manager().get_usage());
+                        state.write_admitted(admitted).await.unwrap();
+                        eprintln!("STR154 contributor_write_end database={database} batch={batch_index} wb_memory={}", resources.write_buffer_manager().get_usage());
+                    }
+                }
+                let used = resources.write_buffer_manager().get_usage();
+                let peak = NATIVE_PRESSURE_PEAK.load(Ordering::Relaxed);
+                eprintln!("STR154 idle_contributors_ready wb_memory={used} wb_peak={peak} wb_limit=4194304");
+                assert!(peak > 4 * 1024 * 1024, "probe did not reach required native pressure; no stall conclusion");
+                let mut tiny = states[2].admitted_batch(1024, 1).await.unwrap();
+                tiny.put(&key(), b"tiny").unwrap();
+                eprintln!("STR154 empty_database_write_begin wb_memory={used}");
+                states[2].write_admitted(tiny).await.unwrap();
+                eprintln!("STR154 empty_database_write_end wb_memory={}", resources.write_buffer_manager().get_usage());
+                for state in &states[..2] {
+                    for index in 0..256u32 {
+                        let mut item = key();
+                        item.key = index.to_be_bytes().to_vec();
+                        assert_eq!(state.get(&item, ReadOptions { max_bytes: 8192 }).await.unwrap(), Some(value.clone()));
+                    }
+                }
+                assert_eq!(states[2].get(&key(), ReadOptions { max_bytes: 1024 }).await.unwrap(), Some(b"tiny".to_vec()));
+                for state in states { state.close_and_remove().await.unwrap(); }
+                eprintln!("STR154 exact_values_and_cleanup_pass");
+            });
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let log_path = directory.path().join("child.log");
+        let output = std::fs::File::create(&log_path).unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "live::rocks::tests::shared_wbm_idle_contributors_do_not_stall_empty_database",
+                "--nocapture",
+            ])
+            .env(CHILD, directory.path())
+            .stdout(output.try_clone().unwrap())
+            .stderr(output)
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                eprintln!("{}", std::fs::read_to_string(&log_path).unwrap());
+                assert!(status.success(), "finite native pressure child failed");
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                let kill_result = child.kill();
+                let wait_result = child.wait();
+                eprintln!("{}", std::fs::read_to_string(&log_path).unwrap());
+                panic!(
+                    "finite native pressure child reached deadline; kill={kill_result:?}, wait={wait_result:?}"
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
     }
 }

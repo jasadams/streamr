@@ -1,3 +1,35 @@
+## Active STR-154 — shared RocksDB write-buffer progress — 2026-10-25
+
+- Recovery worker `codex-01a171dc-905e-70a3-8190-3436e44aaa47`; branch
+  `jason/str-154-wbm-20261025`, fetched base `ac15b4e9`. Read current
+  `AGENTS.md`, `.claude/build-test.md`, `.claude/team.md`, this ledger/feature
+  plan and current STR-154. Previous dirty test tree and evidence preserved.
+- Fresh old-code regression reaches native shared WBM4200448B above4194304B;
+  four contributor writes return, then empty C's native write stalls until the
+  30s parent kills/reaps it (exit101). Same inputs/budgets/peak observer with
+  minimal successful-write pressure flush pass all513 point readbacks/cleanup.
+  Independent observer/plan and backend source reviews approve. No new scans,
+  resource pools, SQL semantics or checkpoint protocol changes.
+- Evidence: `/home/jason/qa-evidence/str154-wbm-20261025/`; old/fixed logs,
+  patches, receipts and ELFs retained outside caches in their build reservations.
+  Check/strict Clippy/fmt pass; state tests84 pass/4 existing diagnostics ignored.
+  Independently audited dev/prebuilt CLI `c6540750…` matches reviewed backend
+  `a1791474…`; native/linkage/startup/owned cleanup receipts pass. Approved
+  67-event Kafka/SIGKILL case independently passes: CP2/source64 and unchanged
+  physical64-record prefix, generation1→2 restoreCP2, fresh3 inputs,
+  CP4/source67/exact131 outputs. This is not WBM pressure proof.
+- Frozen3DB Kafka control: OLD NOT_REPRODUCED (retained2627584B below4MiB;
+  15s sampled predicate, no continuous/peak claim); FIXED513-record correctness
+  PASS. Exact3DB/PID/FD/native-generation0 and cleanup audited. Prior fixture/
+  verifier failures retained; inline-USING lowering defect is separate STR-157.
+- Real-Kafka pressure causality remains open. A proposed7DB candidate must be
+  separately frozen to restore the deployed six-native/one-typed footprint
+  with unchanged total rows/payload and limits; extra native arena overhead is explicit.
+  Next: review its source-led plan/causal predicates, then finite execution,
+  final report/review and PR CI. No adaptive growth of the terminal3DB case.
+  No production mutation, deployed-stack proof, performance/parity/deployment
+  or completion claim.
+
 ## Active STR-150 — coherent finalized-result composition — 2026-10-23
 
 - User directed fixing the captured native publication failure before finishing
