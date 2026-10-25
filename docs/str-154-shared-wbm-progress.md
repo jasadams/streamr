@@ -1,6 +1,6 @@
 # STR-154 shared RocksDB write-buffer progress
 
-This increment repairs the reproduced shared-write-buffer liveness failure. STR-154 remains open: neither the frozen three-database nor seven-database Kafka control reproduced the old sustained shared-pressure failure. Real-Kafka causal pressure qualification remains incomplete; [PR #84](https://github.com/jasadams/streamr/pull/84) remains a draft. The finite native Kafka/process-loss recovery run below passed.
+This increment repairs the reproduced shared-write-buffer liveness failure. On 2026-10-26 the user authorized merging PR #84 and closing STR-154 with the remaining qualification gap recorded. Neither frozen three-/seven-database Kafka control reproduced the old sustained pressure failure; the later 61-input old case reached pressure but its stack diagnostic failed before attachment. Real-Kafka causal qualification remains incomplete. The finite native Kafka/process-loss recovery run and the 61-input fixed correctness control passed.
 
 ## Cause and minimal repair
 
@@ -60,6 +60,6 @@ Old completed all required progress in **21.926 seconds** overall, with **6.309 
 
 There were **no stack requests, host-helper invocations or engine debugger attachments**. The repeated-native-stack criterion was therefore not exercised, and cross-namespace GDB/native-unwind capability remains unqualified. Independent checks confirmed complete inner process cleanup within the hard budget and owned engine/broker containers, network and broker volume absent. These seven-database results do **not** establish an old-fail/fixed-pass causal Kafka pressure pair; the three-database controls and 67-record SIGKILL evidence retain their separate scopes.
 
-## Remaining acceptance
+## Remaining qualification
 
-The native unit's actual old hang/fixed pass and audited 67-record SIGKILL recovery remain scoped positive evidence. Neither frozen real-Kafka comparison reproduced the old sustained pressure failure, so the causal qualification gap remains open. STR-154 remains open and PR #84 remains draft; source CI and correctness controls do not establish causal qualification or readiness to merge. No production job was restarted, reset or modified by this increment. No deployment, arbitrary storage-failure liveness, WAL reopen, throughput/RSS improvement or milestone completion is claimed.
+The native unit's actual old hang/fixed pass and audited 67-record SIGKILL recovery remain scoped positive evidence. The 61-input fixed control independently passed all42 outputs and completed source checkpoints19/41/60/61 with unchanged committed A/B DATA prefixes. Its old counterpart observed4200448 bytes and no C completion/source61 before diagnostics failed; no native stack capture occurred, so this is not a qualified causal pair. Evidence: `independent-wide-old1-terminal-review.md` and `independent-wide-fixed1-terminal-review.md` under the evidence root above. The user accepted merging the reviewed repair and closing the ticket with this gap recorded. Source CI and correctness controls do not establish the missing causal qualification. No production job was restarted, reset or modified by this increment. No deployment, arbitrary storage-failure liveness, WAL reopen, throughput/RSS improvement or milestone completion is claimed.
