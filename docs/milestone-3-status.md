@@ -14,7 +14,7 @@
 - Current-source maintained fmt/check/strict Clippy PASS; reader1,
   continuous-MERGE63 and native-capability14 tests PASS after two test-only
   fixture/assertion repairs (original failures preserved). Fresh test review
-  APPROVE; changes staged, no commit. No CSE disable, UDF workaround or clock change.
+  APPROVE. No CSE disable, UDF workaround or clock change.
 - Same normal-dev/prebuilt pin `b1a00509…`: memory/RocksDB actual SIGKILL recovery
   PASS exact130 typed transitions/64 closures, actual CP1/source offset64 and
   unchanged physical prefix. Both unpaced uninterrupted cases FAIL exact130
