@@ -1,3 +1,37 @@
+## Active STR-155 — SESSION aggregate CAST/CSE registration — 2026-10-25
+
+- Worker `codex-01a171e2-f826-7683-b478-f9b11f250e10`; branch
+  `jason/str-155-session-cse-20261025`, fresh fetched base
+  `ac15b4e9dec7bfa5a8ea080a712c71897c520ca5`. Guidance: `AGENTS.md`,
+  `.claude/build-test.md`, `.claude/team.md`, this ledger and feature plan.
+- Acceptance: preserve captured native SESSION CAST query, explain upstream/CSE
+  cause before repair, retain selector/raw-clock semantics and validate focused
+  memory/RocksDB SQL and recovery with independent review and required CI.
+- Cause/proposal reported before repair: projection re-inference refines CAST/ts
+  nullability while the ordinary keyed reader caches its older logical schema.
+  Metadata refresh and exact-original-SQL/schema/selector regressions implemented;
+  independent source review APPROVE. No decision pending.
+- Current-source maintained fmt/check/strict Clippy PASS; reader1,
+  continuous-MERGE63 and native-capability14 tests PASS after two test-only
+  fixture/assertion repairs (original failures preserved). Fresh test review
+  APPROVE; changes staged, no commit. No CSE disable, UDF workaround or clock change.
+- Same normal-dev/prebuilt pin `b1a00509…`: memory/RocksDB actual SIGKILL recovery
+  PASS exact130 typed transitions/64 closures, actual CP1/source offset64 and
+  unchanged physical prefix. Both unpaced uninterrupted cases FAIL exact130
+  timeout with66 inserts/0 closures; full runtime outer exit1 preserved.
+- Memory liveness CP46–60 actually decode source66, raw maximum00:32 but
+  emitted/max watermark2019-12-31T23:59:55, below00:30 session deadlines.
+  Exact batch lengths unmeasured. Existing upstream batch-MIN behavior unchanged;
+  unpaced oracle remains a separate acceptance gap, not a STR-155 regression.
+  No code work cut/deferred. Independent final review approves narrow repair
+  and exact recovery; all1344 compiled inputs match pin, owned cleanup4/4.
+  Complete four-case acceptance remains unmet. Next: publication/CI.
+- Evidence: STR-155 and original SQL/validation under
+  `/home/jason/qa-evidence/str154-native-kafka-checkpoint-stall-20261023/old-64-partitioned/`.
+  Final gates/source receipt under `/home/jason/qa-evidence/str155-session-cse-20261025/planner-gates/`;
+  Runtime matrix/receipts and `watermark-contract.{json,md}` under the same root;
+  [repair/evidence notes](str-155-session-cse.md). CI remains pending.
+
 ## Active STR-150 — coherent finalized-result composition — 2026-10-23
 
 - User directed fixing the captured native publication failure before finishing

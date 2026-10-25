@@ -233,11 +233,90 @@ impl UserDefinedLogicalNodeCore for KeyCalculationExtension {
             KeysOrExprs::Exprs(_) => KeysOrExprs::Exprs(exprs),
         };
 
+        // Ordinary keyed readers copy the complete row. Child rewrites can
+        // refine its fields (including scalar-expression nullability), so the
+        // logical reader must track the same schema as the graph output.
+        // Named/trimmed and expression-key readers have separate layouts.
+        let schema = if self.name.is_none() && matches!(keys, KeysOrExprs::Keys(_)) {
+            inputs[0].schema().clone()
+        } else {
+            self.schema.clone()
+        };
+
         Ok(Self {
             name: self.name.clone(),
             input: inputs[0].clone(),
             keys,
-            schema: self.schema.clone(),
+            schema,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_schema::{DataType, TimeUnit};
+    use datafusion::logical_expr::EmptyRelation;
+
+    fn input(nullable: bool) -> LogicalPlan {
+        LogicalPlan::EmptyRelation(EmptyRelation {
+            produce_one_row: false,
+            schema: Arc::new(
+                DFSchema::try_from(Schema::new(vec![
+                    Field::new("key", DataType::Utf8, false),
+                    Field::new("value", DataType::Int64, nullable),
+                    Field::new(
+                        arroyo_rpc::TIMESTAMP_FIELD,
+                        DataType::Timestamp(TimeUnit::Nanosecond, None),
+                        false,
+                    ),
+                ]))
+                .unwrap(),
+            ),
+        })
+    }
+
+    #[test]
+    fn keyed_reader_tracks_rewritten_fields_without_changing_other_layouts() {
+        let previous = input(true);
+        let replacement = input(false);
+        let ordinary = KeyCalculationExtension::new(previous.clone(), KeysOrExprs::Keys(vec![0]));
+        let rebound = ordinary
+            .with_exprs_and_inputs(vec![], vec![replacement.clone()])
+            .unwrap();
+        assert_eq!(rebound.schema, *replacement.schema());
+        assert_eq!(
+            rebound.schema.as_arrow(),
+            rebound.output_schema().schema.as_ref()
+        );
+        assert_eq!(rebound.keys, ordinary.keys);
+
+        let trimmed = KeyCalculationExtension::new_named_and_trimmed(
+            previous.clone(),
+            vec![0],
+            "join".into(),
+        );
+        let rebound = trimmed
+            .with_exprs_and_inputs(vec![], vec![replacement.clone()])
+            .unwrap();
+        assert_eq!(rebound.schema, trimmed.schema);
+        assert_eq!(
+            rebound
+                .schema
+                .fields()
+                .iter()
+                .map(|field| field.name().as_str())
+                .collect::<Vec<_>>(),
+            vec!["value", arroyo_rpc::TIMESTAMP_FIELD]
+        );
+        assert_eq!(rebound.name, trimmed.name);
+
+        let expression =
+            KeyCalculationExtension::new(previous, KeysOrExprs::Exprs(vec![col("key")]));
+        let rebound = expression
+            .with_exprs_and_inputs(vec![col("value")], vec![replacement])
+            .unwrap();
+        assert_eq!(rebound.schema, expression.schema);
+        assert_eq!(rebound.keys, KeysOrExprs::Exprs(vec![col("value")]));
     }
 }
