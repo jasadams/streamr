@@ -22,11 +22,17 @@
   15s sampled predicate, no continuous/peak claim); FIXED513-record correctness
   PASS. Exact3DB/PID/FD/native-generation0 and cleanup audited. Prior fixture/
   verifier failures retained; inline-USING lowering defect is separate STR-157.
-- Real-Kafka pressure causality remains open. A proposed7DB candidate must be
-  separately frozen to restore the deployed six-native/one-typed footprint
-  with unchanged total rows/payload and limits; extra native arena overhead is explicit.
-  Next: review its source-led plan/causal predicates, then finite execution,
-  final report/review and PR CI. No adaptive growth of the terminal3DB case.
+- Frozen7DB Kafka control also terminates: OLD NOT_REPRODUCED and FIXED
+  correctness PASS, each513 exact outputs/source513CP2 after emptyCP1. Same
+  worker/PIDFD/native-generation0/sevenDB/shared-WBM ownership independently
+  audited. Thirteen retained resource samples reach3160064B (not peak proof);
+  no native stack request was triggered. All owned resources cleaned up.
+- Real-Kafka pressure causality remains open. Reviewed source increment is
+  draft PR84, head931f11d, six CI checks green; it does not close STR-154.
+  Next: bounded source-led analysis of existing native SQL write sizes before
+  deciding whether another frozen pressure candidate is justified. No adaptive
+  growth of terminal controls. Snapshot restore uses16-row decoded batches;
+  it does not establish a larger-write pressure reproduction.
   No production mutation, deployed-stack proof, performance/parity/deployment
   or completion claim.
 
