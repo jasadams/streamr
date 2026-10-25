@@ -20,8 +20,11 @@
   Separate physical trace14→5 directories/28→10 directory-read calls;
   synthetic warm-cache result, no production/STR-154 speed or recovery claim.
   Full source/pin/native/host/oracle/cleanup receipts preserved; no rerun.
-- Next: final independent source/evidence review, commit/publication and
-  current-head CI, then merge-sweeper handoff. Report `docs/str-156-validation.md`;
+- Final evidence review KEEP and integration review APPROVE, no findings.
+  Rebased onto057c634a, preserved entire incoming ledger; identical three
+  product/test hashes. Fresh integrated fmt/check/strict Clippy and all30
+  selected tests PASS. Original optimized pins retain original provenance.
+- Next: publication/current-head CI, then merge-sweeper handoff. Report `docs/str-156-validation.md`;
   evidence `/home/jason/qa-evidence/str156-cleanup-20261026/`. No decision pending.
 
 ## Active STR-154 — shared RocksDB write-buffer progress — 2026-10-25

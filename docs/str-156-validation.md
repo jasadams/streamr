@@ -123,6 +123,24 @@ source restored, commands joined and queue released. Raw receipts and analysis:
 `gates.json`, `analysis.json`, `source-inverse-proof.json`, `*-native-linkage-proof.json`,
 `*-runtime-linkage.json`, `*-host.json` and `*-cleanup.json` under the evidence root.
 
+## Integrated publication source
+
+Main advanced by one STR-154 RocksDB-only commit during measurement. The ticket
+was rebased onto `057c634a481ad96251e15bb497e8a179a9779778` as `8efe8319`.
+Only the ledger prepend conflicted; both complete ticket entries were preserved.
+Independent integration review approved and verified the three product/test file
+hashes still match the measured candidate, while the entire incoming ledger is
+preserved. Applicable instructions did not change.
+
+The exact same normal dev fmt, affected locked check, strict Clippy, storage8,
+cleanup4 (one opt-in benchmark ignored), and checkpoint18 tests all passed again
+on integrated source, exit 0. Receipts: `rebased-gates/` under the evidence root.
+Independent evidence review recommends KEEP with no findings. The optimized
+measurement remains explicitly bound to its original base and pins; the unchanged
+LocalFileSystem cleanup path does not exercise the incoming RocksDB write change.
+No second optimized campaign was run. Publication/current-head CI are separate
+from these completed source and correctness gates.
+
 ## Delivery boundary
 
 This repair does not establish that STR-154's shared-write-buffer checkpoint
