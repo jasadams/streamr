@@ -1522,6 +1522,145 @@ fn finalized_session_merge() -> String {
      SELECT source.t,source.k,old.n AS previous_n,new.n AS n,action,
        applied._timestamp AS finalized_at FROM applied;".into()
 }
+
+#[test(tokio::test)]
+async fn session_cast_cse_reader_matches_registered_input() {
+    use crate::physical::{ArroyoPhysicalExtensionCodec, DecodingContext};
+    use datafusion::physical_plan::aggregates::AggregateExec;
+    use datafusion_proto::{physical_plan::AsExecutionPlan, protobuf::PhysicalPlanNode};
+
+    // Preserve the complete captured failure, including downstream native MERGE.
+    let sql = include_str!("queries/str155-session-cast.sql");
+    let compiled = plan(sql).await;
+    let registry = ArroyoSchemaProvider::new();
+    let runtime = datafusion::execution::runtime_env::RuntimeEnvBuilder::new()
+        .build()
+        .unwrap();
+    let codec = ArroyoPhysicalExtensionCodec {
+        context: DecodingContext::Planning,
+    };
+    let decode = |bytes: &[u8]| {
+        PhysicalPlanNode::decode(bytes)
+            .unwrap()
+            .try_into_physical_plan(&registry, &runtime, &codec)
+            .unwrap()
+    };
+    use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+    use datafusion::physical_expr::expressions::CastExpr;
+    use datafusion::physical_plan::projection::ProjectionExec;
+    use petgraph::visit::EdgeRef;
+
+    let graph = &compiled.program.graph;
+    let mut sessions = 0;
+    for index in graph.node_indices() {
+        let chain = graph[index].operator_chain.iter().collect::<Vec<_>>();
+        for (position, (operator, _)) in chain.iter().enumerate() {
+            if operator.operator_name != OperatorName::SessionWindowAggregate {
+                continue;
+            }
+            sessions += 1;
+            let config = arroyo_rpc::grpc::api::SessionWindowAggregateOperator::decode(
+                operator.operator_config.as_slice(),
+            )
+            .unwrap();
+            let input: arroyo_rpc::df::ArroyoSchema =
+                config.input_schema.unwrap().try_into().unwrap();
+            // Bind the proof to this SESSION's actual producer, including
+            // chained edges. Other routing adapters can carry the CSE column.
+            let (key_operator, edge_schema) = if position > 0 {
+                let (previous, output) = chain[position - 1];
+                (previous.clone(), output.unwrap().clone())
+            } else {
+                let incoming = graph
+                    .edges_directed(index, petgraph::Direction::Incoming)
+                    .collect::<Vec<_>>();
+                assert_eq!(incoming.len(), 1);
+                let edge = &incoming[0];
+                (
+                    graph[edge.source()]
+                        .operator_chain
+                        .iter()
+                        .last()
+                        .unwrap()
+                        .0
+                        .clone(),
+                    edge.weight().schema.clone(),
+                )
+            };
+            assert_eq!(edge_schema.as_ref(), &input);
+            assert_eq!(key_operator.operator_name, OperatorName::ArrowKey);
+            let key = arroyo_rpc::grpc::api::KeyPlanOperator::decode(
+                key_operator.operator_config.as_slice(),
+            )
+            .unwrap();
+            let key_physical = decode(&key.physical_plan);
+            assert_eq!(key_physical.schema(), input.schema);
+            let mut casts = 0;
+            key_physical
+                .apply(|node| {
+                    if let Some(projection) = node.as_any().downcast_ref::<ProjectionExec>() {
+                        casts += projection
+                            .expr()
+                            .iter()
+                            .filter(|(expression, name)| {
+                                name == "__common_expr_1" && expression.as_any().is::<CastExpr>()
+                            })
+                            .count();
+                    }
+                    Ok(TreeNodeRecursion::Continue)
+                })
+                .unwrap();
+            assert_eq!(
+                casts, 1,
+                "SESSION's shared CAST must remain in its actual producer"
+            );
+            let physical = decode(&config.final_aggregation_plan);
+            crate::physical::validate_session_result_plan(physical.as_ref(), &input.schema)
+                .unwrap();
+            assert!(
+                !input
+                    .schema
+                    .field_with_name("__common_expr_1")
+                    .unwrap()
+                    .is_nullable()
+            );
+            assert!(!input.schema.field_with_name("ts").unwrap().is_nullable());
+            let aggregate = physical.as_any().downcast_ref::<AggregateExec>().unwrap();
+            let selectors: Vec<_> = aggregate
+                .aggr_expr()
+                .iter()
+                .filter(|expression| {
+                    crate::grouped_selector_udaf::classify(expression.fun()).is_some()
+                })
+                .collect();
+            assert_eq!(selectors.len(), 2);
+            for selector in selectors {
+                crate::grouped_selector_udaf::selector_spec(selector, &aggregate.input_schema())
+                    .unwrap();
+                let primary = &selector.order_bys().unwrap()[0];
+                let column = primary
+                    .expr
+                    .as_any()
+                    .downcast_ref::<datafusion::physical_expr::expressions::Column>()
+                    .unwrap();
+                assert_eq!(column.name(), arroyo_rpc::TIMESTAMP_FIELD);
+                assert_eq!(column.index(), input.timestamp_index);
+                assert!(!primary.options.descending && !primary.options.nulls_first);
+            }
+            let reader = aggregate.input_schema();
+            assert_eq!(reader.fields().len(), input.schema.fields().len() + 1);
+            assert_eq!(
+                &reader.fields()[..input.schema.fields().len()],
+                input.schema.fields().as_ref()
+            );
+            assert_eq!(
+                reader.fields().last().unwrap().name(),
+                crate::grouped_selector::ORDINAL_FIELD
+            );
+        }
+    }
+    assert_eq!(sessions, 1);
+}
 // Record the ordinary native producer before proving its MERGE consumer. This
 // keeps its actual admission/key/physical lowering visible when a proof fails.
 async fn record_ordinary_session_plan(sql: &str) {
