@@ -1,6 +1,6 @@
 # STR-159: one orphan traversal per job
 
-The experiment did not meet the user's 10–20× completed-application-throughput target. The observed matched pair improved 1.5446×. Recommendation: reject this change as the proposed 10× solution; preserve the unmerged candidate and evidence for the user's decision. No merge, release or production mutation occurred.
+The experiment did not meet the user's 10–20× completed-application-throughput target. The observed matched pair improved 1.5446×. The user accepted this partial improvement for source merge on 2026-10-26. The 10× minimum remains unmet; deployment is explicitly deferred. Required current-head PR CI and merge review still gate delivery.
 
 ## Source and mechanism
 
@@ -59,11 +59,11 @@ Queue job `813f6aa7a428` covered both `scripts/build-pin --profile release` buil
 
 Primary receipts: `result.json`, `independent-final-measurement-verdict.json`, `independent-final-application-measurement-verdict.json`, `independent-package-audit.json`, `independent-source-proof-control-audit.json`, `matched-pair/pair-result.json`, both runtime rate histories and CPU samples, and all cleanup receipts.
 
-## Limits and remaining decision
+## Limits and delivery decision
 
 - This is one nonrandomized matched application fixture with synthetic immediate checkpoint-directory children. Actual nested directory/file history differs from production; start counts/nesting and subsequent real checkpoint additions are recorded. It is not a production replay throughput guarantee or a regression claim.
 - Host load differed: BEFORE one-minute load 3.73→7.75, AFTER 3.51→3.34. A precise general causal speedup is not established. The observed pair is clearly below 10×.
 - CPU uses stable PID/start counters through the frozen boundary (66.47ms BEFORE, 10.24ms AFTER beyond the credited endpoint). RSS is sampled summed per-process residency, with actual maximum sampling gaps 3.990s BEFORE and 2.048s AFTER; cgroup memory high-water can include preload/page cache/observer memory.
 - The frozen harness had a quadratic offline capture-validation loop. It delayed test completion outside both credited processing/CPU boundaries; the same frozen harness was used for both arms. This is a harness inefficiency, not an engine performance result.
 - The existing STR-126 larger-than-memory/full recovery qualification was reused; no 1.2M-event campaign was repeated. This experiment does not qualify production cutover, FlareDB ingestion throughput or deferred application features.
-- Hosted PR CI was not run because the experiment remains unpublished. Local maintained gates passed. Keeping/merging this partial improvement or selecting another hypothesis requires the user's next decision; no automatic rollout or second experiment follows.
+- Local maintained gates passed. The user authorized merging this partial improvement, with required current-head PR CI and independent review before merge. No deployment, tag or image publication is authorized; remaining-bottleneck diagnosis is separate from this delivery.

@@ -3,9 +3,9 @@
 - Completed one reviewed matched native application experiment. Target **not met**: 46.793875→72.277789 completed DATA/s, **1.5446×**, against minimum 10×. Both exact 5,000-event tails and application/recovery oracles passed.
 - Actual engine candidate `fdcca282185905645ca5b29cfaa85658d68c643d`, base `fe2b44154e21887c4d2953c362c822e7a57c8511`; app harness `79673406028cdfa817a756009471a02831c2f658`. Unrelated invoking changes preserved.
 - CPU 297.21→136.30s; controller 165.93→11.83s, profile worker 105.31→103.61s. Controller cleanup improved; remaining profile work stayed essentially unchanged.
-- Dev correctness/check/Clippy, actual public stop/resume, exact literal outputs, independent raw/Parquet/native/package audits and owned cleanup passed. No new RocksDB scan, semantic/resource change, UDF or alternate processor. Hosted PR CI not run; no publication/merge/deploy.
+- Dev correctness/check/Clippy, actual public stop/resume, exact literal outputs, independent raw/Parquet/native/package audits and owned cleanup passed. No new RocksDB scan, semantic/resource change, UDF or alternate processor. User authorized source merge only; required current-head PR CI still gates delivery. No image publication or deployment.
 - Evidence `/home/jason/qa-evidence/str159-single-pass-20261026/`; exact commands/results/limits in [STR-159 validation](str-159-validation.md). Synthetic history/host load qualify production inference; no full qualification campaign repeated.
-- Recommendation: reject as the proposed 10× solution; preserve unmerged candidate for user decision. No further performance experiment or rollout is running. Queue released after verified owned cleanup. Original quadratic offline harness cost was outside measured intervals.
+- User accepted the partial improvement for source merge on 2026-10-26; the 10× minimum remains unmet and deployment is explicitly deferred. No further performance experiment or rollout is running. Queue released after verified owned cleanup. Original quadratic offline harness cost was outside measured intervals.
 
 ## Active STR-157 — inline MERGE source materialization — 2026-10-26
 
