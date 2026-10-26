@@ -1,3 +1,32 @@
+## Active STR-156 — checkpoint cleanup traversal — 2026-10-26
+
+- Worker `codex-01a174d5-627c-70c2-a63e-96b04e1f81ae`; branch
+  `jason/str-156-cleanup-20261026`, fetched base `d208beda8ea36389d198cf03ad992fea3ba8147a`.
+  Guidance: `AGENTS.md`, `.claude/build-test.md`, `.claude/team.md`, this ledger
+  and feature plan. Invoking dirty checkout and released clean preparation tree preserved.
+- Acceptance: job-prefix physical enumeration, unchanged exact orphan/retention
+  oracle, interruption/fresh-storage retry, focused maintained dev/prebuilt gates,
+  independent source review, one bounded optimized matched cleanup comparison,
+  publication/current-head CI. No STR-154 stall fix or deployment claim.
+- Exact plan `6f28b42353115a226a0abb3c0317b434e551f0c89a994ac05e1f7b81ef0f217e`
+  has three independent pre-code approvals (lifecycle/storage/performance).
+  Prefix starts pinned object_store0.12.3 filesystem WalkDir inside owning job;
+  repeated within-job traversal remains. No policy/protocol/resource changes.
+- Maintained matching-prebuilt dev fmt/check/strict Clippy PASS; storage8,
+  cleanup4 (one opt-in benchmark ignored here) and checkpoint18 tests PASS.
+  Actual partial1/256 deletion then fresh retry256 and physical isolation PASS.
+- One release ABBA complete64-deletion/four-owner oracle PASS in all arms:
+  baseline285–295ms/CPU1.09–1.14s, candidate11–14ms/CPU0.037–0.046s.
+  Separate physical trace14→5 directories/28→10 directory-read calls;
+  synthetic warm-cache result, no production/STR-154 speed or recovery claim.
+  Full source/pin/native/host/oracle/cleanup receipts preserved; no rerun.
+- Final evidence review KEEP and integration review APPROVE, no findings.
+  Rebased onto057c634a, preserved entire incoming ledger; identical three
+  product/test hashes. Fresh integrated fmt/check/strict Clippy and all30
+  selected tests PASS. Original optimized pins retain original provenance.
+- Next: publication/current-head CI, then merge-sweeper handoff. Report `docs/str-156-validation.md`;
+  evidence `/home/jason/qa-evidence/str156-cleanup-20261026/`. No decision pending.
+
 ## Active STR-154 — shared RocksDB write-buffer progress — 2026-10-25
 
 - Recovery worker `codex-01a171dc-905e-70a3-8190-3436e44aaa47`; branch

@@ -393,7 +393,7 @@ pub async fn cleanup_abandoned_controller_disk_files(
     let namespace = format!("{job_id}/checkpoints/");
     let qualified = storage.qualify_path(&namespace.as_str().into()).to_string();
     let prefix = format!("{}/", qualified.trim_end_matches('/'));
-    let listing = storage.list(true).await?;
+    let listing = storage.list_prefix(namespace.as_str().into()).await?;
     futures::pin_mut!(listing);
     while let Some(object) = listing
         .try_next()
@@ -428,33 +428,4 @@ pub async fn cleanup_abandoned_controller_disk_files(
 }
 
 #[cfg(test)]
-mod disk_cleanup_tests {
-    use super::*;
-    #[tokio::test]
-    async fn cleans_abandoned_pages_only_below_retained_minimum_and_for_owned_operator() {
-        let root = tempfile::tempdir().unwrap();
-        let storage =
-            arroyo_storage::StorageProvider::for_url(&format!("file://{}", root.path().display()))
-                .await
-                .unwrap();
-        let abandoned = "J/checkpoints/checkpoint-0000001/operator-o/table-m-000/disk-orphan.bin";
-        let retained = "J/checkpoints/checkpoint-0000002/operator-o/table-m-000/disk-keep.bin";
-        let active = "J/checkpoints/checkpoint-0000003/operator-o/table-m-000/disk-upload.bin";
-        let foreign =
-            "J/checkpoints/checkpoint-0000001/operator-other/table-m-000/disk-foreign.bin";
-        let legacy = "J/checkpoints/checkpoint-0000001/operator-o/table-legacy-000";
-        for path in [abandoned, retained, active, foreign, legacy] {
-            storage.put(path, vec![1]).await.unwrap();
-        }
-        cleanup_abandoned_controller_disk_files(&storage, "J", "o", 2, &HashSet::new())
-            .await
-            .unwrap();
-        assert!(!storage.exists(abandoned).await.unwrap());
-        for path in [retained, active, foreign, legacy] {
-            assert!(storage.exists(path).await.unwrap());
-        }
-        cleanup_abandoned_controller_disk_files(&storage, "J", "o", 2, &HashSet::new())
-            .await
-            .unwrap();
-    }
-}
+mod disk_cleanup_tests;
