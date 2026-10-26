@@ -51,8 +51,12 @@ fn unique_root(label: &str) -> std::path::PathBuf {
 }
 
 async fn harness(rocks: bool) -> Harness {
+    harness_sql(rocks, SQL).await
+}
+
+async fn harness_sql(rocks: bool, sql: &str) -> Harness {
     let compiled = arroyo_planner::parse_and_get_program(
-        SQL,
+        sql,
         arroyo_planner::ArroyoSchemaProvider::new(),
         arroyo_planner::SqlConfig {
             default_parallelism: 1,
@@ -541,6 +545,291 @@ async fn local_scalar_merge_checkpoint_fresh_worker_memory_rocks_batches_1_8() {
             restored.close().await;
             drop(storage);
             std::fs::remove_dir_all(checkpoint_root).unwrap();
+        }
+    }
+}
+
+fn inline_merge_sql(projection: &str, named: bool) -> String {
+    let view = if named {
+        format!("CREATE VIEW selected AS SELECT {projection} FROM items WHERE owner='C';")
+    } else {
+        String::new()
+    };
+    let source = if named {
+        "selected".to_string()
+    } else {
+        format!("(SELECT {projection} FROM items WHERE owner='C')")
+    };
+    format!("CREATE TABLE items(owner TEXT NOT NULL,k BIGINT NOT NULL,payload TEXT NOT NULL) WITH (connector='single_file',path='/tmp/inline-merge-items.jsonl',format='json',type='source');
+    CREATE STATE TABLE c_rows(k BIGINT,payload TEXT,PRIMARY KEY(k)) PARTITION BY k;
+    {view}
+    CREATE VIEW applied AS MERGE INTO c_rows AS target USING {source} AS source ON target.k=source.k
+    WHEN MATCHED THEN UPDATE SET payload=source.payload
+    WHEN NOT MATCHED THEN INSERT(k,payload) VALUES(source.k,source.payload)
+    RETURNING source AS source,old AS old,new AS new,action AS action;
+    SELECT * FROM applied;")
+}
+
+impl Harness {
+    async fn items(&mut self, rows: &[(&str, i64, &str)]) -> Vec<RecordBatch> {
+        let columns = self
+            .input
+            .fields()
+            .iter()
+            .map(|field| match field.name().as_str() {
+                "owner" => Arc::new(StringArray::from(
+                    rows.iter().map(|r| r.0).collect::<Vec<_>>(),
+                )) as ArrayRef,
+                "k" => Arc::new(arrow_array::Int64Array::from(
+                    rows.iter().map(|r| r.1).collect::<Vec<_>>(),
+                )) as ArrayRef,
+                "payload" => Arc::new(StringArray::from(
+                    rows.iter().map(|r| r.2).collect::<Vec<_>>(),
+                )) as ArrayRef,
+                "_timestamp" => {
+                    Arc::new(TimestampNanosecondArray::from(vec![17; rows.len()])) as ArrayRef
+                }
+                name => panic!("unexpected raw column {name}"),
+            })
+            .collect();
+        // All raw source rows, including A/B and dropped columns, enter the
+        // SQL-planned worker. No test-side relational transformation occurs.
+        assert_eq!(self.input.fields().len(), 4);
+        let mut captures = Captures::default();
+        self.owner
+            .process_batch(
+                RecordBatch::try_new(self.input.clone(), columns).unwrap(),
+                &mut self.context,
+                &mut captures,
+            )
+            .await
+            .unwrap();
+        captures
+            .0
+            .iter()
+            .flat_map(|batch| {
+                (0..batch.num_rows()).map(|row| {
+                    extract_capture(
+                        &batch.slice(row, 1),
+                        0,
+                        self.owner.program.capture_schemas[0].clone(),
+                    )
+                    .unwrap()
+                })
+            })
+            // Null capture envelopes represent filtered events, not rows.
+            .filter(|capture| capture.num_rows() != 0)
+            .collect()
+    }
+
+    async fn assert_items_stored(&self) {
+        for (key, payload) in [(1, Some("replacement")), (2, Some("second")), (3, None)] {
+            let key = RecordBatch::try_new(
+                Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, false)])),
+                vec![Arc::new(arrow_array::Int64Array::from(vec![key]))],
+            )
+            .unwrap();
+            let value = self
+                .owner
+                .tables
+                .values()
+                .next()
+                .unwrap()
+                .get(&key)
+                .await
+                .unwrap();
+            match payload {
+                Some(payload) => {
+                    let value = value.unwrap();
+                    assert_eq!(value.batch().num_rows(), 1);
+                    assert_eq!(value.batch().column(0), key.column(0));
+                    assert_eq!(
+                        value
+                            .batch()
+                            .column(1)
+                            .as_any()
+                            .downcast_ref::<StringArray>()
+                            .unwrap()
+                            .value(0),
+                        payload
+                    );
+                }
+                None => assert!(value.is_none(), "excluded A key3 must not write state"),
+            }
+        }
+    }
+}
+
+fn assert_item(
+    capture: &RecordBatch,
+    source_fields: &[&str],
+    key: i64,
+    payload: &str,
+    old: Option<&str>,
+) {
+    assert_eq!(capture.num_rows(), 1);
+    for (index, expected_payload) in [(0, Some(payload)), (1, old), (2, Some(payload))] {
+        let row = capture
+            .column(index)
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        assert_eq!(row.is_null(0), expected_payload.is_none());
+        if let Some(expected_payload) = expected_payload {
+            assert_eq!(
+                row.column_by_name("k")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<arrow_array::Int64Array>()
+                    .unwrap()
+                    .value(0),
+                key
+            );
+            assert_eq!(
+                row.column_by_name("payload")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap()
+                    .value(0),
+                expected_payload
+            );
+        }
+        if index == 0 {
+            assert_eq!(
+                row.fields()
+                    .iter()
+                    .map(|f| f.name().as_str())
+                    .collect::<Vec<_>>(),
+                source_fields
+            );
+            if let Some(owner) = row.column_by_name("owner") {
+                assert_eq!(
+                    owner
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .unwrap()
+                        .value(0),
+                    "C"
+                );
+            }
+        }
+    }
+    assert_eq!(
+        capture
+            .column(3)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .value(0),
+        if old.is_some() { "update" } else { "insert" }
+    );
+    assert_eq!(
+        capture
+            .column(4)
+            .as_any()
+            .downcast_ref::<TimestampNanosecondArray>()
+            .unwrap()
+            .value(0),
+        17
+    );
+}
+
+#[tokio::test]
+async fn inline_merge_filter_projection_checkpoint_fresh_worker_memory_rocks() {
+    for rocks in [false, true] {
+        for (projection, fields) in [
+            ("k,payload", vec!["k", "payload"]),
+            ("payload,k", vec!["payload", "k"]),
+            ("owner,k,payload", vec!["owner", "k", "payload"]),
+        ] {
+            for named in [false, true] {
+                let sql = inline_merge_sql(projection, named);
+                let mut worker = harness_sql(rocks, &sql).await;
+                let first = worker
+                    .items(&[
+                        ("A", 1, "excluded-a"),
+                        ("C", 1, "first"),
+                        ("B", 2, "excluded-b"),
+                    ])
+                    .await;
+                assert_eq!(first.len(), 1, "{sql}");
+                assert_item(&first[0], &fields, 1, "first", None);
+                let config = worker.checkpoint_config();
+                let namespace = worker
+                    .owner
+                    .tables
+                    .values()
+                    .next()
+                    .unwrap()
+                    .namespace()
+                    .clone();
+                let root = unique_root("inline-checkpoint");
+                std::fs::create_dir_all(&root).unwrap();
+                let storage = get_storage_provider(&StorageProviderFor::Controller {
+                    storage_url: Some(format!("file://{}", root.display())),
+                })
+                .await
+                .unwrap();
+                let snapshot = worker.backend.snapshot().await.unwrap();
+                let selected = checkpoint::export_typed(
+                    &snapshot,
+                    &namespace,
+                    &config,
+                    &storage,
+                    &format!(
+                        "local-recovery/checkpoints/checkpoint-0000007/operator-owner/table-{}-000",
+                        config.transport_name
+                    ),
+                    7,
+                    0,
+                    0,
+                    16,
+                )
+                .await
+                .unwrap();
+                drop(snapshot);
+                let selected = TypedStateTableSubtaskCheckpointMetadata::decode(
+                    selected.encode_to_vec().as_slice(),
+                )
+                .unwrap();
+                let suffix = [
+                    ("B", 1, "excluded-replacement"),
+                    ("C", 1, "replacement"),
+                    ("C", 2, "second"),
+                    ("A", 3, "excluded-new"),
+                ];
+                let expected = worker.items(&suffix).await;
+                assert_eq!(expected.len(), 2);
+                assert_item(&expected[0], &fields, 1, "replacement", Some("first"));
+                assert_item(&expected[1], &fields, 2, "second", None);
+                worker.assert_items_stored().await;
+                worker.close().await;
+                let mut fresh = harness_sql(rocks, &sql).await;
+                let fresh_namespace = fresh
+                    .owner
+                    .tables
+                    .values()
+                    .next()
+                    .unwrap()
+                    .namespace()
+                    .clone();
+                assert_eq!(fresh_namespace, namespace);
+                checkpoint::restore_typed(
+                    fresh.backend.as_ref(),
+                    &fresh_namespace,
+                    &config,
+                    &selected,
+                    &storage,
+                )
+                .await
+                .unwrap();
+                assert_eq!(fresh.items(&suffix).await, expected);
+                fresh.assert_items_stored().await;
+                fresh.close().await;
+                drop(storage);
+                std::fs::remove_dir_all(root).unwrap();
+            }
         }
     }
 }
