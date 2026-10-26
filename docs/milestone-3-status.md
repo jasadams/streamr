@@ -1,3 +1,25 @@
+## Active STR-157 — inline MERGE source materialization — 2026-10-26
+
+- Branch `jason/str-157-inline-merge-20261026`, fetched base
+  `476baa5b096e27158cec4f956d6bbe93dbd6bd3b`; instructions `AGENTS.md`,
+  `.claude/build-test.md`, `.claude/team.md`, this ledger/feature plan and full
+  Trakkt STR-157 read. Invoking checkout preserved; no signing/time limit.
+- Repair uses the existing native value boundary for resolved MERGE sources;
+  worker schema guard, predicates, clock, ownership and checkpoint contracts stay
+  intact. No new scans, resource pools, SQL syntax or backend behavior.
+- Native matrix12 arms PASS: dropped/reordered/same-width filter × inline/named
+  × memory/RocksDB, literal source/old/new/action and clock, excluded A/B rows,
+  known-key readbacks, typed checkpoint/fresh decoded worker continuation.
+- Maintained dev/prebuilt check/strict Clippy/fmt pass; planner64 and final
+  worker31 pass/1 existing ignore. Old-code planner control fails exact raw vs
+  projected schema; exact fixed SHA restored and focused planner control passes.
+  Initial helper-count and fixture checkpoint-path failures remain recorded,
+  not matrix passes. Report `docs/str-157-validation.md`; evidence
+  `/home/jason/qa-evidence/str157-inline-merge-20261026/`.
+- Independent source review approves. Next: final evidence audit,
+  publication/current-head CI. No user decision pending; no controller/Kafka or
+  process-loss qualification claim.
+
 ## Active STR-156 — checkpoint cleanup traversal — 2026-10-26
 
 - Worker `codex-01a174d5-627c-70c2-a63e-96b04e1f81ae`; branch

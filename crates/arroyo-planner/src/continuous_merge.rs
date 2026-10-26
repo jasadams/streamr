@@ -328,6 +328,19 @@ pub(crate) fn plan_named_merge(
     {
         return plan_err!("native MERGE source must be an append event stream, not a changelog");
     }
+    // Graph construction visits streaming extensions; ordinary SELECT nodes are
+    // evaluated by a value boundary. Preserve the complete resolved source plan
+    // here so inline filters/projections run before state keys and clauses read it.
+    let input = LogicalPlan::Extension(Extension {
+        node: Arc::new(crate::extension::remote_table::RemoteTableExtension {
+            schema: input.schema().clone(),
+            input,
+            name: TableReference::bare("merge_source"),
+            materialize: false,
+            accepted_result: None,
+            union_schema: false,
+        }),
+    });
     let target_schema =
         DFSchema::try_from_qualified_schema(target_alias, descriptor.schema.as_ref())?;
     let mut fields = input

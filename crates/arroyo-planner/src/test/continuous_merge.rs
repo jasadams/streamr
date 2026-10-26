@@ -1969,3 +1969,50 @@ async fn maintained_merge_session_route_keeps_ordinary_window_shuffle() {
         arroyo_datastream::logical::LogicalEdgeType::Shuffle
     );
 }
+
+#[test(tokio::test)]
+async fn inline_merge_materializes_filtered_and_reordered_source() {
+    for projection in ["k,payload", "payload,k", "owner,k,payload"] {
+        let compiled = plan(&format!(
+            "CREATE TABLE items(owner TEXT NOT NULL,k BIGINT NOT NULL,payload TEXT NOT NULL) WITH (connector='single_file',path='/tmp/inline-merge-items.jsonl',format='json',type='source');
+             CREATE STATE TABLE c_rows(k BIGINT,payload TEXT,PRIMARY KEY(k)) PARTITION BY k;
+             CREATE VIEW applied AS MERGE INTO c_rows AS target USING (SELECT {projection} FROM items WHERE owner='C') AS source ON target.k=source.k
+             WHEN MATCHED THEN UPDATE SET payload=source.payload
+             WHEN NOT MATCHED THEN INSERT(k,payload) VALUES(source.k,source.payload)
+             RETURNING source AS source,old AS old,new AS new,action AS action;
+             SELECT * FROM applied;"
+        )).await;
+        let operators = state_operators(&compiled);
+        assert_eq!(operators.len(), 1);
+        let access = &operators[0];
+        let input: arroyo_rpc::df::ArroyoSchema =
+            access.input_schema.clone().unwrap().try_into().unwrap();
+        let fields = projection
+            .split(',')
+            .chain(std::iter::once("_timestamp"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            input
+                .schema
+                .fields()
+                .iter()
+                .map(|f| f.name().as_str())
+                .collect::<Vec<_>>(),
+            fields
+        );
+        let expression: arrow_schema::Schema =
+            serde_json::from_str(&access.expression_schema_json).unwrap();
+        assert_eq!(expression.fields().len(), input.schema.fields().len() + 2);
+        let owner = compiled
+            .program
+            .graph
+            .node_weights()
+            .flat_map(|node| node.operator_chain.iter())
+            .find(|(operator, _)| operator.operator_name == OperatorName::FusedStateTable)
+            .unwrap();
+        let owner = FusedStateTableOperator::decode(owner.0.operator_config.as_slice()).unwrap();
+        let raw: arroyo_rpc::df::ArroyoSchema = owner.input_schema.unwrap().try_into().unwrap();
+        assert_eq!(raw.schema.fields().len(), 4);
+        assert_eq!(owner.steps[0].kind, "value");
+    }
+}
