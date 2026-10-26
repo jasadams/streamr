@@ -1,3 +1,12 @@
+## Active STR-159 — one job-level orphan cleanup traversal — 2026-10-26
+
+- User approved one performance experiment; minimum target 10× completed application throughput, 20× stretch. Lower gains do not meet the target.
+- Fresh engine base `fe2b44154e21887c4d2953c362c822e7a57c8511`; branch `jason/str-159-one-pass-cleanup-20261026`. Application fixture base `b173ca1bf84d19877d38021f64231789dcefad90`. Unrelated dirty checkouts preserved; in-flight check CLEAR.
+- Read current `AGENTS.md`, `.claude/build-test.md`, `.claude/team.md`, milestone plan/ledger and performance-spike skill. All three independent plan reviews approved v4 SHA256 `b1f480689e2c8d2e9a045e62a8270a4a91a5f48d2d66fd8e6efa24b994577a9d`.
+- Implementing one shared orphan enumeration after known-file cleanup; retain existing semantics/resources and metadata retry ordering. No new RocksDB scans. Independent fixture/oracle and runner work lives in Arcstream.
+- Cleanup 6 tests and checkpoint 18 tests passed; locked check passed. Clippy test-only guard-scope repair is under recheck; affected controller SQL smokes compiling. Independent source and application/storage runner reviews approved frozen sources. Next: finish dev gates, then one optimized matched BEFORE/AFTER (≤599.5s processing each). No deployment or second experiment authorized by this result.
+- Evidence/plan/verdicts: `/home/jason/qa-evidence/str159-single-pass-20261026/`; prior diagnosis `/home/jason/qa-evidence/native-throughput-diagnosis-20261026/`. Dev gates in progress; no optimized build or capacity measurement yet.
+
 ## Active STR-157 — inline MERGE source materialization — 2026-10-26
 
 - Branch `jason/str-157-inline-merge-20261026`, fetched base

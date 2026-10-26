@@ -25,6 +25,138 @@ pub const GENERATIONS_TO_COMPACT: u32 = 1; // only compact generation 0 files
 
 pub struct ParquetBackend;
 
+/// Only the existing cleanup operations. The private seam permits failure tests
+/// against a real filesystem without changing configured storage or GC policy.
+#[async_trait::async_trait]
+trait CleanupStore: Sync {
+    async fn load_operator(
+        &self,
+        job: &str,
+        operator: &str,
+        epoch: u32,
+    ) -> Result<Option<OperatorCheckpointMetadata>, StateError>;
+    async fn delete(&self, path: &str) -> Result<(), StateError>;
+    async fn publish(&self, metadata: CheckpointMetadata) -> Result<(), StateError>;
+    fn qualified_prefix(&self, prefix: &str) -> String;
+    async fn list_prefix(
+        &self,
+        prefix: &str,
+    ) -> Result<
+        futures::stream::BoxStream<'_, Result<object_store::path::Path, object_store::Error>>,
+        StateError,
+    >;
+}
+
+#[async_trait::async_trait]
+impl CleanupStore for arroyo_storage::StorageProvider {
+    async fn load_operator(
+        &self,
+        job: &str,
+        operator: &str,
+        epoch: u32,
+    ) -> Result<Option<OperatorCheckpointMetadata>, StateError> {
+        self.get_if_present(metadata_path(&operator_path(job, epoch, operator)).as_str())
+            .await?
+            .map(|bytes| OperatorCheckpointMetadata::decode(bytes.as_ref()).map_err(Into::into))
+            .transpose()
+    }
+
+    async fn delete(&self, path: &str) -> Result<(), StateError> {
+        self.delete_if_present(path).await?;
+        Ok(())
+    }
+
+    async fn publish(&self, metadata: CheckpointMetadata) -> Result<(), StateError> {
+        self.put(
+            metadata_path(&base_path(&metadata.job_id, metadata.epoch)),
+            metadata.encode_to_vec(),
+        )
+        .await?;
+        Ok(())
+    }
+
+    fn qualified_prefix(&self, prefix: &str) -> String {
+        self.qualify_path(&prefix.into()).to_string()
+    }
+
+    async fn list_prefix(
+        &self,
+        prefix: &str,
+    ) -> Result<
+        futures::stream::BoxStream<'_, Result<object_store::path::Path, object_store::Error>>,
+        StateError,
+    > {
+        Ok(
+            arroyo_storage::StorageProvider::list_prefix(self, prefix.into())
+                .await?
+                .boxed(),
+        )
+    }
+}
+
+async fn cleanup_checkpoint_files<S: CleanupStore + ?Sized>(
+    storage: &S,
+    mut metadata: CheckpointMetadata,
+    old_min_epoch: u32,
+    min_epoch: u32,
+) -> Result<(), StateError> {
+    info!(
+        message = "Cleaning checkpoint",
+        min_epoch,
+        job_id = metadata.job_id
+    );
+    let mut futures: FuturesUnordered<_> = metadata
+        .operator_ids
+        .iter()
+        .map(|operator| {
+            ParquetBackend::cleanup_operator_files(
+                storage,
+                metadata.job_id.clone(),
+                operator.clone(),
+                old_min_epoch,
+                min_epoch,
+            )
+        })
+        .collect();
+    // Move each existing retained-path set, including empty declared owners.
+    // This is bounded by the selected graph/retained descriptors, not historical
+    // filesystem objects. No checkpoint payload or path inventory is copied.
+    let mut retained = HashMap::with_capacity(metadata.operator_ids.len());
+    while let Some(result) = futures.next().await {
+        let (operator, paths) = result?;
+        retained.insert(operator, paths);
+    }
+    cleanup_abandoned_controller_job_disk_files(storage, &metadata.job_id, min_epoch, &retained)
+        .await?;
+    // Preserve all old metadata if known-file cleanup or orphan traversal fails.
+    // After this point deletion can partially complete; retry is idempotent and
+    // the retained minimum's descriptors remain outside this deletion range.
+    for operator in &metadata.operator_ids {
+        for epoch in old_min_epoch..min_epoch {
+            storage
+                .delete(&metadata_path(&operator_path(
+                    &metadata.job_id,
+                    epoch,
+                    operator,
+                )))
+                .await?;
+        }
+        debug!(
+            message = "Finished cleaning operator",
+            job_id = metadata.job_id,
+            operator_id = operator,
+            min_epoch
+        );
+    }
+    for epoch in old_min_epoch..min_epoch {
+        storage
+            .delete(&metadata_path(&base_path(&metadata.job_id, epoch)))
+            .await?;
+    }
+    metadata.min_epoch = min_epoch;
+    storage.publish(metadata).await
+}
+
 fn base_path(job_id: &str, epoch: u32) -> String {
     format!("{job_id}/checkpoints/checkpoint-{epoch:0>7}")
 }
@@ -110,60 +242,12 @@ impl BackingStore for ParquetBackend {
 
     async fn cleanup_checkpoint(
         role: &StorageProviderFor,
-        mut metadata: CheckpointMetadata,
+        metadata: CheckpointMetadata,
         old_min_epoch: u32,
         min_epoch: u32,
     ) -> Result<(), StateError> {
-        info!(
-            message = "Cleaning checkpoint",
-            min_epoch,
-            job_id = metadata.job_id
-        );
-
-        let mut futures: FuturesUnordered<_> = metadata
-            .operator_ids
-            .iter()
-            .map(|operator_id| {
-                Self::cleanup_operator(
-                    role,
-                    metadata.job_id.clone(),
-                    operator_id.clone(),
-                    old_min_epoch,
-                    min_epoch,
-                )
-            })
-            .collect();
-
-        let storage_client = get_storage_provider(role).await?;
-
-        // wait for all of the futures to complete
-        while let Some(result) = futures.next().await {
-            let operator_id = result?;
-
-            for epoch_to_remove in old_min_epoch..min_epoch {
-                let path = metadata_path(&operator_path(
-                    &metadata.job_id,
-                    epoch_to_remove,
-                    &operator_id,
-                ));
-                storage_client.delete_if_present(path).await?;
-            }
-            debug!(
-                message = "Finished cleaning operator",
-                job_id = metadata.job_id,
-                operator_id,
-                min_epoch
-            );
-        }
-
-        for epoch_to_remove in old_min_epoch..min_epoch {
-            storage_client
-                .delete_if_present(metadata_path(&base_path(&metadata.job_id, epoch_to_remove)))
-                .await?;
-        }
-        metadata.min_epoch = min_epoch;
-        Self::write_checkpoint_metadata(role, metadata).await?;
-        Ok(())
+        let storage = get_storage_provider(role).await?;
+        cleanup_checkpoint_files(storage.as_ref(), metadata, old_min_epoch, min_epoch).await
     }
 }
 
@@ -232,18 +316,18 @@ impl ParquetBackend {
         Ok(result)
     }
 
-    /// Delete files no longer referenced by the new min epoch
-    pub async fn cleanup_operator(
-        role: &StorageProviderFor,
+    /// Delete known obsolete files; the job owner performs orphan enumeration.
+    async fn cleanup_operator_files<S: CleanupStore + ?Sized>(
+        storage: &S,
         job_id: String,
         operator_id: String,
         old_min_epoch: u32,
         new_min_epoch: u32,
-    ) -> Result<String, StateError> {
-        let operator_metadata =
-            Self::load_operator_metadata(role, &job_id, &operator_id, new_min_epoch)
-                .await?
-                .expect("expect new_min_epoch metadata to still be present");
+    ) -> Result<(String, HashSet<String>), StateError> {
+        let operator_metadata = storage
+            .load_operator(&job_id, &operator_id, new_min_epoch)
+            .await?
+            .expect("expect new_min_epoch metadata to still be present");
         let mut paths_to_keep = HashSet::new();
         for (table_name, metadata) in &operator_metadata.table_checkpoint_metadata {
             let table_config = operator_metadata
@@ -285,11 +369,11 @@ impl ParquetBackend {
         }
 
         let mut deleted_paths = HashSet::new();
-        let storage_client = get_storage_provider(role).await?;
 
         for epoch_to_remove in old_min_epoch..new_min_epoch {
-            let Some(operator_metadata) =
-                Self::load_operator_metadata(role, &job_id, &operator_id, epoch_to_remove).await?
+            let Some(operator_metadata) = storage
+                .load_operator(&job_id, &operator_id, epoch_to_remove)
+                .await?
             else {
                 continue;
             };
@@ -336,20 +420,12 @@ impl ParquetBackend {
             for file in files {
                 if !paths_to_keep.contains(&file) && !deleted_paths.contains(&file) {
                     deleted_paths.insert(file.clone());
-                    storage_client.delete_if_present(file).await?;
+                    storage.delete(&file).await?;
                 }
             }
         }
 
-        cleanup_abandoned_controller_disk_files(
-            storage_client.as_ref(),
-            &job_id,
-            &operator_id,
-            new_min_epoch,
-            &paths_to_keep,
-        )
-        .await?;
-        Ok(operator_id)
+        Ok((operator_id, paths_to_keep))
     }
 }
 
@@ -382,18 +458,17 @@ impl ParquetStats {
 /// advances its retained minimum, pages in older epochs cannot be referenced by
 /// a retained checkpoint or an active publication, including pages uploaded by
 /// workers that crashed before reporting completion.
-pub async fn cleanup_abandoned_controller_disk_files(
-    storage: &arroyo_storage::StorageProvider,
+async fn cleanup_abandoned_controller_job_disk_files<S: CleanupStore + ?Sized>(
+    storage: &S,
     job_id: &str,
-    operator_id: &str,
     retained_min_epoch: u32,
-    retained_files: &HashSet<String>,
+    retained_by_operator: &HashMap<String, HashSet<String>>,
 ) -> Result<(), StateError> {
     use futures::TryStreamExt;
     let namespace = format!("{job_id}/checkpoints/");
-    let qualified = storage.qualify_path(&namespace.as_str().into()).to_string();
+    let qualified = storage.qualified_prefix(&namespace);
     let prefix = format!("{}/", qualified.trim_end_matches('/'));
-    let listing = storage.list_prefix(namespace.as_str().into()).await?;
+    let listing = storage.list_prefix(&namespace).await?;
     futures::pin_mut!(listing);
     while let Some(object) = listing
         .try_next()
@@ -405,13 +480,15 @@ pub async fn cleanup_abandoned_controller_disk_files(
             continue;
         };
         let parts: Vec<_> = suffix.split('/').collect();
-        if parts.len() != 4
-            || parts[1] != format!("operator-{operator_id}")
-            || !parts[2].starts_with("table-")
-            || !parts[3].starts_with("disk-")
-        {
+        if parts.len() != 4 || !parts[2].starts_with("table-") || !parts[3].starts_with("disk-") {
             continue;
         }
+        let Some(retained_files) = parts[1]
+            .strip_prefix("operator-")
+            .and_then(|operator| retained_by_operator.get(operator))
+        else {
+            continue;
+        };
         let Some(epoch) = parts[0].strip_prefix("checkpoint-") else {
             continue;
         };
@@ -419,9 +496,7 @@ pub async fn cleanup_abandoned_controller_disk_files(
             continue;
         };
         if epoch < retained_min_epoch && !retained_files.contains(&format!("{namespace}{suffix}")) {
-            storage
-                .delete_if_present(format!("{namespace}{suffix}"))
-                .await?;
+            storage.delete(&format!("{namespace}{suffix}")).await?;
         }
     }
     Ok(())

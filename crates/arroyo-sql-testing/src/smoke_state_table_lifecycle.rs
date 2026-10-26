@@ -230,19 +230,13 @@ async fn lifecycle() {
                 .await
                 .unwrap();
             } else {
-                for node in logical.graph.node_weights() {
-                    for (op, _) in node.operator_chain.iter() {
-                        ParquetBackend::cleanup_operator(
-                            &StorageProviderFor::Worker,
-                            job_id.clone(),
-                            op.operator_id.clone(),
-                            1,
-                            1,
-                        )
+                let metadata =
+                    StateBackend::load_checkpoint_metadata(&StorageProviderFor::Worker, &job_id, 3)
                         .await
                         .unwrap();
-                    }
-                }
+                StateBackend::cleanup_checkpoint(&StorageProviderFor::Worker, metadata, 1, 1)
+                    .await
+                    .unwrap();
             }
         }
     }
