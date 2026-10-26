@@ -1,4 +1,497 @@
 use super::*;
+
+fn owner_paths(operator: &str, paths: &HashSet<String>) -> HashMap<String, HashSet<String>> {
+    HashMap::from([(operator.to_owned(), paths.clone())])
+}
+
+#[derive(Clone, Copy, Default)]
+enum CleanupFault {
+    #[default]
+    None,
+    KnownFile,
+    Listing,
+    OrphanDelete,
+    MetadataDelete,
+    Publish,
+}
+
+#[derive(Default)]
+struct CleanupTrace {
+    listings: usize,
+    orphan_deletes: usize,
+    metadata_deletes: usize,
+    deleted: Vec<String>,
+}
+
+struct ObservedCleanupStore {
+    inner: arroyo_storage::StorageProvider,
+    fault: CleanupFault,
+    trace: std::sync::Mutex<CleanupTrace>,
+}
+
+fn injected_cleanup_error() -> StateError {
+    StateError::Other {
+        table: "cleanup-test".into(),
+        error: "injected storage operation failure".into(),
+    }
+}
+
+#[async_trait::async_trait]
+impl CleanupStore for ObservedCleanupStore {
+    async fn load_operator(
+        &self,
+        job: &str,
+        operator: &str,
+        epoch: u32,
+    ) -> Result<Option<OperatorCheckpointMetadata>, StateError> {
+        CleanupStore::load_operator(&self.inner, job, operator, epoch).await
+    }
+    async fn delete(&self, path: &str) -> Result<(), StateError> {
+        let fail = {
+            let trace = self.trace.lock().unwrap();
+            match self.fault {
+                CleanupFault::KnownFile => {
+                    path.contains("checkpoint-0000002/operator-o/table-t-000/disk-")
+                }
+                CleanupFault::OrphanDelete => {
+                    trace.listings > 0 && trace.orphan_deletes == 1 && path.contains("/disk-")
+                }
+                CleanupFault::MetadataDelete => {
+                    trace.metadata_deletes == 1 && path.ends_with("/metadata")
+                }
+                _ => false,
+            }
+        };
+        if fail {
+            return Err(injected_cleanup_error());
+        }
+        CleanupStore::delete(&self.inner, path).await?;
+        let mut trace = self.trace.lock().unwrap();
+        if trace.listings > 0 && path.contains("/disk-") {
+            trace.orphan_deletes += 1;
+        }
+        if path.ends_with("/metadata") {
+            trace.metadata_deletes += 1;
+        }
+        trace.deleted.push(path.into());
+        Ok(())
+    }
+    async fn publish(&self, metadata: CheckpointMetadata) -> Result<(), StateError> {
+        if matches!(self.fault, CleanupFault::Publish) {
+            return Err(injected_cleanup_error());
+        }
+        CleanupStore::publish(&self.inner, metadata).await
+    }
+    fn qualified_prefix(&self, prefix: &str) -> String {
+        CleanupStore::qualified_prefix(&self.inner, prefix)
+    }
+    async fn list_prefix(
+        &self,
+        prefix: &str,
+    ) -> Result<
+        futures::stream::BoxStream<'_, Result<object_store::path::Path, object_store::Error>>,
+        StateError,
+    > {
+        self.trace.lock().unwrap().listings += 1;
+        let listing = CleanupStore::list_prefix(&self.inner, prefix).await?;
+        if matches!(self.fault, CleanupFault::Listing) {
+            // Fail the actual streaming operation after yielding its first object.
+            let error = object_store::Error::Generic {
+                store: "cleanup-test",
+                source: std::io::Error::other("injected listing failure").into(),
+            };
+            Ok(listing
+                .take(1)
+                .chain(futures::stream::once(async move { Err(error) }))
+                .boxed())
+        } else {
+            Ok(listing)
+        }
+    }
+}
+
+fn disk_operator_metadata(operator: &str, epoch: u32) -> (OperatorCheckpointMetadata, String) {
+    let table = "t";
+    let path = format!(
+        "J/checkpoints/checkpoint-{epoch:07}/operator-{operator}/table-t-000/disk-{epoch}.parquet"
+    );
+    let mut namespace = vec![1, 0];
+    namespace.extend_from_slice(&0u32.to_be_bytes());
+    namespace.extend_from_slice(&1u32.to_be_bytes());
+    namespace.extend_from_slice(&1u32.to_be_bytes());
+    namespace.push(b't');
+    let subtask = rpc::DiskKeyedTableSubtaskCheckpointMetadata {
+        format_version: 2,
+        encoding_version: 1,
+        schema_identity: b"schema".to_vec(),
+        namespace,
+        epoch,
+        files: vec![rpc::DiskCheckpointFile {
+            path: path.clone(),
+            size_bytes: 1,
+            checksum: vec![0; 32],
+            row_count: 1,
+        }],
+        ..Default::default()
+    };
+    let metadata = rpc::DiskKeyedTableTaskCheckpointMetadata {
+        format_version: 2,
+        subtasks: HashMap::from([(0, subtask)]),
+    };
+    let config = rpc::DiskKeyedTableConfig {
+        table_name: table.into(),
+        encoding_version: 1,
+        schema_identity: b"schema".to_vec(),
+    };
+    (
+        OperatorCheckpointMetadata {
+            operator_metadata: Some(rpc::OperatorMetadata {
+                job_id: "J".into(),
+                operator_id: operator.into(),
+                epoch,
+                parallelism: 1,
+                ..Default::default()
+            }),
+            table_configs: HashMap::from([(
+                table.into(),
+                rpc::TableConfig {
+                    table_type: rpc::TableEnum::DiskKeyedMap.into(),
+                    config: config.encode_to_vec(),
+                    state_version: 1,
+                },
+            )]),
+            table_checkpoint_metadata: HashMap::from([(
+                table.into(),
+                rpc::TableCheckpointMetadata {
+                    table_type: rpc::TableEnum::DiskKeyedMap.into(),
+                    data: metadata.encode_to_vec(),
+                },
+            )]),
+            ..Default::default()
+        },
+        path,
+    )
+}
+
+fn checkpoint_cleanup_fixture(root: &Path) -> (CheckpointMetadata, ObjectMap) {
+    let mut objects = ObjectMap::new();
+    let owners = vec!["o".to_owned(), "p".to_owned(), "empty".to_owned()];
+    let global_keep = "J/checkpoints/checkpoint-0000001/operator-p/table-k-000";
+    objects.insert(global_keep.into(), vec![7]);
+    for epoch in 1..=3 {
+        let checkpoint = CheckpointMetadata {
+            job_id: "J".into(),
+            epoch,
+            min_epoch: 1,
+            operator_ids: owners.clone(),
+            ..Default::default()
+        };
+        objects.insert(
+            metadata_path(&base_path("J", epoch)),
+            checkpoint.encode_to_vec(),
+        );
+        let (disk, path) = disk_operator_metadata("o", epoch);
+        objects.insert(path, vec![epoch as u8]);
+        objects.insert(
+            metadata_path(&operator_path("J", epoch, "o")),
+            disk.encode_to_vec(),
+        );
+        let files = if epoch == 2 {
+            vec!["J/checkpoints/checkpoint-0000002/operator-p/table-k-000".to_owned()]
+        } else {
+            vec![global_keep.to_owned()]
+        };
+        for path in &files {
+            objects.entry(path.clone()).or_insert(vec![7]);
+        }
+        let global = OperatorCheckpointMetadata {
+            operator_metadata: Some(rpc::OperatorMetadata {
+                job_id: "J".into(),
+                operator_id: "p".into(),
+                epoch,
+                parallelism: 1,
+                ..Default::default()
+            }),
+            table_configs: HashMap::from([(
+                "k".into(),
+                rpc::TableConfig {
+                    table_type: rpc::TableEnum::GlobalKeyValue.into(),
+                    config: rpc::GlobalKeyedTableConfig {
+                        table_name: "k".into(),
+                        ..Default::default()
+                    }
+                    .encode_to_vec(),
+                    state_version: 1,
+                },
+            )]),
+            table_checkpoint_metadata: HashMap::from([(
+                "k".into(),
+                rpc::TableCheckpointMetadata {
+                    table_type: rpc::TableEnum::GlobalKeyValue.into(),
+                    data: rpc::GlobalKeyedTableTaskCheckpointMetadata {
+                        files,
+                        ..Default::default()
+                    }
+                    .encode_to_vec(),
+                },
+            )]),
+            ..Default::default()
+        };
+        objects.insert(
+            metadata_path(&operator_path("J", epoch, "p")),
+            global.encode_to_vec(),
+        );
+        let empty = OperatorCheckpointMetadata {
+            operator_metadata: Some(rpc::OperatorMetadata {
+                job_id: "J".into(),
+                operator_id: "empty".into(),
+                epoch,
+                parallelism: 1,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        objects.insert(
+            metadata_path(&operator_path("J", epoch, "empty")),
+            empty.encode_to_vec(),
+        );
+    }
+    for path in [
+        "J/checkpoints/checkpoint-0000001/operator-o/table-t-000/disk-orphan",
+        "J/checkpoints/checkpoint-0000001/operator-empty/table-t-000/disk-orphan-a",
+        "J/checkpoints/checkpoint-0000001/operator-empty/table-t-000/disk-orphan-b",
+        "J/checkpoints/checkpoint-0000001/operator-unknown/table-t-000/disk-foreign",
+        "J-other/checkpoints/checkpoint-0000001/operator-o/table-t-000/disk-foreign",
+        "J/checkpoints-extra/checkpoint-0000001/operator-o/table-t-000/disk-neighbor",
+        "J/checkpoints/checkpoint-0000001/operator-empty/table-t-000/ordinary",
+        "J/checkpoints/checkpoint-invalid/operator-empty/table-t-000/disk-invalid",
+        "J/checkpoints/checkpoint-0000003/operator-empty/table-t-000/disk-equal",
+        "J/checkpoints/checkpoint-0000004/operator-empty/table-t-000/disk-newer",
+    ] {
+        objects.insert(path.into(), path.as_bytes().to_vec());
+    }
+    write_objects(root, &objects);
+    let head =
+        CheckpointMetadata::decode(objects[&metadata_path(&base_path("J", 3))].as_slice()).unwrap();
+    (head, objects)
+}
+
+fn expected_checkpoint_cleanup(mut objects: ObjectMap, mut head: CheckpointMetadata) -> ObjectMap {
+    for epoch in 1..3 {
+        objects
+            .remove(&format!(
+                "J/checkpoints/checkpoint-{epoch:07}/operator-o/table-t-000/disk-{epoch}.parquet"
+            ))
+            .unwrap();
+        objects
+            .remove(&metadata_path(&base_path("J", epoch)))
+            .unwrap();
+        for owner in &head.operator_ids {
+            objects
+                .remove(&metadata_path(&operator_path("J", epoch, owner)))
+                .unwrap();
+        }
+    }
+    for path in [
+        "J/checkpoints/checkpoint-0000002/operator-p/table-k-000",
+        "J/checkpoints/checkpoint-0000001/operator-o/table-t-000/disk-orphan",
+        "J/checkpoints/checkpoint-0000001/operator-empty/table-t-000/disk-orphan-a",
+        "J/checkpoints/checkpoint-0000001/operator-empty/table-t-000/disk-orphan-b",
+    ] {
+        objects.remove(path).unwrap();
+    }
+    head.min_epoch = 3;
+    objects.insert(metadata_path(&base_path("J", 3)), head.encode_to_vec());
+    objects
+}
+
+#[cfg(target_os = "linux")]
+fn watch_directory(path: &Path) -> std::os::fd::OwnedFd {
+    use std::os::fd::FromRawFd;
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+    // SAFETY: no pointer arguments; the successful descriptor is owned once.
+    let raw = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
+    assert!(raw >= 0);
+    let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) };
+    // Close events separate successive opens, preventing identical open events
+    // from coalescing. Child-directory events have names; only self opens count.
+    // SAFETY: path remains NUL-terminated through the synchronous call.
+    assert!(
+        unsafe {
+            libc::inotify_add_watch(raw, path.as_ptr(), libc::IN_OPEN | libc::IN_CLOSE_NOWRITE)
+        } >= 0
+    );
+    fd
+}
+
+#[cfg(target_os = "linux")]
+fn observed_directory_opens(fd: &std::os::fd::OwnedFd) -> usize {
+    use std::os::fd::AsRawFd;
+    let mut buffer = [0u8; 16384];
+    let mut opens = 0;
+    loop {
+        // SAFETY: the buffer is writable for exactly the provided length.
+        let count = unsafe { libc::read(fd.as_raw_fd(), buffer.as_mut_ptr().cast(), buffer.len()) };
+        if count < 0 {
+            assert_eq!(
+                std::io::Error::last_os_error().kind(),
+                std::io::ErrorKind::WouldBlock
+            );
+            break;
+        }
+        assert!(count > 0);
+        let mut offset = 0;
+        while offset < count as usize {
+            assert!(offset + std::mem::size_of::<libc::inotify_event>() <= count as usize);
+            // SAFETY: the complete header is in bounds; its alignment is arbitrary.
+            let event = unsafe {
+                buffer
+                    .as_ptr()
+                    .add(offset)
+                    .cast::<libc::inotify_event>()
+                    .read_unaligned()
+            };
+            assert_eq!(
+                event.mask & libc::IN_Q_OVERFLOW,
+                0,
+                "inotify overflow invalidates physical count"
+            );
+            if event.mask & libc::IN_OPEN != 0 && event.mask & libc::IN_ISDIR != 0 && event.len == 0
+            {
+                opens += 1;
+            }
+            offset += std::mem::size_of::<libc::inotify_event>() + event.len as usize;
+            assert!(offset <= count as usize);
+        }
+    }
+    opens
+}
+
+#[tokio::test]
+async fn job_cleanup_has_one_listing_and_exact_multi_owner_file_oracle() {
+    let root = tempfile::tempdir().unwrap();
+    let (head, initial) = checkpoint_cleanup_fixture(root.path());
+    let observed = ObservedCleanupStore {
+        inner: provider(root.path()).await,
+        fault: CleanupFault::None,
+        trace: Default::default(),
+    };
+    #[cfg(target_os = "linux")]
+    let watch = watch_directory(&root.path().join("J/checkpoints"));
+    cleanup_checkpoint_files(&observed, head.clone(), 1, 3)
+        .await
+        .unwrap();
+    assert_eq!(observed.trace.lock().unwrap().listings, 1);
+    #[cfg(target_os = "linux")]
+    assert_eq!(
+        observed_directory_opens(&watch),
+        1,
+        "one physical job-directory traversal for three declared operators"
+    );
+    assert_eq!(
+        read_objects(root.path()),
+        expected_checkpoint_cleanup(initial, head)
+    );
+    assert!(
+        root.path()
+            .join("J/checkpoints/checkpoint-0000002/operator-o/table-t-000")
+            .is_dir(),
+        "empty directories are not removed"
+    );
+    // No history inventory survives: a fresh owner must discover a late old upload,
+    // even for an explicitly declared owner with zero retained state descriptors.
+    let late = "J/checkpoints/checkpoint-0000000/operator-empty/table-t-000/disk-late";
+    observed.inner.put(late, vec![9]).await.unwrap();
+    let fresh = provider(root.path()).await;
+    let retained = CheckpointMetadata::decode(
+        fresh
+            .get(metadata_path(&base_path("J", 3)))
+            .await
+            .unwrap()
+            .as_ref(),
+    )
+    .unwrap();
+    cleanup_checkpoint_files(&fresh, retained, 3, 3)
+        .await
+        .unwrap();
+    assert!(!fresh.exists(late).await.unwrap());
+}
+
+#[tokio::test]
+async fn job_cleanup_failures_preserve_retry_proof_and_commit_minimum_last() {
+    for fault in [
+        CleanupFault::KnownFile,
+        CleanupFault::Listing,
+        CleanupFault::OrphanDelete,
+        CleanupFault::MetadataDelete,
+        CleanupFault::Publish,
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let (head, initial) = checkpoint_cleanup_fixture(root.path());
+        let observed = ObservedCleanupStore {
+            inner: provider(root.path()).await,
+            fault,
+            trace: Default::default(),
+        };
+        assert!(
+            cleanup_checkpoint_files(&observed, head.clone(), 1, 3)
+                .await
+                .is_err()
+        );
+        let current = read_objects(root.path());
+        assert_eq!(
+            current[&metadata_path(&base_path("J", 3))],
+            initial[&metadata_path(&base_path("J", 3))],
+            "frontier must not advance on any failed operation"
+        );
+        for owner in &head.operator_ids {
+            assert_eq!(
+                current[&metadata_path(&operator_path("J", 3, owner))],
+                initial[&metadata_path(&operator_path("J", 3, owner))]
+            );
+        }
+        if matches!(
+            fault,
+            CleanupFault::KnownFile | CleanupFault::Listing | CleanupFault::OrphanDelete
+        ) {
+            for epoch in 1..3 {
+                assert_eq!(
+                    current[&metadata_path(&base_path("J", epoch))],
+                    initial[&metadata_path(&base_path("J", epoch))]
+                );
+                for owner in &head.operator_ids {
+                    assert_eq!(
+                        current[&metadata_path(&operator_path("J", epoch, owner))],
+                        initial[&metadata_path(&operator_path("J", epoch, owner))]
+                    );
+                }
+            }
+        }
+        {
+            let trace = observed.trace.lock().unwrap();
+            if matches!(fault, CleanupFault::KnownFile) {
+                assert_eq!(trace.listings, 0);
+                assert!(!trace.deleted.is_empty());
+            }
+            if matches!(fault, CleanupFault::OrphanDelete) {
+                assert_eq!(trace.orphan_deletes, 1);
+            }
+            if matches!(fault, CleanupFault::MetadataDelete) {
+                assert_eq!(trace.metadata_deletes, 1);
+            }
+        }
+        let fresh = provider(root.path()).await;
+        cleanup_checkpoint_files(&fresh, head.clone(), 1, 3)
+            .await
+            .unwrap();
+        assert_eq!(
+            read_objects(root.path()),
+            expected_checkpoint_cleanup(initial, head)
+        );
+    }
+}
+
 #[tokio::test]
 async fn cleans_abandoned_pages_only_below_retained_minimum_and_for_owned_operator() {
     let root = tempfile::tempdir().unwrap();
@@ -14,16 +507,26 @@ async fn cleans_abandoned_pages_only_below_retained_minimum_and_for_owned_operat
     for path in [abandoned, retained, active, foreign, legacy] {
         storage.put(path, vec![1]).await.unwrap();
     }
-    cleanup_abandoned_controller_disk_files(&storage, "J", "o", 2, &HashSet::new())
-        .await
-        .unwrap();
+    cleanup_abandoned_controller_job_disk_files(
+        &storage,
+        "J",
+        2,
+        &owner_paths("o", &HashSet::new()),
+    )
+    .await
+    .unwrap();
     assert!(!storage.exists(abandoned).await.unwrap());
     for path in [retained, active, foreign, legacy] {
         assert!(storage.exists(path).await.unwrap());
     }
-    cleanup_abandoned_controller_disk_files(&storage, "J", "o", 2, &HashSet::new())
-        .await
-        .unwrap();
+    cleanup_abandoned_controller_job_disk_files(
+        &storage,
+        "J",
+        2,
+        &owner_paths("o", &HashSet::new()),
+    )
+    .await
+    .unwrap();
 }
 
 use std::collections::BTreeMap;
@@ -110,15 +613,20 @@ async fn exact_cleanup_oracle_retention_isolation_and_late_uploads() {
     write_objects(root.path(), &expected);
     std::fs::create_dir_all(root.path().join("J/checkpoints/checkpoint-0/empty-table")).unwrap();
     for operator in ["o", "p"] {
-        cleanup_abandoned_controller_disk_files(&storage, "J", operator, 3, &retained)
-            .await
-            .unwrap();
+        cleanup_abandoned_controller_job_disk_files(
+            &storage,
+            "J",
+            3,
+            &owner_paths(operator, &retained),
+        )
+        .await
+        .unwrap();
         for orphan in &orphans[operator] {
             expected.remove(orphan).unwrap();
         }
         assert_eq!(read_objects(root.path()), expected);
     }
-    cleanup_abandoned_controller_disk_files(&storage, "J", "o", 3, &retained)
+    cleanup_abandoned_controller_job_disk_files(&storage, "J", 3, &owner_paths("o", &retained))
         .await
         .unwrap();
     assert_eq!(read_objects(root.path()), expected);
@@ -130,7 +638,7 @@ async fn exact_cleanup_oracle_retention_isolation_and_late_uploads() {
     }
     // A fresh owner must find late uploads without any cached inventory.
     let fresh = provider(root.path()).await;
-    cleanup_abandoned_controller_disk_files(&fresh, "J", "o", 3, &retained)
+    cleanup_abandoned_controller_job_disk_files(&fresh, "J", 3, &owner_paths("o", &retained))
         .await
         .unwrap();
     expected.insert(active.into(), vec![9]);
@@ -139,9 +647,14 @@ async fn exact_cleanup_oracle_retention_isolation_and_late_uploads() {
         if missing == "empty" {
             std::fs::create_dir_all(root.path().join("empty/checkpoints")).unwrap();
         }
-        cleanup_abandoned_controller_disk_files(&fresh, missing, "o", 3, &retained)
-            .await
-            .unwrap();
+        cleanup_abandoned_controller_job_disk_files(
+            &fresh,
+            missing,
+            3,
+            &owner_paths("o", &retained),
+        )
+        .await
+        .unwrap();
         assert_eq!(read_objects(root.path()), expected);
     }
 }
@@ -161,8 +674,9 @@ async fn observed_partial_cleanup_retries_with_fresh_storage_owner() {
     objects.insert(kept.into(), vec![7]);
     write_objects(root.path(), &objects);
     let retained = HashSet::new();
-    let mut cleanup = Box::pin(cleanup_abandoned_controller_disk_files(
-        &storage, "J", "o", 3, &retained,
+    let owners = owner_paths("o", &retained);
+    let mut cleanup = Box::pin(cleanup_abandoned_controller_job_disk_files(
+        &storage, "J", 3, &owners,
     ));
     let partial = tokio::time::timeout(std::time::Duration::from_secs(10), async {
         loop {
@@ -187,7 +701,7 @@ async fn observed_partial_cleanup_retries_with_fresh_storage_owner() {
     // A pending local delete may finish after dropping the future. Retrying
     // remains safe because delete_if_present treats NotFound as success.
     let fresh = provider(root.path()).await;
-    cleanup_abandoned_controller_disk_files(&fresh, "J", "o", 3, &HashSet::new())
+    cleanup_abandoned_controller_job_disk_files(&fresh, "J", 3, &owner_paths("o", &HashSet::new()))
         .await
         .unwrap();
     assert_eq!(
@@ -246,9 +760,14 @@ async fn prefix_listing_physically_excludes_unrelated_directories() {
     use std::io::Write;
     eprintln!("STR156_CLEANUP_START");
     std::io::stderr().flush().unwrap();
-    cleanup_abandoned_controller_disk_files(&storage, "J", "o", 3, &HashSet::new())
-        .await
-        .unwrap();
+    cleanup_abandoned_controller_job_disk_files(
+        &storage,
+        "J",
+        3,
+        &owner_paths("o", &HashSet::new()),
+    )
+    .await
+    .unwrap();
     eprintln!("STR156_CLEANUP_END");
     std::io::stderr().flush().unwrap();
     let mut opened = HashSet::new();
@@ -351,8 +870,6 @@ fn host_counters() -> BTreeMap<String, serde_json::Value> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "opt-in finite STR-156 release comparison; requires evidence paths"]
 async fn cleanup_prefix_benchmark() {
-    use futures::TryStreamExt;
-    use futures::stream::FuturesUnordered;
     use std::io::Write;
     use std::time::{Duration, Instant};
 
@@ -419,28 +936,18 @@ async fn cleanup_prefix_benchmark() {
     std::io::stderr().flush().unwrap();
     let start = Instant::now();
     let result = tokio::time::timeout(Duration::from_secs(120), async {
-        let cleanups: FuturesUnordered<_> = (0..4)
+        let owners: HashMap<_, _> = (0..4)
             .map(|operator| {
-                let storage = &storage;
-                let retained = &retained;
-                async move {
-                    let started = Instant::now();
-                    cleanup_abandoned_controller_disk_files(
-                        storage,
-                        "J",
-                        &operator.to_string(),
-                        8,
-                        retained,
-                    )
-                    .await?;
-                    Ok::<_, StateError>(serde_json::json!({
-                        "operator": operator,
-                        "elapsed_seconds": started.elapsed().as_secs_f64(),
-                    }))
-                }
+                let operator = operator.to_string();
+                let paths = retained
+                    .iter()
+                    .filter(|path| path.contains(&format!("/operator-{operator}/")))
+                    .cloned()
+                    .collect();
+                (operator, paths)
             })
             .collect();
-        cleanups.try_collect::<Vec<_>>().await
+        cleanup_abandoned_controller_job_disk_files(&storage, "J", 8, &owners).await
     })
     .await;
     let elapsed_seconds = start.elapsed().as_secs_f64();
@@ -449,10 +956,9 @@ async fn cleanup_prefix_benchmark() {
     let cpu_after = process_usage();
     let io_after = io_counters();
     let host_after = host_counters();
-    let completions = result
+    result
         .expect("120-second processing bound exceeded")
         .unwrap();
-    assert_eq!(completions.len(), 4);
     for deleted in &expected_deleted {
         objects.remove(deleted).unwrap();
     }
@@ -469,8 +975,8 @@ async fn cleanup_prefix_benchmark() {
     let receipt = serde_json::json!({
         "status": "pass",
         "arm": std::env::var("STR156_ARM").unwrap_or_else(|_| "unspecified".into()),
-        "completed_operators": completions.len(),
-        "operator_completions": completions,
+        "completed_jobs": 1,
+        "completed_operators": 4,
         "deleted_files": before_files - actual.len(),
         "expected_deletions": expected_deleted.len(),
         "root_files": before_files,

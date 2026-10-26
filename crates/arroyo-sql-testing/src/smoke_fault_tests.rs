@@ -784,17 +784,16 @@ async fn retained_recovery() {
         );
     } else {
         for _ in 0..2 {
-            for operator in tasks_per_operator(&fixture.program.graph).keys() {
-                ParquetBackend::cleanup_operator(
-                    &StorageProviderFor::Worker,
-                    (*fixture.job_id).clone(),
-                    operator.clone(),
-                    1,
-                    2,
-                )
+            let metadata = StateBackend::load_checkpoint_metadata(
+                &StorageProviderFor::Worker,
+                &fixture.job_id,
+                2,
+            )
+            .await
+            .unwrap();
+            StateBackend::cleanup_checkpoint(&StorageProviderFor::Worker, metadata, 1, 2)
                 .await
                 .unwrap();
-            }
         }
     }
     assert!(match tokio::fs::read_dir(&first_dir).await {
