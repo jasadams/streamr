@@ -1,11 +1,11 @@
-## Active STR-159 — one job-level orphan cleanup traversal — 2026-10-26
+## STR-159 — measured one-pass cleanup experiment — 2026-10-26
 
-- User approved one performance experiment; minimum target 10× completed application throughput, 20× stretch. Lower gains do not meet the target.
-- Fresh engine base `fe2b44154e21887c4d2953c362c822e7a57c8511`; branch `jason/str-159-one-pass-cleanup-20261026`. Application fixture base `b173ca1bf84d19877d38021f64231789dcefad90`. Unrelated dirty checkouts preserved; in-flight check CLEAR.
-- Read current `AGENTS.md`, `.claude/build-test.md`, `.claude/team.md`, milestone plan/ledger and performance-spike skill. All three independent plan reviews approved v4 SHA256 `b1f480689e2c8d2e9a045e62a8270a4a91a5f48d2d66fd8e6efa24b994577a9d`.
-- Implementing one shared orphan enumeration after known-file cleanup; retain existing semantics/resources and metadata retry ordering. No new RocksDB scans. Independent fixture/oracle and runner work lives in Arcstream.
-- Cleanup 6 tests and checkpoint 18 tests passed; locked check passed. Clippy test-only guard-scope repair is under recheck; affected controller SQL smokes compiling. Independent source and application/storage runner reviews approved frozen sources. Next: finish dev gates, then one optimized matched BEFORE/AFTER (≤599.5s processing each). No deployment or second experiment authorized by this result.
-- Evidence/plan/verdicts: `/home/jason/qa-evidence/str159-single-pass-20261026/`; prior diagnosis `/home/jason/qa-evidence/native-throughput-diagnosis-20261026/`. Dev gates in progress; no optimized build or capacity measurement yet.
+- Completed one reviewed matched native application experiment. Target **not met**: 46.793875→72.277789 completed DATA/s, **1.5446×**, against minimum 10×. Both exact 5,000-event tails and application/recovery oracles passed.
+- Actual engine candidate `fdcca282185905645ca5b29cfaa85658d68c643d`, base `fe2b44154e21887c4d2953c362c822e7a57c8511`; app harness `79673406028cdfa817a756009471a02831c2f658`. Unrelated invoking changes preserved.
+- CPU 297.21→136.30s; controller 165.93→11.83s, profile worker 105.31→103.61s. Controller cleanup improved; remaining profile work stayed essentially unchanged.
+- Dev correctness/check/Clippy, actual public stop/resume, exact literal outputs, independent raw/Parquet/native/package audits and owned cleanup passed. No new RocksDB scan, semantic/resource change, UDF or alternate processor. Hosted PR CI not run; no publication/merge/deploy.
+- Evidence `/home/jason/qa-evidence/str159-single-pass-20261026/`; exact commands/results/limits in [STR-159 validation](str-159-validation.md). Synthetic history/host load qualify production inference; no full qualification campaign repeated.
+- Recommendation: reject as the proposed 10× solution; preserve unmerged candidate for user decision. No further performance experiment or rollout is running. Queue released after verified owned cleanup. Original quadratic offline harness cost was outside measured intervals.
 
 ## Active STR-157 — inline MERGE source materialization — 2026-10-26
 
