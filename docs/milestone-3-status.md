@@ -1,12 +1,12 @@
-## Active STR-158 — qualified operation, production decision pending — 2026-10-27
+## Active STR-158 — current-image qualification, production decision pending — 2026-10-28
 
 - Approved revised plan excludes the earlier general recovery framework. Standard
   incomplete-checkpoint recovery and exact pending-commit guards are correct;
   no engine/Rust repair demonstrated. Source/upstream/catalog trace preserved.
 - Fresh base b448819312c5a16f5b3815a993000497ca550e19; workspace
   `/home/jason/repos/streamr-worktrees/str-158-flink-recovery-20261027`.
-  Dirty invoking checkout preserved. PR88 code delivery7bd3463a has all6CI
-  checks green; all executable source/evidence publication reviews pass.
+  Dirty invoking checkout preserved. PR88 prior head369ba04e has all6CI checks green. Additional exact-image
+  test adapter and evidence publication are under final review.
 - Current normal-dev/prebuilt pin9f070fad...a572f8: ordinary inprogress worker
   loss,60s-vs900s matched65s controls and900s pending SIGKILL pass. Eight
   one-time native operation cases pass memory/RocksDB, actual crash cuts,
@@ -17,9 +17,15 @@
   one-time-summary-{1,2,3}.json and review-one-time-*.md. Read-only production
   archives2474files/462780627B verified. Current two Failed jobs remain run20/22,
   equal nonces0, no target workers; exact old SQL/program hashes match candidates.
-- Next: finish exact-runtime staging/backup/deadline tooling qualification and
-  final operation packet review, then the explicit production replay decision.
-  Existing production image is supported; no engine publication is required.
+- Exact production image54b1/source597 passed targeted RocksDB expiry→guarded
+  P recovery→newC/fresh native UUID/state case actual-image597-rocks-1, using
+  its own engine55a48879/Python3.12.5; no rebuild or production action. Thirteen
+  current-phase isolated cases total. Final independent audit/publication pending.
+  Corrected timing: Redpanda reports last_update_ts as transaction start; prior
+  field-based full-lifetime claims are withdrawn, raw receipts preserved.
+- Exact-runtime staging/backup/deadline tools are qualified. Next: publish
+  current-image evidence, verify current-head CI and refresh the operation packet,
+  then the explicit production replay decision. No engine publication is required.
   Production identity4456→4457/profiles1016→1017 recovery is NOT done.
   User decision must explicitly accept uncommitted-suffix replay/UUID changes,
   then coordinate operation with integration agent and verify fresh processing.

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Finite unpaced real-Kafka liveness and worker-loss qualification."""
-import argparse, importlib.util, json, os, re, subprocess, time, urllib.request, signal, sqlite3, shutil
+import argparse, hashlib, importlib.util, json, os, re, subprocess, sys, time, urllib.request, signal, sqlite3, shutil, stat
 from pathlib import Path
 from datetime import datetime, timezone
 from types import SimpleNamespace
@@ -20,6 +20,8 @@ def main():
     for n in ('binary', 'helper', 'baseline', 'case', 'rpk'):
         p.add_argument('--' + n, type=Path, required=True)
     p.add_argument('--fixture', type=Path)
+    p.add_argument('--immutable-image-manifest',type=Path)
+    p.add_argument('--immutable-image-manifest-sha256')
     p.add_argument('--operation-cut', choices=['none','after-cas','replay-inprogress','replay-committed','exact-c','source-retention-refused'], default='none', help='Finite isolated one-time process-loss branch.')
     p.add_argument('--operation-python', type=Path, help='Pinned production-matching CPython3.12.5 for external Kafka and catalog CLIs only.')
     p.add_argument('--operation-root', type=Path)
@@ -34,6 +36,16 @@ def main():
     p.add_argument('--port', type=int, default=18146)
     p.add_argument('--checkpoint-seconds', type=int, default=2, choices=[2])
     a = p.parse_args()
+    immutable=None
+    assert (a.immutable_image_manifest is not None)==(a.immutable_image_manifest_sha256 is not None)
+    if a.immutable_image_manifest:
+        fd=os.open(a.immutable_image_manifest,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
+        with os.fdopen(fd,'rb') as stream:
+            assert stat.S_ISREG(os.fstat(stream.fileno()).st_mode)
+            raw=stream.read(1024*1024+1)
+        assert len(raw)<=1024*1024 and hashlib.sha256(raw).hexdigest()==a.immutable_image_manifest_sha256
+        immutable=json.loads(raw)
+        assert a.scenario=='one-time-repair' and a.operation_cut=='none' and a.backend=='rocksdb' and a.port==immutable['api_port']
     assert a.operation_python is None or a.scenario=='one-time-repair'
     assert a.operation_cut=='none' or a.scenario=='one-time-repair'
     uuid_fixture=a.scenario=='one-time-repair'
@@ -51,10 +63,39 @@ def main():
     spec = importlib.util.spec_from_file_location('h', a.helper)
     h = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(h)
+    if immutable:
+        assert a.binary==Path(immutable['binary']['path']) and a.binary.stat().st_size==immutable['binary']['bytes'] and h.sha(a.binary)==immutable['binary']['sha256']
+        assert sys.version_info[:3]==(3,12,5) and sys.executable==immutable['python']['path'] and h.sha(Path(sys.executable))==immutable['python']['sha256']
+        runner=Path(immutable['support']['runner']['path'])
+        assert h.sha(runner)==immutable['support']['runner']['sha256']=='99556a7c4163ea0f69859ce6ca3df25850461e9649e1f3791cddfb6a90fe3def'
+        assert h.sha(a.helper)==immutable['support']['process_helper']['sha256']=='dd4fdb42ad5975640064a87dd83e04dfbe4f1633661f9ea360c58dd28bd846ca'
+        support_spec=importlib.util.spec_from_file_location('qualified_pidfd_support',runner)
+        support_module=importlib.util.module_from_spec(support_spec);support_spec.loader.exec_module(support_module)
+        h=support_module.support()  # Reviewed local facades and self-pidfd signal0 probe precede all children.
+        import pyarrow,pyarrow.lib,pyarrow.parquet
+        arrow_root=Path(immutable['pyarrow']['runtime_root']).resolve()
+        assert pyarrow.__version__==immutable['pyarrow']['version']=='20.0.0'
+        assert Path(pyarrow.__file__).resolve().is_relative_to(arrow_root) and Path(pyarrow.lib.__file__).resolve().is_relative_to(arrow_root)
+        table=pyarrow.table({'key':[b'k'],'value':[b'v']})
+        pyarrow.parquet.write_table(table,case/'arrow-binary-probe.parquet')
+        assert pyarrow.parquet.read_table(case/'arrow-binary-probe.parquet',columns=['key','value']).to_pylist()==[{'key':b'k','value':b'v'}]
+        (case/'immutable-runtime.json').write_text(json.dumps(dict(binary_sha256=h.sha(a.binary),binary_bytes=a.binary.stat().st_size,python=sys.executable,python_sha256=h.sha(Path(sys.executable)),python_version=sys.version,sqlite_version=sqlite3.sqlite_version,pyarrow_version=pyarrow.__version__,pyarrow_path=pyarrow.__file__,pyarrow_native_path=pyarrow.lib.__file__,pyarrow_binary_parquet_probe='passed',profile=immutable['profile']),indent=2)+'\n')
     h.enable_subreaper()
 
     def write(n, v):
         (case / n).write_text(json.dumps(v, indent=2, sort_keys=True) + '\n')
+    verified_workers=set()
+    def bind_workers(processes,label):
+        if not immutable:return
+        for process in processes:
+            if not process['args'] or process['args'][-1]!='worker':continue
+            assert process['exe']==str(a.binary),'worker executable path differs from actual immutable image'
+            identity=h.identity(process)
+            if identity in verified_workers:continue
+            digest=h.sha(Path('/proc')/str(process['pid'])/'exe')
+            assert digest==immutable['binary']['sha256'],'worker executable bytes differ from actual immutable image'
+            verified_workers.add(identity)
+            with (case/'immutable-worker-bindings.jsonl').open('a') as stream:stream.write(json.dumps(dict(time_ns=time.time_ns(),label=label,process=process,worker=h.worker(process,a.binary),binary_sha256=digest))+'\n')
     commands = []
 
     def broker(*args, data=None, command_timeout=60):
@@ -161,6 +202,7 @@ def main():
             assert child.poll() is None, 'cluster exited ' + label
             procs = h.session_processes(child.pid)
             result['max_sampled_owned_rss_bytes'] = max(result.get('max_sampled_owned_rss_bytes', 0), sum((x['rss'] for x in procs)))
+            bind_workers(procs,label)
             for x in procs:
                 owned[h.identity(x)] = x
             with (case / 'process-samples.jsonl').open('a') as samples:
@@ -233,13 +275,22 @@ def main():
             states.append(current);raws.append(raw)
         return states,raws
     try:
-        env = {k: v for k, v in os.environ.items() if not k.startswith(('ARROYO__', 'STREAMR_TEST_'))}
+        env = {k: v for k, v in os.environ.items() if not k.startswith('STREAMR_TEST_') and (immutable or not k.startswith('ARROYO__'))}
+        if immutable:
+            config_raw=Path(immutable['registry_config']['path']).read_bytes()
+            assert hashlib.sha256(config_raw).hexdigest()==immutable['registry_config']['sha256']
+            image_config=json.loads(config_raw)
+            expected_arroyo=dict(item.split('=',1) for item in image_config['config']['Env'] if item.startswith('ARROYO__'))
+            assert {key:value for key,value in env.items() if key.startswith('ARROYO__')}==expected_arroyo
         env['RUST_LOG'] = 'info'
         fault_dir = case / 'fault-gates'
         fault_dir.mkdir()
-        env['STREAMR_TEST_CHECKPOINT_COMPLETION_FAULT_DIR'] = str(fault_dir)
         env['STREAMR_TEST_KAFKA_COMMIT_FAULT_DIR'] = str(fault_dir)
-        env['STREAMR_TEST_KAFKA_DISPATCH_FAULT_DIR'] = str(fault_dir)
+        if not immutable:
+            env['STREAMR_TEST_CHECKPOINT_COMPLETION_FAULT_DIR'] = str(fault_dir)
+            env['STREAMR_TEST_KAFKA_DISPATCH_FAULT_DIR'] = str(fault_dir)
+        if immutable:
+            write('immutable-environment.json',dict(preserved_image_arroyo=expected_arroyo,host_arroyo_forwarded=False,test_config=str(case/'config.json'),test_namespace=a.namespace,test_overrides={key:value for key,value in env.items() if key=='RUST_LOG' or key.startswith('STREAMR_TEST_')},injected_dev_libraries=False))
         log = (case / 'runtime.log').open('wb')
         child = subprocess.Popen([str(a.binary), '--config', str(case / 'config.json'), 'cluster'], stdout=log, stderr=subprocess.STDOUT, start_new_session=True, env=env, cwd=case)
 
@@ -318,7 +369,7 @@ def main():
         if uuid_fixture:
             module_spec=importlib.util.spec_from_file_location('one_time_recovery',a.one_time_module)
             one_time=importlib.util.module_from_spec(module_spec);module_spec.loader.exec_module(one_time)
-            context=SimpleNamespace(a=a,h=h,case=case,write=write,broker=broker,api=api,job=job,pid=pid,original_job=original_job,src=src,outputs=outputs,commits=commits,query=query,inputs=inputs,expected=expected,manifest=manifest,result=result,prefix=prefix,cut=cut,fault_dir=fault_dir,child=child,owned=owned,log=log,env=env,snapshot=snapshot,committed_raw=committed_raw,validate_uuid_values=validate_uuid_values)
+            context=SimpleNamespace(a=a,h=h,immutable=immutable,case=case,write=write,broker=broker,api=api,job=job,pid=pid,original_job=original_job,src=src,outputs=outputs,commits=commits,query=query,inputs=inputs,expected=expected,manifest=manifest,result=result,prefix=prefix,cut=cut,fault_dir=fault_dir,child=child,owned=owned,log=log,env=env,snapshot=snapshot,committed_raw=committed_raw,validate_uuid_values=validate_uuid_values,bind_workers=bind_workers)
             try:one_time.run(context)
             finally:child=context.child
             return

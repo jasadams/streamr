@@ -38,7 +38,9 @@ def run(c):
     patch=importlib.util.module_from_spec(patch_spec);patch_spec.loader.exec_module(patch)
     operation_python=str(a.operation_python.resolve()) if a.operation_python else sys.executable
     if a.operation_python:
-        expected_python=a.operation_root/'production-runtime-312/interpreter/python/bin/python3.12'
+        if getattr(a,'immutable_image_manifest',None):
+            expected_python=Path(c.immutable['python']['path'])
+        else:expected_python=a.operation_root/'production-runtime-312/interpreter/python/bin/python3.12'
         assert a.operation_python.resolve()==expected_python.resolve()
         assert h.sha(expected_python)=='147ab3b44ef31b301e3fe39e12dd3502b462977371ad7cece59c703f8f7d0f0e'
     database=case/'catalog.sqlite'
@@ -50,6 +52,7 @@ def run(c):
         while time.monotonic()<end:
             assert c.child.poll() is None, 'cluster exited during '+label
             processes=h.session_processes(c.child.pid)
+            c.bind_workers(processes,label)
             c.owned.update({h.identity(p):p for p in processes})
             c.result['max_sampled_owned_rss_bytes']=max(c.result.get('max_sampled_owned_rss_bytes',0),sum(p['rss'] for p in processes))
             with (case/'one-time-process-samples.jsonl').open('a') as stream:stream.write(json.dumps(dict(time_ns=time.time_ns(),processes=processes))+'\n')
@@ -182,14 +185,19 @@ print(json.dumps(receipt))
         text=log_since(start_log)
         return rows[0] if len(rows)==1 and any('Kafka commit fault pause' in line and job in line and re.search(rf'\bepoch={c_epoch}\b',line) for line in text.splitlines()) else None
     C=wait(prepared_C,'durable committing C before original EndTxn')
+    original_committing_pause_observed_ns=time.time_ns()
     C_pending=pending(c_epoch,sink)
     assert C_pending['generation']==P_pending['generation'] and C_pending['transaction_index']==P_pending['transaction_index']+1
     assert source_next(c_epoch,sources[0])==2
     transaction_ids=[f'streamr-v4-id-{job}-{sink}-{c.outputs[0]}-0-{slot}' for slot in [0,1]]
     selected_id=transaction_ids[C_pending['transaction_index']%2]
+    describe_observations={}
     def describe(label):
+        request_start_ns=time.time_ns()
         raw=c.broker('cluster','txn','describe',*transaction_ids,'--format=json',command_timeout=10)
+        describe_observations[label]=dict(request_start_ns=request_start_ns,response_observed_ns=time.time_ns())
         (case/(label+'.json.stdout')).write_text(raw)
+        c.write(label+'-observation.json',describe_observations[label])
         return json.loads(raw)
     original_workers=[h.worker(p,a.binary) for p in h.session_processes(c.child.pid)]
     original_workers=[worker for worker in original_workers if worker and worker['job']==job]
@@ -199,8 +207,11 @@ print(json.dumps(receipt))
     def owner_alive():
         return any(h.identity(process)==h.identity(original_owner) for process in h.session_processes(c.child.pid))
     ongoing=describe('operation-original-ongoing')
+    original_ongoing_observed_ns=time.time_ns()
     selected=[row for row in ongoing if row['transaction_id']==selected_id]
     assert selected and all(row['producer_id']==C_pending['producer_id'] and row['producer_epoch']==C_pending['producer_epoch'] and row['state']=='Ongoing' and row['timeout']==60000 for row in selected)
+    original_last_updates={int(row['start_timestamp']) for row in selected};assert len(original_last_updates)==1
+    timing=dict(original_broker_last_update_ms=original_last_updates.pop(),original_committing_pause_observed_ns=original_committing_pause_observed_ns,original_ongoing_observed_ns=original_ongoing_observed_ns,last_original_ongoing_request_start_ns=describe_observations['operation-original-ongoing']['request_start_ns'])
     raw=c.broker('topic','consume',c.outputs[0],'--read-committed=false','--offset',':end','--format','%p\t%o\t%x\t%y\t%k{hex}\t%d\t%v\n')
     (case/'original-C-uncommitted.tsv').write_text(raw)
     records=[row.split('\t',6) for row in raw.splitlines()]
@@ -223,17 +234,22 @@ print(json.dumps(receipt))
             nonlocal probe
             assert owner_alive(), 'original prepared owner exited before expiry/release'
             assert 'Kafka compact transaction resume' not in log_since(start_log), 'replacement resumed before original release'
-            rows=describe(f'operation-expiry-{probe:04}');probe+=1
+            label=f'operation-expiry-{probe:04}'
+            rows=describe(label);probe+=1
             selected=[row for row in rows if row['transaction_id']==selected_id]
+            if selected and all(row['producer_id']==C_pending['producer_id'] and row['producer_epoch']==C_pending['producer_epoch'] and row['state']=='Ongoing' for row in selected):timing['last_original_ongoing_request_start_ns']=describe_observations[label]['request_start_ns']
             return selected if selected and all(row['producer_id']==C_pending['producer_id'] and row['producer_epoch']==C_pending['producer_epoch']+1 and row['state']=='CompleteAbort' for row in selected) else None
         expired=wait(aborted,'actual original selected transaction broker abort',90)
+        timing['original_abort_observed_ns']=time.time_ns()
         c.write('operation-expired.json',dict(P=P,C=C,pending=C_pending,ongoing=ongoing,aborted=expired))
         assert owner_alive() and 'Kafka compact transaction resume' not in log_since(start_log)
         gate.unlink()
         original_error=wait(lambda:[line for line in log_since(start_log).splitlines() if 'Kafka transaction failed without acknowledgement:' in line and sink in line and 'fenced by a newer instance' in line and 'Kafka prepared transaction recovery failed:' not in line],'original EndTxn fencing before worker loss',15)
+        timing['original_error_observed_ns']=time.time_ns()
         assert owner_alive(), 'original error owner exited before actual SIGKILL'
         assert 'Kafka compact transaction resume' not in log_since(start_log), 'replacement error cannot qualify original failure'
         assert h.terminate_identity(original_owner,signal.SIGKILL)
+        timing['original_worker_SIGKILL_ns']=time.time_ns()
         restore_boundary=(case/'runtime.log').stat().st_size
         c.write('operation-original-loss.json',dict(time_ns=time.time_ns(),worker=original_owner,error=original_error,restore_log_boundary=restore_boundary))
         wait(lambda:c.job()['state']=='Failed','ordinary selected-C recovery exhausted with missing marker')
@@ -453,6 +469,7 @@ print(json.dumps(receipt))
         paused=any('Kafka commit fault pause' in line and job in line and re.search(rf'\bepoch={c_epoch}\b',line) for line in text.splitlines())
         return candidates[0] if len(candidates)==1 and paused else None
     prepared_replacement=wait(replacement_prepared,'replacement C before EndTxn for actual timeout proof')
+    timing['replacement_committing_pause_observed_ns']=time.time_ns()
     replacement_pending=pending(c_epoch,sink)
     assert replacement_pending['generation']==P_pending['generation'] and replacement_pending['epoch']==c_epoch
     assert (replacement_pending['producer_id'],replacement_pending['producer_epoch'])!=(C_pending['producer_id'],C_pending['producer_epoch'])
@@ -460,6 +477,9 @@ print(json.dumps(receipt))
     replacement_transactions=describe('operation-replacement-broker')
     matches=[row for row in replacement_transactions if row['transaction_id']==replacement_id]
     assert matches and all(row['producer_id']==replacement_pending['producer_id'] and row['producer_epoch']==replacement_pending['producer_epoch'] and row['state']=='Ongoing' and row['timeout']==900000 for row in matches), 'replacement did not adopt compiled client timeout'
+    replacement_last_updates={int(row['start_timestamp']) for row in matches};assert len(replacement_last_updates)==1
+    timing['replacement_broker_last_update_ms']=replacement_last_updates.pop()
+    timing['replacement_ongoing_observed_ns']=time.time_ns()
     prepared_workers=[h.worker(process,a.binary) for process in h.session_processes(c.child.pid)]
     prepared_workers=[worker for worker in prepared_workers if worker and worker['job']==job];assert len(prepared_workers)==1
     prepared_owner=prepared_workers[0]
@@ -490,6 +510,15 @@ print(json.dumps(receipt))
         assert len(old)==1 and old[0]['state']=='failed'
         return dict(old=old[0],new=new[0]) if len(new)==1 else None
     replacement_rows=wait(replacement_C,'distinct replacement C ready')
+    timing['replacement_ready_observed_ns']=time.time_ns()
+    if getattr(a,'immutable_image_manifest',None):
+        for label,transaction,boundary in [('original',C_pending,start_log),('replacement',replacement_pending,restore_start)]:
+            prepared=[line for line in log_since(boundary).splitlines() if 'Kafka compact transaction prepared' in line and job in line and sink in line and all(re.search(rf'\b{name}={value}\b',line) for name,value in [('epoch',c_epoch),('producer_id',transaction['producer_id']),('producer_epoch',transaction['producer_epoch']),('transaction_index',transaction['transaction_index'])])]
+            assert len(prepared)==1
+            timing[label+'_native_prepare_line']=prepared[0]
+            timing[label+'_native_prepare_utc']=prepared[0].split()[0]
+        timing.update(original_last_update_to_abort_observation_bracket_ms=[timing['last_original_ongoing_request_start_ns']/1e6-timing['original_broker_last_update_ms'],timing['original_abort_observed_ns']/1e6-timing['original_broker_last_update_ms']],replacement_last_update_to_ready_observed_ms=timing['replacement_ready_observed_ns']/1e6-timing['replacement_broker_last_update_ms'],replacement_ready_catalog_finish= replacement_rows['new']['finish_time'],scope='Only this actual immutable artifact/fixture: Redpanda v24.3.7 substitutes last_update_ts for Kafka start_timestamp. These last-update-relative observations do not establish full transaction age, broker start or exact EndTxn time; frozen older receipt labels require this correction')
+        c.write('immutable-transaction-timing.json',timing)
     c.write('operation-replacement-C.json',replacement_rows)
     assert replacement_rows['new']['pub_id']==prepared_replacement['pub_id']
     markers('replayed',c_epoch,replacement_pending)

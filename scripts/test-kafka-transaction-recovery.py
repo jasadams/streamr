@@ -3,13 +3,60 @@
 
 Run through scripts/rust-build; requires a scripts/build-pin source-free dev pin.
 The frozen baseline directory is read-only evidence and is never changed."""
-import argparse, json, os, re, subprocess, time
+import argparse, hashlib, json, os, re, stat, subprocess, time, zipfile
 from pathlib import Path
+
+def descriptor_bytes(spec,limit=16*1024*1024):
+    path=Path(spec['path'])
+    assert path.is_absolute() and path.resolve()==path and not path.is_symlink()
+    fd=os.open(path,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
+    with os.fdopen(fd,'rb') as stream:
+        assert stat.S_ISREG(os.fstat(stream.fileno()).st_mode)
+        assert os.fstat(stream.fileno()).st_size==spec['size']<=limit
+        raw=stream.read(limit+1)
+    assert len(raw)==spec['size'] and hashlib.sha256(raw).hexdigest()==spec['sha256']
+    return raw
+
+
+def immutable_descriptor(path,digest):
+    assert digest and re.fullmatch('[a-f0-9]{64}',digest)
+    runtime=json.loads(descriptor_bytes(dict(path=str(path.resolve()),size=path.stat().st_size,sha256=digest)))
+    assert type(runtime['version']) is int and runtime['version']==1 and runtime['image']['os']=='linux' and runtime['image']['architecture']=='amd64'
+    image=runtime['image'];manifest=json.loads(descriptor_bytes(runtime['registry_manifest']));config=json.loads(descriptor_bytes(runtime['registry_config']))
+    assert image['reference'].endswith('@sha256:'+image['manifest_sha256'])
+    assert runtime['registry_manifest']['sha256']==image['manifest_sha256']
+    assert manifest['config']['digest']==image['config_digest']=='sha256:'+runtime['registry_config']['sha256']
+    assert config['os']==image['os'] and config['architecture']==image['architecture']
+    assert config['config']['Labels']['org.opencontainers.image.revision']==image['source_commit']
+    assert runtime['binary']['path']=='/app/arroyo' and runtime['profile']['declared_recipe_profile']=='release'
+    descriptor_bytes(runtime['source_audit'])
+    for spec in runtime['support'].values():descriptor_bytes(spec)
+    assert runtime['support']['runner']['sha256']=='99556a7c4163ea0f69859ce6ca3df25850461e9649e1f3791cddfb6a90fe3def'
+    assert runtime['support']['process_helper']['sha256']=='dd4fdb42ad5975640064a87dd83e04dfbe4f1633661f9ea360c58dd28bd846ca'
+    arrow=runtime['pyarrow'];receipt=json.loads(descriptor_bytes(arrow['receipt']));members=json.loads(descriptor_bytes(arrow['members']))
+    assert receipt['package']=='pyarrow' and receipt['version']==arrow['version']=='20.0.0' and receipt['python']==arrow['python_abi']=='cp312'
+    assert receipt['member_hash_manifest_sha256']==arrow['members']['sha256'] and receipt['wheel_sha256']==arrow['wheel']['sha256']
+    root=Path(arrow['runtime_root']);assert root.resolve()==root and receipt['runtime_root']==str(root)
+    wheel=Path(arrow['wheel']['path']);assert wheel.resolve()==wheel and wheel.stat().st_size==arrow['wheel']['size']
+    with wheel.open('rb') as stream:assert hashlib.file_digest(stream,'sha256').hexdigest()==arrow['wheel']['sha256']
+    indexed={row['path']:row for row in members};assert len(indexed)==len(members)
+    with zipfile.ZipFile(wheel) as archive:
+        assert {entry.filename for entry in archive.infolist() if not entry.is_dir()}==set(indexed)
+        for name,row in indexed.items():
+            member=root/name;assert member.is_file() and member.resolve().is_relative_to(root) and not member.is_symlink() and member.stat().st_size==row['size']
+            with member.open('rb') as stream:assert hashlib.file_digest(stream,'sha256').hexdigest()==row['sha256']
+            with archive.open(name) as stream:assert hashlib.file_digest(stream,'sha256').hexdigest()==row['sha256']
+    assert {str(p.relative_to(root)) for p in root.rglob('*') if p.is_file()}==set(indexed)
+    return runtime,config
+
 
 def main():
     p = argparse.ArgumentParser()
     p.add_argument('--case', type=Path, required=True)
-    p.add_argument('--pin', type=Path, required=True)
+    artifact=p.add_mutually_exclusive_group(required=True)
+    artifact.add_argument('--pin',type=Path)
+    artifact.add_argument('--immutable-image-manifest',type=Path,help='Explicit inspected release-image qualification; never substitutes for a dev pin.')
+    p.add_argument('--immutable-image-manifest-sha256')
     p.add_argument('--checkpoint-seconds', type=int, choices=[2], default=2)
     p.add_argument('--repo', type=Path, required=True)
     p.add_argument('--baseline', type=Path, required=True)
@@ -24,9 +71,12 @@ def main():
     p.add_argument('--broker-pause-seconds', type=int, choices=[0, 3], default=0)
     p.add_argument('--transaction-timeout-ms', type=int, choices=[60000, 900000], help='Explicit existing client configuration for prevention qualification; ordinary case defaults unchanged.')
     p.add_argument('--pyarrow', type=Path, required=True)
-    p.add_argument('--image', default='localhost/streamr-str127-dev:latest')
+    p.add_argument('--image', help='Dev-pin compatible runtime; immutable-image mode uses only its descriptor reference.')
     p.add_argument('--broker-image', default='docker.io/redpandadata/redpanda:v24.3.7')
     a = p.parse_args()
+    assert (a.immutable_image_manifest is not None)==(a.immutable_image_manifest_sha256 is not None)
+    if a.immutable_image_manifest:
+        assert a.image is None and a.scenario=='one-time-repair' and a.operation_cut=='none' and a.backend=='rocksdb' and a.operation_python and a.fixture
     assert os.environ.get('RUST_BUILD_QUEUE_HELD'), 'shared queue required'
     assert a.operation_python is None or a.scenario=='one-time-repair'
     assert a.operation_cut=='none' or a.scenario=='one-time-repair'
@@ -46,23 +96,32 @@ def main():
         write('host-commands.json', commands)
         assert r.returncode == 0, (argv, r.stderr)
         return r.stdout.strip()
-    pin = a.pin.resolve()
-    binary = pin / 'package/bin/arroyo'
-    receipt = json.loads((pin / 'source-manifest.json').read_text())
-    import hashlib
-    with binary.open('rb') as stream:
-        binary_digest = hashlib.file_digest(stream, 'sha256').hexdigest()
-    assert binary_digest == receipt['binary_sha256']
-    assert receipt['build_profile'] == 'dev', 'qualification requires normal dev pin'
-    for name, digest in receipt['package_files'].items():
-        with (pin / 'package' / name).open('rb') as stream:
-            assert hashlib.file_digest(stream, 'sha256').hexdigest() == digest
-    for key, name in [('image_native_receipt_sha256', 'image-native-receipt.json'), ('runtime_linkage_receipt_sha256', 'runtime-linkage.json')]:
-        assert hashlib.sha256((pin / name).read_bytes()).hexdigest() == receipt[key]
-    image = json.loads(run(['podman', 'image', 'inspect', a.image]))[0]
-    assert image['Id']==receipt['runtime_image'], 'runtime image differs from preserved pin'
+    immutable=None;pin=None;receipt=None
+    if a.immutable_image_manifest:
+        immutable,oci_config=immutable_descriptor(a.immutable_image_manifest,a.immutable_image_manifest_sha256)
+        assert a.pyarrow.resolve()==Path(immutable['pyarrow']['runtime_root'])
+        assert str(a.operation_python)==immutable['python']['path']  # Container path need not exist on this host.
+        binary=Path(immutable['binary']['path'])
+        image=json.loads(run(['podman','image','inspect',immutable['image']['reference']]))[0]
+        assert image['Id'].removeprefix('sha256:')==immutable['image']['config_digest'].removeprefix('sha256:')
+        assert image['RootFS']['Layers']==oci_config['rootfs']['diff_ids']
+    else:
+        pin = a.pin.resolve()
+        binary = pin / 'package/bin/arroyo'
+        receipt = json.loads((pin / 'source-manifest.json').read_text())
+        with binary.open('rb') as stream:
+            binary_digest = hashlib.file_digest(stream, 'sha256').hexdigest()
+        assert binary_digest == receipt['binary_sha256']
+        assert receipt['build_profile'] == 'dev', 'qualification requires normal dev pin'
+        for name, digest in receipt['package_files'].items():
+            with (pin / 'package' / name).open('rb') as stream:
+                assert hashlib.file_digest(stream, 'sha256').hexdigest() == digest
+        for key, name in [('image_native_receipt_sha256', 'image-native-receipt.json'), ('runtime_linkage_receipt_sha256', 'runtime-linkage.json')]:
+            assert hashlib.sha256((pin / name).read_bytes()).hexdigest() == receipt[key]
+        image = json.loads(run(['podman', 'image', 'inspect', (a.image or 'localhost/streamr-str127-dev:latest')]))[0]
+        assert image['Id']==receipt['runtime_image'], 'runtime image differs from preserved pin'
     broker_image = json.loads(run(['podman', 'image', 'inspect', a.broker_image]))[0]
-    write('source.json', dict(pin=receipt, image=image, broker_image=broker_image, supervisor_sha256=hashlib.sha256(a.supervisor.read_bytes()).hexdigest(), wrapper_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(), helper_sha256=hashlib.sha256((a.repo / 'scripts/test-native-process-recovery.py').read_bytes()).hexdigest()))
+    write('source.json', dict(**({'runtime_mode':'immutable_image','immutable_image':immutable,'manifest_sha256':a.immutable_image_manifest_sha256} if immutable else {'pin':receipt}), image=image, broker_image=broker_image, supervisor_sha256=hashlib.sha256(a.supervisor.read_bytes()).hexdigest(), wrapper_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(), helper_sha256=hashlib.sha256((a.repo / 'scripts/test-native-process-recovery.py').read_bytes()).hexdigest()))
     suffix = case.name.lower()
     assert re.fullmatch('[a-z0-9-]+', suffix)
     prefix = 'str146-' + suffix
@@ -103,21 +162,36 @@ def main():
         run(['podman', 'cp', broker_id + ':/opt/redpanda/libexec/rpk', str(case / 'rpk')])
         with (case/'rpk').open('rb') as stream:
             write('broker-rpk.json',dict(broker_image_id=broker_image['Id'],binary_sha256=hashlib.file_digest(stream,'sha256').hexdigest(),describe_schema_source='https://github.com/redpanda-data/redpanda/blob/v24.3.7/src/go/rpk/pkg/cli/cluster/txn/describe.go'))
-        argv = ['podman', 'run', '--rm', '--cidfile', str(cidfile), '--name', engine, '--network', network, '--security-opt', 'label=disable', '--memory', '2G', '-v', str(case) + ':' + str(case) + ':rw', '-v', str(pin) + ':' + str(pin) + ':ro', '-v', str(a.supervisor.resolve()) + ':/runner/supervisor.py:ro', '-v', str(a.repo.resolve() / 'scripts/test-native-process-recovery.py') + ':/runner/helper.py:ro', '-v', str(a.baseline.resolve()) + ':/runner/baseline:ro', '-v', str(a.pyarrow.resolve()) + ':' + str(a.pyarrow.resolve()) + ':ro', '-e', 'RUST_BUILD_QUEUE_HELD=' + os.environ['RUST_BUILD_QUEUE_HELD'], '-e', 'PYTHONDONTWRITEBYTECODE=1', '-e', 'PYTHONPATH=' + str(a.pyarrow.resolve())]
+        argv = ['podman', 'run', '--rm', '--cidfile', str(cidfile), '--name', engine, '--network', network, '--security-opt', 'label=disable', '--memory', '2G', '-v', str(case) + ':' + str(case) + ':rw', '-v', str(a.supervisor.resolve()) + ':/runner/supervisor.py:ro', '-v', str(a.repo.resolve() / 'scripts/test-native-process-recovery.py') + ':/runner/helper.py:ro', '-v', str(a.baseline.resolve()) + ':/runner/baseline:ro', '-v', str(a.pyarrow.resolve()) + ':' + str(a.pyarrow.resolve()) + ':ro', '-e', 'RUST_BUILD_QUEUE_HELD=' + os.environ['RUST_BUILD_QUEUE_HELD'], '-e', 'PYTHONDONTWRITEBYTECODE=1', '-e', 'PYTHONPATH=' + str(a.pyarrow.resolve())]
+        if pin:argv += ['-v',str(pin)+':'+str(pin)+':ro']
         if a.operation_root:
-            first_mount=argv.index('-v')
-            argv[first_mount:first_mount]=['-v',str(a.operation_root.resolve())+':'+str(a.operation_root.resolve())+':ro','-v',str(Path(__file__).resolve().with_name('kafka-one-time-recovery.py'))+':/runner/one-time.py:ro']
+            if immutable:
+                selected=[a.operation_root/'operational-helper'/name for name in ['kafka_helper.py','catalog_helper.py','checkpoint_closure.py']]
+                selected += [a.operation_root/'prevention/prepare_timeout_patch.py',a.immutable_image_manifest.resolve(),Path(immutable['pyarrow']['root'])]
+                client=a.operation_root/'production-runtime-312'
+                client_receipt=json.loads((client/'dependency-receipt.json').read_text())
+                selected += [client/'dependency-receipt.json',client/client_receipt['wheel_filename'],client/'python-runtime']
+                selected += [Path(spec['path']) for spec in immutable['support'].values()]
+                selected += [Path(immutable[key]['path']) for key in ['registry_manifest','registry_config','source_audit']]
+                for path in selected:argv += ['-v',str(path)+':'+str(path)+':ro']
+                argv += ['-v',str(Path(__file__).resolve().with_name('kafka-one-time-recovery.py'))+':/runner/one-time.py:ro']
+            else:
+                first_mount=argv.index('-v')
+                argv[first_mount:first_mount]=['-v',str(a.operation_root.resolve())+':'+str(a.operation_root.resolve())+':ro','-v',str(Path(__file__).resolve().with_name('kafka-one-time-recovery.py'))+':/runner/one-time.py:ro']
         if a.fixture:
             argv += ['-v', str(a.fixture.resolve()) + ':/runner/fixture:ro']
-        libraries = [str(pin / 'package/lib')]
-        argv += ['-e', 'LD_LIBRARY_PATH=' + ':'.join(libraries), image['Id'], 'python3', '/runner/supervisor.py', '--binary', str(binary), '--helper', '/runner/helper.py', '--baseline', '/runner/baseline', '--scenario', a.scenario, '--case', str(case), '--rpk', str(case / 'rpk'), '--namespace', prefix, '--checkpoint-seconds', str(a.checkpoint_seconds)]
+        if immutable:
+            argv += ['--entrypoint',immutable['python']['path'],image['Id'],'/runner/supervisor.py','--immutable-image-manifest',str(a.immutable_image_manifest.resolve()),'--immutable-image-manifest-sha256',a.immutable_image_manifest_sha256,'--port',str(immutable['api_port'])]
+        else:
+            argv += ['-e','LD_LIBRARY_PATH='+str(pin/'package/lib'),image['Id'],'python3','/runner/supervisor.py']
+        argv += ['--binary',str(binary),'--helper','/runner/helper.py','--baseline','/runner/baseline','--scenario',a.scenario,'--case',str(case),'--rpk',str(case/'rpk'),'--namespace',prefix,'--checkpoint-seconds',str(a.checkpoint_seconds)]
         argv += ['--backend', a.backend]
         if a.fixture:
             argv += ['--fixture', '/runner/fixture']
         argv += ['--commit-delay-seconds', str(a.commit_delay_seconds), '--broker-pause-seconds', str(a.broker_pause_seconds)]
         if a.transaction_timeout_ms is not None:argv += ['--transaction-timeout-ms',str(a.transaction_timeout_ms)]
         if a.operation_root:argv += ['--operation-root',str(a.operation_root.resolve()),'--one-time-module','/runner/one-time.py','--operation-cut',a.operation_cut]
-        if a.operation_python:argv += ['--operation-python',str(a.operation_python.resolve())]
+        if a.operation_python:argv += ['--operation-python',str(a.operation_python if immutable else a.operation_python.resolve())]
         write('inner-command.json', argv)
         with (case / 'container.log').open('w') as out:
             engine_process = subprocess.Popen(argv, stdout=out, stderr=subprocess.STDOUT)
