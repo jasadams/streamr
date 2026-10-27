@@ -1,39 +1,44 @@
-## Active STR-158 — prepared Kafka recovery diagnosis — 2026-10-27
+## Active STR-158 — approved Flink-style baseline and expiry repair — 2026-10-27
 
-- Session `codex-01a17c72-104c-7ad0-8ed7-87198176c8d3`; branch
-  `jason/str-158-kafka-recovery-20261027`, fetched base
-  `597b6326ab82f9c70634fe3e241f0c355f8e72cf`. Guidance: `AGENTS.md`,
-  `.claude/team.md`, `.claude/build-test.md`, this ledger/feature plan,
-  full STR-158 and STR-146 protocol report. Invoking dirty checkout preserved.
-- Acceptance now: finite isolated real-Kafka original commit-delay/fencing
-  reproduction, literal source/output/marker oracle and actual process loss;
-  precise cause and smallest repair/contract proposal before product changes.
-- Preserve previous evidence under
-  `/home/jason/qa-evidence/str158-identity-kafka-recovery-20261026/`.
-  Identity pending4457/marker4456; profiles pending1017/marker1016.
-  Transaction expiry is a lead, not a proven historical cause.
-- First causal case PASS on dev pin `8ea202e5…`: both CP3 IDs Ongoing→
-  CompleteAbort(epoch+1), original EndTxn fenced, exact-worker SIGKILL, CP3
-  restore/refusal marker2/expected3, unchanged committed prefix; owned cleanup
-  complete. Independent raw evidence audit PASS. This is post-global commit
-  delay, not historical cause or operator-duration proof. Exact evidence:
-  `/home/jason/qa-evidence/str158-reproduction-20261027/original-expired-1/`.
-- Debug-only source checkpoint-completion gate independently source-approved;
-  maintained fmt/check/strict state Clippy and four focused async tests PASS.
-  No new RocksDB scans or recovery behavior changes.
-- Actual checkpoint-delay case PASS on dev pin `63e4f767…`: catalog operator
-  checkpoint10,760,966µs crosses unchanged10s transaction window; same graph
-  and budgets, broker expiry before release, normal dispatch/original fencing,
-  actual worker SIGKILL/exact restore refusal, unchanged prefix/markers and owned
-  cleanup. Synthetic completion withholding does not measure state export cost.
-- Final independent source/raw audit APPROVE (`review-final.md`).
-- Next: diagnostic-increment PR/current-head CI. Historical production cause
-  and recovery of selected4457/1017
-  remain unresolved; a new rewind/replay contract requires user discussion.
-  No product repair, reset, retry, marker edit or production action performed.
-  Existing exact-marker refusal stays intact; new recovery semantics require
-  user agreement. Coordinate production testing with Arcstream integration agent.
-
+- User approved four-step plan: verify/fix standard incomplete-checkpoint restore
+  and pending Kafka commit recovery; address60s transaction expiry using measured
+  lifetime/existing configuration or demonstrated engine delay; qualify native
+  Kafka failure/recovery/prefix/fresh output; establish exact safe operation for
+  existing failed production jobs and coordinate testing with integration agent.
+- The general guarded recovery-framework proposal is removed from immediate
+  implementation. Earlier proposal approval question is superseded, not approved.
+  No skip/forcecommit/new generic rollback semantics inferred.
+- Fresh base `b448819312c5a16f5b3815a993000497ca550e19` includes STR161;
+  workspace `/home/jason/repos/streamr-worktrees/str-158-flink-recovery-20261027`,
+  branch `jason/str-158-flink-recovery-20261027`; PR88 diagnostic lineage replayed
+  into c0fa39df/efb0d51a. AGENTS/team/build/ledger/plan/current ticket read.
+  Invoking dirty checkout and prior design workspace preserved.
+- Settled evidence: two expected-refusal real-Kafka cases, exact saved sink/source
+  identities/markers/catalog states,38 ready operator metadata and1197file closure
+  (230862401B;1191declared hashes match,6globalnewhashes,0mismatches).
+  Roots `/home/jason/qa-evidence/str158-reproduction-20261027/` and
+  `/home/jason/qa-evidence/str158-recovery-plan-20261027/`; no campaign repeat.
+- Current-source normal-dev/prebuilt pin `9f070fad...a572f8`: actual worker
+  SIGKILL with C inprogress passes automatic ready-P restore/replay, old C failed,
+  new same-epoch public ID ready, exact native RocksDB state and fresh suffix
+  65/65 per sink, committed prefixes preserved. Source/upstream/catalog review
+  finds no ordinary recovery defect. Independent raw/source/package/native audit
+  passes;85 native files and exact state/output oracle verified.
+- Frozen65s controls pass: old60s expires/refuses; explicit900s survives/commits
+  exact65/65 native outputs. Actual pending-worker loss at900s also passes
+  exact65/65 outputs; observed-ready lifetime bounds67.048s/32.718s. Raw batch
+  audit passes, including all owned runtime cleanup. No original production
+  timeout causality or15minute outage guarantee claimed.
+  Broker max900s verified; exact two saved program/SQL timeout-only candidates
+  prepared/reversibility independently reviewed, not applied. External init-only
+  and atomic catalog helpers each pass11pure tests and independent source review;
+  actual pinned-runtime/broker/native qualification pending.
+- Existing4457/1017 recovery remains open: qualify exact single-sink external
+  operation, immutable P/C archive, both-slot resolution/final marker, exact-row
+  catalog CAS/public safe restart and crash cuts. Evidence root
+  `/home/jason/qa-evidence/str158-flink-baseline-20261027/`.
+  No production mutation, rewind/reset/marker edit or covert timeout change.
+  Maintained normal-dev/prebuilt paths/shared queue; baseline reservation released.
 
 ## Active STR-161 — historical checkpoint-directory cleanup — 2026-10-27
 

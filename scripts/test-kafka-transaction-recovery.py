@@ -15,15 +15,17 @@ def main():
     p.add_argument('--baseline', type=Path, required=True)
     p.add_argument('--fixture', type=Path, help='Optional generic fixture directory: config.json, query.sql, inputs.json, expected.json, manifest.json; query uses ${namespace} and ${broker}.')
     p.add_argument('--backend', choices=['memory', 'rocksdb'], default='rocksdb')
-    p.add_argument('--scenario', choices=['liveness', 'before', 'after', 'expired', 'original-expired', 'checkpoint-expired', 'orphan'], default='liveness')
+    p.add_argument('--scenario', choices=['liveness', 'before', 'after', 'expired', 'original-expired', 'checkpoint-expired', 'inprogress', 'delay-expired', 'delay-live', 'orphan'], default='liveness')
     p.add_argument('--supervisor', type=Path, default=Path(__file__).with_name('kafka-transaction-recovery-supervisor.py'))
-    p.add_argument('--commit-delay-seconds', type=int, choices=[0, 3], default=0)
+    p.add_argument('--commit-delay-seconds', type=int, choices=[0, 3, 65], default=0)
     p.add_argument('--broker-pause-seconds', type=int, choices=[0, 3], default=0)
+    p.add_argument('--transaction-timeout-ms', type=int, choices=[60000, 900000], help='Explicit existing client configuration for prevention qualification; ordinary case defaults unchanged.')
     p.add_argument('--pyarrow', type=Path, required=True)
     p.add_argument('--image', default='localhost/streamr-str127-dev:latest')
     p.add_argument('--broker-image', default='docker.io/redpandadata/redpanda:v24.3.7')
     a = p.parse_args()
     assert os.environ.get('RUST_BUILD_QUEUE_HELD'), 'shared queue required'
+    assert a.commit_delay_seconds!=65 or a.scenario in ('delay-expired','delay-live')
     case = a.case.resolve()
     case.mkdir(parents=True, exist_ok=False)
     commands = []
@@ -87,6 +89,10 @@ def main():
             time.sleep(1)
         else:
             raise RuntimeError('owned broker startup failed')
+        if a.transaction_timeout_ms is not None:
+            broker_max=int(run(['podman','exec',broker_id,'rpk','cluster','config','get','transaction_max_timeout_ms']))
+            assert a.transaction_timeout_ms<=broker_max, 'configured timeout exceeds owned broker maximum'
+            write('broker-transaction-timeout-limit.json',dict(maximum_ms=broker_max,selected_ms=a.transaction_timeout_ms,mutated=False))
         run(['podman', 'cp', broker_id + ':/opt/redpanda/libexec/rpk', str(case / 'rpk')])
         with (case/'rpk').open('rb') as stream:
             write('broker-rpk.json',dict(broker_image_id=broker_image['Id'],binary_sha256=hashlib.file_digest(stream,'sha256').hexdigest(),describe_schema_source='https://github.com/redpanda-data/redpanda/blob/v24.3.7/src/go/rpk/pkg/cli/cluster/txn/describe.go'))
@@ -99,6 +105,7 @@ def main():
         if a.fixture:
             argv += ['--fixture', '/runner/fixture']
         argv += ['--commit-delay-seconds', str(a.commit_delay_seconds), '--broker-pause-seconds', str(a.broker_pause_seconds)]
+        if a.transaction_timeout_ms is not None:argv += ['--transaction-timeout-ms',str(a.transaction_timeout_ms)]
         write('inner-command.json', argv)
         with (case / 'container.log').open('w') as out:
             engine_process = subprocess.Popen(argv, stdout=out, stderr=subprocess.STDOUT)
