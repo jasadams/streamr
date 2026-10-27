@@ -9,7 +9,7 @@ def main():
         p.add_argument('--' + n, type=Path, required=True)
     p.add_argument('--fixture', type=Path)
     p.add_argument('--backend', choices=['memory', 'rocksdb'], default='rocksdb')
-    p.add_argument('--scenario', choices=['liveness', 'before', 'after', 'expired', 'orphan'], required=True)
+    p.add_argument('--scenario', choices=['liveness', 'before', 'after', 'expired', 'original-expired', 'checkpoint-expired', 'orphan'], required=True)
     p.add_argument('--commit-delay-seconds', type=int, choices=[0, 3], default=0)
     p.add_argument('--broker-pause-seconds', type=int, choices=[0, 3], default=0)
     p.add_argument('--broker', default='broker:9092')
@@ -134,14 +134,14 @@ def main():
             time.sleep(0.1)
         raise AssertionError('timeout ' + label)
 
-    def committed_raw(output,label,index):
+    def committed_raw(output,label,index,record_format='%p\t%o\t%v\n'):
         frontier=broker('topic','consume',output,'--read-committed','--offset','start','--num','1','--fetch-max-wait','100ms','--format','%|\n',command_timeout=10)
         positions=frontier.splitlines()
         assert len(positions)==1 and positions[0].isdigit(),'missing actual Fetch last-stable-offset frontier'
         lso=int(positions[0])
         write(f'{label}-{index}-frontier.json',dict(time_ns=time.time_ns(),topic=output,last_stable_offset=lso,scope='actual Fetch LSO; numeric range includes control records for finite completion',source='https://github.com/redpanda-data/redpanda/blob/v24.3.7/src/go/rpk/pkg/cli/topic/consume.go'))
         if lso==0:return ''
-        return broker('topic','consume',output,'--read-committed','--offset',f':{lso}','--fetch-max-wait','100ms','--format','%p\t%o\t%v\n',command_timeout=10)
+        return broker('topic','consume',output,'--read-committed','--offset',f':{lso}','--fetch-max-wait','100ms','--format',record_format,command_timeout=10)
 
     def snapshot(label):
         rows = []
@@ -186,6 +186,7 @@ def main():
         env['RUST_LOG'] = 'info'
         fault_dir = case / 'fault-gates'
         fault_dir.mkdir()
+        env['STREAMR_TEST_CHECKPOINT_COMPLETION_FAULT_DIR'] = str(fault_dir)
         env['STREAMR_TEST_KAFKA_COMMIT_FAULT_DIR'] = str(fault_dir)
         env['STREAMR_TEST_KAFKA_DISPATCH_FAULT_DIR'] = str(fault_dir)
         log = (case / 'runtime.log').open('wb')
@@ -262,11 +263,74 @@ def main():
         broker('topic', 'produce', src, data=''.join((json.dumps(x) + '\n' for x in inputs[recovery_prefix_count:cut])))
         write('input-scheduling.json', dict(prefix_count=recovery_prefix_count, preloaded_count=cut - recovery_prefix_count, fresh_suffix_count=len(inputs) - cut, reason='frozen liveness preloads64; fault variants withhold a declared fresh suffix until replacement worker restore'))
         original_job = job()['id']
-        point = 'dispatch' if a.scenario=='orphan' else ('before' if a.scenario == 'expired' or a.commit_delay_seconds or a.broker_pause_seconds else a.scenario)
+        point = 'dispatch' if a.scenario=='orphan' else ('before' if a.scenario in ('expired', 'original-expired', 'checkpoint-expired') or a.commit_delay_seconds or a.broker_pause_seconds else a.scenario)
         gate = fault_dir / f'{point}-{original_job}'
         if a.scenario != 'liveness' or a.commit_delay_seconds or a.broker_pause_seconds:
             gate.touch()
+        if a.scenario=='checkpoint-expired':
+            with sqlite3.connect(case/'catalog.sqlite') as db:
+                db.row_factory=sqlite3.Row
+                stopped=dict(db.execute("SELECT * FROM checkpoints WHERE job_id=? AND state='ready' ORDER BY epoch DESC LIMIT 1",(original_job,)).fetchone())
+            targets=[op for op in json.loads(stopped['operators']) if op.startswith('source_')]
+            assert len(targets)==1, 'frozen graph must have exactly one checkpointed source operator'
+            completion_epoch=stopped['epoch']+1
+            completion_operator=targets[0]
+            completion_scope=f"completion-{original_job.encode().hex()}-{completion_operator.encode().hex()}-0-{completion_epoch}"
+            (fault_dir/(completion_scope+'.request')).touch()
+            write('operator-completion-request.json',dict(time_ns=time.time_ns(),job=original_job,operator=completion_operator,subtask=0,epoch=completion_epoch,scope=completion_scope))
         api(f'pipelines/{pid}', {'stop': 'none'}, method='PATCH')
+        if a.scenario=='checkpoint-expired':
+            def clean_runtime():
+                return re.sub(chr(27)+'\\[[0-?]*[ -/]*[@-~]','',(case/'runtime.log').read_text(errors='replace'))
+            def checkpoint_incomplete(label):
+                with sqlite3.connect(case/'catalog.sqlite') as db:
+                    db.row_factory=sqlite3.Row
+                    rows=[dict(row) for row in db.execute('SELECT * FROM checkpoints WHERE job_id=? AND epoch=?',(original_job,completion_epoch))]
+                assert len(rows)==1 and rows[0]['state']=='inprogress' and rows[0]['finish_time'] is None, 'checkpoint already authorized commit while completion withheld'
+                details=json.loads(rows[0]['operators'])
+                assert not details.get(completion_operator,{}).get('finishTime'), 'selected operator completion already reported'
+                assert not any('Kafka commit fault pause' in line and original_job in line and re.search(rf'\bepoch={completion_epoch}\b',line) for line in clean_runtime().splitlines()), 'commit dispatched before withheld completion released'
+                write(label,dict(time_ns=time.time_ns(),checkpoint=rows[0]))
+                return rows[0]
+            def prepared_while_incomplete():
+                text=clean_runtime()
+                if not any('Checkpoint completion fault entered' in line and completion_scope in line for line in text.splitlines()):return None
+                prepared=[]
+                for line in text.splitlines():
+                    if 'Kafka compact transaction prepared' not in line or original_job not in line or not re.search(rf'\bepoch={completion_epoch}\b',line):continue
+                    fields=dict(re.findall(r'\b(operator_id|transactional_id|transaction_index|producer_id|producer_epoch)=(\S+)',line))
+                    if len(fields)!=5:continue
+                    prepared.append(dict(operator=fields['operator_id'],transactional_id=fields['transactional_id'],transaction_index=int(fields['transaction_index']),producer_id=int(fields['producer_id']),producer_epoch=int(fields['producer_epoch']),epoch=completion_epoch))
+                return prepared if len(prepared)==2 else None
+            pre_transactions=wait(prepared_while_incomplete,'dual sink prepare while source operator completion withheld',15)
+            completion_observed_monotonic=time.monotonic()
+            completion_observed_ns=time.time_ns()
+            checkpoint_incomplete('operator-checkpoint-incomplete-ongoing.json')
+            def describe_prepared(label,state):
+                raw=broker('cluster','txn','describe',*[t['transactional_id'] for t in pre_transactions],'--format=json',command_timeout=10)
+                (case/(label+'.json.stdout')).write_text(raw)
+                rows=json.loads(raw)
+                matched=[]
+                for transaction in pre_transactions:
+                    values=[row for row in rows if row['transaction_id']==transaction['transactional_id']]
+                    assert values and all(row['producer_id']==transaction['producer_id'] and row['timeout']==10000 for row in values), 'broker identity/timeout differs from prepared sink'
+                    matched.extend(values)
+                write(label+'.json',dict(time_ns=time.time_ns(),transactions=matched))
+                return matched if all(row['state']==state for row in matched) else None
+            ongoing=describe_prepared('operator-broker-ongoing','Ongoing')
+            assert ongoing and all(row['producer_epoch']==next(t['producer_epoch'] for t in pre_transactions if t['transactional_id']==row['transaction_id']) for row in ongoing), 'prepared sink not Ongoing before delayed completion'
+            expiry_probes=0
+            def expired_while_incomplete():
+                nonlocal expiry_probes
+                checkpoint_incomplete(f'operator-checkpoint-incomplete-{expiry_probes:04}.json')
+                rows=describe_prepared(f'operator-broker-probe-{expiry_probes:04}','CompleteAbort')
+                expiry_probes+=1
+                return rows if rows and time.monotonic()-completion_observed_monotonic>=10.25 else None
+            expired=wait(expired_while_incomplete,'broker expiry while global operator checkpoint incomplete',20)
+            assert all(row['producer_epoch']==next(t['producer_epoch']+1 for t in pre_transactions if t['transactional_id']==row['transaction_id']) for row in expired), 'expiry did not bump exact prepared identity once'
+            checkpoint_incomplete('operator-checkpoint-incomplete-aborted.json')
+            write('operator-expiry-before-release.json',dict(time_ns=time.time_ns(),prepared=pre_transactions,ongoing=ongoing,aborted=expired,scope=completion_scope,prepared_observed_ns=completion_observed_ns,completion_withheld_seconds=time.monotonic()-completion_observed_monotonic))
+            (fault_dir/(completion_scope+'.release')).touch()
         if a.scenario != 'liveness' or a.commit_delay_seconds or a.broker_pause_seconds:
 
             def paused():
@@ -306,6 +370,11 @@ def main():
                     selected = [dict(row) for row in db.execute('SELECT checkpoints.* FROM checkpoints WHERE checkpoints.epoch=? AND checkpoints.state=? AND checkpoints.job_id=?', (epoch, 'committing', original_job))]
                 assert selected and all((row['job_id'] == selected[0]['job_id'] for row in selected))
                 assert len(selected) == 1, 'selected checkpoint is not durably committing'
+                if a.scenario=='checkpoint-expired':
+                    operator_span=next(event for event in json.loads(selected[0]['event_spans']) if event['event']=='CheckpointingOperators')
+                    elapsed_us=operator_span['finish_time']-operator_span['start_time']
+                    assert elapsed_us>10000000, 'actual global operator checkpoint did not cross configured10s transaction window'
+                    write('operator-global-checkpoint-duration.json',dict(time_ns=time.time_ns(),epoch=epoch,operator_span=operator_span,elapsed_us=elapsed_us,transaction_timeout_ms=10000))
                 retained = case / 'selected-checkpoint-before-loss'
                 shutil.copytree(case / 'checkpoints', retained)
                 write('checkpoint-artifacts.json', {str(path.relative_to(retained)): h.sha(path) for path in retained.rglob('*') if path.is_file()})
@@ -352,7 +421,21 @@ def main():
                             transaction_id=f"streamr-v4-id-{original_job}-{operator.decode()}-{matched_topics[0]}-{task}-{pending['transaction_index']%2}"
                             transactions.append(dict(operator=operator.decode(), subtask=task, transactional_id=transaction_id, metadata_bytes=len(encoded_pending), **pending))
                 assert len(transactions) == 2 and len({t['operator'] for t in transactions}) == 2, 'missing dual sink compact prepared metadata'
+                if a.scenario=='checkpoint-expired':
+                    assert all(any(all(t[k]==p[k] for k in ('operator','transactional_id','transaction_index','producer_id','producer_epoch','epoch')) for p in pre_transactions) for t in transactions), 'durable pending identity differs from before operator completion'
                 write('selected-transactions.json', transactions)
+                if a.scenario=='original-expired':
+                    raw=broker('cluster','txn','describe',*[t['transactional_id'] for t in transactions],'--format=json',command_timeout=10)
+                    (case/'broker-ongoing-before-delay.json.stdout').write_text(raw)
+                    descriptions=json.loads(raw)
+                    for transaction in transactions:
+                        matching=[row for row in descriptions if row['transaction_id']==transaction['transactional_id']]
+                        assert matching and all(row['producer_id']==transaction['producer_id'] and row['producer_epoch']==transaction['producer_epoch'] and row['state']=='Ongoing' and row['timeout']==10000 for row in matching), 'saved identity was not broker-proven Ongoing before expiry'
+                    write('broker-ongoing-before-delay.json',dict(time_ns=time.time_ns(),transactions=descriptions))
+                if a.scenario in ('original-expired','checkpoint-expired'):
+                    source_raw=broker('topic','consume',src,'--offset',':end','--fetch-max-wait','100ms','--format','%p\t%o\t%v\n',command_timeout=10)
+                    (case/'literal-source.tsv').write_text(source_raw)
+                    assert [json.loads(row.split('\t',2)[2]) for row in source_raw.splitlines()]==inputs[:cut], 'actual broker source differs from literal declared prefix'
                 assert len(source_offsets)==1 and source_offsets[0]['next_offset']==cut,'selected source checkpoint must contain exactly the declared fault input prefix'
                 write('selected-source-offsets.json',source_offsets)
                 if a.scenario=='orphan':
@@ -381,12 +464,27 @@ def main():
                     orphan_records=wait(orphan_delivered,'actual alternate Q payload delivered to both broker outputs')
                     write('orphan-records-before-loss.json',dict(time_ns=time.time_ns(),source_record_index=cut,records=orphan_records,scope='actual read-uncommitted Q data; no Q marker exists under one pending checkpoint'))
                 before = snapshot('before-loss')
+                def markers(label):
+                    observed=[]
+                    for index,topic in enumerate(commits):
+                        raw=committed_raw(topic,label+'-marker',index,'%p\t%o\t%k\t%v\n')
+                        (case/f'{label}-marker-{index}.tsv').write_text(raw)
+                        physical=[line.split('\t',3) for line in raw.splitlines()]
+                        values=[json.loads(line[3]) for line in physical]
+                        transaction=next(t for t in transactions if f'-{outputs[index]}-' in t['transactional_id'])
+                        expected_key=f"streamr-v4/{original_job}/{transaction['operator']}/{outputs[index]}/0"
+                        assert all(row[2]==expected_key for row in physical), 'marker key is not exact selected sink key'
+                        assert values and all(v['version']==4 and v['generation']==transaction['generation'] and v['epoch']<epoch for v in values), 'marker does not prove prior-only selected generation'
+                        observed.append(values)
+                    return observed
+                if a.scenario in ('expired','original-expired','checkpoint-expired'):
+                    prior_markers=markers('before-loss')
                 workers = [h.worker(p, a.binary) for p in h.session_processes(child.pid)]
                 workers = [w for w in workers if w and w['job'] == original_job]
                 assert len(workers) == 1, 'expected one owned worker'
                 owner = workers[0]
                 assert h.identity(owner) in owned
-                if a.scenario == 'expired':
+                if a.scenario in ('expired', 'original-expired', 'checkpoint-expired'):
                     probe_number=0
                     def broker_aborted():
                         nonlocal probe_number
@@ -418,23 +516,65 @@ def main():
                         return states if all(all(row['state']=='CompleteAbort' for row in item['observed']) for item in states) else None
                     aborted=wait(broker_aborted,'broker-observed CompleteAbort for both saved prepared identities',60)
                     write('broker-aborted-before-loss.json',aborted)
+                    if a.scenario in ('original-expired','checkpoint-expired'):
+                        assert all(row['producer_epoch']==item['saved_producer_epoch']+1 for item in aborted for row in item['observed']), 'expiry did not produce exactly one broker epoch bump'
+                        # Unlike expired, exercise EndTxn on the original live
+                        # producer before imposing actual worker process loss.
+                        write('original-release.json',dict(time_ns=time.time_ns(),worker=owner,transactions=transactions))
+                        assert any(h.identity(w)==h.identity(owner) for p in h.session_processes(child.pid) if (w:=h.worker(p,a.binary))), 'original worker absent at gate release'
+                        gate.unlink()
+                        def original_failed():
+                            with (case/'runtime.log').open('rb') as stream:
+                                stream.seek(restore_log_start)
+                                text=stream.read().decode(errors='replace')
+                            lines=[line for line in text.splitlines() if 'Kafka transaction failed without acknowledgement:' in line and any(t['operator'] in line for t in transactions) and 'Kafka prepared transaction recovery failed:' not in line]
+                            assert 'Kafka compact transaction resume' not in text, 'recovery overtook original-failure capture'
+                            assert not lines or any('fenced' in line.lower() for line in lines), 'original EndTxn error is not fencing'
+                            return lines if lines else None
+                        failures=wait(original_failed,'original producer EndTxn failure',15)
+                        write('original-failure.json',dict(time_ns=time.time_ns(),worker=owner,lines=failures))
                 assert h.terminate_identity(owner, signal.SIGKILL), 'worker exited before SIGKILL'
-                gate.unlink()
+                loss_log_start=(case/'runtime.log').stat().st_size
+                if gate.exists():gate.unlink()
                 write('fault.json', dict(time_ns=time.time_ns(), point=a.scenario, worker=owner, checkpoint=selected[0], gate_log=pause))
 
                 def restarted():
                     candidates = [h.worker(p, a.binary) for p in h.session_processes(child.pid)]
                     return [w for w in candidates if w and w['job'] == original_job and (w['generation'] > owner['generation'])]
-                if a.scenario == 'expired':
+                if a.scenario in ('expired', 'original-expired', 'checkpoint-expired'):
+                    observed_replacements=[]
                     def missing_marker_refusal():
-                        text=(case/'runtime.log').read_text(errors='replace')
+                        observed_replacements.extend(w for w in restarted() if h.identity(w) not in {h.identity(old) for old in observed_replacements})
+                        with (case/'runtime.log').open('rb') as stream:
+                            stream.seek(loss_log_start)
+                            text=stream.read().decode(errors='replace')
                         return 'Kafka prepared transaction recovery failed:' in text and 'no exact committed marker' in text
                     wait(missing_marker_refusal, 'explicit missing-marker refusal after broker-proven transaction abort')
+                    if a.scenario in ('original-expired','checkpoint-expired'):
+                        assert observed_replacements, 'no live post-loss replacement generation observed'
+                        replacement=observed_replacements
+                        write('replacement-workers.json',replacement)
+                        def selected_refusal():
+                            with (case/'runtime.log').open('rb') as stream:
+                                stream.seek(loss_log_start)
+                                text=re.sub(chr(27)+'\\[[0-?]*[ -/]*[@-~]','',stream.read().decode(errors='replace'))
+                            restores=[line for line in text.splitlines() if 'restoring checkpoint' in line and original_job in line and re.search(rf'\bepoch={epoch}\b',line)]
+                            if not restores:return None
+                            receipts=[]
+                            for transaction in transactions:
+                                output_index=next(i for i,out in enumerate(outputs) if f'-{out}-' in transaction['transactional_id'])
+                                observed_epoch=prior_markers[output_index][-1]['epoch']
+                                resumes=[line for line in text.splitlines() if 'Kafka compact transaction resume' in line and original_job in line and transaction['operator'] in line and transaction['transactional_id'] in line and all(re.search(rf'\b{name}={value}\b',line) for name,value in [('epoch',epoch),('transaction_index',transaction['transaction_index']),('producer_id',transaction['producer_id']),('producer_epoch',transaction['producer_epoch'])])]
+                                errors=[line for line in text.splitlines() if 'Kafka prepared transaction recovery failed:' in line and transaction['operator'] in line and f'no exact committed marker (observed {observed_epoch}, expected {epoch})' in line]
+                                if resumes and errors:receipts.append(dict(transaction=transaction,resume=resumes,error=errors))
+                            return dict(restores=restores,transactions=receipts) if receipts else None
+                        write('selected-restore-refusal.json',wait(selected_refusal,'exact selected checkpoint/identity resume and refusal'))
                     wait(lambda: job()['state'] == 'Failed', 'terminal refusal')
+                    assert markers('expired-refusal')==prior_markers, 'refused transaction changed committed markers'
                     rows, raws = snapshot('expired-refusal')
                     assert rows == prefix[0] and raws == prefix[1], 'expired transaction published or changed physical prefix'
                     write('expired-job.json', job())
-                    result.update(status='passed', scenario='expired', scope='actual broker CompleteAbort observed for both saved prepared identities under configured10s timeout before worker loss; explicit missing-marker recovery refusal and unchanged physical prefix')
+                    result.update(status='passed', scenario=a.scenario, scope='actual broker CompleteAbort observed for both saved prepared identities under configured10s timeout before worker loss; explicit missing-marker recovery refusal and unchanged physical prefix')
                     return
                 replacement = wait(restarted, 'fresh worker generation')
                 write('replacement-workers.json', replacement)

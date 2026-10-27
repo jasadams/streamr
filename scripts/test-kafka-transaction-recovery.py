@@ -15,7 +15,7 @@ def main():
     p.add_argument('--baseline', type=Path, required=True)
     p.add_argument('--fixture', type=Path, help='Optional generic fixture directory: config.json, query.sql, inputs.json, expected.json, manifest.json; query uses ${namespace} and ${broker}.')
     p.add_argument('--backend', choices=['memory', 'rocksdb'], default='rocksdb')
-    p.add_argument('--scenario', choices=['liveness', 'before', 'after', 'expired', 'orphan'], default='liveness')
+    p.add_argument('--scenario', choices=['liveness', 'before', 'after', 'expired', 'original-expired', 'checkpoint-expired', 'orphan'], default='liveness')
     p.add_argument('--supervisor', type=Path, default=Path(__file__).with_name('kafka-transaction-recovery-supervisor.py'))
     p.add_argument('--commit-delay-seconds', type=int, choices=[0, 3], default=0)
     p.add_argument('--broker-pause-seconds', type=int, choices=[0, 3], default=0)

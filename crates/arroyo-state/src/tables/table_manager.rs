@@ -341,6 +341,9 @@ impl BackendFlusher {
         }) {
             validate_disk_subtask_metadata_size(&subtask_metadata)?;
         }
+        #[cfg(debug_assertions)]
+        super::checkpoint_completion_fault::pause(&self.task_info, cp.epoch).await?;
+
         self.control_tx
             .send(ControlResp::CheckpointCompleted(CheckpointCompleted {
                 checkpoint_epoch: cp.epoch as u64,

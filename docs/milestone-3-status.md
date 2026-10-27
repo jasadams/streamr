@@ -1,3 +1,40 @@
+## Active STR-158 — prepared Kafka recovery diagnosis — 2026-10-27
+
+- Session `codex-01a17c72-104c-7ad0-8ed7-87198176c8d3`; branch
+  `jason/str-158-kafka-recovery-20261027`, fetched base
+  `597b6326ab82f9c70634fe3e241f0c355f8e72cf`. Guidance: `AGENTS.md`,
+  `.claude/team.md`, `.claude/build-test.md`, this ledger/feature plan,
+  full STR-158 and STR-146 protocol report. Invoking dirty checkout preserved.
+- Acceptance now: finite isolated real-Kafka original commit-delay/fencing
+  reproduction, literal source/output/marker oracle and actual process loss;
+  precise cause and smallest repair/contract proposal before product changes.
+- Preserve previous evidence under
+  `/home/jason/qa-evidence/str158-identity-kafka-recovery-20261026/`.
+  Identity pending4457/marker4456; profiles pending1017/marker1016.
+  Transaction expiry is a lead, not a proven historical cause.
+- First causal case PASS on dev pin `8ea202e5…`: both CP3 IDs Ongoing→
+  CompleteAbort(epoch+1), original EndTxn fenced, exact-worker SIGKILL, CP3
+  restore/refusal marker2/expected3, unchanged committed prefix; owned cleanup
+  complete. Independent raw evidence audit PASS. This is post-global commit
+  delay, not historical cause or operator-duration proof. Exact evidence:
+  `/home/jason/qa-evidence/str158-reproduction-20261027/original-expired-1/`.
+- Debug-only source checkpoint-completion gate independently source-approved;
+  maintained fmt/check/strict state Clippy and four focused async tests PASS.
+  No new RocksDB scans or recovery behavior changes.
+- Actual checkpoint-delay case PASS on dev pin `63e4f767…`: catalog operator
+  checkpoint10,760,966µs crosses unchanged10s transaction window; same graph
+  and budgets, broker expiry before release, normal dispatch/original fencing,
+  actual worker SIGKILL/exact restore refusal, unchanged prefix/markers and owned
+  cleanup. Synthetic completion withholding does not measure state export cost.
+- Final independent source/raw audit APPROVE (`review-final.md`).
+- Next: diagnostic-increment PR/current-head CI. Historical production cause
+  and recovery of selected4457/1017
+  remain unresolved; a new rewind/replay contract requires user discussion.
+  No product repair, reset, retry, marker edit or production action performed.
+  Existing exact-marker refusal stays intact; new recovery semantics require
+  user agreement. Coordinate production testing with Arcstream integration agent.
+
+
 ## Active STR-161 — historical checkpoint-directory cleanup — 2026-10-27
 
 - User reopened the completed diagnosis and authorized fixing the proposed
