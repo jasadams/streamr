@@ -64,15 +64,15 @@ claim successful suffix continuity.
 
 This gate is after global committing authorization. It isolates transaction age
 and original EndTxn failure, but does **not** reproduce a slow operator's async
-checkpoint before global completion. Existing hooks are before/after EndTxn and
-commit dispatch; none delay an operator before checkpoint completion. SIGSTOP
-of the single worker freezes sinks too. A deterministic operator-duration case
-would need a separately approved debug-only asynchronous gate in
+checkpoint before global completion. Previously available hooks were before/
+after EndTxn and commit dispatch; none withheld operator completion. SIGSTOP
+of the single worker freezes sinks too. The separately approved deterministic
+operator-duration case adds a debug-only asynchronous gate in
 `arroyo-state/src/tables/table_manager.rs`, immediately before sending
 `ControlResp::CheckpointCompleted`, selecting job/operator/epoch and emitting
 PID/timing receipts. That leaves other operator tasks/sinks runnable without
-changing production behavior. After the first causal pass, the coordinator authorized the debug-only hook
-described below; this is fault-injection support, not a recovery repair.
+changing production behavior. The coordinator authorized the debug-only hook
+after the first causal pass; this is fault-injection support, not a recovery repair.
 
 ## Execution evidence and remaining checks
 
@@ -169,7 +169,7 @@ explicit test environment; the normal release profile omits it. No release-
 profile build was needed or performed.
 
 No repair is selected. The smallest preventive option already exists:
-`sink client_configs='transaction.timeout.ms=...'` can select a broker-supported
+`client_configs='transaction.timeout.ms=...'` can select a broker-supported
 lifetime that covers the full open transaction, including checkpoint alignment,
 operator completion and restart. Lifetime begins before prepare; a prepared wait
 below60s does not establish that the full transaction stayed within60s. The fixed
@@ -179,8 +179,8 @@ transaction. No new configuration or protocol is proposed from this test alone.
 A preventive timeout/latency repair cannot reconstruct
 already aborted prepared output. New rewind/replay, force acknowledgement,
 skipping markers or resetting state would change the contract and require user
-agreement. Historical production cause and a continuity repair remain open. Actual operator
-checkpoint-duration reproduction is now demonstrated through the disclosed
+agreement. Historical production cause and a continuity repair remain open.
+Actual operator checkpoint-duration reproduction is now demonstrated through the disclosed
 synthetic completion withholding, not slow serialization or state-export I/O.
 Independent first-case raw evidence review passed (`review-first-case.md`), and
 instrumentation source review passed (`review-completion-source.md`). Final
@@ -193,6 +193,6 @@ configuration can prevent future expiration within its configured operating
 window; it cannot reconstruct a prepared transaction that has already been aborted.
 No safe recovery of selected production4457/1017 has been established; their
 historical abort lineage is not proven. No contract-preserving recovery defect
-has been demonstrated and no continuity repair was implemented. No production action, recovery redesign, replay, reset, missing-
-marker suppression or force acknowledgement was performed. No deferrals beyond
+has been demonstrated and no continuity repair was implemented. No production
+action, recovery redesign, replay, reset, missing-marker suppression or force acknowledgement was performed. No deferrals beyond
 STR-158's still-open historical-cause/recovery decision.
