@@ -5,8 +5,8 @@
   no engine/Rust repair demonstrated. Source/upstream/catalog trace preserved.
 - Fresh base b448819312c5a16f5b3815a993000497ca550e19; workspace
   `/home/jason/repos/streamr-worktrees/str-158-flink-recovery-20261027`.
-  Dirty invoking checkout preserved. PR88 head5ade88a6 has6CI checks green;
-  final one-time harness increment reviewed/tested, publication next.
+  Dirty invoking checkout preserved. PR88 code delivery7bd3463a has all6CI
+  checks green; all executable source/evidence publication reviews pass.
 - Current normal-dev/prebuilt pin9f070fad...a572f8: ordinary inprogress worker
   loss,60s-vs900s matched65s controls and900s pending SIGKILL pass. Eight
   one-time native operation cases pass memory/RocksDB, actual crash cuts,
@@ -17,8 +17,10 @@
   one-time-summary-{1,2,3}.json and review-one-time-*.md. Read-only production
   archives2474files/462780627B verified. Current two Failed jobs remain run20/22,
   equal nonces0, no target workers; exact old SQL/program hashes match candidates.
-- Next: final PR source/evidence publication/CI and reviewed concrete operation
-  packet. Production identity4456→4457/profiles1016→1017 recovery is NOT done.
+- Next: finish exact-runtime staging/backup/deadline tooling qualification and
+  final operation packet review, then the explicit production replay decision.
+  Existing production image is supported; no engine publication is required.
+  Production identity4456→4457/profiles1016→1017 recovery is NOT done.
   User decision must explicitly accept uncommitted-suffix replay/UUID changes,
   then coordinate operation with integration agent and verify fresh processing.
   No producer init/CAS/SQL/config/marker/reset/restart/deployment in production.
