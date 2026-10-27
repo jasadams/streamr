@@ -1,37 +1,31 @@
-## Active STR-158 — current-image qualification, production decision pending — 2026-10-28
+## Active STR-158 — scoped production acceptance passed; final handoff — 2026-10-28
 
-- Approved revised plan excludes the earlier general recovery framework. Standard
-  incomplete-checkpoint recovery and exact pending-commit guards are correct;
-  no engine/Rust repair demonstrated. Source/upstream/catalog trace preserved.
-- Fresh base b448819312c5a16f5b3815a993000497ca550e19; workspace
-  `/home/jason/repos/streamr-worktrees/str-158-flink-recovery-20261027`.
-  Dirty invoking checkout preserved. PR88 test head4b97d1a9 has all6CI checks green; current-head CI receipts
-  are preserved with the external evidence. Independent publication review passes.
-- Current normal-dev/prebuilt pin9f070fad...a572f8: ordinary inprogress worker
-  loss,60s-vs900s matched65s controls and900s pending SIGKILL pass. Eight
-  one-time native operation cases pass memory/RocksDB, actual crash cuts,
-  exactC ordinary acknowledgement, production-matching Python3.12/SQLite3.46,
-  actual retained-source refusal. Independent raw/source/native/archive/cleanup
-  audits pass; no full capacity campaign or historical timeout causality claim.
-- Evidence `/home/jason/qa-evidence/str158-flink-baseline-20261027/`;
-  one-time-summary-{1,2,3}.json and review-one-time-*.md. Read-only production
-  archives2474files/462780627B verified. Current two Failed jobs remain run20/22,
-  equal nonces0, no target workers; exact old SQL/program hashes match candidates.
-- Exact production image54b1/source597 passed targeted RocksDB expiry→guarded
-  P recovery→newC/fresh native UUID/state case actual-image597-rocks-1, using
-  its own engine55a48879/Python3.12.5; no rebuild or production action. Thirteen
-  current-phase isolated cases total. Final independent raw/source audit passes.
-  Corrected timing: Redpanda reports last_update_ts as transaction start; prior
-  field-based full-lifetime claims are withdrawn, raw receipts preserved.
-- Exact-runtime staging/backup/deadline tools and current-image evidence are
-  qualified. The operation packet binds reviewed artifacts, offline plans and CI.
-  Next: explicit production replay decision, coordinated operation and fresh
-  end-to-end acceptance. No engine publication is required.
-  Production identity4456→4457/profiles1016→1017 recovery is NOT done.
-  User decision must explicitly accept uncommitted-suffix replay/UUID changes,
-  then coordinate operation with integration agent and verify fresh processing.
-  No producer init/CAS/SQL/config/marker/reset/restart/deployment in production.
-  Existing60s→900s setting only; unchanged native SQL/resources, no pacing.
+- Existing incomplete-checkpoint/pending-commit contract is correct; no engine
+  recovery redesign or Rust repair demonstrated. Thirteen isolated native cases,
+  exact production image54b1/source597 and external operation tools passed review.
+- User-authorized production CAS/restart completed once per job: identity
+  nonce1/run21 restoredP4456→new4457 `chk_IIBbqBsQDf` ready; profiles nonce1/run23
+  restoredP1016→new1017 `chk_fxehNmTKqV` ready. Later ready4462/source291644653
+  and1019/source1730734 passed original C frontiers. Both slots/job900000ms;
+  all five captured jobs Running/checkpointing. Retained backlog progress only.
+- All2474 immutable archive files rehashed unchanged on host/pod after C-path
+  reuse. Each126-record fixed[0,127) output-prefix sample remained exact; no
+  whole-history or tail-catch-up claim. Evidence phase root
+  `/home/jason/qa-evidence/str158-flink-baseline-20261027/production-execution-20261028/`.
+- Postincident Flare transport failure required one independently reviewed,
+  guarded Flare-only restart: same image/PVC/config/groups, no offset edits,
+  old writer gone, three ingestions healthy/table recovery ready. Exact public
+  identity11-field oracle passed. Separate preregistered profile singleton case
+  at Kafka1799884 passed21 typed fields through direct Flare/public in the same
+  process, one query/interface, no retries/tolerance. Historical142-vs172 failure
+  remains FAIL; no global-key stability/whole-application parity claim.
+- Final capture: all5jobs Running/5workers; ready identity4534/profiles1033;
+  node Ready/no pressure. Declared scoped production acceptance complete.
+  Independent closure audit passed; current-head CI receipts accompany the
+  PR handoff. Merge and the Done transition belong to merge-sweeper.
+  No production replay decision or further live qualification pending.
+  Native SQL/resources retained; no application UDF or client-side replacement.
+  [Detailed results and limits](str-158-recovery-validation.md).
 
 ## Active STR-161 — historical checkpoint-directory cleanup — 2026-10-27
 
