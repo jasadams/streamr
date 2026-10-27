@@ -1,44 +1,28 @@
-## Active STR-158 — approved Flink-style baseline and expiry repair — 2026-10-27
+## Active STR-158 — qualified operation, production decision pending — 2026-10-27
 
-- User approved four-step plan: verify/fix standard incomplete-checkpoint restore
-  and pending Kafka commit recovery; address60s transaction expiry using measured
-  lifetime/existing configuration or demonstrated engine delay; qualify native
-  Kafka failure/recovery/prefix/fresh output; establish exact safe operation for
-  existing failed production jobs and coordinate testing with integration agent.
-- The general guarded recovery-framework proposal is removed from immediate
-  implementation. Earlier proposal approval question is superseded, not approved.
-  No skip/forcecommit/new generic rollback semantics inferred.
-- Fresh base `b448819312c5a16f5b3815a993000497ca550e19` includes STR161;
-  workspace `/home/jason/repos/streamr-worktrees/str-158-flink-recovery-20261027`,
-  branch `jason/str-158-flink-recovery-20261027`; PR88 diagnostic lineage replayed
-  into c0fa39df/efb0d51a. AGENTS/team/build/ledger/plan/current ticket read.
-  Invoking dirty checkout and prior design workspace preserved.
-- Settled evidence: two expected-refusal real-Kafka cases, exact saved sink/source
-  identities/markers/catalog states,38 ready operator metadata and1197file closure
-  (230862401B;1191declared hashes match,6globalnewhashes,0mismatches).
-  Roots `/home/jason/qa-evidence/str158-reproduction-20261027/` and
-  `/home/jason/qa-evidence/str158-recovery-plan-20261027/`; no campaign repeat.
-- Current-source normal-dev/prebuilt pin `9f070fad...a572f8`: actual worker
-  SIGKILL with C inprogress passes automatic ready-P restore/replay, old C failed,
-  new same-epoch public ID ready, exact native RocksDB state and fresh suffix
-  65/65 per sink, committed prefixes preserved. Source/upstream/catalog review
-  finds no ordinary recovery defect. Independent raw/source/package/native audit
-  passes;85 native files and exact state/output oracle verified.
-- Frozen65s controls pass: old60s expires/refuses; explicit900s survives/commits
-  exact65/65 native outputs. Actual pending-worker loss at900s also passes
-  exact65/65 outputs; observed-ready lifetime bounds67.048s/32.718s. Raw batch
-  audit passes, including all owned runtime cleanup. No original production
-  timeout causality or15minute outage guarantee claimed.
-  Broker max900s verified; exact two saved program/SQL timeout-only candidates
-  prepared/reversibility independently reviewed, not applied. External init-only
-  and atomic catalog helpers each pass11pure tests and independent source review;
-  actual pinned-runtime/broker/native qualification pending.
-- Existing4457/1017 recovery remains open: qualify exact single-sink external
-  operation, immutable P/C archive, both-slot resolution/final marker, exact-row
-  catalog CAS/public safe restart and crash cuts. Evidence root
-  `/home/jason/qa-evidence/str158-flink-baseline-20261027/`.
-  No production mutation, rewind/reset/marker edit or covert timeout change.
-  Maintained normal-dev/prebuilt paths/shared queue; baseline reservation released.
+- Approved revised plan excludes the earlier general recovery framework. Standard
+  incomplete-checkpoint recovery and exact pending-commit guards are correct;
+  no engine/Rust repair demonstrated. Source/upstream/catalog trace preserved.
+- Fresh base b448819312c5a16f5b3815a993000497ca550e19; workspace
+  `/home/jason/repos/streamr-worktrees/str-158-flink-recovery-20261027`.
+  Dirty invoking checkout preserved. PR88 head5ade88a6 has6CI checks green;
+  final one-time harness increment reviewed/tested, publication next.
+- Current normal-dev/prebuilt pin9f070fad...a572f8: ordinary inprogress worker
+  loss,60s-vs900s matched65s controls and900s pending SIGKILL pass. Eight
+  one-time native operation cases pass memory/RocksDB, actual crash cuts,
+  exactC ordinary acknowledgement, production-matching Python3.12/SQLite3.46,
+  actual retained-source refusal. Independent raw/source/native/archive/cleanup
+  audits pass; no full capacity campaign or historical timeout causality claim.
+- Evidence `/home/jason/qa-evidence/str158-flink-baseline-20261027/`;
+  one-time-summary-{1,2,3}.json and review-one-time-*.md. Read-only production
+  archives2474files/462780627B verified. Current two Failed jobs remain run20/22,
+  equal nonces0, no target workers; exact old SQL/program hashes match candidates.
+- Next: final PR source/evidence publication/CI and reviewed concrete operation
+  packet. Production identity4456→4457/profiles1016→1017 recovery is NOT done.
+  User decision must explicitly accept uncommitted-suffix replay/UUID changes,
+  then coordinate operation with integration agent and verify fresh processing.
+  No producer init/CAS/SQL/config/marker/reset/restart/deployment in production.
+  Existing60s→900s setting only; unchanged native SQL/resources, no pacing.
 
 ## Active STR-161 — historical checkpoint-directory cleanup — 2026-10-27
 

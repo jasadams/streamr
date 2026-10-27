@@ -3,6 +3,8 @@
 import argparse, importlib.util, json, os, re, subprocess, time, urllib.request, signal, sqlite3, shutil
 from pathlib import Path
 from datetime import datetime, timezone
+from types import SimpleNamespace
+import uuid
 
 def catalog_finish_us(value):
     """Decode SQLite's timezone-bearing text; API receipts may use integer us."""
@@ -18,8 +20,12 @@ def main():
     for n in ('binary', 'helper', 'baseline', 'case', 'rpk'):
         p.add_argument('--' + n, type=Path, required=True)
     p.add_argument('--fixture', type=Path)
+    p.add_argument('--operation-cut', choices=['none','after-cas','replay-inprogress','replay-committed','exact-c','source-retention-refused'], default='none', help='Finite isolated one-time process-loss branch.')
+    p.add_argument('--operation-python', type=Path, help='Pinned production-matching CPython3.12.5 for external Kafka and catalog CLIs only.')
+    p.add_argument('--operation-root', type=Path)
+    p.add_argument('--one-time-module', type=Path)
     p.add_argument('--backend', choices=['memory', 'rocksdb'], default='rocksdb')
-    p.add_argument('--scenario', choices=['liveness', 'before', 'after', 'expired', 'original-expired', 'checkpoint-expired', 'inprogress', 'delay-expired', 'delay-live', 'orphan'], required=True)
+    p.add_argument('--scenario', choices=['liveness', 'before', 'after', 'expired', 'original-expired', 'checkpoint-expired', 'inprogress', 'delay-expired', 'delay-live', 'one-time-repair', 'orphan'], required=True)
     p.add_argument('--commit-delay-seconds', type=int, choices=[0, 3, 65], default=0)
     p.add_argument('--broker-pause-seconds', type=int, choices=[0, 3], default=0)
     p.add_argument('--transaction-timeout-ms', type=int, choices=[60000, 900000], help='Explicit existing client configuration for prevention qualification; ordinary case defaults unchanged.')
@@ -28,6 +34,11 @@ def main():
     p.add_argument('--port', type=int, default=18146)
     p.add_argument('--checkpoint-seconds', type=int, default=2, choices=[2])
     a = p.parse_args()
+    assert a.operation_python is None or a.scenario=='one-time-repair'
+    assert a.operation_cut=='none' or a.scenario=='one-time-repair'
+    uuid_fixture=a.scenario=='one-time-repair'
+    assert uuid_fixture==(a.operation_root is not None)==(a.one_time_module is not None)
+    if uuid_fixture:assert a.fixture and a.case.resolve().parent==a.operation_root.resolve()
     assert os.environ.get('RUST_BUILD_QUEUE_HELD') and re.fullmatch('str146-[a-z0-9-]+', a.namespace)
     assert not (a.scenario not in ('liveness','delay-expired','delay-live') and (a.commit_delay_seconds or a.broker_pause_seconds)), 'delay variants use liveness scenario'
     assert a.commit_delay_seconds!=65 or a.scenario in ('delay-expired','delay-live'), '65s delay is an explicit prevention case'
@@ -59,8 +70,9 @@ def main():
         with urllib.request.urlopen(req, timeout=30) as r:
             return json.load(r)
     src = a.namespace + '-input'
-    outputs = [a.namespace + '-output-' + str(i) for i in range(2)]
-    commits = [a.namespace + '-commits-' + str(i) for i in range(2)]
+    sink_count=1 if uuid_fixture else 2
+    outputs = [a.namespace + '-output-' + str(i) for i in range(sink_count)]
+    commits = [a.namespace + '-commits-' + str(i) for i in range(sink_count)]
     for t in [src, *outputs, *commits]:
         broker('topic', 'create', t, '--partitions', '1', '--replicas', '1', '--topic-config', 'cleanup.policy=' + ('compact' if t in commits else 'delete'))
     frozen = json.loads((a.baseline / 'frozen-input-hashes.json').read_text())
@@ -96,7 +108,11 @@ def main():
     fault_count = 1
     if a.fixture:
         manifest = json.loads((a.fixture / 'manifest.json').read_text())
-        assert manifest['coverage'] in (['updates', 'state-deletions', 'lookups', 'amplified-output'],['updates','rowkind-retractions','count','sum','amplified-output']), 'fixture must declare required graph coverage'
+        if uuid_fixture:
+            assert manifest['kind']=='uuid-state-recovery' and manifest['declared_sink_count']==1
+            assert manifest['binding_fields']==['old_binding','new_binding','lookup_binding']
+        else:
+            assert manifest['coverage'] in (['updates', 'state-deletions', 'lookups', 'amplified-output'],['updates','rowkind-retractions','count','sum','amplified-output']), 'fixture must declare required graph coverage'
         for name in ('config.json', 'query.sql', 'inputs.json', 'expected.json'):
             assert h.sha(a.fixture / name) == manifest['sha256'][name], 'external fixture changed'
         config = json.loads((a.fixture / 'config.json').read_text())
@@ -120,11 +136,15 @@ def main():
     else:
         assert a.backend == 'rocksdb', 'frozen baseline backend must remain rocksdb'
     timeout_ms = 120000 if a.scenario in ('before', 'after', 'orphan', 'inprogress') or a.commit_delay_seconds or a.broker_pause_seconds else 10000
-    if a.transaction_timeout_ms is not None:timeout_ms=a.transaction_timeout_ms
-    assert query.count('transaction.timeout.ms=10000') == 2
-    query = query.replace('transaction.timeout.ms=10000', f'transaction.timeout.ms={timeout_ms}')
+    if uuid_fixture:
+        assert a.transaction_timeout_ms is None and query.count('transaction.timeout.ms=60000')==1
+        timeout_ms=60000
+    else:
+        if a.transaction_timeout_ms is not None:timeout_ms=a.transaction_timeout_ms
+        assert query.count('transaction.timeout.ms=10000') == 2
+        query = query.replace('transaction.timeout.ms=10000', f'transaction.timeout.ms={timeout_ms}')
     (case / 'query.sql').write_text(query)
-    write('timeout-delta.json', dict(original_transaction_timeout_ms=10000, actual_transaction_timeout_ms=timeout_ms, reason=('explicit existing client timeout prevention qualification; original case defaults unchanged' if a.transaction_timeout_ms is not None else 'fault/delay recovery allows finite worker replacement; expired scenario deliberately retains10s')))
+    write('timeout-delta.json', dict(original_transaction_timeout_ms=(60000 if uuid_fixture else 10000), actual_transaction_timeout_ms=timeout_ms, reason=('isolated one-time fixture retains declared60000ms before reviewed timeout-only operation' if uuid_fixture else ('explicit existing client timeout prevention qualification; original case defaults unchanged' if a.transaction_timeout_ms is not None else 'fault/delay recovery allows finite worker replacement; expired scenario deliberately retains10s'))))
     write('frozen-input-hashes.json', {n: h.sha(case / n) for n in frozen})
     for name in changed:
         changed[name]['initial_candidate_after']=changed[name]['after']
@@ -160,6 +180,19 @@ def main():
         if lso==0:return ''
         return broker('topic','consume',output,'--read-committed','--offset',f':{lso}','--fetch-max-wait','100ms','--format',record_format,command_timeout=10)
 
+    def validate_uuid_values(values):
+        assert len(values)<=len(expected)
+        bindings={}
+        for index,row in enumerate(values):
+            assert {k:v for k,v in row.items() if k not in manifest['binding_fields']}==expected[index], 'deterministic native UUID-state row differs'
+            value=row['new_binding']
+            assert isinstance(value,str) and str(uuid.UUID(value))==value and row['lookup_binding']==value
+            assert row['old_binding']==(None if row['action']=='insert' else value)
+            group=next(name for name,indexes in manifest['binding_groups'].items() if index in indexes)
+            if group in bindings:assert bindings[group]==value, 'native binding changed on update'
+            else:bindings[group]=value
+        assert len(set(bindings.values()))==len(bindings), 'distinct keys share a UUID binding'
+
     def snapshot(label):
         rows = []
         raws = []
@@ -167,7 +200,8 @@ def main():
             raw = committed_raw(out,label,i)
             (case / f'{label}-{i}.tsv').write_text(raw)
             values = [json.loads(x.split('\t', 2)[2]) for x in raw.splitlines()]
-            assert values == expected[:len(values)], 'committed output is not exact ordered oracle prefix'
+            if uuid_fixture:validate_uuid_values(values)
+            else:assert values == expected[:len(values)], 'committed output is not exact ordered oracle prefix'
             rows.append(values)
             raws.append(raw)
         return (rows, raws)
@@ -269,6 +303,7 @@ def main():
 
         def prefix_ready():
             x = snapshot('prefix')
+            if uuid_fixture:return x if all(len(v)==manifest['prefix_output_count'] for v in x[0]) else None
             return x if all((v == expected[:manifest['prefix_output_count'] if a.fixture else 1] for v in x[0])) else None
         prefix = wait(prefix_ready, 'committed prefix')
         write('prefix-job.json', job())
@@ -280,6 +315,13 @@ def main():
         broker('topic', 'produce', src, data=''.join((json.dumps(x) + '\n' for x in inputs[recovery_prefix_count:cut])))
         write('input-scheduling.json', dict(prefix_count=recovery_prefix_count, preloaded_count=cut - recovery_prefix_count, fresh_suffix_count=len(inputs) - cut, reason='frozen liveness preloads64; fault variants withhold a declared fresh suffix until replacement worker restore'))
         original_job = job()['id']
+        if uuid_fixture:
+            module_spec=importlib.util.spec_from_file_location('one_time_recovery',a.one_time_module)
+            one_time=importlib.util.module_from_spec(module_spec);module_spec.loader.exec_module(one_time)
+            context=SimpleNamespace(a=a,h=h,case=case,write=write,broker=broker,api=api,job=job,pid=pid,original_job=original_job,src=src,outputs=outputs,commits=commits,query=query,inputs=inputs,expected=expected,manifest=manifest,result=result,prefix=prefix,cut=cut,fault_dir=fault_dir,child=child,owned=owned,log=log,env=env,snapshot=snapshot,committed_raw=committed_raw,validate_uuid_values=validate_uuid_values)
+            try:one_time.run(context)
+            finally:child=context.child
+            return
         if a.scenario=='inprogress':
             assert a.fixture and manifest['coverage']==['updates','state-deletions','lookups','amplified-output'], 'inprogress case requires declared native state-table fixture'
             def clean_log(start=0):

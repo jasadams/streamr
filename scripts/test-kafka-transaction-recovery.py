@@ -14,8 +14,11 @@ def main():
     p.add_argument('--repo', type=Path, required=True)
     p.add_argument('--baseline', type=Path, required=True)
     p.add_argument('--fixture', type=Path, help='Optional generic fixture directory: config.json, query.sql, inputs.json, expected.json, manifest.json; query uses ${namespace} and ${broker}.')
+    p.add_argument('--operation-cut', choices=['none','after-cas','replay-inprogress','replay-committed','exact-c','source-retention-refused'], default='none', help='Finite isolated one-time process-loss branch.')
+    p.add_argument('--operation-python', type=Path, help='Pinned production-matching CPython3.12.5 for external Kafka and catalog CLIs only.')
+    p.add_argument('--operation-root', type=Path, help='Reviewed external helper/dependency evidence root for isolated one-time qualification only.')
     p.add_argument('--backend', choices=['memory', 'rocksdb'], default='rocksdb')
-    p.add_argument('--scenario', choices=['liveness', 'before', 'after', 'expired', 'original-expired', 'checkpoint-expired', 'inprogress', 'delay-expired', 'delay-live', 'orphan'], default='liveness')
+    p.add_argument('--scenario', choices=['liveness', 'before', 'after', 'expired', 'original-expired', 'checkpoint-expired', 'inprogress', 'delay-expired', 'delay-live', 'one-time-repair', 'orphan'], default='liveness')
     p.add_argument('--supervisor', type=Path, default=Path(__file__).with_name('kafka-transaction-recovery-supervisor.py'))
     p.add_argument('--commit-delay-seconds', type=int, choices=[0, 3, 65], default=0)
     p.add_argument('--broker-pause-seconds', type=int, choices=[0, 3], default=0)
@@ -25,6 +28,10 @@ def main():
     p.add_argument('--broker-image', default='docker.io/redpandadata/redpanda:v24.3.7')
     a = p.parse_args()
     assert os.environ.get('RUST_BUILD_QUEUE_HELD'), 'shared queue required'
+    assert a.operation_python is None or a.scenario=='one-time-repair'
+    assert a.operation_cut=='none' or a.scenario=='one-time-repair'
+    assert (a.scenario=='one-time-repair')==(a.operation_root is not None)
+    if a.operation_root:assert a.fixture and a.case.resolve().parent==a.operation_root.resolve()
     assert a.commit_delay_seconds!=65 or a.scenario in ('delay-expired','delay-live')
     case = a.case.resolve()
     case.mkdir(parents=True, exist_ok=False)
@@ -89,14 +96,17 @@ def main():
             time.sleep(1)
         else:
             raise RuntimeError('owned broker startup failed')
-        if a.transaction_timeout_ms is not None:
+        if a.transaction_timeout_ms is not None or a.scenario=='one-time-repair':
             broker_max=int(run(['podman','exec',broker_id,'rpk','cluster','config','get','transaction_max_timeout_ms']))
-            assert a.transaction_timeout_ms<=broker_max, 'configured timeout exceeds owned broker maximum'
+            assert (a.transaction_timeout_ms or 900000)<=broker_max, 'configured timeout exceeds owned broker maximum'
             write('broker-transaction-timeout-limit.json',dict(maximum_ms=broker_max,selected_ms=a.transaction_timeout_ms,mutated=False))
         run(['podman', 'cp', broker_id + ':/opt/redpanda/libexec/rpk', str(case / 'rpk')])
         with (case/'rpk').open('rb') as stream:
             write('broker-rpk.json',dict(broker_image_id=broker_image['Id'],binary_sha256=hashlib.file_digest(stream,'sha256').hexdigest(),describe_schema_source='https://github.com/redpanda-data/redpanda/blob/v24.3.7/src/go/rpk/pkg/cli/cluster/txn/describe.go'))
         argv = ['podman', 'run', '--rm', '--cidfile', str(cidfile), '--name', engine, '--network', network, '--security-opt', 'label=disable', '--memory', '2G', '-v', str(case) + ':' + str(case) + ':rw', '-v', str(pin) + ':' + str(pin) + ':ro', '-v', str(a.supervisor.resolve()) + ':/runner/supervisor.py:ro', '-v', str(a.repo.resolve() / 'scripts/test-native-process-recovery.py') + ':/runner/helper.py:ro', '-v', str(a.baseline.resolve()) + ':/runner/baseline:ro', '-v', str(a.pyarrow.resolve()) + ':' + str(a.pyarrow.resolve()) + ':ro', '-e', 'RUST_BUILD_QUEUE_HELD=' + os.environ['RUST_BUILD_QUEUE_HELD'], '-e', 'PYTHONDONTWRITEBYTECODE=1', '-e', 'PYTHONPATH=' + str(a.pyarrow.resolve())]
+        if a.operation_root:
+            first_mount=argv.index('-v')
+            argv[first_mount:first_mount]=['-v',str(a.operation_root.resolve())+':'+str(a.operation_root.resolve())+':ro','-v',str(Path(__file__).resolve().with_name('kafka-one-time-recovery.py'))+':/runner/one-time.py:ro']
         if a.fixture:
             argv += ['-v', str(a.fixture.resolve()) + ':/runner/fixture:ro']
         libraries = [str(pin / 'package/lib')]
@@ -106,6 +116,8 @@ def main():
             argv += ['--fixture', '/runner/fixture']
         argv += ['--commit-delay-seconds', str(a.commit_delay_seconds), '--broker-pause-seconds', str(a.broker_pause_seconds)]
         if a.transaction_timeout_ms is not None:argv += ['--transaction-timeout-ms',str(a.transaction_timeout_ms)]
+        if a.operation_root:argv += ['--operation-root',str(a.operation_root.resolve()),'--one-time-module','/runner/one-time.py','--operation-cut',a.operation_cut]
+        if a.operation_python:argv += ['--operation-python',str(a.operation_python.resolve())]
         write('inner-command.json', argv)
         with (case / 'container.log').open('w') as out:
             engine_process = subprocess.Popen(argv, stdout=out, stderr=subprocess.STDOUT)
