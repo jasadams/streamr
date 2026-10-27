@@ -15,6 +15,8 @@ use std::sync::Arc;
 use std::time::SystemTime;
 use tracing::debug;
 
+#[cfg(debug_assertions)]
+mod checkpoint_completion_fault;
 pub mod disk_keyed_map;
 pub mod expiring_time_key_map;
 pub mod global_keyed_map;

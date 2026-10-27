@@ -1,3 +1,32 @@
+## Active STR-158 — scoped production acceptance passed; final handoff — 2026-10-28
+
+- Existing incomplete-checkpoint/pending-commit contract is correct; no engine
+  recovery redesign or Rust repair demonstrated. Thirteen isolated native cases,
+  exact production image54b1/source597 and external operation tools passed review.
+- User-authorized production CAS/restart completed once per job: identity
+  nonce1/run21 restoredP4456→new4457 `chk_IIBbqBsQDf` ready; profiles nonce1/run23
+  restoredP1016→new1017 `chk_fxehNmTKqV` ready. Later ready4462/source291644653
+  and1019/source1730734 passed original C frontiers. Both slots/job900000ms;
+  all five captured jobs Running/checkpointing. Retained backlog progress only.
+- All2474 immutable archive files rehashed unchanged on host/pod after C-path
+  reuse. Each126-record fixed[0,127) output-prefix sample remained exact; no
+  whole-history or tail-catch-up claim. Evidence phase root
+  `/home/jason/qa-evidence/str158-flink-baseline-20261027/production-execution-20261028/`.
+- Postincident Flare transport failure required one independently reviewed,
+  guarded Flare-only restart: same image/PVC/config/groups, no offset edits,
+  old writer gone, three ingestions healthy/table recovery ready. Exact public
+  identity11-field oracle passed. Separate preregistered profile singleton case
+  at Kafka1799884 passed21 typed fields through direct Flare/public in the same
+  process, one query/interface, no retries/tolerance. Historical142-vs172 failure
+  remains FAIL; no global-key stability/whole-application parity claim.
+- Final capture: all5jobs Running/5workers; ready identity4534/profiles1033;
+  node Ready/no pressure. Declared scoped production acceptance complete.
+  Independent closure audit passed; current-head CI receipts accompany the
+  PR handoff. Merge and the Done transition belong to merge-sweeper.
+  No production replay decision or further live qualification pending.
+  Native SQL/resources retained; no application UDF or client-side replacement.
+  [Detailed results and limits](str-158-recovery-validation.md).
+
 ## Active STR-161 — historical checkpoint-directory cleanup — 2026-10-27
 
 - User reopened the completed diagnosis and authorized fixing the proposed
