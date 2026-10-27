@@ -27,6 +27,7 @@ use std::{
 use tracing::{debug, error};
 
 mod aws;
+mod local_cleanup;
 
 /// A reference-counted reference to a [StorageProvider].
 pub type StorageProviderRef = Arc<StorageProvider>;
