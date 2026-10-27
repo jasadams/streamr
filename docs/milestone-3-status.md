@@ -5,8 +5,8 @@
   no engine/Rust repair demonstrated. Source/upstream/catalog trace preserved.
 - Fresh base b448819312c5a16f5b3815a993000497ca550e19; workspace
   `/home/jason/repos/streamr-worktrees/str-158-flink-recovery-20261027`.
-  Dirty invoking checkout preserved. PR88 prior head369ba04e has all6CI checks green. Additional exact-image
-  test adapter and evidence publication are under final review.
+  Dirty invoking checkout preserved. PR88 test head4b97d1a9 has all6CI checks green; current-head CI receipts
+  are preserved with the external evidence. Independent publication review passes.
 - Current normal-dev/prebuilt pin9f070fad...a572f8: ordinary inprogress worker
   loss,60s-vs900s matched65s controls and900s pending SIGKILL pass. Eight
   one-time native operation cases pass memory/RocksDB, actual crash cuts,
@@ -20,12 +20,13 @@
 - Exact production image54b1/source597 passed targeted RocksDB expiry→guarded
   P recovery→newC/fresh native UUID/state case actual-image597-rocks-1, using
   its own engine55a48879/Python3.12.5; no rebuild or production action. Thirteen
-  current-phase isolated cases total. Final independent audit/publication pending.
+  current-phase isolated cases total. Final independent raw/source audit passes.
   Corrected timing: Redpanda reports last_update_ts as transaction start; prior
   field-based full-lifetime claims are withdrawn, raw receipts preserved.
-- Exact-runtime staging/backup/deadline tools are qualified. Next: publish
-  current-image evidence, verify current-head CI and refresh the operation packet,
-  then the explicit production replay decision. No engine publication is required.
+- Exact-runtime staging/backup/deadline tools and current-image evidence are
+  qualified. The operation packet binds reviewed artifacts, offline plans and CI.
+  Next: explicit production replay decision, coordinated operation and fresh
+  end-to-end acceptance. No engine publication is required.
   Production identity4456→4457/profiles1016→1017 recovery is NOT done.
   User decision must explicitly accept uncommitted-suffix replay/UUID changes,
   then coordinate operation with integration agent and verify fresh processing.
