@@ -9,6 +9,8 @@ enum CleanupFault {
     #[default]
     None,
     KnownFile,
+    Pruning,
+    SkipPruning,
     Listing,
     OrphanDelete,
     MetadataDelete,
@@ -75,6 +77,16 @@ impl CleanupStore for ObservedCleanupStore {
         }
         trace.deleted.push(path.into());
         Ok(())
+    }
+    async fn prune_empty_directories(&self, prefix: &str) -> Result<(), StateError> {
+        // Baseline control exists only in this private test adapter.
+        if matches!(self.fault, CleanupFault::SkipPruning) {
+            return Ok(());
+        }
+        if matches!(self.fault, CleanupFault::Pruning) {
+            return Err(injected_cleanup_error());
+        }
+        CleanupStore::prune_empty_directories(&self.inner, prefix).await
     }
     async fn publish(&self, metadata: CheckpointMetadata) -> Result<(), StateError> {
         if matches!(self.fault, CleanupFault::Publish) {
@@ -386,18 +398,19 @@ async fn job_cleanup_has_one_listing_and_exact_multi_owner_file_oracle() {
     #[cfg(target_os = "linux")]
     assert_eq!(
         observed_directory_opens(&watch),
-        1,
-        "one physical job-directory traversal for three declared operators"
+        2,
+        "one pruning traversal and one object listing for three declared operators"
     );
     assert_eq!(
         read_objects(root.path()),
         expected_checkpoint_cleanup(initial, head)
     );
     assert!(
-        root.path()
+        !root
+            .path()
             .join("J/checkpoints/checkpoint-0000002/operator-o/table-t-000")
-            .is_dir(),
-        "empty directories are not removed"
+            .exists(),
+        "known-file deletion empties are pruned before listing"
     );
     // No history inventory survives: a fresh owner must discover a late old upload,
     // even for an explicitly declared owner with zero retained state descriptors.
@@ -422,6 +435,7 @@ async fn job_cleanup_has_one_listing_and_exact_multi_owner_file_oracle() {
 async fn job_cleanup_failures_preserve_retry_proof_and_commit_minimum_last() {
     for fault in [
         CleanupFault::KnownFile,
+        CleanupFault::Pruning,
         CleanupFault::Listing,
         CleanupFault::OrphanDelete,
         CleanupFault::MetadataDelete,
@@ -453,7 +467,10 @@ async fn job_cleanup_failures_preserve_retry_proof_and_commit_minimum_last() {
         }
         if matches!(
             fault,
-            CleanupFault::KnownFile | CleanupFault::Listing | CleanupFault::OrphanDelete
+            CleanupFault::KnownFile
+                | CleanupFault::Pruning
+                | CleanupFault::Listing
+                | CleanupFault::OrphanDelete
         ) {
             for epoch in 1..3 {
                 assert_eq!(
@@ -473,6 +490,14 @@ async fn job_cleanup_failures_preserve_retry_proof_and_commit_minimum_last() {
             if matches!(fault, CleanupFault::KnownFile) {
                 assert_eq!(trace.listings, 0);
                 assert!(!trace.deleted.is_empty());
+            }
+            if matches!(fault, CleanupFault::Pruning) {
+                assert_eq!(trace.listings, 0);
+                assert_eq!(trace.metadata_deletes, 0);
+                assert!(
+                    !trace.deleted.is_empty(),
+                    "known-file deletion may already complete"
+                );
             }
             if matches!(fault, CleanupFault::OrphanDelete) {
                 assert_eq!(trace.orphan_deletes, 1);
@@ -997,4 +1022,257 @@ async fn cleanup_prefix_benchmark() {
     root.close().unwrap();
     std::fs::write(receipt_path, serde_json::to_vec_pretty(&receipt).unwrap()).unwrap();
     eprintln!("STR156_RECEIPT {}", receipt);
+}
+
+#[tokio::test]
+async fn historical_empty_cleanup_cancellation_retries_before_publication() {
+    let root = tempfile::tempdir().unwrap();
+    let (head, initial) = checkpoint_cleanup_fixture(root.path());
+    let empty: Vec<_> = (0..256)
+        .map(|epoch| {
+            root.path().join(format!(
+                "J/checkpoints/historical-{epoch:04}/operator/table"
+            ))
+        })
+        .collect();
+    for directory in &empty {
+        std::fs::create_dir_all(directory).unwrap();
+    }
+    let observed = ObservedCleanupStore {
+        inner: provider(root.path()).await,
+        fault: CleanupFault::None,
+        trace: Default::default(),
+    };
+    let mut cleanup = Box::pin(cleanup_checkpoint_files(&observed, head.clone(), 1, 3));
+    let removed = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let poll = futures::poll!(cleanup.as_mut());
+            let removed = empty.iter().filter(|directory| !directory.exists()).count();
+            if removed > 0 && removed < empty.len() {
+                assert_eq!(observed.trace.lock().unwrap().listings, 0);
+                break removed;
+            }
+            assert!(
+                matches!(poll, Poll::Pending),
+                "must interrupt the prune, not file cleanup"
+            );
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("observe partial directory pruning");
+    drop(cleanup);
+    let current = read_objects(root.path());
+    for epoch in 1..=3 {
+        let metadata = metadata_path(&base_path("J", epoch));
+        assert_eq!(
+            current[&metadata], initial[&metadata],
+            "prune cancellation cannot advance metadata"
+        );
+    }
+    let fresh = provider(root.path()).await;
+    cleanup_checkpoint_files(&fresh, head.clone(), 1, 3)
+        .await
+        .unwrap();
+    let mut expected = expected_checkpoint_cleanup(initial, head.clone());
+    assert_eq!(read_objects(root.path()), expected);
+    assert!(empty.iter().all(|directory| !directory.exists()));
+    let late = "J/checkpoints/checkpoint-0000000/operator-empty/table-t/disk-late";
+    fresh.put(late, vec![9]).await.unwrap();
+    let active = "J/checkpoints/checkpoint-0000004/operator-empty/table-t/disk-active";
+    fresh.put(active, vec![8]).await.unwrap();
+    let retained = CheckpointMetadata::decode(
+        fresh
+            .get(metadata_path(&base_path("J", 3)))
+            .await
+            .unwrap()
+            .as_ref(),
+    )
+    .unwrap();
+    let retry = provider(root.path()).await;
+    cleanup_checkpoint_files(&retry, retained.clone(), 3, 3)
+        .await
+        .unwrap();
+    expected.insert(active.into(), vec![8]);
+    assert_eq!(read_objects(root.path()), expected);
+    // Files deleted after the prepass can leave directories until the next pass.
+    assert!(
+        root.path()
+            .join("J/checkpoints/checkpoint-0000000")
+            .exists()
+    );
+    cleanup_checkpoint_files(&retry, retained, 3, 3)
+        .await
+        .unwrap();
+    assert!(
+        !root
+            .path()
+            .join("J/checkpoints/checkpoint-0000000")
+            .exists()
+    );
+    assert_eq!(read_objects(root.path()), expected);
+    eprintln!("STR161_PRUNE_INTERRUPTION observed_removed={removed} total=256");
+}
+
+/// Finite filesystem-work comparison, not an engine throughput benchmark.
+/// The baseline changes only the private test adapter's pruning operation.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[ignore = "opt-in finite STR-161 local directory comparison"]
+async fn historical_empty_directory_work_comparison() {
+    fn directory_count(path: &Path) -> usize {
+        std::fs::read_dir(path)
+            .unwrap()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                if entry.file_type().unwrap().is_dir() {
+                    1 + directory_count(&entry.path())
+                } else {
+                    0
+                }
+            })
+            .sum()
+    }
+    let mut results = Vec::new();
+    for history in [0, 2_000] {
+        let baseline_root = tempfile::tempdir().unwrap();
+        let candidate_root = tempfile::tempdir().unwrap();
+        let roots = [baseline_root.path(), candidate_root.path()];
+        let mut expected = ObjectMap::new();
+        for epoch in 2_001..=2_004 {
+            for table in ["a", "b"] {
+                let key = format!(
+                    "J/checkpoints/checkpoint-{epoch:07}/operator-o/table-{table}/disk-live"
+                );
+                expected.insert(key.clone(), key.into_bytes());
+            }
+        }
+        let reference = "J/checkpoints/checkpoint-0000000/operator-o/table-a/disk-reference";
+        expected.insert(reference.into(), vec![7]);
+        expected.insert("other/checkpoints/untouched/data".into(), vec![8]);
+        let owners = owner_paths("o", &HashSet::from([reference.to_owned()]));
+        let mut watches = Vec::new();
+        for root in roots {
+            for epoch in 1..=history {
+                for table in ["a", "b"] {
+                    std::fs::create_dir_all(root.join(format!(
+                        "J/checkpoints/checkpoint-{epoch:07}/operator-o/table-{table}"
+                    )))
+                    .unwrap();
+                }
+            }
+            std::fs::create_dir_all(root.join("other/checkpoints/empty/descendant")).unwrap();
+            write_objects(root, &expected);
+            assert_eq!(read_objects(root), expected);
+            if history > 0 {
+                watches.push(watch_directory(
+                    &root.join("J/checkpoints/checkpoint-0001000"),
+                ));
+            }
+        }
+        let baseline = ObservedCleanupStore {
+            inner: provider(roots[0]).await,
+            fault: CleanupFault::SkipPruning,
+            trace: Default::default(),
+        };
+        let candidate = ObservedCleanupStore {
+            inner: provider(roots[1]).await,
+            fault: CleanupFault::None,
+            trace: Default::default(),
+        };
+        let stores = [&baseline, &candidate];
+        let before_directories = roots.map(directory_count);
+        // Initial inventory opens watched directories; exclude setup events.
+        for watch in &watches {
+            let _ = observed_directory_opens(watch);
+        }
+        let mut first_directories = [0; 2];
+        for pass in 0..=8 {
+            let order = if pass % 2 == 0 { [0, 1] } else { [1, 0] };
+            for arm in order {
+                let before = process_usage();
+                let start = std::time::Instant::now();
+                cleanup_abandoned_controller_job_disk_files(stores[arm], "J", 2_001, &owners)
+                    .await
+                    .unwrap();
+                let elapsed = start.elapsed().as_secs_f64();
+                let after = process_usage();
+                // Drain instrumentation before untimed oracle enumeration.
+                let historical_opens = if history > 0 {
+                    Some(observed_directory_opens(&watches[arm]))
+                } else {
+                    None
+                };
+                if let Some(opens) = historical_opens {
+                    assert_eq!(opens, usize::from(arm == 0 || pass == 0));
+                }
+                assert_eq!(read_objects(roots[arm]), expected);
+                if history > 0 {
+                    // Oracle traversal also opens the baseline watched directory.
+                    let _ = observed_directory_opens(&watches[arm]);
+                    assert_eq!(
+                        roots[arm].join("J/checkpoints/checkpoint-0001000").exists(),
+                        arm == 0
+                    );
+                }
+                assert!(
+                    roots[arm]
+                        .join("other/checkpoints/empty/descendant")
+                        .is_dir()
+                );
+                if pass == 0 {
+                    first_directories[arm] = directory_count(roots[arm]);
+                    if history > 0 {
+                        let _ = observed_directory_opens(&watches[arm]);
+                    }
+                }
+                let seconds =
+                    |time: libc::timeval| time.tv_sec as f64 + time.tv_usec as f64 / 1_000_000.0;
+                results.push(serde_json::json!({
+                    "history_epochs": history,
+                    "arm": if arm == 0 { "baseline" } else { "candidate" },
+                    "pass": pass,
+                    "phase": if pass == 0 { "first" } else { "steady" },
+                    "wall_seconds": elapsed,
+                    "user_cpu_seconds": seconds(after.ru_utime) - seconds(before.ru_utime),
+                    "system_cpu_seconds": seconds(after.ru_stime) - seconds(before.ru_stime),
+                    "selected_historical_directory_opens": historical_opens,
+                    "oracle_pass": true,
+                }));
+            }
+        }
+        let after_directories = roots.map(directory_count);
+        assert_eq!(before_directories[0], before_directories[1]);
+        assert_eq!(before_directories[0], after_directories[0]);
+        assert_eq!(after_directories, first_directories);
+        assert_eq!(
+            after_directories[0] - after_directories[1],
+            history as usize * 4
+        );
+        results.push(serde_json::json!({
+            "history_epochs": history,
+            "directories_before": before_directories,
+            "directories_after_first": first_directories,
+            "directories_after_all": after_directories,
+            "immutable_objects": expected.len(),
+        }));
+    }
+    let receipt = serde_json::json!({
+        "status": "pass", "profile": "test", "results": results,
+        "scope": "local filesystem cleanup only; selected opens are not whole-tree syscalls",
+        "timing_excludes": "fixture construction, inventories, inotify setup/drain and byte oracle",
+    });
+    if let Some(path) = std::env::var_os("STR161_RECEIPT") {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .unwrap();
+        writeln!(file, "{}", serde_json::to_string_pretty(&receipt).unwrap()).unwrap();
+    }
+    eprintln!(
+        "STR161_COMPARISON {}",
+        serde_json::to_string(&receipt).unwrap()
+    );
 }

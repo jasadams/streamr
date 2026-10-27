@@ -36,6 +36,7 @@ trait CleanupStore: Sync {
         epoch: u32,
     ) -> Result<Option<OperatorCheckpointMetadata>, StateError>;
     async fn delete(&self, path: &str) -> Result<(), StateError>;
+    async fn prune_empty_directories(&self, prefix: &str) -> Result<(), StateError>;
     async fn publish(&self, metadata: CheckpointMetadata) -> Result<(), StateError>;
     fn qualified_prefix(&self, prefix: &str) -> String;
     async fn list_prefix(
@@ -63,6 +64,11 @@ impl CleanupStore for arroyo_storage::StorageProvider {
 
     async fn delete(&self, path: &str) -> Result<(), StateError> {
         self.delete_if_present(path).await?;
+        Ok(())
+    }
+
+    async fn prune_empty_directories(&self, prefix: &str) -> Result<(), StateError> {
+        arroyo_storage::StorageProvider::prune_empty_directories(self, prefix.into()).await?;
         Ok(())
     }
 
@@ -468,6 +474,10 @@ async fn cleanup_abandoned_controller_job_disk_files<S: CleanupStore + ?Sized>(
     let namespace = format!("{job_id}/checkpoints/");
     let qualified = storage.qualified_prefix(&namespace);
     let prefix = format!("{}/", qualified.trim_end_matches('/'));
+    // Remove historical local empty trees before the complete late-upload scan.
+    // Files deleted below (or by metadata cleanup) can leave empties until the
+    // next pass; no directory inventory or old-epoch exclusion survives a pass.
+    storage.prune_empty_directories(&namespace).await?;
     let listing = storage.list_prefix(&namespace).await?;
     futures::pin_mut!(listing);
     while let Some(object) = listing

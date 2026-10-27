@@ -1,3 +1,37 @@
+## Active STR-161 — historical checkpoint-directory cleanup — 2026-10-27
+
+- User reopened the completed diagnosis and authorized fixing the proposed
+  historical empty-directory traversal issue. Session
+  `codex-01a17ca0-9f9f-7e40-a311-3e393e95a9af`, branch
+  `jason/str-161-checkpoint-cleanup-20261027`, fetched base `597b6326`.
+  Task guidance: `AGENTS.md`, `.claude/build-test.md`, `.claude/team.md`,
+  this ledger; `CLAUDE.md`/`docs/CODING_STANDARDS.md` absent.
+- Reuse diagnosis `/home/jason/qa-evidence/str-idle-cpu-20261027/RESULT.md`.
+  Preserve late uploads, retained references, owner isolation, retention,
+  cancellation/retry and recovery; no checkpoint-policy, Kafka protocol or
+  unchanged SESSION-export redesign. No production mutation/deployment.
+- Acceptance: minimal plan with three independent perspectives; focused local
+  history and cleanup regressions; maintained affected-crate dev/prebuilt gates;
+  bounded work comparison; independent final review and current-head PR CI.
+- Three independent pre-code perspectives approve plan `61c30f93...11a04f`.
+  Scoped local-only rmdir prepass implemented; independent source review approves
+  after one benchmark setup-event fix. Test-only baseline seam; no product flag.
+- Maintained image `bad108ab1443`, dev/test matching prebuilt RocksDB: fmt,
+  affected storage/state locked check, strict Clippy and 36 correctness tests
+  (storage11/cleanup7/checkpoint18) pass. Explicit finite comparison also passes;
+  unrelated historical STR-156 benchmark stays unrun. All five tested file
+  hashes unchanged across the complete inventory.
+- Historical fixture: 8,000 empty directories removed; steady wall median
+  150.36→2.99ms. First-pass cost 143.51→826.52ms and zero-history steady median
+  0.736→2.184ms are retained tradeoffs. Independent raw measurement review KEEP;
+  exact ten-file byte oracles pass. Selected opens are not whole-tree syscalls.
+  Evidence `/home/jason/qa-evidence/str161-cleanup-20261027/`; report
+  [str-161-validation.md](str-161-validation.md) preserves environment failures.
+- Final integrated source/evidence review APPROVE, no findings. Next: PR and
+  current-head CI (live delivery outcome on ticket/PR). Remaining unchanged
+  export cost tracked in STR-162; no production CPU or application-
+  throughput improvement, full engine recovery, deployment or merge claimed.
+
 ## STR-159 — measured one-pass cleanup experiment — 2026-10-26
 
 - Completed one reviewed matched native application experiment. Target **not met**: 46.793875→72.277789 completed DATA/s, **1.5446×**, against minimum 10×. Both exact 5,000-event tails and application/recovery oracles passed.
