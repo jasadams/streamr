@@ -1,5 +1,10 @@
 # Native checkpoint measurement — 2026-10-29
 
+The subsequent [coverage verification](str-25-native-checkpoint-verification.md)
+passes all phase-count and independent native-compaction gates, supporting KEEP
+of the unchanged product. The original first experiment below remains unchanged
+and INCONCLUSIVE; its sample-count failure is not reclassified.
+
 **First experiment: INCONCLUSIVE against the frozen acceptance gates.**
 The mechanism has substantial observed CPU/checkpoint savings, all declared
 output oracles pass, and native reuse/compaction evidence passes. Some baseline
@@ -10,7 +15,8 @@ observations into a fully accepted performance or throughput-capacity claim.
 
 Base `8cddb321b631b79185bf6d166a0fdf9522db529f`; complete candidate compiled-source
 manifest SHA `02744b92d97e656ae94d8e4ea9599b18d8fe7b662a044edf771d198f9bc8cf08`.
-All 1,354 candidate inputs match the implementation worktree. Baseline has 1,349
+At the first experiment freeze, all 1,354 candidate inputs matched the implementation
+worktree. Baseline had 1,349
 inputs: 1,347 exact base files and the two reviewed measurement overlay files.
 
 - Baseline executable `09f9db9ee9c1cfb568a3cbbadc3b55e9aa84e4ab4360c5554fa20f35ab6abd47`.
@@ -97,8 +103,10 @@ The frozen requirement is at least two in **every** phase of **every** arm.
 Cross-boundary checkpoints stay excluded. The raw result remains INCONCLUSIVE;
 native compaction audit clears its own placeholder, not the baseline gap.
 Technical review supports retaining the mechanism while leaving full measurement
-acceptance unresolved. User decision on the [bounded phase-length follow-up](str-25-checkpoint-measurement-followup.md)
-is pending; no follow-up implementation/run is authorized yet.
+acceptance unresolved. The user directed completion of the same verification. The [reviewed phase-length
+check](str-25-checkpoint-measurement-followup.md) has completed with independent
+KEEP; see the separate verification report. Its matched costs are not an old/new
+campaign speedup comparison.
 
 The sampled frontier-lag metric begins at observed completed output and ends at
 publication. It is not event-admission latency or Kafka committed visibility.

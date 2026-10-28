@@ -7,10 +7,13 @@ retention, the core outcomes of STR-25 and STR-24. The user agreed to this
 architecture on 2026-10-28; the concrete
 [implementation plan](str-25-native-checkpoint-plan.md) now governs execution.
 Implementation and scoped correctness/recovery gates pass, including fresh-process
-recovery from the measured large state on normal dev/test and optimized pins. The first optimized
-comparison shows substantial checkpoint/CPU savings but remains inconclusive
-against its per-phase sample-count gate; see [measurement](str-25-native-checkpoint-measurement.md)
-and [validation](str-25-native-checkpoint-validation.md).
+recovery from the measured large state on normal dev/test and optimized pins. The completed
+[coverage verification](str-25-native-checkpoint-verification.md) passes every
+phase-count and native-compaction gate with independent KEEP. Mean sampled CPU
+is 60.8% lower and idle checkpoint median is 3.978→0.110s within matched arms.
+The original first experiment remains INCONCLUSIVE; its evidence is preserved.
+See [measurement](str-25-native-checkpoint-measurement.md) and
+[validation](str-25-native-checkpoint-validation.md) for source bounds and limits.
 
 Source is `8cddb321b631b79185bf6d166a0fdf9522db529f`; guidance and worktree are
 recorded in [STR-162 review](str-162-export-reuse-review.md). Current full tickets

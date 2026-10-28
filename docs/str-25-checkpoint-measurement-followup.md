@@ -1,8 +1,12 @@
-# Proposed checkpoint measurement follow-up
+# Checkpoint coverage verification plan — completed
 
-Status: proposed, not authorized or implemented. The first frozen experiment is
-finished and remains INCONCLUSIVE under its original coverage gates. Preserve
-its inputs, outputs and receipts unchanged. No automatic rerun.
+Status: completed following the user's direction to finish verification of the
+same implementation. All coverage and native-compaction gates pass, with
+independent KEEP; see [verification](str-25-native-checkpoint-verification.md).
+The originally reviewed plan SHA `7c57dc116d92a9d1f65639cea394f77fe6d4e11effb86a9a51ce4a2e209475ff`
+is preserved as `verification-preregistered-plan.md` in the evidence root.
+The specification below records the bounded verification that ran. The first
+frozen experiment remains unchanged and INCONCLUSIVE under its original gates.
 
 ## Evidence and remaining gap
 
@@ -10,7 +14,7 @@ The first ABBA campaign completed 59,474 exact outputs in every arm and all
 state-change targets. Independent process/oracle audit reports mean sampled CPU
 69.845 to 30.170 seconds and idle checkpoint request-to-publication median
 4.029 to 0.106 seconds. This is fixed offered work, not a throughput-capacity
-speedup. Native compaction/inventory audit is being completed separately.
+speedup. The original native compaction/inventory audit passed independently.
 
 The fixed 20-second phases did not always contain two complete baseline
 checkpoints: baseline 1 sparse/churn and baseline 4 idle each contain one. The
@@ -19,7 +23,7 @@ its configured next-checkpoint delay is five seconds after completion. Phase
 alignment can therefore require almost 24.803 seconds to contain two complete
 checkpoints. This is a measurement coverage gap, not an output/recovery failure.
 
-## One proposed bounded experiment
+## Bounded verification specification
 
 Keep the approved native-checkpoint hypothesis, product source, payloads, input
 sequence, backend limits, source pacing, checkpoint policy, protocols, CPUs,
@@ -48,7 +52,7 @@ Preserve 49,152 independent 8,192-byte seed payloads (384 MiB logical payload),
 ownership, controller protocol and five-second checkpoint delay. Sampled RSS
 is not an OS-enforced whole-host memory bound.
 
-After user agreement, update only the shared measurement overlay and matching
+For this verification, update only the shared measurement overlay and matching
 Python phase/audit constants. Copy the Rust driver byte-for-byte into both
 source trees and obtain fresh independent overlay and plan reviews. Rebuild
 both optimized SQL-test executables through maintained scripts, invalidating
@@ -88,7 +92,8 @@ Report CPU and checkpoint/transfer costs for fixed completed work. Label sampled
 output-observation-to-publication lag accurately; it is neither event-admission
 latency nor Kafka committed visibility.
 
-All three plan perspectives must review this proposed timing change before
-implementation. The user decides whether to run this additional experiment or
-retain the first measured result with its explicit coverage gap. No production
+All three plan perspectives approved the timing specification before
+implementation; paired source overlays, build orchestration and actual frozen
+pins/fixtures received fresh independent review before processing. The user
+directed completion of this same-hypothesis coverage verification. No production
 rollout, extra performance hypothesis or larger qualification campaign is implied.

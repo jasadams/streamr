@@ -3,10 +3,10 @@
 Native implementation, independent source review, strict Clippy and current-source
 dev SQL recovery gates pass. Source-free CLI worker/controller process-loss and
 isolated Kafka pending-commit replay gates pass with independent evidence audits.
-The first optimized ABBA comparison is complete but **inconclusive against its
-frozen acceptance criteria**: some baseline phases contain fewer than two complete
-checkpoints. Observed CPU and checkpoint costs improved; this does not waive the
-coverage criterion. See [the measurement report](str-25-native-checkpoint-measurement.md).
+The completed [coverage verification](str-25-native-checkpoint-verification.md)
+passes every phase-count and native-compaction gate with independent KEEP.
+The first optimized ABBA comparison remains INCONCLUSIVE against its original
+sample-count gates; its evidence and boundaries are unchanged.
 
 Evidence root: `/home/jason/qa-evidence/str25-native-checkpoints-20261028/`.
 
@@ -45,13 +45,14 @@ completion propagation, validation and both cleanup paths. Test work owns
 dedicated real-engine native checkpoint cases and finite runners. All share
 the single STR-25 worktree; builds remain serialized.
 
-## Remaining acceptance and delivery
+## Delivery and qualification limits
 
 Fresh-process restore of the measured native state passes on the existing normal
 dev/test pin and on the optimized producer pin, with every retained key checked
 through real SQL. The state exceeds configured resident pools and observed
-sampled process RSS; it does not exceed whole-host RAM. A proposed second
-comparison requires the user's decision; the first result remains immutable.
+sampled process RSS; it does not exceed whole-host RAM. The user directed
+completion of the same performance verification; all four matched arms and
+independent evidence audits now pass. The first result remains immutable.
 [Draft PR #90](https://github.com/jasadams/streamr/pull/90) is published.
 PR checks are limited to active Lint and Backlog tooling workflows;
 full CI and Semgrep are manually disabled, so those jobs have not run.
@@ -319,3 +320,21 @@ hashes, exact output and owned cleanup. Independent audit
 `large-native-recovery-dev-result-review.{md,json}` passes the scoped normal
 dev large-state recovery gate.
 No engine source or resource limit changed. Evidence: `large-native-recovery-dev/`.
+
+## Completed coverage verification
+
+The user directed finishing the same approved implementation's verification.
+Only paired measurement timing changed; product source, input/oracle bytes,
+CPU/backend limits and checkpoint policy are unchanged. Four 144s ABBA arms
+completed 576.030329162s total, all 59,474 exact rows per arm and at least two
+wholly-contained checkpoints in every measured phase. Independent native audit
+checked 824 payloads/52 manifest links and successful local SST replacement in
+both native arms. Independent process/oracle and storage verdicts support KEEP.
+
+Whole-window sampled CPU means 78.705→30.820s (60.8% lower), idle checkpoint
+median 3.978→0.110s. No throughput-capacity or production Kafka latency claim.
+The original first campaign remains unchanged and INCONCLUSIVE; raw verification
+JSON retains its reserved independent-audit status, resolved in the separate
+written reviews. [Exact current evidence and limits](str-25-native-checkpoint-verification.md)
+include source/pin hashes, phase counts, SST/compaction proof, CPU scope and
+resource/cleanup qualifications. No additional engineering hypothesis was tested.

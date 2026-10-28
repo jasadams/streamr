@@ -352,7 +352,7 @@ async fn lifecycle() {
 #[test_log(tokio::test)]
 #[ignore = "finite native checkpoint performance arm"]
 async fn native_checkpoint_performance_arm() {
-    tokio::time::timeout(test_runtime_timeout(), performance_arm())
+    tokio::time::timeout(Duration::from_secs(174), performance_arm())
         .await
         .expect("native checkpoint arm exceeded its outer deadline");
 }
@@ -404,7 +404,7 @@ async fn performance_arm() {
         "NATIVE_PERF_START unix_micros={}",
         to_micros(SystemTime::now())
     );
-    let deadline = started + Duration::from_secs(120);
+    let deadline = started + Duration::from_secs(144);
     let released = Arc::new(std::sync::atomic::AtomicUsize::new(1));
     let feed = Arc::new(tokio::sync::Mutex::new(()));
     let sources = running.source_controls();
@@ -420,9 +420,9 @@ async fn performance_arm() {
         let producer = async {
             loop {
                 let elapsed = started.elapsed().as_secs_f64();
-                let phase = if elapsed < 80.0 {
+                let phase = if elapsed < 88.0 {
                     0
-                } else if elapsed < 100.0 {
+                } else if elapsed < 116.0 {
                     1
                 } else {
                     2
@@ -527,7 +527,7 @@ async fn performance_arm() {
     let processing_seconds = started.elapsed().as_secs_f64();
     let phase_complete = std::array::from_fn::<_, 3, _>(|index| {
         phase_first_complete_seconds[index]
-            .is_some_and(|seconds| seconds <= [60.0, 100.0, 120.0][index])
+            .is_some_and(|seconds| seconds <= [60.0, 116.0, 144.0][index])
     });
     let seed_complete = phase_complete[0];
     // Freeze the completed prefix before aborting: teardown may append more
@@ -549,7 +549,7 @@ async fn performance_arm() {
         "phase_first_complete_seconds":phase_first_complete_seconds,
         "completed_output_bytes":progress.offset - progress.partial.len() as u64,
         "checkpoints":checkpoints,"job_id":job_id,
-        "phase_boundaries_seconds":[0,60,80,100,120]});
+        "phase_boundaries_seconds":[0,60,88,116,144]});
     tokio::fs::write(
         root.join("arm.json"),
         serde_json::to_vec_pretty(&receipt).unwrap(),

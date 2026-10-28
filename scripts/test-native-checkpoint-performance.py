@@ -20,7 +20,7 @@ native = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(native)
 KEYS, SIZE = 49152, 8192
 SPARSE, CHURN = 492, 4915
-ARM_SECONDS = 120
+ARM_SECONDS = 144
 
 
 def prepare(args):
@@ -73,7 +73,7 @@ def prepare(args):
         case.mkdir()
         (case / 'checkpoints').mkdir()
         (case / 'query.sql').write_text(native.query(root / 'input.jsonl', case / 'output.jsonl'))
-        env = native.clean_environment(case, 'rocksdb', args.protocol, 150, max_databases=1)
+        env = native.clean_environment(case, 'rocksdb', args.protocol, 174, max_databases=1)
         env.update(STREAMR_NATIVE_PHASE_TARGETS=f'{seed},{sparse},{churn}',
                    STREAMR_NATIVE_INPUT_PATH=str(root / 'input.jsonl'),
                    STREAMR_NATIVE_CHECKPOINT_MS=str(args.checkpoint_ms),
@@ -86,10 +86,10 @@ def prepare(args):
     manifest = dict(status='PREPARED; NOT MEASURED', arms=arms, files=files, protocol=args.protocol,
                     cpu_affinity=cpus, checkpoint_ms=args.checkpoint_ms,
                     child_rss_limit_bytes=args.rss_limit_mib * 1048576,
-                    phase_boundaries_seconds=[0, 60, 80, 100, 120], phase_targets=[seed, sparse, churn],
+                    phase_boundaries_seconds=[0, 60, 88, 116, 144], phase_targets=[seed, sparse, churn],
                     seed_keys=KEYS, payload_bytes=SIZE, seed_logical_payload_bytes=KEYS * SIZE,
-                    backend_pool_bytes=32 * 1048576, max_processing_seconds=480,
-                    checkpoints_required_per_phase=2, startup_cleanup_outer_timeout_seconds=160,
+                    backend_pool_bytes=32 * 1048576, max_processing_seconds=576,
+                    checkpoints_required_per_phase=2, startup_cleanup_outer_timeout_seconds=184,
                     host_initial_disk_free_bytes=free,
                     comparison_limits=['Single generic MERGE/lookup fixture; not previous Flink comparison.',
                      'File-source event-to-checkpoint publication latency is not Kafka read_committed visibility.',
@@ -101,12 +101,13 @@ def prepare(args):
 
 def audit_arm(case, manifest, arm):
     result = json.loads((case / 'arm.json').read_text())
+    native.require(result['phase_boundaries_seconds'] == manifest['phase_boundaries_seconds'], 'compiled driver phase boundaries differ from frozen controls')
     native.require(result['processing_seconds'] <= ARM_SECONDS + 0.25, 'processing cap exceeded')
     rows = result['completed_rows']
     native.require(0 <= rows <= manifest['phase_targets'][-1], 'completed row denominator differs')
     native.compare_jsonl(case / 'output.processing.jsonl', case.parent / 'expected.jsonl', rows)
     by_phase = {'idle': [], 'sparse': [], 'churn': []}
-    intervals = [('idle', 60, 80), ('sparse', 80, 100), ('churn', 100, 120)]
+    intervals = [('idle', 60, 88), ('sparse', 88, 116), ('churn', 116, 144)]
     inventories = []
     prior = set()
     for checkpoint in result['checkpoints']:

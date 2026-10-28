@@ -25,9 +25,16 @@
 - Published [draft PR #90](https://github.com/jasadams/streamr/pull/90). Active
   PR checks are Lint and Backlog tooling. Full CI and Semgrep workflows
   are manually disabled; their build/tests/scans are not claimed passed.
-- Next: user decision on the reviewed 576s follow-up; no additional benchmark
-  code/run authorized. Original evidence
-  stays immutable. Existing post-SIGKILL working-DB orphan limit remains explicit.
+- Same-implementation coverage verification is complete: all four 144s arms
+  produced 59,474 exact rows; all 12 phase cells contain at least two completed
+  checkpoints. Independent process/oracle and native-compaction audits pass KEEP.
+  Matched CPU 78.705→30.820s mean (60.8% lower), idle CP 3.978→0.110s.
+  First result stays INCONCLUSIVE and immutable. No throughput-capacity claim.
+- Delivery: PR #90 carries the reviewed implementation, timing overlay and
+  completed verification report; enabled current-head checks are recorded on PR.
+  Next is normal PR review/merge, not another processing/benchmark decision.
+  Known cloud/host-RAM/post-SIGKILL working-directory limits remain explicit.
+
 
 ## Active STR-158 — scoped production acceptance passed; final handoff — 2026-10-28
 
