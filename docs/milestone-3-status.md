@@ -22,8 +22,11 @@
   49,152 new all-key SQL probes, exact 108,626 full rows, zero logical scan pages.
   Dev peak sampled RSS 380,051,456B < 402,653,184B logical state; native 503,303,110B.
   Independent optimized and dev result audits pass.
-- Next: finalize docs, draft delivery and current-head CI. Proposed 576s follow-up awaits
-  user decision; no additional benchmark code/run authorized. Original evidence
+- Published [draft PR #90](https://github.com/jasadams/streamr/pull/90). Active
+  PR checks are Lint and Backlog tooling. Full CI and Semgrep workflows
+  are manually disabled; their build/tests/scans are not claimed passed.
+- Next: user decision on the reviewed 576s follow-up; no additional benchmark
+  code/run authorized. Original evidence
   stays immutable. Existing post-SIGKILL working-DB orphan limit remains explicit.
 
 ## Active STR-158 — scoped production acceptance passed; final handoff — 2026-10-28

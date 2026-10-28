@@ -52,7 +52,10 @@ dev/test pin and on the optimized producer pin, with every retained key checked
 through real SQL. The state exceeds configured resident pools and observed
 sampled process RSS; it does not exceed whole-host RAM. A proposed second
 comparison requires the user's decision; the first result remains immutable.
-Draft publication and CI remain pending.
+[Draft PR #90](https://github.com/jasadams/streamr/pull/90) is published.
+PR checks are limited to active Lint and Backlog tooling workflows;
+full CI and Semgrep are manually disabled, so those jobs have not run.
+The maintained local Rust gates above remain distinct from remote CI.
 
 Current-source dev SQL gates verify six epochs and 48 fresh-process restores,
 all five native backend construction paths, same-backend zero logical scans,
