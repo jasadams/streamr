@@ -56,10 +56,45 @@ pub async fn construct_configured_backend(
     owner: ConfiguredBackendOwner,
     max_resident_bytes: usize,
     resources: WorkerStateResources,
+    native_restore: Option<super::native_checkpoint::NativeRestoreRequest>,
 ) -> Result<std::sync::Arc<dyn super::LiveStateBackend>> {
     use arroyo_rpc::config::SqlStateBackend;
     let configured = arroyo_rpc::config::config();
     let worker = &configured.worker;
+    if let Some(request) = native_restore {
+        let root = worker
+            .disk_sql_state
+            .as_ref()
+            .map(|disk| disk.directory.clone())
+            .unwrap_or_else(std::env::temp_dir)
+            .join(uuid::Uuid::new_v4().to_string());
+        let native_config = super::lifecycle::RocksStateConfig {
+            root,
+            job_id: owner.job_id,
+            operator_id: owner.operator_id,
+            subtask: owner.subtask,
+            generation: owner.generation,
+            attempt: 0,
+        };
+        let source = super::rocks::RocksLiveState::restore_worker_with_resources(
+            native_config,
+            resources.clone(),
+            request.clone(),
+        )
+        .await?;
+        return match worker.sql_state_backend {
+            SqlStateBackend::Rocksdb => Ok(std::sync::Arc::new(source)),
+            SqlStateBackend::Memory => Ok(std::sync::Arc::new(
+                super::native_checkpoint::into_memory(
+                    source,
+                    &request.metadata,
+                    resources,
+                    max_resident_bytes,
+                )
+                .await?,
+            )),
+        };
+    }
     let construction = match worker.sql_state_backend {
         SqlStateBackend::Memory => BackendConstruction::Memory { max_resident_bytes },
         SqlStateBackend::Rocksdb => {

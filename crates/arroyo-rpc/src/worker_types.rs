@@ -53,7 +53,7 @@ impl From<TaskFailedEvent> for rpc::JobFailure {
 #[derive(Debug)]
 pub enum RunningMessage {
     TaskCheckpointEvent(TaskCheckpointEventReq),
-    TaskCheckpointFinished(TaskCheckpointCompletedReq),
+    TaskCheckpointFinished(Box<TaskCheckpointCompletedReq>),
     TaskFinished {
         worker_id: WorkerId,
         time: SystemTime,

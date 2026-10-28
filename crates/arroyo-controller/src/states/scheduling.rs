@@ -940,6 +940,10 @@ impl State for Scheduling {
                     program,
                     start_epoch,
                     min_epoch,
+                    checkpoint_info
+                        .as_ref()
+                        .filter(|info| !info.needs_commits)
+                        .and_then(|info| u32::try_from(info.epoch).ok()),
                     worker_connects,
                     committing_state,
                     metrics,

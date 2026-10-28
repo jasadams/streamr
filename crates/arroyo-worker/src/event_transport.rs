@@ -716,6 +716,7 @@ mod repaired_tests {
         let span = Duration::new(u64::from(u32::MAX) + 1, 999_999_999);
         vec![
             SignalMessage::Barrier(CheckpointBarrier {
+                completed_base_epoch: None,
                 epoch: u32::MAX,
                 min_epoch: u32::MAX,
                 timestamp: UNIX_EPOCH.checked_add(span).unwrap(),

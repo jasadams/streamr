@@ -574,6 +574,7 @@ async fn upload_failure() {
         .await
         .unwrap();
     let barrier = CheckpointBarrier {
+        completed_base_epoch: None,
         epoch: 2,
         min_epoch: 0,
         timestamp: SystemTime::now(),

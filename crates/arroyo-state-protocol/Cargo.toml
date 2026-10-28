@@ -16,6 +16,8 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 futures = { workspace =  true }
 sha2 = "0.10"
+tempfile = "3"
+libc = "0.2"
 
 [dev-dependencies]
 tokio = { workspace = true }

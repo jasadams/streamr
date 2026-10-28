@@ -28,6 +28,7 @@ use tracing::{debug, error};
 
 mod aws;
 mod local_cleanup;
+pub mod streaming;
 
 /// A reference-counted reference to a [StorageProvider].
 pub type StorageProviderRef = Arc<StorageProvider>;
@@ -60,6 +61,7 @@ pub struct StorageProvider {
     multipart_store: Option<Arc<dyn MultipartStore>>,
     canonical_url: String,
     storage_options: HashMap<String, String>,
+    native_copy_probe: Arc<tokio::sync::OnceCell<()>>,
 }
 
 impl Debug for StorageProvider {
@@ -483,6 +485,14 @@ impl StorageProvider {
         options: HashMap<String, String>,
     ) -> Result<Self, StorageError> {
         let mut builder = AmazonS3Builder::from_env().with_bucket_name(&config.bucket);
+        if builder
+            .get_config_value(&AmazonS3ConfigKey::CopyIfNotExists)
+            .is_none()
+        {
+            builder = builder.with_copy_if_not_exists(
+                object_store::aws::S3CopyIfNotExists::Header("If-None-Match".into(), "*".into()),
+            );
+        }
         let mut aws_key_manually_set = false;
         let mut s3_options = HashMap::new();
 
@@ -566,10 +576,14 @@ impl StorageProvider {
             canonical_url = format!("{canonical_url}/{key}");
         }
 
+        if let Some(strategy) = builder.get_config_value(&AmazonS3ConfigKey::CopyIfNotExists) {
+            s3_options.insert(AmazonS3ConfigKey::CopyIfNotExists, strategy);
+        }
         let object_store = Arc::new(builder.build()?);
 
         Ok(Self {
             config: BackendConfig::S3(config),
+            native_copy_probe: Default::default(),
             object_store: object_store.clone(),
             multipart_store: Some(object_store),
             canonical_url,
@@ -585,6 +599,16 @@ impl StorageProvider {
         options: HashMap<String, String>,
     ) -> Result<Self, StorageError> {
         let mut builder = AmazonS3Builder::from_env().with_bucket_name(&config.bucket);
+        if builder
+            .get_config_value(&AmazonS3ConfigKey::CopyIfNotExists)
+            .is_none()
+        {
+            builder =
+                builder.with_copy_if_not_exists(object_store::aws::S3CopyIfNotExists::Header(
+                    "cf-copy-destination-if-none-match".into(),
+                    "*".into(),
+                ));
+        }
 
         builder = builder.with_access_key_id(
             last([
@@ -640,14 +664,24 @@ impl StorageProvider {
             .with_endpoint(endpoint)
             .with_virtual_hosted_style_request(false);
 
+        let native_copy_strategy = builder.get_config_value(&AmazonS3ConfigKey::CopyIfNotExists);
         let object_store = Arc::new(builder.build()?);
 
         Ok(Self {
             config: BackendConfig::R2(config),
+            native_copy_probe: Default::default(),
             object_store: object_store.clone(),
             multipart_store: Some(object_store),
             canonical_url,
-            storage_options: HashMap::new(),
+            storage_options: native_copy_strategy
+                .map(|strategy| {
+                    (
+                        AmazonS3ConfigKey::CopyIfNotExists.as_ref().to_owned(),
+                        strategy,
+                    )
+                })
+                .into_iter()
+                .collect(),
         })
     }
 
@@ -676,6 +710,7 @@ impl StorageProvider {
 
         Ok(Self {
             config: BackendConfig::GCS(config),
+            native_copy_probe: Default::default(),
             object_store: object_store.clone(),
             multipart_store: Some(object_store),
             canonical_url,
@@ -696,6 +731,7 @@ impl StorageProvider {
 
         Ok(Self {
             config: BackendConfig::Azure(config),
+            native_copy_probe: Default::default(),
             object_store: object_store.clone(),
             multipart_store: Some(object_store),
             canonical_url,
@@ -718,6 +754,7 @@ impl StorageProvider {
         let canonical_url = format!("file://{}", config.path);
         Ok(Self {
             config: BackendConfig::Local(config),
+            native_copy_probe: Default::default(),
             object_store,
             multipart_store: None,
             canonical_url,

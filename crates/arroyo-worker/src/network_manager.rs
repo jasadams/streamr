@@ -1354,6 +1354,7 @@ mod test {
 
         // test control message
         let message = ArrowMessage::Signal(SignalMessage::Barrier(CheckpointBarrier {
+            completed_base_epoch: None,
             epoch: 5,
             min_epoch: 3,
             timestamp: SystemTime::now(),

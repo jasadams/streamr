@@ -6,6 +6,8 @@
 
 pub mod disk;
 pub mod gc;
+pub mod gc_spool;
+pub mod native_checkpoint;
 pub mod publication;
 mod ready;
 pub mod resolve;
@@ -271,6 +273,7 @@ mod tests {
 
     fn global_operator(files: Vec<CheckpointRef>) -> OperatorCheckpointMetadata {
         OperatorCheckpointMetadata {
+            native_database: None,
             operator_metadata: Some(OperatorMetadata {
                 job_id: "J".to_string(),
                 operator_id: "op".to_string(),

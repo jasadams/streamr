@@ -156,7 +156,8 @@ async fn branch_response_join_native_duplicate_full_key_refuses_final_probe() {
 async fn branch_response_join_actual_pair_hooks_allow_watermark_skew_and_compose_checkpoint() {
     let (mut op,mut ctx)=owner(true).await;let mut out=Capture::default();let mut counter=CheckpointCounter::new(2);
     let closed=HashSet::new();let watermark=SignalMessage::Watermark(arroyo_types::Watermark::Idle);
-    let barrier=CheckpointBarrier {epoch:1,min_epoch:0,timestamp:std::time::UNIX_EPOCH,then_stop:false};
+    let barrier=CheckpointBarrier {
+        completed_base_epoch: None,epoch:1,min_epoch:0,timestamp:std::time::UNIX_EPOCH,then_stop:false};
     op.check_event_control_input(0,&watermark,&counter,&closed).unwrap();
     let left=packet(&op,0,1,5,&[],&[]);op.process_response_index(0,2,left,&mut ctx,&mut out).await.unwrap();
     op.check_event_control_input(1,&watermark,&counter,&closed).unwrap();

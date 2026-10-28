@@ -886,6 +886,7 @@ async fn scalar_response_union_maintenance_drains_after_other_inputs_close() {
             .is_err()
     );
     let barrier = arroyo_types::CheckpointBarrier {
+        completed_base_epoch: None,
         epoch: 1,
         min_epoch: 0,
         timestamp: std::time::SystemTime::UNIX_EPOCH,

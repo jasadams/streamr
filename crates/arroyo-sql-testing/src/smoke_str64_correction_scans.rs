@@ -545,6 +545,7 @@ async fn fail_scan_after_live_commit(
     for source in failed.source_controls() {
         source
             .send(ControlMessage::Checkpoint(CheckpointBarrier {
+                completed_base_epoch: None,
                 epoch: barrier_epoch,
                 min_epoch: 0,
                 timestamp: SystemTime::now(),

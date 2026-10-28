@@ -411,6 +411,7 @@ mod tests {
     }
     fn barrier() -> CheckpointBarrier {
         CheckpointBarrier {
+            completed_base_epoch: None,
             epoch: 1,
             min_epoch: 0,
             timestamp: SystemTime::UNIX_EPOCH,
@@ -471,6 +472,7 @@ mod tests {
         state.check_control(
             0,
             &SignalMessage::Barrier(CheckpointBarrier {
+                completed_base_epoch: None,
                 epoch: 2,
                 ..checkpoint
             }),

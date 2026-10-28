@@ -31,6 +31,9 @@ pub struct RocksLiveState {
     path: PathBuf,
     resources: WorkerStateResources,
     durability: WriteDurability,
+    native_database_id: Vec<u8>,
+    native_reuse: Arc<Mutex<super::native_checkpoint::NativeReuseState>>,
+    restored_native_source: Option<Vec<u8>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -179,10 +182,71 @@ impl RocksLiveState {
                     path,
                     resources: task_resources,
                     durability,
+                    native_database_id: uuid::Uuid::new_v4().as_bytes().to_vec(),
+                    native_reuse: Arc::new(Mutex::new(
+                        super::native_checkpoint::NativeReuseState::default(),
+                    )),
+                    restored_native_source: None,
                 })
             })
             .await
             .map_err(LiveStateError::from)?
+    }
+
+    pub(crate) async fn restore_worker_with_resources(
+        config: RocksStateConfig,
+        resources: WorkerStateResources,
+        request: super::native_checkpoint::NativeRestoreRequest,
+    ) -> Result<Self> {
+        use super::native_checkpoint::{NativeReuseState, StagingDirectory};
+        let database_permit = resources.try_database()?;
+        let cleanup = resources.cleanup().await?;
+        let staging = resources
+            .run_blocking(move || {
+                let path = config.prepare(false)?;
+                Ok::<_, LiveStateError>(StagingDirectory::restoring(path, cleanup))
+            })
+            .await??;
+        super::native_checkpoint::download(&request, &staging.path, &resources).await?;
+        let task_resources = resources.clone();
+        resources
+            .run_blocking(move || {
+                let _latency = task_resources.operation_timer("open");
+                task_resources.ensure_disk_space(&staging.path, 0)?;
+                let db =
+                    DB::open(&options(&task_resources, false), &staging.path).map_err(backend)?;
+                let health = health::BackendHealth::new("rocksdb", false);
+                health.sample_native(&db, &staging.path);
+                task_resources.observe_health(&health);
+                let path = staging.path.clone();
+                let (finished, completion) = oneshot::channel();
+                let source_id = request.metadata.database_id.clone();
+                let fingerprint =
+                    super::native_checkpoint::checkpoint_fingerprint(&request.metadata);
+                Ok(Self {
+                    db: Arc::new(NativeDb {
+                        db: Some(db),
+                        write_lock: Mutex::new(()),
+                        health: Some(health),
+                        path: path.clone(),
+                        remove: AtomicBool::new(true),
+                        permit: Some(database_permit),
+                        resources: Some(task_resources.clone()),
+                        cleanup: Some(staging.release_to_database()),
+                        finished: Some(finished),
+                    }),
+                    completion,
+                    path,
+                    resources: task_resources,
+                    durability: WriteDurability::Checkpoint,
+                    native_database_id: source_id.clone(),
+                    native_reuse: Arc::new(Mutex::new(NativeReuseState::restored(
+                        request.metadata,
+                    ))),
+                    restored_native_source: Some(fingerprint),
+                })
+            })
+            .await?
     }
 
     /// Reserve producer bytes before constructing owned pending writes.
@@ -394,6 +458,92 @@ async fn read_many(
 
 #[async_trait]
 impl LiveStateBackend for RocksLiveState {
+    fn restored_native_checkpoint_fingerprint(&self) -> Option<&[u8]> {
+        self.restored_native_source.as_deref()
+    }
+    async fn capture_native(
+        &self,
+    ) -> Result<Option<super::native_checkpoint::NativeCheckpointCapture>> {
+        use super::native_checkpoint::{NativeCheckpointCapture, StagingDirectory};
+        let started = std::time::Instant::now();
+        let permit = self.resources.snapshot().await?;
+        let cleanup = self.resources.cleanup().await?;
+        let db = self.db.clone();
+        let resources = self.resources.clone();
+        let reuse = self.native_reuse.clone();
+        let database_id = self.native_database_id.clone();
+        let directory = self
+            .path
+            .parent()
+            .ok_or_else(|| backend("native database path has no parent"))?
+            .join(format!("native-capture-{}", uuid::Uuid::new_v4().simple()));
+        let capture = self
+            .resources
+            .run_blocking(move || {
+                let _latency = resources.operation_timer("native_checkpoint");
+                let staging = StagingDirectory::new(directory, cleanup, permit);
+                let _write = db.write_lock.lock().map_err(backend)?;
+                resources.ensure_disk_space(
+                    &db.path,
+                    resources.write_buffer_manager().get_usage() as u64,
+                )?;
+                // WAL is disabled in workers. Flush while writes are excluded, then
+                // establish the filesystem checkpoint before releasing the barrier.
+                let mut flush = FlushOptions::default();
+                flush.set_wait(true);
+                db.flush_opt(&flush).map_err(backend)?;
+                rocksdb::checkpoint::Checkpoint::new(&**db)
+                    .map_err(backend)?
+                    .create_checkpoint(&staging.path)
+                    .map_err(backend)?;
+                let mut files = Vec::new();
+                let mut inventory_bytes = 0usize;
+                for entry in std::fs::read_dir(&staging.path).map_err(backend)? {
+                    let entry = entry.map_err(backend)?;
+                    let metadata = entry.metadata().map_err(backend)?;
+                    let name = entry
+                        .file_name()
+                        .into_string()
+                        .map_err(|_| backend("non-UTF8 native checkpoint filename"))?;
+                    if !metadata.is_file() {
+                        return Err(backend("native checkpoint contains non-file entry"));
+                    }
+                    if files.len() >= arroyo_state_protocol::native_checkpoint::MAX_FILES {
+                        return Err(backend("native checkpoint file inventory exceeds limit"));
+                    }
+                    inventory_bytes = inventory_bytes
+                        .saturating_add(name.capacity())
+                        .saturating_add(2 * std::mem::size_of::<(String, u64)>());
+                    if inventory_bytes
+                        > arroyo_state_protocol::native_checkpoint::MAX_METADATA_BYTES
+                    {
+                        return Err(backend(
+                            "native staging inventory exceeds metadata memory bound",
+                        ));
+                    }
+                    files.push((name, metadata.len()));
+                }
+                files.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+                let cfstats = if std::env::var_os("STREAMR_NATIVE_CHECKPOINT_RECEIPTS").is_some() {
+                    db.property_value("rocksdb.cfstats-no-file-histogram")
+                        .map_err(backend)?
+                        .filter(|stats| stats.len() <= 64 * 1024)
+                } else {
+                    None
+                };
+                Ok(NativeCheckpointCapture {
+                    staging,
+                    resources: resources.clone(),
+                    reuse,
+                    database_id,
+                    files,
+                    sync_capture_seconds: started.elapsed().as_secs_f64(),
+                    cfstats,
+                })
+            })
+            .await??;
+        Ok(Some(capture))
+    }
     async fn try_get(&self, key: &StateKey, options: ReadOptions) -> Result<Option<Vec<u8>>> {
         Ok(read_many(
             DbHandle::Live(self.db.clone()),
@@ -921,6 +1071,101 @@ impl RocksSnapshot {
 mod tests {
     use super::super::resources::ResourceConfig;
     use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_native_capture_keeps_admission_until_uncancellable_checkpoint_cleanup() {
+        tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            let directory = tempfile::tempdir().unwrap();
+            let resources = resources();
+            let registry = prometheus::Registry::new();
+            resources.register_metrics(&registry).unwrap();
+            let config = RocksStateConfig {
+                root: directory.path().to_owned(),
+                job_id: "job".into(),
+                operator_id: "operator".into(),
+                subtask: 0,
+                generation: 0,
+                attempt: 0,
+            };
+            let state = Arc::new(
+                RocksLiveState::open_worker_with_resources(config, resources.clone())
+                    .await
+                    .unwrap(),
+            );
+            state.remove_on_drop();
+            let parent = state.path().parent().unwrap().to_owned();
+            let db = state.db.clone();
+            let release = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+            let signal = release.clone();
+            let (locked, wait_locked) = oneshot::channel();
+            let holder = std::thread::spawn(move || {
+                let _write = db.write_lock.lock().unwrap();
+                locked.send(()).unwrap();
+                let (mutex, condition) = &*signal;
+                let mut ready = mutex.lock().unwrap();
+                while !*ready {
+                    let (next, timeout) = condition
+                        .wait_timeout(ready, std::time::Duration::from_secs(10))
+                        .unwrap();
+                    ready = next;
+                    if timeout.timed_out() {
+                        break;
+                    }
+                }
+            });
+            wait_locked.await.unwrap();
+            let captured_state = state.clone();
+            let capture = tokio::spawn(async move { captured_state.capture_native().await });
+            while health_value(
+                &registry,
+                "arroyo_live_state_resources",
+                &[("resource", "blocking_operations"), ("measurement", "used")],
+            ) < 1.0
+            {
+                tokio::task::yield_now().await;
+            }
+            capture.abort();
+            assert!(matches!(capture.await, Err(error) if error.is_cancelled()));
+            assert_eq!(
+                health_value(
+                    &registry,
+                    "arroyo_live_state_resources",
+                    &[("resource", "snapshots"), ("measurement", "used")]
+                ),
+                1.0
+            );
+            let (mutex, condition) = &*release;
+            *mutex.lock().unwrap() = true;
+            condition.notify_one();
+            holder.join().unwrap();
+            loop {
+                if health_value(
+                    &registry,
+                    "arroyo_live_state_resources",
+                    &[("resource", "snapshots"), ("measurement", "used")],
+                ) == 0.0
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            assert!(std::fs::read_dir(parent).unwrap().all(|entry| {
+                !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("native-capture-")
+            }));
+            Arc::try_unwrap(state)
+                .ok()
+                .unwrap()
+                .close_and_remove()
+                .await
+                .unwrap();
+        })
+        .await
+        .expect("native capture cancellation test exceeded finite bound");
+    }
 
     fn resources() -> WorkerStateResources {
         WorkerStateResources::new(ResourceConfig {

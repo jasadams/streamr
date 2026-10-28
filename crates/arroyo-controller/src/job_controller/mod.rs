@@ -70,10 +70,12 @@ impl JobController {
         program: Arc<LogicalProgram>,
         epoch: u64,
         min_epoch: u64,
+        completed_base_epoch: Option<u32>,
         worker_connects: HashMap<WorkerId, WorkerClient>,
         commit_state: Option<CommittingState>,
         job_metrics: Option<JobMetrics>,
     ) -> Self {
+        let last_completed_epoch = completed_base_epoch.filter(|_| commit_state.is_none());
         Self {
             checkpoint_store,
             model: RunningJobModel {
@@ -84,6 +86,7 @@ impl JobController {
                 state: JobState::Running,
                 checkpoint_state: commit_state.map(CheckpointingOrCommittingState::Committing),
                 epoch: Epoch(epoch),
+                last_completed_epoch,
                 min_epoch: Epoch(min_epoch),
                 // delay the initial checkpoint by a random amount so that on controller restart,
                 // checkpoint times are staggered across jobs
@@ -341,42 +344,109 @@ impl JobController {
         let start = Instant::now();
         let cur_epoch = self.model.epoch;
 
-        tokio::spawn(async move {
-            let checkpoint =
-                StateBackend::load_checkpoint_metadata(&storage_role, &job_id, *cur_epoch as u32)
-                    .await?;
-
-            store
-                .mark_compacting(&job_id, *min_epoch as u32, *new_min as u32)
+        let runtime = tokio::runtime::Handle::current();
+        // The existing per-job cleanup gate bounds one blocking closure per
+        // pass; no sort or fsync executes on a Tokio worker thread. The closure
+        // keeps the owned spool alive even if its join handle is cancelled.
+        tokio::task::spawn_blocking(move || {
+            runtime.block_on(async move {
+                let checkpoint = StateBackend::load_checkpoint_metadata(
+                    &storage_role,
+                    &job_id,
+                    *cur_epoch as u32,
+                )
                 .await?;
 
-            StateBackend::cleanup_checkpoint(
-                &storage_role,
-                checkpoint,
-                *min_epoch as u32,
-                *new_min as u32,
-            )
-            .await?;
-
-            store
-                .mark_checkpoints_compacted(&job_id, *new_min as u32)
-                .await?;
-
-            if let Some(epoch_to_filter_before) = min_epoch.checked_sub(CHECKPOINT_ROWS_TO_KEEP) {
                 store
-                    .drop_old_checkpoint_rows(&job_id, epoch_to_filter_before as u32)
+                    .mark_compacting(&job_id, *min_epoch as u32, *new_min as u32)
                     .await?;
-            }
 
-            info!(
-                message = "Finished cleaning",
-                job_id = *job_id,
-                min_epoch = *min_epoch,
-                new_min = *new_min,
-                duration = start.elapsed().as_secs_f32()
-            );
+                StateBackend::cleanup_checkpoint(
+                    &storage_role,
+                    checkpoint,
+                    *min_epoch as u32,
+                    *new_min as u32,
+                )
+                .await?;
 
-            Ok(new_min)
+                store
+                    .mark_checkpoints_compacted(&job_id, *new_min as u32)
+                    .await?;
+
+                if let Some(epoch_to_filter_before) = min_epoch.checked_sub(CHECKPOINT_ROWS_TO_KEEP)
+                {
+                    store
+                        .drop_old_checkpoint_rows(&job_id, epoch_to_filter_before as u32)
+                        .await?;
+                }
+
+                info!(
+                    message = "Finished cleaning",
+                    job_id = *job_id,
+                    min_epoch = *min_epoch,
+                    new_min = *new_min,
+                    duration = start.elapsed().as_secs_f32()
+                );
+
+                Ok(new_min)
+            })
         })
+    }
+}
+
+#[cfg(test)]
+mod native_completed_base_tests {
+    use super::*;
+    use crate::types::public::{RestartMode, StopMode as ConfigStopMode};
+    use arroyo_worker::job_controller::committing_state::CheckpointIdOrRef;
+    use arroyo_worker::job_controller::{CheckpointHistory, JobControllerStatus};
+    use std::sync::Mutex;
+    fn make(completed: Option<u32>, pending: bool) -> JobController {
+        let store = Arc::new(JobControllerStatus {
+            job_status: Arc::new(Mutex::new(arroyo_rpc::grpc::rpc::JobStatus::default())),
+            checkpoint_history: Arc::new(Mutex::new(CheckpointHistory::default())),
+        });
+        let config = JobConfig {
+            id: Arc::new("J".into()),
+            organization_id: "org".into(),
+            pipeline_name: "pipeline".into(),
+            pipeline_id: 1,
+            stop_mode: ConfigStopMode::none,
+            checkpoint_interval: Duration::from_secs(1),
+            ttl: None,
+            parallelism_overrides: HashMap::new(),
+            restart_nonce: 0,
+            restart_mode: RestartMode::safe,
+            ignore_state_before_epoch: Some(100),
+            env_vars: serde_json::json!({}),
+            scheduler_config: serde_json::json!({}),
+        };
+        let commit = pending.then(|| {
+            CommittingState::new(
+                CheckpointIdOrRef::CheckpointId("selected".into()),
+                Default::default(),
+                Default::default(),
+            )
+        });
+        JobController::new(
+            store,
+            config,
+            PipelineId::new("P"),
+            None,
+            1,
+            Arc::new(LogicalProgram::default()),
+            99,
+            90,
+            completed,
+            HashMap::new(),
+            commit,
+            None,
+        )
+    }
+    #[test]
+    fn fresh_epoch_threshold_does_not_advertise_a_completed_checkpoint() {
+        assert_eq!(make(None, false).model.last_completed_epoch, None);
+        assert_eq!(make(Some(99), false).model.last_completed_epoch, Some(99));
+        assert_eq!(make(Some(99), true).model.last_completed_epoch, None);
     }
 }

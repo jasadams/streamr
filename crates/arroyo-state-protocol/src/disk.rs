@@ -120,6 +120,7 @@ pub fn validate_table(
 pub fn validate_manifest(
     manifest: &arroyo_rpc::grpc::rpc::CheckpointManifest,
 ) -> Result<(), String> {
+    crate::native_checkpoint::validate_manifest(manifest)?;
     use arroyo_rpc::grpc::rpc::{
         DiskKeyedTableConfig, DiskKeyedTableTaskCheckpointMetadata, TableEnum,
         TypedStateTableConfig, TypedStateTableTaskCheckpointMetadata,

@@ -1,10 +1,13 @@
 // Owned live handles are separate from the legacy Parquet checkpoint manager.
 pub use crate::live::table::{LiveTable, LiveTableManager};
 
+use crate::live::native_checkpoint::{
+    NativeCheckpointCapture, NativeRestoreRequest, NativeUploadContext,
+};
 use crate::live::{LiveStateBackend, Ownership, StateNamespace, StateSnapshot};
 use arroyo_rpc::grpc::rpc::{
-    DiskKeyedTableConfig, DiskKeyedTableTaskCheckpointMetadata, TypedStateTableConfig,
-    TypedStateTableTaskCheckpointMetadata,
+    DiskKeyedTableConfig, DiskKeyedTableTaskCheckpointMetadata, NativeCheckpointTable,
+    NativeDatabaseCheckpointMetadata, TypedStateTableConfig, TypedStateTableTaskCheckpointMetadata,
 };
 use prost::Message;
 use std::any::Any;
@@ -17,6 +20,7 @@ struct RegisteredLiveTable {
 }
 struct CapturedLiveTables {
     tables: Vec<(String, StateSnapshot, StateNamespace, LiveCheckpointConfig)>,
+    native: Option<(NativeCheckpointCapture, Vec<NativeCheckpointTable>)>,
     _permit: OwnedSemaphorePermit,
 }
 #[derive(Clone)]
@@ -76,6 +80,8 @@ pub struct TableManager {
     restore_layout: Option<arroyo_types::CheckpointFilePathLayout>,
     live_configs: HashMap<String, TableConfig>,
     live_restore: HashMap<String, arroyo_rpc::grpc::rpc::TableCheckpointMetadata>,
+    native_restore: Option<NativeDatabaseCheckpointMetadata>,
+    native_restore_fingerprint: Option<Vec<u8>>,
     live_tables: HashMap<String, RegisteredLiveTable>,
     live_captures: LiveCaptures,
     live_capture_limit: Arc<Semaphore>,
@@ -194,7 +200,46 @@ impl BackendFlusher {
             }
         }
 
+        let mut native_database = None;
         if let Some(captured) = self.live_captures.lock().await.remove(&cp.epoch) {
+            if let Some((capture, tables)) = captured.native {
+                let (pipeline_id, generation) = match &self.task_info.checkpoint_file_path_layout {
+                    arroyo_types::CheckpointFilePathLayout::Legacy => (None, 0),
+                    arroyo_types::CheckpointFilePathLayout::Protocol {
+                        pipeline_id,
+                        generation,
+                    } => (Some(pipeline_id.to_string()), *generation),
+                };
+                let metadata = capture
+                    .upload(
+                        NativeUploadContext {
+                            job_id: self.task_info.job_id.clone(),
+                            operator_id: self.task_info.operator_id.clone(),
+                            pipeline_id,
+                            generation,
+                            epoch: cp.epoch,
+                            subtask_index: self.task_info.task_index,
+                            tables,
+                        },
+                        &self.storage,
+                        cp.completed_base_epoch,
+                    )
+                    .await
+                    .map_err(|error| StateError::Other {
+                        table: "native database checkpoint".into(),
+                        error: error.to_string(),
+                    })?;
+                // Transfer bytes differ from the complete referenced state size.
+                bytes += metadata
+                    .files
+                    .iter()
+                    .filter(|file| {
+                        file.birth_epoch == cp.epoch && file.birth_generation == generation
+                    })
+                    .map(|file| file.size_bytes as usize)
+                    .sum::<usize>();
+                native_database = Some(metadata);
+            }
             for (name, snapshot, namespace, config) in captured.tables {
                 let path = super::table_checkpoint_path(
                     &self.task_info,
@@ -332,6 +377,7 @@ impl BackendFlusher {
             table_metadata: metadatas,
             table_configs: self.table_configs.clone(),
             bytes: bytes as u64,
+            native_database,
         };
         if self.table_configs.values().any(|config| {
             matches!(
@@ -345,12 +391,14 @@ impl BackendFlusher {
         super::checkpoint_completion_fault::pause(&self.task_info, cp.epoch).await?;
 
         self.control_tx
-            .send(ControlResp::CheckpointCompleted(CheckpointCompleted {
-                checkpoint_epoch: cp.epoch as u64,
-                operator_idx: self.task_info.operator_idx,
-                operator_id: self.task_info.operator_id.clone(),
-                subtask_metadata,
-            }))
+            .send(ControlResp::CheckpointCompleted(Box::new(
+                CheckpointCompleted {
+                    checkpoint_epoch: cp.epoch as u64,
+                    operator_idx: self.task_info.operator_idx,
+                    operator_id: self.task_info.operator_id.clone(),
+                    subtask_metadata,
+                },
+            )))
             .await
             .expect("control queue closed");
         if cp.then_stop {
@@ -455,6 +503,7 @@ fn validate_disk_tables_wire_budget(
         bytes: u64::MAX,
         table_configs: HashMap::new(),
         table_metadata: HashMap::new(),
+        native_database: None,
     }
     .encoded_len();
     let bytes = envelope + protobuf_map_wire_bytes(configs) + protobuf_map_wire_bytes(tables);
@@ -674,6 +723,42 @@ impl TableManager {
                         .collect()
                 })
                 .unwrap_or_default();
+        let native_restore = checkpoint_metadata
+            .as_ref()
+            .and_then(|m| m.native_database.clone());
+        if let Some(metadata) = &native_restore {
+            if !live_restore.is_empty() {
+                bail!("selected checkpoint mixes native and logical live state");
+            }
+            let (layout, epoch) = restore_identity
+                .as_ref()
+                .ok_or_else(|| anyhow!("native state requires a selected checkpoint"))?;
+            let (pipeline, generation) = match layout {
+                arroyo_types::CheckpointFilePathLayout::Legacy => (None, 0),
+                arroyo_types::CheckpointFilePathLayout::Protocol {
+                    pipeline_id,
+                    generation,
+                } => (Some(pipeline_id.as_str()), *generation),
+            };
+            if metadata.epoch != *epoch
+                || metadata.generation != generation
+                || metadata.subtask_index != task_info.task_index
+                || task_info.parallelism != 1
+            {
+                bail!("native database differs from selected checkpoint ownership");
+            }
+            arroyo_state_protocol::native_checkpoint::validate(
+                metadata,
+                &live_configs,
+                &task_info.job_id,
+                &task_info.operator_id,
+                pipeline,
+            )
+            .map_err(|e| anyhow!(e))?;
+        }
+        let native_restore_fingerprint = native_restore
+            .as_ref()
+            .map(crate::live::native_checkpoint::checkpoint_fingerprint);
         let mut restore_files = 0usize;
         for metadata in live_restore.values() {
             let files = match metadata.table_type() {
@@ -794,12 +879,43 @@ impl TableManager {
                 restore_layout: restore_identity.map(|(layout, _)| layout),
                 live_configs,
                 live_restore,
+                native_restore,
+                native_restore_fingerprint,
                 live_tables: HashMap::new(),
                 live_captures,
                 live_capture_limit: Arc::new(Semaphore::new(1)),
             },
             watermark,
         ))
+    }
+
+    /// Selected native files must be restored during backend construction, before
+    /// any logical handles can read the database.
+    pub fn native_restore_request(&self) -> Option<NativeRestoreRequest> {
+        self.native_restore
+            .as_ref()
+            .map(|metadata| NativeRestoreRequest {
+                metadata: metadata.clone(),
+                storage: self.storage.clone(),
+            })
+    }
+
+    fn is_native_restored(&self, backend: &dyn LiveStateBackend) -> Result<bool> {
+        match &self.native_restore_fingerprint {
+            Some(fingerprint) => {
+                if backend.restored_native_checkpoint_fingerprint() != Some(fingerprint.as_slice())
+                {
+                    bail!("backend has not restored the selected native database");
+                }
+                Ok(true)
+            }
+            None => {
+                if backend.restored_native_checkpoint_fingerprint().is_some() {
+                    bail!("unexpected native database on a logical restore");
+                }
+                Ok(false)
+            }
+        }
     }
 
     /// Register a fresh backend before processing input. The protocol-selected
@@ -822,7 +938,8 @@ impl TableManager {
         if self.task_info.parallelism != 1 || self.task_info.task_index != 0 {
             bail!("disk SQL supports singleton execution without rescaling");
         }
-        if self.restoring && !self.live_restore.contains_key(name) {
+        let native_restored = self.is_native_restored(backend.as_ref())?;
+        if self.restoring && !native_restored && !self.live_restore.contains_key(name) {
             bail!("selected checkpoint missing disk table {name}");
         }
         let wrapped = self
@@ -853,7 +970,9 @@ impl TableManager {
         {
             bail!("disk table namespace exceeds 512 bytes or schema identity exceeds 1024 bytes");
         }
-        crate::live::checkpoint::ensure_empty(backend.as_ref(), &namespace).await?;
+        if !native_restored {
+            crate::live::checkpoint::ensure_empty(backend.as_ref(), &namespace).await?;
+        }
         if let Some(metadata) = self.live_restore.get(name) {
             if metadata.table_type() != TableEnum::DiskKeyedMap {
                 bail!("legacy state cannot be restored as disk SQL state");
@@ -937,6 +1056,7 @@ impl TableManager {
         let mut handles = HashMap::new();
         let mut registered = HashMap::new();
         let mut shared_limits = None;
+        let native_restored = self.is_native_restored(backend.as_ref())?;
         for (name, (descriptor, limits)) in definitions {
             if shared_limits.is_some_and(|expected| expected != limits) {
                 bail!("typed state tables in one owner require identical working-scope limits");
@@ -976,8 +1096,10 @@ impl TableManager {
                 resources.clone(),
             )?
             .with_owner(owner.clone());
-            crate::live::checkpoint::ensure_empty(backend.as_ref(), &namespace).await?;
-            if self.restoring && !self.live_restore.contains_key(&name) {
+            if !native_restored {
+                crate::live::checkpoint::ensure_empty(backend.as_ref(), &namespace).await?;
+            }
+            if self.restoring && !native_restored && !self.live_restore.contains_key(&name) {
                 bail!("selected checkpoint missing typed state table {name}");
             }
             if let Some(metadata) = self.live_restore.get(&name) {
@@ -1042,6 +1164,70 @@ impl TableManager {
         Ok(handles)
     }
 
+    async fn capture_live_tables(
+        &mut self,
+        permit: OwnedSemaphorePermit,
+    ) -> Result<CapturedLiveTables> {
+        let backend = &self
+            .live_tables
+            .values()
+            .next()
+            .ok_or_else(|| anyhow!("no registered live backend"))?
+            .backend;
+        if self
+            .live_tables
+            .values()
+            .any(|table| !Arc::ptr_eq(backend, &table.backend))
+        {
+            bail!("live tables must share one checkpoint backend");
+        }
+        // Operator processing is suspended until this capture is established.
+        // A native capture pins files at this boundary; it is not a later export
+        // of an MVCC reader against a database that may already have advanced.
+        if let Some(capture) = backend.capture_native().await? {
+            let mut tables = self
+                .live_tables
+                .iter()
+                .map(|(name, table)| {
+                    Ok(NativeCheckpointTable {
+                        name: name.clone(),
+                        config: Some(
+                            self.live_configs
+                                .get(name)
+                                .ok_or_else(|| anyhow!("missing live table configuration"))?
+                                .clone(),
+                        ),
+                        namespace: crate::live::encoding::encode_namespace(&table.namespace)?,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            tables.sort_by(|a, b| a.name.cmp(&b.name));
+            return Ok(CapturedLiveTables {
+                tables: vec![],
+                native: Some((capture, tables)),
+                _permit: permit,
+            });
+        }
+        let snapshot = backend.snapshot().await?;
+        let tables = self
+            .live_tables
+            .iter()
+            .map(|(name, table)| {
+                (
+                    name.clone(),
+                    snapshot.clone(),
+                    table.namespace.clone(),
+                    table.config.clone(),
+                )
+            })
+            .collect();
+        Ok(CapturedLiveTables {
+            tables,
+            native: None,
+            _permit: permit,
+        })
+    }
+
     pub async fn checkpoint(&mut self, barrier: CheckpointBarrier, watermark: Option<SystemTime>) {
         if self.checkpoint_failed {
             return;
@@ -1058,56 +1244,31 @@ impl TableManager {
                 .acquire_owned()
                 .await
                 .expect("capture semaphore open");
-            let mut tables = Vec::with_capacity(self.live_tables.len());
-            let mut snapshots: Vec<(Arc<dyn LiveStateBackend>, StateSnapshot)> = vec![];
-            for (name, table) in &self.live_tables {
-                // Operator processing is suspended here: all pre-barrier writes
-                // finished, and post-barrier processing cannot begin until capture.
-                let snapshot = if let Some((_, snapshot)) = snapshots
-                    .iter()
-                    .find(|(backend, _)| Arc::ptr_eq(backend, &table.backend))
-                {
-                    snapshot.clone()
-                } else {
-                    let snapshot = match table.backend.snapshot().await {
-                        Ok(snapshot) => snapshot,
-                        Err(error) => {
-                            self.checkpoint_failed = true;
-                            let error =
-                                arroyo_rpc::errors::DataflowError::from(StateError::Other {
-                                    table: name.clone(),
-                                    error: error.to_string(),
-                                });
-                            let _ = self
-                                .control_tx
-                                .send(ControlResp::TaskFailed {
-                                    task_id: self.task_info.operator_idx,
-                                    subtask_idx: self.task_info.task_index,
-                                    error: error
-                                        .with_operator(self.task_info.operator_id.clone())
-                                        .into(),
-                                })
-                                .await;
-                            return;
-                        }
-                    };
-                    snapshots.push((table.backend.clone(), snapshot.clone()));
-                    snapshot
-                };
-                tables.push((
-                    name.clone(),
-                    snapshot,
-                    table.namespace.clone(),
-                    table.config.clone(),
-                ));
-            }
-            self.live_captures.lock().await.insert(
-                barrier.epoch,
-                CapturedLiveTables {
-                    tables,
-                    _permit: permit,
-                },
-            );
+            let captured = match self.capture_live_tables(permit).await {
+                Ok(captured) => captured,
+                Err(error) => {
+                    self.checkpoint_failed = true;
+                    let error = arroyo_rpc::errors::DataflowError::from(StateError::Other {
+                        table: "live database checkpoint".into(),
+                        error: error.to_string(),
+                    });
+                    let _ = self
+                        .control_tx
+                        .send(ControlResp::TaskFailed {
+                            task_id: self.task_info.operator_idx,
+                            subtask_idx: self.task_info.task_index,
+                            error: error
+                                .with_operator(self.task_info.operator_id.clone())
+                                .into(),
+                        })
+                        .await;
+                    return;
+                }
+            };
+            self.live_captures
+                .lock()
+                .await
+                .insert(barrier.epoch, captured);
         }
         self.writer
             .sender
@@ -1116,6 +1277,7 @@ impl TableManager {
                 time: barrier.timestamp,
                 watermark,
                 then_stop: barrier.then_stop,
+                completed_base_epoch: barrier.completed_base_epoch,
             }))
             .await
             .expect("should be able to send checkpoint");
@@ -1425,6 +1587,7 @@ mod tests {
         captures.lock().await.insert(
             1,
             CapturedLiveTables {
+                native: None,
                 tables: vec![(
                     "map".into(),
                     snapshot,
@@ -1462,6 +1625,7 @@ mod tests {
                 time: SystemTime::now(),
                 watermark: None,
                 then_stop: false,
+                completed_base_epoch: None,
             }))
             .await
             .unwrap();
@@ -1639,6 +1803,7 @@ mod tests {
             }).collect(),
         };
         let mut metadata = SubtaskCheckpointMetadata {
+            native_database: None,
             subtask_index: 0,
             start_time: u64::MAX,
             finish_time: u64::MAX,
@@ -1732,6 +1897,7 @@ mod tests {
         // This legacy checkpoint remains below the transport's 4 MiB limit,
         // but exceeds the extra allowance reserved for disk checkpoint RPCs.
         let mut metadata = SubtaskCheckpointMetadata {
+            native_database: None,
             table_metadata: HashMap::from([(
                 "connector".into(),
                 TableSubtaskCheckpointMetadata {
@@ -1772,4 +1938,183 @@ mod tests {
         );
         assert!(validate_disk_subtask_metadata_size(&metadata).is_err());
     }
+}
+/// A native DB lineage spans many epochs. Registration must reject an
+/// actually restored old epoch even when the lineage and table roster match.
+#[tokio::test]
+async fn registration_rejects_restored_older_epoch_in_same_native_lineage() {
+    use crate::live::{
+        ReadOptions, StateKey,
+        lifecycle::RocksStateConfig,
+        resources::{ResourceConfig, WorkerStateResources},
+        rocks::RocksLiveState,
+    };
+    use arroyo_rpc::grpc::rpc::{CheckpointManifest, OperatorMetadata};
+    let directory = tempfile::tempdir().unwrap();
+    let storage = Arc::new(
+        arroyo_storage::StorageProvider::for_url(&format!(
+            "file://{}",
+            directory.path().join("checkpoints").display()
+        ))
+        .await
+        .unwrap(),
+    );
+    let resources = WorkerStateResources::new(ResourceConfig {
+        block_cache_bytes: 16 << 20,
+        memtable_bytes: 2 << 20,
+        queued_write_bytes: 4 << 20,
+        decoded_value_bytes: 8 << 20,
+        scan_page_bytes: 4 << 20,
+        max_blocking_operations: 2,
+        max_snapshots: 1,
+        max_open_databases: 1,
+        disk_reserve_bytes: 0,
+    })
+    .unwrap();
+    let config = |attempt| RocksStateConfig {
+        root: directory.path().join("state"),
+        job_id: "job".into(),
+        operator_id: "operator".into(),
+        subtask: 0,
+        generation: 0,
+        attempt,
+    };
+    let namespace = StateNamespace {
+        ownership: Ownership::PartitionLocal {
+            subtask: 0,
+            parallelism: 1,
+        },
+        table: b"map".to_vec(),
+    };
+    let key = StateKey {
+        namespace: namespace.clone(),
+        key: b"key".to_vec(),
+        routing_hash: None,
+    };
+    let wrapped = TableConfig {
+        table_type: TableEnum::DiskKeyedMap.into(),
+        state_version: 1,
+        config: DiskKeyedTableConfig {
+            table_name: "map".into(),
+            encoding_version: 1,
+            schema_identity: vec![1],
+        }
+        .encode_to_vec(),
+    };
+    let context = |epoch| NativeUploadContext {
+        job_id: "job".into(),
+        operator_id: "operator".into(),
+        pipeline_id: Some("pipe-test".into()),
+        generation: 0,
+        epoch,
+        subtask_index: 0,
+        tables: vec![NativeCheckpointTable {
+            name: "map".into(),
+            config: Some(wrapped.clone()),
+            namespace: crate::live::encoding::encode_namespace(&namespace).unwrap(),
+        }],
+    };
+    let source = Arc::new(
+        RocksLiveState::open_worker_with_resources(config(0), resources.clone())
+            .await
+            .unwrap(),
+    );
+    source
+        .put(key.clone(), b"old".to_vec(), 4096)
+        .await
+        .unwrap();
+    let first = source
+        .capture_native()
+        .await
+        .unwrap()
+        .unwrap()
+        .upload(context(1), &storage, None)
+        .await
+        .unwrap();
+    source
+        .put(key.clone(), b"selected".to_vec(), 4096)
+        .await
+        .unwrap();
+    let selected = source
+        .capture_native()
+        .await
+        .unwrap()
+        .unwrap()
+        .upload(context(2), &storage, Some(1))
+        .await
+        .unwrap();
+    assert_eq!(first.database_id, selected.database_id);
+    source.close().await.unwrap();
+    let wrong = Arc::new(
+        RocksLiveState::restore_worker_with_resources(
+            config(1),
+            resources.clone(),
+            NativeRestoreRequest {
+                metadata: first,
+                storage: storage.clone(),
+            },
+        )
+        .await
+        .unwrap(),
+    );
+    assert_eq!(
+        wrong
+            .get(&key, ReadOptions { max_bytes: 4096 })
+            .await
+            .unwrap(),
+        Some(b"old".to_vec())
+    );
+    let manifest = MetadataOrManifest::Manifest(CheckpointManifest {
+        pipeline_id: "pipe-test".into(),
+        job_id: "job".into(),
+        generation: 0,
+        epoch: 2,
+        operators: vec![OperatorCheckpointMetadata {
+            operator_metadata: Some(OperatorMetadata {
+                job_id: "job".into(),
+                operator_id: "operator".into(),
+                epoch: 2,
+                parallelism: 1,
+                ..Default::default()
+            }),
+            table_configs: HashMap::from([("map".into(), wrapped.clone())]),
+            native_database: Some(selected),
+            ..Default::default()
+        }],
+        ..Default::default()
+    });
+    let task = Arc::new(TaskInfo {
+        job_id: "job".into(),
+        operator_idx: 0,
+        operator_name: "native restore guard".into(),
+        operator_id: "operator".into(),
+        task_index: 0,
+        parallelism: 1,
+        key_range: crate::FULL_KEY_RANGE,
+        checkpoint_file_path_layout: arroyo_types::CheckpointFilePathLayout::Protocol {
+            pipeline_id: arroyo_types::PipelineId::new("pipe-test"),
+            generation: 1,
+        },
+    });
+    let (tx, _rx) = mpsc::channel(4);
+    let (mut manager, _) = TableManager::load(
+        task,
+        HashMap::from([("map".into(), wrapped)]),
+        tx,
+        Some(&manifest),
+    )
+    .await
+    .unwrap();
+    let error = manager
+        .register_live_table("map", wrong.clone())
+        .await
+        .err()
+        .expect("stale native backend must be rejected");
+    assert!(
+        error
+            .to_string()
+            .contains("has not restored the selected native database")
+    );
+    drop(manager);
+    wrong.close().await.unwrap();
 }

@@ -169,7 +169,7 @@ async fn lifecycle() {
                         .unwrap();
                 assert_eq!(metadata.epoch, u64::from(epoch));
                 assert_eq!(metadata.job_id, job_id);
-                assert_typed_epoch(&metadata.operators, epoch);
+                assert_typed_epoch(&metadata.operators, epoch, Some(&metadata.pipeline_id));
                 reference.to_string()
             } else {
                 let metadata = StateBackend::load_checkpoint_metadata(
@@ -195,7 +195,7 @@ async fn lifecycle() {
                         .unwrap(),
                     );
                 }
-                assert_typed_epoch(&operators, epoch);
+                assert_typed_epoch(&operators, epoch, None);
                 format!("{job_id}/checkpoints/checkpoint-{epoch:07}/metadata")
             };
             let artifacts: Vec<_> = sinks.iter().map(|sink| {
@@ -401,18 +401,90 @@ async fn lifecycle() {
     }
 }
 
-fn assert_typed_epoch(operators: &[arroyo_rpc::grpc::rpc::OperatorCheckpointMetadata], epoch: u32) {
+fn assert_typed_epoch(
+    operators: &[arroyo_rpc::grpc::rpc::OperatorCheckpointMetadata],
+    epoch: u32,
+    pipeline: Option<&str>,
+) {
     use arroyo_rpc::grpc::rpc::{
         TableEnum, TypedStateTableConfig, TypedStateTableTaskCheckpointMetadata,
     };
     use prost::Message;
     let mut tables = 0;
     for operator in operators {
+        if let Some(native) = &operator.native_database {
+            let owner = operator.operator_metadata.as_ref().unwrap();
+            assert_eq!(owner.epoch, epoch);
+            assert_eq!(native.epoch, epoch);
+            assert_eq!(native.subtask_index, 0);
+            assert_eq!(owner.parallelism, 1);
+            assert!(
+                operator.encoded_len()
+                    <= arroyo_state_protocol::native_checkpoint::MAX_METADATA_BYTES
+            );
+            arroyo_state_protocol::native_checkpoint::validate(
+                native,
+                &operator.table_configs,
+                &owner.job_id,
+                &owner.operator_id,
+                pipeline,
+            )
+            .unwrap();
+            assert!(
+                native
+                    .tables
+                    .iter()
+                    .all(|table| { !operator.table_checkpoint_metadata.contains_key(&table.name) })
+            );
+        }
         for (name, config) in &operator.table_configs {
             if config.table_type() != TableEnum::TypedStateTable {
                 continue;
             }
             let config = TypedStateTableConfig::decode(config.config.as_slice()).unwrap();
+            if let Some(native) = &operator.native_database {
+                let owner = operator.operator_metadata.as_ref().unwrap();
+                let index = native
+                    .tables
+                    .iter()
+                    .position(|table| &table.name == name)
+                    .unwrap();
+                let validate =
+                    |candidate: &arroyo_rpc::grpc::rpc::NativeDatabaseCheckpointMetadata| {
+                        arroyo_state_protocol::native_checkpoint::validate(
+                            candidate,
+                            &operator.table_configs,
+                            &owner.job_id,
+                            &owner.operator_id,
+                            pipeline,
+                        )
+                    };
+                let mut incompatible = native.clone();
+                let mut incompatible_config = config.clone();
+                incompatible_config.schema_identity.push(0);
+                incompatible.tables[index].config.as_mut().unwrap().config =
+                    incompatible_config.encode_to_vec();
+                assert!(
+                    validate(&incompatible).is_err(),
+                    "native schema mismatch must fail"
+                );
+                let mut foreign = native.clone();
+                foreign.tables[index].namespace.push(0);
+                assert!(
+                    validate(&foreign).is_err(),
+                    "native namespace mismatch must fail"
+                );
+                let mut unsupported = native.clone();
+                unsupported.format_version = u32::MAX;
+                assert!(
+                    validate(&unsupported).is_err(),
+                    "native format mismatch must fail"
+                );
+                // Epoch-three SQL oracles establish logical emptiness. A full
+                // RocksDB inventory may still retain SSTs and tombstones.
+                tables += 1;
+                continue;
+            }
             let metadata = TypedStateTableTaskCheckpointMetadata::decode(
                 operator.table_checkpoint_metadata[name].data.as_slice(),
             )

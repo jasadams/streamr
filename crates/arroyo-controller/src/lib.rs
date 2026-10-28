@@ -403,7 +403,7 @@ impl JobControllerGrpc for ControllerServer {
 
         self.send_to_job_queue(
             &job_id,
-            JobMessage::RunningMessage(RunningMessage::TaskCheckpointFinished(req)),
+            JobMessage::RunningMessage(RunningMessage::TaskCheckpointFinished(Box::new(req))),
         )
         .await?;
 

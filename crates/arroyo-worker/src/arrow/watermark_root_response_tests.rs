@@ -455,7 +455,8 @@ async fn root_response_actual_fanout_queue_one_finishes_event_prefix_before_late
         let info=Arc::new(ChainInfo {job_id:format!("root-fanout-{}",std::process::id()),task_id:999,description:"root-fanout".into(),task_index:0});
         let mut collector=ArrowCollector::new(info,Some(Arc::new(ArroyoSchema::new_unkeyed(schema(false),0))),vec![vec![left],vec![right]]);
         collector.register_event_output(spec).unwrap();
-        let checkpoint=CheckpointBarrier {epoch:1,min_epoch:0,timestamp:SystemTime::UNIX_EPOCH,then_stop:false};
+        let checkpoint=CheckpointBarrier {
+            completed_base_epoch: None,epoch:1,min_epoch:0,timestamp:SystemTime::UNIX_EPOCH,then_stop:false};
         let mut prefix=Box::pin(async {
             root.admit_batch(input,0,&mut collector).await?;
             // Same existing FIFO queues AFTER callback returns, just as the

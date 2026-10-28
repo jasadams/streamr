@@ -63,7 +63,7 @@ impl CleanupStore for arroyo_storage::StorageProvider {
     }
 
     async fn delete(&self, path: &str) -> Result<(), StateError> {
-        self.delete_if_present(path).await?;
+        self.delete_native_checkpoint_artifact(path).await?;
         Ok(())
     }
 
@@ -100,6 +100,121 @@ impl CleanupStore for arroyo_storage::StorageProvider {
     }
 }
 
+fn native_cleanup_error(error: impl std::fmt::Display) -> StateError {
+    StateError::Other {
+        table: "native checkpoint cleanup".into(),
+        error: error.to_string(),
+    }
+}
+
+/// Native inventories share immutable files across epochs. Preflight every
+/// retained root and the complete deletion spool before touching payloads.
+async fn cleanup_native_controller_files<S: CleanupStore + ?Sized>(
+    storage: &S,
+    metadata: &CheckpointMetadata,
+    old_min_epoch: u32,
+    min_epoch: u32,
+) -> Result<bool, StateError> {
+    use arroyo_state_protocol::gc_spool::ReachabilitySpool;
+    use futures::TryStreamExt;
+    let mut spool = ReachabilitySpool::configured().map_err(native_cleanup_error)?;
+    let mut found_native = false;
+    let mut missing_retained = false;
+    for epoch in old_min_epoch..=metadata.epoch {
+        for operator in &metadata.operator_ids {
+            let Some(root) = storage
+                .load_operator(&metadata.job_id, operator, epoch)
+                .await?
+            else {
+                missing_retained |= epoch >= min_epoch;
+                continue;
+            };
+            spool
+                .descriptor_bytes(root.encoded_len())
+                .map_err(native_cleanup_error)?;
+            let Some(native) = &root.native_database else {
+                continue;
+            };
+            found_native = true;
+            if native.epoch != epoch || native.generation != 0 {
+                return Err(native_cleanup_error(
+                    "native controller root ownership mismatch",
+                ));
+            }
+            arroyo_state_protocol::native_checkpoint::validate(
+                native,
+                &root.table_configs,
+                &metadata.job_id,
+                operator,
+                None,
+            )
+            .map_err(native_cleanup_error)?;
+            for file in &native.files {
+                if epoch >= min_epoch {
+                    spool.retain(&file.path)
+                } else {
+                    spool.candidate(&file.path)
+                }
+                .map_err(native_cleanup_error)?;
+            }
+        }
+    }
+    // Missing retained descriptors cannot prove that this is a logical-only
+    // history. Check for native payloads before allowing orphan reclamation;
+    // they may belong to a retained descriptor that could not be read.
+    if !found_native && !missing_retained {
+        return Ok(false);
+    }
+    // A native source can switch to memory. Enumerate orphan native objects
+    // even if none of the current retained roots use that representation.
+    let namespace = format!("{}/checkpoints/", metadata.job_id);
+    let qualified = storage.qualified_prefix(&namespace);
+    let prefix = format!("{}/", qualified.trim_end_matches('/'));
+    let mut listing = storage.list_prefix(&namespace).await?;
+    while let Some(object) = listing
+        .try_next()
+        .await
+        .map_err(arroyo_rpc::errors::StorageError::from)?
+    {
+        let object = object.to_string();
+        let Some(suffix) = object.strip_prefix(&prefix) else {
+            continue;
+        };
+        let parts = suffix.split('/').collect::<Vec<_>>();
+        if parts.len() != 4 || !parts[2].starts_with("native-") {
+            continue;
+        }
+        let Some(operator) = parts[1].strip_prefix("operator-") else {
+            continue;
+        };
+        if !metadata.operator_ids.iter().any(|op| op == operator) {
+            continue;
+        }
+        let Some(epoch) = parts[0]
+            .strip_prefix("checkpoint-")
+            .and_then(|epoch| epoch.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if epoch < min_epoch {
+            found_native = true;
+            spool
+                .candidate(&format!("{namespace}{suffix}"))
+                .map_err(native_cleanup_error)?;
+        }
+    }
+    if found_native && missing_retained {
+        return Err(native_cleanup_error(
+            "missing retained native controller root",
+        ));
+    }
+    let plan = spool.finish().map_err(native_cleanup_error)?;
+    for file in plan {
+        storage.delete(&file.map_err(native_cleanup_error)?).await?;
+    }
+    Ok(true)
+}
+
 async fn cleanup_checkpoint_files<S: CleanupStore + ?Sized>(
     storage: &S,
     mut metadata: CheckpointMetadata,
@@ -111,6 +226,8 @@ async fn cleanup_checkpoint_files<S: CleanupStore + ?Sized>(
         min_epoch,
         job_id = metadata.job_id
     );
+    let has_native_roots =
+        cleanup_native_controller_files(storage, &metadata, old_min_epoch, min_epoch).await?;
     let mut futures: FuturesUnordered<_> = metadata
         .operator_ids
         .iter()
@@ -132,8 +249,14 @@ async fn cleanup_checkpoint_files<S: CleanupStore + ?Sized>(
         let (operator, paths) = result?;
         retained.insert(operator, paths);
     }
-    cleanup_abandoned_controller_job_disk_files(storage, &metadata.job_id, min_epoch, &retained)
-        .await?;
+    cleanup_abandoned_controller_job_disk_files_with_native(
+        storage,
+        &metadata.job_id,
+        min_epoch,
+        &retained,
+        !has_native_roots,
+    )
+    .await?;
     // Preserve all old metadata if known-file cleanup or orphan traversal fails.
     // After this point deletion can partially complete; retry is idempotent and
     // the retained minimum's descriptors remain outside this deletion range.
@@ -221,6 +344,32 @@ impl BackingStore for ParquetBackend {
                     table: "".to_string(),
                     error: "missing operator metadata".to_string(),
                 })?;
+        if let Some(native) = &metadata.native_database {
+            arroyo_state_protocol::native_checkpoint::validate(
+                native,
+                &metadata.table_configs,
+                &operator_metadata.job_id,
+                &operator_metadata.operator_id,
+                None,
+            )
+            .map_err(native_cleanup_error)?;
+            let base = if let Some(epoch) = native.completed_base_epoch {
+                Self::load_operator_metadata(
+                    role,
+                    &operator_metadata.job_id,
+                    &operator_metadata.operator_id,
+                    epoch,
+                )
+                .await?
+            } else {
+                None
+            };
+            arroyo_state_protocol::native_checkpoint::validate_reuse(
+                native,
+                base.as_ref().and_then(|op| op.native_database.as_ref()),
+            )
+            .map_err(native_cleanup_error)?;
+        }
         let path = metadata_path(&operator_path(
             &operator_metadata.job_id,
             operator_metadata.epoch,
@@ -464,11 +613,29 @@ impl ParquetStats {
 /// advances its retained minimum, pages in older epochs cannot be referenced by
 /// a retained checkpoint or an active publication, including pages uploaded by
 /// workers that crashed before reporting completion.
+#[cfg(test)]
 async fn cleanup_abandoned_controller_job_disk_files<S: CleanupStore + ?Sized>(
     storage: &S,
     job_id: &str,
     retained_min_epoch: u32,
     retained_by_operator: &HashMap<String, HashSet<String>>,
+) -> Result<(), StateError> {
+    cleanup_abandoned_controller_job_disk_files_with_native(
+        storage,
+        job_id,
+        retained_min_epoch,
+        retained_by_operator,
+        false,
+    )
+    .await
+}
+
+async fn cleanup_abandoned_controller_job_disk_files_with_native<S: CleanupStore + ?Sized>(
+    storage: &S,
+    job_id: &str,
+    retained_min_epoch: u32,
+    retained_by_operator: &HashMap<String, HashSet<String>>,
+    native_roots_empty: bool,
 ) -> Result<(), StateError> {
     use futures::TryStreamExt;
     let namespace = format!("{job_id}/checkpoints/");
@@ -490,7 +657,10 @@ async fn cleanup_abandoned_controller_job_disk_files<S: CleanupStore + ?Sized>(
             continue;
         };
         let parts: Vec<_> = suffix.split('/').collect();
-        if parts.len() != 4 || !parts[2].starts_with("table-") || !parts[3].starts_with("disk-") {
+        if parts.len() != 4
+            || !(parts[2].starts_with("table-") && parts[3].starts_with("disk-")
+                || native_roots_empty && parts[2].starts_with("native-"))
+        {
             continue;
         }
         let Some(retained_files) = parts[1]
@@ -514,3 +684,6 @@ async fn cleanup_abandoned_controller_job_disk_files<S: CleanupStore + ?Sized>(
 
 #[cfg(test)]
 mod disk_cleanup_tests;
+
+#[cfg(test)]
+mod native_cleanup_tests;

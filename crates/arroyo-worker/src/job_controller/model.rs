@@ -45,6 +45,7 @@ pub struct RunningJobModel {
     pub epoch: Epoch,
     pub min_epoch: Epoch,
     pub last_checkpoint: Instant,
+    pub last_completed_epoch: Option<u32>,
     pub workers: HashMap<WorkerId, WorkerStatus>,
     pub tasks: HashMap<(u32, u32), TaskStatus>,
     pub operator_parallelism: HashMap<u32, usize>,
@@ -201,6 +202,17 @@ impl RunningJobModel {
                 }
             }
             RunningMessage::TaskCheckpointFinished(c) => {
+                if self.checkpoint_state.is_some()
+                    && c.epoch == *self.epoch
+                    && let Some(native) =
+                        c.metadata.as_ref().and_then(|m| m.native_database.as_ref())
+                    && native.completed_base_epoch.is_some()
+                    && native.completed_base_epoch != self.last_completed_epoch
+                {
+                    bail!(
+                        "native checkpoint attempted inheritance outside authoritative completed base"
+                    );
+                }
                 if let Some(checkpoint_state) = &mut self.checkpoint_state {
                     if c.epoch != *self.epoch {
                         warn!(
@@ -215,7 +227,7 @@ impl RunningJobModel {
                         else {
                             bail!("Received checkpoint finished but not checkpointing");
                         };
-                        if let Some(operator_metadata) = checkpoint_state.checkpoint_finished(c)? {
+                        if let Some(operator_metadata) = checkpoint_state.checkpoint_finished(*c)? {
                             if self.worker_leader_mode {
                                 self.finished_operators.push(operator_metadata);
                             } else {
@@ -349,6 +361,7 @@ impl RunningJobModel {
                 min_epoch: *self.min_epoch,
                 then_stop,
                 is_commit: false,
+                completed_base_epoch: self.last_completed_epoch,
             }))
         });
 
@@ -508,6 +521,7 @@ impl RunningJobModel {
                             .finish();
                         self.last_checkpoint = Instant::now();
                         self.checkpoint_state = None;
+                        self.last_completed_epoch = Some(*self.epoch as u32);
                         info!(
                             message = "Finished checkpointing",
                             job_id = *self.job_id,
@@ -643,6 +657,7 @@ impl RunningJobModel {
 
                 self.last_checkpoint = Instant::now();
                 self.checkpoint_state = None;
+                self.last_completed_epoch = Some(*self.epoch as u32);
                 info!(
                     message = "Finished committing checkpointing",
                     job_id = *self.job_id,
@@ -689,6 +704,7 @@ impl RunningJobModel {
                         .await?;
                     self.last_checkpoint = Instant::now();
                     self.checkpoint_state = None;
+                    self.last_completed_epoch = Some(*self.epoch as u32);
                     self.compact_state().await?;
 
                     info!(
@@ -744,6 +760,7 @@ impl RunningJobModel {
                     .await?;
                 self.last_checkpoint = Instant::now();
                 self.checkpoint_state = None;
+                self.last_completed_epoch = Some(*self.epoch as u32);
                 info!(
                     message = "Finished committing checkpointing",
                     job_id = *self.job_id,
@@ -956,4 +973,92 @@ pub struct TaskStatus {
 pub enum JobState {
     Running,
     Stopped,
+}
+
+#[cfg(test)]
+mod native_completion_tests {
+    use super::*;
+    use crate::job_controller::{CheckpointHistory, JobControllerStatus};
+    use arroyo_rpc::grpc::rpc::{
+        JobStatus, NativeDatabaseCheckpointMetadata, SubtaskCheckpointMetadata,
+        TaskCheckpointCompletedReq,
+    };
+    use std::sync::Mutex;
+    fn model() -> RunningJobModel {
+        RunningJobModel {
+            pipeline_id: PipelineId::new("P"),
+            job_id: JobId::new("J"),
+            generation: Generation(1),
+            state: JobState::Running,
+            program: Arc::new(LogicalProgram::default()),
+            checkpoint_state: None,
+            epoch: Epoch(11),
+            min_epoch: Epoch(1),
+            last_checkpoint: Instant::now(),
+            last_completed_epoch: Some(10),
+            workers: HashMap::new(),
+            tasks: HashMap::new(),
+            operator_parallelism: HashMap::new(),
+            metric_update_task: None,
+            last_updated_metrics: Instant::now(),
+            protocol_paths: ProtocolPaths::new(PipelineId::new("P"), JobId::new("J")),
+            checkpoint_parent_ref: None,
+            generation_manifest: None,
+            finished_operators: vec![],
+            worker_leader_mode: true,
+            storage_role: StorageProviderFor::Worker,
+            checkpoint_spans: vec![],
+            job_metrics: None,
+        }
+    }
+    fn completion(epoch: u64) -> RunningMessage {
+        RunningMessage::TaskCheckpointFinished(Box::new(TaskCheckpointCompletedReq {
+            epoch,
+            operator_id: "o".into(),
+            metadata: Some(SubtaskCheckpointMetadata {
+                native_database: Some(NativeDatabaseCheckpointMetadata {
+                    completed_base_epoch: Some(9),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }))
+    }
+    #[tokio::test]
+    async fn delayed_native_completion_is_ignored_before_authoritative_base_validation() {
+        let status = JobControllerStatus {
+            job_status: Arc::new(Mutex::new(JobStatus::default())),
+            checkpoint_history: Arc::new(Mutex::new(CheckpointHistory::default())),
+        };
+        let mut model = model();
+        model.handle_message(completion(10), &status).await.unwrap();
+        model.checkpoint_state = Some(CheckpointingOrCommittingState::Checkpointing(
+            CheckpointState::new(
+                Arc::new("J".into()),
+                "checkpoint".into(),
+                Epoch(11),
+                Epoch(1),
+                model.program.clone(),
+            ),
+        ));
+        model.handle_message(completion(10), &status).await.unwrap();
+        assert_eq!(model.last_completed_epoch, Some(10));
+        assert!(
+            model
+                .handle_message(completion(11), &status)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("authoritative completed base")
+        );
+        assert!(
+            status
+                .checkpoint_history
+                .lock()
+                .unwrap()
+                .checkpoints
+                .is_empty()
+        );
+    }
 }
