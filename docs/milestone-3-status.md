@@ -1,3 +1,41 @@
+## Active STR-25 — native incremental checkpoints — 2026-10-29
+
+- User approved complete native capture, incremental SST transfer, shared-file
+  retention and native restore after STR-162 review. Memory portability, native
+  SQL, backend budgets, global publication and Kafka contracts are preserved.
+- Base `8cddb321b631b79185bf6d166a0fdf9522db529f`; branch
+  `jason/str-25-native-checkpoints-20261028`; invoking checkout untouched.
+  Applicable AGENTS/build guidance and current tickets read. No signing/time cap.
+- Implementation/source/scope reviews pass; strict Clippy and dev gates pass.
+  70 protocol tests, 15 focused cases, 48 fresh-process restores, all five native
+  operator paths, one-DB paged portability, three real CLI loss cases and isolated
+  Kafka pending-commit replay are supported by exact independent evidence.
+- First optimized ABBA completed all four 120s arms / 59,474 exact rows each.
+  CPU 69.845→30.170s mean; idle checkpoint median 4.029→0.106s. Reuse and
+  installed compaction rewrite audited. **INCONCLUSIVE:** three baseline phases
+  have one complete CP, required two. No throughput-capacity/production claim.
+- [Measurement](str-25-native-checkpoint-measurement.md) and
+  [validation](str-25-native-checkpoint-validation.md) bind source, executables,
+  native archives, raw counters and failures. Evidence root
+  `/home/jason/qa-evidence/str25-native-checkpoints-20261028/`.
+- Large-state fresh recovery passes on unchanged dev/test and optimized pins:
+  49,152 new all-key SQL probes, exact 108,626 full rows, zero logical scan pages.
+  Dev peak sampled RSS 380,051,456B < 402,653,184B logical state; native 503,303,110B.
+  Independent optimized and dev result audits pass.
+- Published [draft PR #90](https://github.com/jasadams/streamr/pull/90). Active
+  PR checks are Lint and Backlog tooling. Full CI and Semgrep workflows
+  are manually disabled; their build/tests/scans are not claimed passed.
+- Same-implementation coverage verification is complete: all four 144s arms
+  produced 59,474 exact rows; all 12 phase cells contain at least two completed
+  checkpoints. Independent process/oracle and native-compaction audits pass KEEP.
+  Matched CPU 78.705→30.820s mean (60.8% lower), idle CP 3.978→0.110s.
+  First result stays INCONCLUSIVE and immutable. No throughput-capacity claim.
+- Delivery: PR #90 carries the reviewed implementation, timing overlay and
+  completed verification report; enabled current-head checks are recorded on PR.
+  Next is normal PR review/merge, not another processing/benchmark decision.
+  Known cloud/host-RAM/post-SIGKILL working-directory limits remain explicit.
+
+
 ## Active STR-158 — scoped production acceptance passed; final handoff — 2026-10-28
 
 - Existing incomplete-checkpoint/pending-commit contract is correct; no engine

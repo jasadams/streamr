@@ -208,6 +208,11 @@ impl WorkerJobController {
             restore_commit_epoch == authoritative_commit_epoch,
             "worker restore commit phase differs from authoritative generation recovery"
         );
+        let last_completed_epoch = if matches!(&recovery, GenerationRecovery::Ready { .. }) {
+            u32::try_from(*epoch).ok()
+        } else {
+            None
+        };
         let (parent_ref, replay_commits) = match recovery {
             GenerationRecovery::NoCheckpoint => {
                 // nothing to do -- make sure that we're not inconsistent with the controller /
@@ -265,6 +270,7 @@ impl WorkerJobController {
                 checkpoint_state: None,
                 epoch,
                 min_epoch,
+                last_completed_epoch,
                 last_checkpoint: Instant::now(),
                 workers,
                 tasks,
@@ -430,9 +436,11 @@ impl WorkerJobController {
             .await?
             {
                 CommittedMarkerOutcome::Created => {
+                    self.model.last_completed_epoch = u32::try_from(*self.model.epoch).ok();
                     info!(job_id = ?self.worker_context.job_id, checkpoint_ref =? commit_permit.checkpoint_ref(), "finalized replayed commit");
                 }
                 CommittedMarkerOutcome::AlreadyCommitted => {
+                    self.model.last_completed_epoch = u32::try_from(*self.model.epoch).ok();
                     info!(job_id = ?self.worker_context.job_id, checkpoint_ref =? commit_permit.checkpoint_ref(), "replayed commit already finalized");
                 }
             }
@@ -849,19 +857,36 @@ impl WorkerJobController {
         );
 
         let start = Instant::now();
+        let runtime = tokio::runtime::Handle::current();
         Some(tokio::spawn(async move {
-            let storage = get_storage_provider(&StorageProviderFor::Worker).await?;
-            reconcile_abandoned_disk_uploads(storage.as_ref(), &paths).await?;
-            cleanup_leader_checkpoints(storage.as_ref(), &paths, last_checkpoint, new_min).await?;
+            let resources = arroyo_state::live::worker::configured_worker_resources()?;
+            // One admitted closure owns the entire spool and its I/O until it
+            // returns. Cancelling the async waiter cannot release its capacity
+            // or remove scratch while an uncancellable sort/fsync still runs.
+            let work = move || {
+                runtime.block_on(async move {
+                    let storage = get_storage_provider(&StorageProviderFor::Worker).await?;
+                    reconcile_abandoned_disk_uploads(storage.as_ref(), &paths).await?;
+                    cleanup_leader_checkpoints(storage.as_ref(), &paths, last_checkpoint, new_min)
+                        .await?;
 
-            info!(
-                message = "Finished cleaning",
-                job_id = *job_id,
-                new_min = *new_min,
-                duration = start.elapsed().as_secs_f32()
-            );
+                    info!(
+                        message = "Finished cleaning",
+                        job_id = *job_id,
+                        new_min = *new_min,
+                        duration = start.elapsed().as_secs_f32()
+                    );
 
-            Ok(new_min)
+                    Ok(new_min)
+                })
+            };
+            if let Some(resources) = resources {
+                resources.run_blocking(work).await?
+            } else {
+                // Memory-only jobs have no native pool. Their existing single
+                // cleanup gate bounds this one use of Tokio's blocking executor.
+                tokio::task::spawn_blocking(work).await?
+            }
         }))
     }
 }

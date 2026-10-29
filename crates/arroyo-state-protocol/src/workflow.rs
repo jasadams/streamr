@@ -581,6 +581,7 @@ where
     S: ProtocolStore + ?Sized,
 {
     validate_checkpoint_for_generation(request.generation_manifest, request.checkpoint)?;
+    crate::native_checkpoint::validate_manifest_reuse(store, request.checkpoint).await?;
     crate::disk::validate_manifest(request.checkpoint).map_err(|msg| {
         StoreError::InvalidProtobuf {
             path: request.checkpoint_ref.clone(),

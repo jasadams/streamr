@@ -197,3 +197,32 @@ worktree. Do not delete the shared target or edit generated Rust files.
 Evidence: `/home/jason/qa-evidence/streamr-str62-2147/optimized-pruning/check.log`
 (exit 101). Corrected current-source retry and its results are preserved in
 `optimized-pruning-retry1/` under the same receipt root.
+
+STR-25 reproduced a broader shared-target freshness failure on 2026-10-29,
+alternating baseline and candidate worktrees at `/app` with image `bad108ab`.
+The baseline release build regenerated its older RPC schema and rebuilt every
+first-party artifact. After switching to candidate sources whose modification
+times preceded those outputs, Cargo reported the RPC build script/library and
+ordinary changed libraries such as `arroyo-types` and `arroyo-storage` as
+`fresh: true`. The candidate failed with E0432 for
+`NativeDatabaseCheckpointMetadata`, despite that type existing in its proto.
+The retained generated Rust still contained the baseline schema. Source hashes
+and a preserved executable alone do not prove Cargo rebuilt changed inputs.
+
+When ordinary Rust inputs are also stale, touching only the proto is
+insufficient. Preserve the failed log, Cargo JSON freshness records and generated
+schema, then use `scripts/cargo-dev clean --release -p <changed-first-party-crate>`
+for the affected workspace packages inside the existing shared queue reservation.
+Rebuild and pin through the maintained path, checking that changed packages are
+rebuilt and the generated schema matches the selected source. Preserve
+third-party caches, the shared target, matching precompiled native archives and
+previous pins outside Cargo caches. No cache-wrapper replacement, new target or
+generated-source edit is required.
+
+Evidence: `/home/jason/qa-evidence/str25-native-checkpoints-20261028/`,
+`release-stale-workspace-audit.json`, `pins/release/candidate/` (initial failed
+build), and `stale-generated-rpc-baseline/`. The baseline audit found all 25
+first-party artifacts rebuilt and 1,347 of 1,349 frozen inputs matching the
+fetched base; the other two were declared measurement overlays. This establishes
+baseline build provenance, not runtime correctness or performance. The targeted
+candidate rebuild and measurement require their own receipts.

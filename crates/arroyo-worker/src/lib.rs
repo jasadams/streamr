@@ -966,6 +966,7 @@ impl WorkerGrpc for WorkerServer {
             min_epoch: req.min_epoch as u32,
             timestamp: from_millis(req.timestamp),
             then_stop: req.then_stop,
+            completed_base_epoch: req.completed_base_epoch,
         };
 
         for n in &sources {
@@ -1285,7 +1286,7 @@ impl JobControllerGrpc for LeaderServer {
 
         debug!("received task checkpoint completed {:?}", req);
 
-        self.send_job_message(RunningMessage::TaskCheckpointFinished(req))
+        self.send_job_message(RunningMessage::TaskCheckpointFinished(Box::new(req)))
             .await?;
 
         Ok(Response::new(TaskCheckpointCompletedResp {}))

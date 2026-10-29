@@ -506,6 +506,7 @@ pub struct CheckpointBarrier {
     pub min_epoch: u32,
     pub timestamp: SystemTime,
     pub then_stop: bool,
+    pub completed_base_epoch: Option<u32>,
 }
 
 pub struct DisplayAsSql<'a>(pub &'a DataType);

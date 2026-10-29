@@ -43,6 +43,7 @@ pub struct CheckpointMessage {
     time: SystemTime,
     watermark: Option<SystemTime>,
     then_stop: bool,
+    completed_base_epoch: Option<u32>,
 }
 
 #[derive(Debug)]

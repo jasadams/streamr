@@ -1945,6 +1945,7 @@ mod event_pair_input_tests {
     }
     fn barrier(epoch: u32) -> ArrowMessage {
         ArrowMessage::Signal(SignalMessage::Barrier(CheckpointBarrier {
+            completed_base_epoch: None,
             epoch,
             min_epoch: 0,
             timestamp: SystemTime::UNIX_EPOCH,

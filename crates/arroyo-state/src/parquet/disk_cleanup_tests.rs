@@ -157,6 +157,7 @@ fn disk_operator_metadata(operator: &str, epoch: u32) -> (OperatorCheckpointMeta
     };
     (
         OperatorCheckpointMetadata {
+            native_database: None,
             operator_metadata: Some(rpc::OperatorMetadata {
                 job_id: "J".into(),
                 operator_id: operator.into(),
@@ -217,6 +218,7 @@ fn checkpoint_cleanup_fixture(root: &Path) -> (CheckpointMetadata, ObjectMap) {
             objects.entry(path.clone()).or_insert(vec![7]);
         }
         let global = OperatorCheckpointMetadata {
+            native_database: None,
             operator_metadata: Some(rpc::OperatorMetadata {
                 job_id: "J".into(),
                 operator_id: "p".into(),
@@ -254,6 +256,7 @@ fn checkpoint_cleanup_fixture(root: &Path) -> (CheckpointMetadata, ObjectMap) {
             global.encode_to_vec(),
         );
         let empty = OperatorCheckpointMetadata {
+            native_database: None,
             operator_metadata: Some(rpc::OperatorMetadata {
                 job_id: "J".into(),
                 operator_id: "empty".into(),

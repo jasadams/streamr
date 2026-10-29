@@ -318,7 +318,7 @@ pub enum JobControllerEvent {
         time: SystemTime,
         operator_id: String,
         epoch: u32,
-        metadata: SubtaskCheckpointMetadata,
+        metadata: Box<SubtaskCheckpointMetadata>,
         needs_commit: bool,
     },
     NonfatalError {

@@ -649,16 +649,14 @@ fn repartition<'a>(
 #[async_trait]
 impl Collector for ArrowCollector {
     async fn collect(&mut self, record: RecordBatch) -> DataflowResult<()> {
-        if let Some(spec) = &self.event_spec {
-            if !spec.maintenance
+        if let Some(spec) = &self.event_spec
+            && (!spec.maintenance
                 || record.schema() != spec.schema
-                || !(1..=2).contains(&record.num_rows())
-            {
-                return Err(DataflowError::ArgumentError(
-                    "ordinary Data on response edge without a complete native maintenance unit"
-                        .into(),
-                ));
-            }
+                || !(1..=2).contains(&record.num_rows()))
+        {
+            return Err(DataflowError::ArgumentError(
+                "ordinary Data on response edge without a complete native maintenance unit".into(),
+            ));
         }
         TaskCounters::MessagesSent
             .for_task(&self.chain_info, |c| c.inc_by(record.num_rows() as u64));

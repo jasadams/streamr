@@ -255,6 +255,62 @@ def checkpoint(root, epoch, owner, protocol):
         info = wire(one(op, 1))
         require(one(info, 1) == owner['job'].encode() and one(info, 3, 0) == epoch and one(info, 6, 0) == 1, 'operator ownership/parallelism differs')
         configs, tables = pairs(op, 14), pairs(op, 13)
+        native = one(op, 15)
+        if native is not None:
+            # Current RocksDB checkpoints own one full database, while the
+            # source/sink tables below retain ordinary checkpoint metadata.
+            descriptor = wire(native)
+            expected_generation = 0 if protocol == 'controller' else owner['generation']
+            require(one(descriptor,1,0) == 1 and one(descriptor,2,0) == expected_generation
+                    and one(descriptor,3,0) == epoch and one(descriptor,4,0) == 0
+                    and one(descriptor,5,b'') and one(descriptor,6,b''),
+                    'native database format/owner/epoch/identity differs')
+            roster = [wire(entry) for entry in descriptor.get(7,[])]
+            require(len(roster) == 1 and one(roster[0],1,b'') == b'native-aggregate-v1',
+                    'native database table roster differs from actual aggregate fixture')
+            name = b'native-aggregate-v1'
+            require(name in configs and name not in tables and one(roster[0],2) == configs[name],
+                    'native roster/config mismatch or mixed logical representation')
+            wrapper = wire(configs[name])
+            config = wire(one(wrapper,2,b''))
+            namespace = bytes([1,0])+bytes(4)+(1).to_bytes(4,'big')+len(name).to_bytes(4,'big')+name
+            require(one(wrapper,1,0) == 3 and one(wrapper,3,0) == 1
+                    and one(config,1,b'') == name and one(config,2,0) == 1
+                    and len(one(config,3,b'')) == 32 and one(roster[0],3,b'') == namespace,
+                    'native aggregate schema/namespace/config differs')
+            native_files, local_names = [], set()
+            operator_id = one(info,2,b'').decode()
+            for encoded in descriptor.get(8,[]):
+                file = wire(encoded)
+                local_name = one(file,1,b'').decode()
+                relative = one(file,2,b'').decode()
+                shared = bool(one(file,5,0))
+                birth_generation, birth_epoch = one(file,6,0), one(file,7,0)
+                require(local_name and local_name not in ('.','..') and '/' not in local_name
+                        and '\\' not in local_name and local_name not in local_names,
+                        'unsafe/duplicate native basename')
+                local_names.add(local_name)
+                require(0 < birth_epoch <= epoch and birth_generation <= expected_generation,
+                        'native file birth exceeds selected checkpoint')
+                require(not shared or local_name.endswith('.sst'), 'only immutable SSTs may be shared')
+                require(shared or (birth_epoch == epoch and birth_generation == expected_generation),
+                        'private native metadata belongs to another checkpoint')
+                birth_base = (f"{owner['job']}/checkpoints/checkpoint-{birth_epoch:07}" if protocol == 'controller'
+                              else f"{owner['pipeline']}/{owner['job']}/generations/{birth_generation}/checkpoints/checkpoint-{birth_epoch:07}")
+                require(relative.startswith(f'{birth_base}/operator-{operator_id}/native-'),
+                        'native file belongs to another owner/birth checkpoint')
+                require(relative.rsplit('/',1)[-1] == local_name, 'native basename/path mapping differs')
+                checksum, size = one(file,4,b''), one(file,3,0)
+                require(len(checksum) == 32, 'native file checksum descriptor differs')
+                path = artifact(root,relative,records,checksum)
+                require(path.stat().st_size == size, 'native file size differs')
+                native_files.append(relative)
+            require(len(set(native_files)) == len(native_files), 'duplicate native remote objects')
+            require('CURRENT' in local_names and any(name.startswith('MANIFEST-') for name in local_names)
+                    and any(name.endswith('.sst') for name in local_names),
+                    'native database lacks complete nonempty checkpoint files')
+            owners.append(dict(operator=operator_id,table=name.decode(),kind=3,files=native_files,
+                               representation='native_database'))
         for name, encoded in tables.items():
             require(name in configs, 'checkpoint table has no config')
             table = wire(encoded)

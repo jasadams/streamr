@@ -1003,6 +1003,7 @@ async fn enqueue_delivery_fault_checkpoint(engine: &RunningEngine) {
     for source in engine.source_controls() {
         source
             .send(ControlMessage::Checkpoint(CheckpointBarrier {
+                completed_base_epoch: None,
                 epoch: 2,
                 min_epoch: 0,
                 timestamp: SystemTime::now(),

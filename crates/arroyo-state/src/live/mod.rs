@@ -11,6 +11,7 @@ pub mod encoding;
 mod health;
 pub mod lifecycle;
 pub mod memory;
+pub mod native_checkpoint;
 pub mod resources;
 pub mod rocks;
 pub mod table;
@@ -318,6 +319,12 @@ impl StateSnapshot {
 
 #[async_trait]
 pub trait LiveStateBackend: Send + Sync {
+    async fn capture_native(&self) -> Result<Option<native_checkpoint::NativeCheckpointCapture>> {
+        Ok(None)
+    }
+    fn restored_native_checkpoint_fingerprint(&self) -> Option<&[u8]> {
+        None
+    }
     async fn get(&self, key: &StateKey, options: ReadOptions) -> Result<Option<Vec<u8>>>;
     async fn try_get(&self, _key: &StateKey, _options: ReadOptions) -> Result<Option<Vec<u8>>> {
         Err(LiveStateError::Backend(

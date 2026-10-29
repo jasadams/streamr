@@ -117,6 +117,7 @@ async fn event_transport_actual_network_roundtrips_empty_keys_and_null() {
     for signal in [
         SignalMessage::Watermark(arroyo_types::Watermark::Idle),
         SignalMessage::Barrier(arroyo_types::CheckpointBarrier {
+            completed_base_epoch: None,
             epoch: 2,
             min_epoch: 1,
             timestamp: std::time::UNIX_EPOCH,

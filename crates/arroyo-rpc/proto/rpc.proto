@@ -380,6 +380,36 @@ message SubtaskCheckpointMetadata {
   map<string, TableSubtaskCheckpointMetadata> table_metadata = 10;
   // TODO: move this into plan?
   map<string, TableConfig> table_configs = 11;
+  optional NativeDatabaseCheckpointMetadata native_database = 12;
+}
+
+// A complete native database inventory. Only immutable SST objects are shared.
+message NativeCheckpointFile {
+  string local_name = 1;
+  string path = 2;
+  uint64 size_bytes = 3;
+  bytes checksum = 4;
+  bool shared = 5;
+  uint64 birth_generation = 6;
+  uint32 birth_epoch = 7;
+}
+
+message NativeCheckpointTable {
+  string name = 1;
+  TableConfig config = 2;
+  bytes namespace = 3;
+}
+
+message NativeDatabaseCheckpointMetadata {
+  uint32 format_version = 1;
+  uint64 generation = 2;
+  uint32 epoch = 3;
+  uint32 subtask_index = 4;
+  bytes database_id = 5;
+  string compatibility_identity = 6;
+  repeated NativeCheckpointTable tables = 7;
+  repeated NativeCheckpointFile files = 8;
+  optional uint32 completed_base_epoch = 9;
 }
 
 message GlobalKeyedTableConfig {
@@ -492,6 +522,7 @@ message OperatorCheckpointMetadata {
   uint64 finish_time = 3;
   map<string, TableCheckpointMetadata> table_checkpoint_metadata = 13;
   map<string, TableConfig> table_configs = 14;
+  optional NativeDatabaseCheckpointMetadata native_database = 15;
 }
 
 
@@ -574,6 +605,7 @@ message CheckpointReq {
   bool then_stop = 4;
   // if this message is solely to perform a commit.
   bool is_commit = 5;
+  optional uint32 completed_base_epoch = 6;
 }
 
 message CheckpointResp {

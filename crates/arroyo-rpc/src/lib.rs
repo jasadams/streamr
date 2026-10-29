@@ -229,7 +229,7 @@ pub struct CheckpointEvent {
 #[derive(Debug, Clone)]
 pub enum ControlResp {
     CheckpointEvent(CheckpointEvent),
-    CheckpointCompleted(CheckpointCompleted),
+    CheckpointCompleted(Box<CheckpointCompleted>),
     TaskStarted {
         task_id: u32,
         subtask_idx: u32,

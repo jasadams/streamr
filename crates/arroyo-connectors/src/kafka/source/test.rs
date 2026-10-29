@@ -325,7 +325,7 @@ impl KafkaSourceWithReads {
 
             if let ControlResp::CheckpointCompleted(checkpoint) = control_response {
                 assert_eq!(expected_epoch as u64, checkpoint.checkpoint_epoch);
-                return checkpoint;
+                return *checkpoint;
             }
         }
     }
@@ -363,6 +363,7 @@ async fn test_kafka_restored_offsets_survive_idle_checkpoint_and_continue() {
         reader
             .to_control_tx
             .send(ControlMessage::Checkpoint(CheckpointBarrier {
+                completed_base_epoch: None,
                 epoch,
                 min_epoch: 1,
                 timestamp: SystemTime::now(),
@@ -388,6 +389,7 @@ async fn test_kafka_restored_offsets_survive_idle_checkpoint_and_continue() {
         StateBackend::write_operator_checkpoint_metadata(
             &StorageProviderFor::Worker,
             OperatorCheckpointMetadata {
+                native_database: None,
                 start_time: 0,
                 finish_time: 0,
                 table_checkpoint_metadata: single_item_hash_map("k", table_metadata),
@@ -479,6 +481,7 @@ async fn test_kafka() {
         .await;
 
     let barrier = ControlMessage::Checkpoint(CheckpointBarrier {
+        completed_base_epoch: None,
         epoch: 1,
         min_epoch: 0,
         timestamp: (SystemTime::now()),
@@ -503,6 +506,7 @@ async fn test_kafka() {
     StateBackend::write_operator_checkpoint_metadata(
         &StorageProviderFor::Worker,
         OperatorCheckpointMetadata {
+            native_database: None,
             start_time: 0,
             finish_time: 0,
             table_checkpoint_metadata: single_item_hash_map("k", table_metadata),

@@ -1403,6 +1403,7 @@ async fn source_ack(
     for source in running.source_controls() {
         source
             .send(ControlMessage::Checkpoint(CheckpointBarrier {
+                completed_base_epoch: None,
                 epoch: u32::try_from(epoch).unwrap(),
                 min_epoch: 0,
                 timestamp: SystemTime::now(),

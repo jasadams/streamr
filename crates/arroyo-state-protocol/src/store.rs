@@ -18,6 +18,8 @@ pub enum CreateResult<T> {
 /// Error type for protocol storage and serialization operations.
 #[derive(Debug, Error)]
 pub enum StoreError {
+    #[error("checkpoint cleanup resource error: {0}")]
+    CleanupResource(#[from] std::io::Error),
     #[error("storage error: {0}")]
     Storage(#[from] StorageError),
     #[error("failed to encode protocol object for {path}: {source}")]
@@ -73,6 +75,16 @@ pub trait ProtocolStore: Send + Sync {
 
     /// Deletes raw object bytes, succeeding if the object is already absent.
     async fn delete_object(&self, path: &CheckpointRef) -> Result<(), StoreError>;
+
+    /// Streaming relative paths for bounded orphan reconciliation. Stores that
+    /// cannot enumerate must reject native cleanup instead of claiming success.
+    async fn list_objects(
+        &self,
+        _prefix: &str,
+    ) -> Result<Option<futures::stream::BoxStream<'_, Result<String, StoreError>>>, StoreError>
+    {
+        Ok(None)
+    }
 
     /// Attempts to delete the specified directory, which must be empty; this is a no-op for
     /// object stores.
@@ -243,9 +255,37 @@ impl ProtocolStore for StorageProvider {
     }
 
     async fn delete_object(&self, path: &CheckpointRef) -> Result<(), StoreError> {
-        self.delete_if_present(path.as_str())
+        self.delete_native_checkpoint_artifact(path.as_str())
             .await
             .map_err(StoreError::from)
+    }
+
+    async fn list_objects(
+        &self,
+        prefix: &str,
+    ) -> Result<Option<futures::stream::BoxStream<'_, Result<String, StoreError>>>, StoreError>
+    {
+        use futures::StreamExt;
+        let qualified = self.qualify_path(&"".into()).to_string();
+        let strip = if qualified.is_empty() {
+            String::new()
+        } else {
+            format!("{}/", qualified.trim_end_matches('/'))
+        };
+        let listing = self.list_prefix(prefix.into()).await?;
+        Ok(Some(
+            listing
+                .map(move |item| {
+                    let path = item.map_err(StorageError::from)?.to_string();
+                    path.strip_prefix(&strip).map(str::to_owned).ok_or_else(|| {
+                        StoreError::InvalidProtobuf {
+                            path: CheckpointRef::new(path.clone()).expect("object path"),
+                            msg: "listed object outside configured storage prefix".into(),
+                        }
+                    })
+                })
+                .boxed(),
+        ))
     }
 
     async fn delete_directory(&self, path: &str) {
@@ -298,6 +338,24 @@ pub(crate) mod tests {
 
             objects.insert(path.as_str().to_string(), bytes);
             Ok(CreateResult::Created)
+        }
+
+        async fn list_objects(
+            &self,
+            prefix: &str,
+        ) -> Result<Option<futures::stream::BoxStream<'_, Result<String, StoreError>>>, StoreError>
+        {
+            use futures::StreamExt;
+            let paths = self
+                .objects
+                .lock()
+                .unwrap()
+                .keys()
+                .filter(|p| p.starts_with(prefix))
+                .cloned()
+                .map(Ok)
+                .collect::<Vec<_>>();
+            Ok(Some(futures::stream::iter(paths).boxed()))
         }
 
         async fn delete_object(&self, path: &CheckpointRef) -> Result<(), StoreError> {

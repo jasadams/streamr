@@ -4,10 +4,11 @@ use arroyo_datastream::logical::LogicalProgram;
 use arroyo_rpc::grpc::api::OperatorCheckpointDetail;
 use arroyo_rpc::grpc::rpc::{
     CheckpointMetadata, DiskKeyedTableConfig, DiskKeyedTableSubtaskCheckpointMetadata,
-    OperatorCheckpointMetadata, OperatorMetadata, SubtaskCheckpointMetadata,
-    TableCheckpointMetadata, TableConfig, TableEnum, TableSubtaskCheckpointMetadata,
-    TaskCheckpointCompletedReq, TaskCheckpointEventReq, TypedStateTableConfig,
-    TypedStateTableSubtaskCheckpointMetadata, TypedStateTableTaskCheckpointMetadata,
+    NativeDatabaseCheckpointMetadata, OperatorCheckpointMetadata, OperatorMetadata,
+    SubtaskCheckpointMetadata, TableCheckpointMetadata, TableConfig, TableEnum,
+    TableSubtaskCheckpointMetadata, TaskCheckpointCompletedReq, TaskCheckpointEventReq,
+    TypedStateTableConfig, TypedStateTableSubtaskCheckpointMetadata,
+    TypedStateTableTaskCheckpointMetadata,
 };
 use arroyo_rpc::grpc::{api, rpc};
 use arroyo_rpc::progress::{decode_progress, encode_progress};
@@ -89,6 +90,8 @@ pub struct OperatorState {
     pub finish_time: Option<SystemTime>,
     table_state: HashMap<String, TableState>,
     watermarks: Vec<Option<SystemTime>>,
+    native_database: Option<NativeDatabaseCheckpointMetadata>,
+    native_configs: HashMap<String, TableConfig>,
 }
 
 impl OperatorState {
@@ -101,6 +104,8 @@ impl OperatorState {
             finish_time: None,
             table_state: HashMap::new(),
             watermarks: vec![],
+            native_database: None,
+            native_configs: HashMap::new(),
         }
     }
 
@@ -113,6 +118,21 @@ impl OperatorState {
             HashMap<String, TableCheckpointMetadata>,
         )>,
     > {
+        if let Some(native) = c.native_database.clone() {
+            if self.subtasks != 1 || self.native_database.is_some() {
+                bail!("native database checkpoints require one unique singleton subtask");
+            }
+            for table in &native.tables {
+                self.native_configs.insert(
+                    table.name.clone(),
+                    table
+                        .config
+                        .clone()
+                        .ok_or_else(|| anyhow!("missing native table config"))?,
+                );
+            }
+            self.native_database = Some(native);
+        }
         self.subtasks_checkpointed += 1;
         self.watermarks
             .push(decode_progress(c.watermark, c.watermark_negative_nanos)?);
@@ -151,6 +171,7 @@ impl OperatorState {
                     table_metadatas.insert(table_name, metadata);
                 }
             }
+            table_configs.extend(self.native_configs.drain());
             Ok(Some((table_configs, table_metadatas)))
         } else {
             Ok(None)
@@ -322,6 +343,42 @@ impl CheckpointState {
 
         if c.epoch != *self.epoch {
             bail!("checkpoint completion epoch mismatch");
+        }
+        if let Some(native) = &metadata.native_database {
+            let context = c
+                .worker_context
+                .as_ref()
+                .ok_or_else(|| anyhow!("native checkpoint missing worker context"))?;
+            if context.job_id != *self.job_id
+                || u64::from(native.epoch) != c.epoch
+                || native.subtask_index != metadata.subtask_index
+                || (native.generation != 0 && native.generation != context.generation)
+                || metadata.encoded_len()
+                    > arroyo_state_protocol::native_checkpoint::MAX_METADATA_BYTES
+                || native
+                    .tables
+                    .iter()
+                    .any(|t| metadata.table_metadata.contains_key(&t.name))
+            {
+                bail!("native checkpoint worker ownership/representation mismatch");
+            }
+            arroyo_state_protocol::native_checkpoint::validate(
+                native,
+                &metadata.table_configs,
+                &self.job_id,
+                &c.operator_id,
+                if native.generation == 0
+                    && native
+                        .files
+                        .iter()
+                        .all(|f| f.path.starts_with(&format!("{}/checkpoints/", self.job_id)))
+                {
+                    None
+                } else {
+                    Some(&context.pipeline_id)
+                },
+            )
+            .map_err(|e| anyhow!(e))?;
         }
         for (name, wrapped) in &metadata.table_metadata {
             if wrapped.table_type() == TableEnum::TypedStateTable {
@@ -526,6 +583,7 @@ impl CheckpointState {
                 finish_time: to_micros(operator_state.finish_time.unwrap()),
                 table_checkpoint_metadata,
                 table_configs,
+                native_database: operator_state.native_database.take(),
                 operator_metadata: Some(OperatorMetadata {
                     job_id: self.job_id.to_string(),
                     operator_id: c.operator_id,
@@ -538,6 +596,12 @@ impl CheckpointState {
                 }),
             };
 
+            if metadata.native_database.is_some()
+                && metadata.encoded_len()
+                    > arroyo_state_protocol::native_checkpoint::MAX_METADATA_BYTES
+            {
+                bail!("native operator checkpoint exceeds complete metadata wire budget");
+            }
             operator_detail.finish_time = Some(to_micros(SystemTime::now()));
             return Ok(Some(metadata));
         }

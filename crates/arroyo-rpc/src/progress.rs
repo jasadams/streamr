@@ -64,6 +64,7 @@ mod tests {
             let time = from_signed_nanos(nanos).unwrap();
             let (watermark, watermark_negative_nanos) = encode_progress(Some(time)).unwrap();
             let encoded = SubtaskCheckpointMetadata {
+                native_database: None,
                 watermark,
                 watermark_negative_nanos,
                 ..Default::default()

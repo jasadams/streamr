@@ -28,6 +28,7 @@ pub struct MemoryLiveState {
     max_resident_bytes: Option<usize>,
     _database: Option<resources::ResourcePermit>,
     health: Option<Arc<health::BackendHealth>>,
+    restored_native_source: Option<Vec<u8>>,
 }
 impl MemoryLiveState {
     pub fn new() -> Self {
@@ -50,7 +51,55 @@ impl MemoryLiveState {
             data: RwLock::new(MemoryData::default()),
             resources: Some(resources),
             max_resident_bytes: Some(max_resident_bytes),
+            restored_native_source: None,
         })
+    }
+}
+
+/// The eventual memory destination, constructed while a managed native reader
+/// owns the sole database permit. It cannot escape as a backend before finish.
+pub(crate) struct MemoryRestoreBuilder {
+    state: MemoryLiveState,
+}
+impl MemoryRestoreBuilder {
+    pub(crate) fn new(
+        resources: resources::WorkerStateResources,
+        limit: usize,
+        source: Vec<u8>,
+    ) -> Result<Self> {
+        if limit == 0 {
+            return Err(LiveStateError::InvalidLimit);
+        }
+        let health = health::BackendHealth::new("memory", true);
+        resources.observe_health(&health);
+        Ok(Self {
+            state: MemoryLiveState {
+                data: RwLock::new(MemoryData::default()),
+                resources: Some(resources),
+                max_resident_bytes: Some(limit),
+                _database: None,
+                health: Some(health),
+                restored_native_source: Some(source),
+            },
+        })
+    }
+    pub(crate) async fn insert(&mut self, entry: &ScanEntry) -> Result<()> {
+        let bytes = encoding::encoded_key_size(&entry.key)?
+            .checked_add(encoding::encoded_value_size(&entry.value)?)
+            .ok_or(LiveStateError::InvalidLimit)?;
+        let mut admitted = self.state.try_admit_write(bytes, 1)?;
+        admitted.put(&entry.key, &entry.value)?;
+        self.state.write_admitted(admitted).await
+    }
+    pub(crate) fn finish(mut self) -> Result<MemoryLiveState> {
+        self.state._database = Some(
+            self.state
+                .resources
+                .as_ref()
+                .expect("builder resources")
+                .try_database()?,
+        );
+        Ok(self.state)
     }
 }
 fn poisoned() -> LiveStateError {
@@ -78,6 +127,9 @@ fn read_many(data: &Map, keys: &[StateKey], options: ReadOptions) -> Result<Vec<
 
 #[async_trait]
 impl LiveStateBackend for MemoryLiveState {
+    fn restored_native_checkpoint_fingerprint(&self) -> Option<&[u8]> {
+        self.restored_native_source.as_deref()
+    }
     async fn try_get(&self, key: &StateKey, options: ReadOptions) -> Result<Option<Vec<u8>>> {
         self.get(key, options).await
     }

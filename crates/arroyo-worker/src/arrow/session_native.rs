@@ -431,6 +431,7 @@ impl NativeSession {
             },
             self.limits.max_resident_bytes,
             resources.clone(),
+            ctx.table_manager.native_restore_request(),
         )
         .await?;
         let table = ctx
@@ -2660,6 +2661,7 @@ mod tests {
             response_owner
                 .handle_checkpoint(
                     arroyo_types::CheckpointBarrier {
+                        completed_base_epoch: None,
                         epoch: 1,
                         min_epoch: 0,
                         timestamp: UNIX_EPOCH,

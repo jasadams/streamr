@@ -162,6 +162,7 @@ async fn test_kafka_checkpoint_flushes() {
             .unwrap();
     }
     let barrier = CheckpointBarrier {
+        completed_base_epoch: None,
         epoch: 2,
         min_epoch: 0,
         timestamp: SystemTime::now(),

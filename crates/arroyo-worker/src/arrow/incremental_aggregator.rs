@@ -3802,6 +3802,7 @@ impl IncrementalAggregatingFunc {
             },
             limits.max_resident_bytes,
             resources.clone(),
+            ctx.table_manager.native_restore_request(),
         )
         .await?;
         let table = ctx

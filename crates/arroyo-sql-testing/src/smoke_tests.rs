@@ -135,6 +135,62 @@ async fn checkpoint_with_stop(
     then_stop: bool,
     finished_tasks: &mut HashSet<(u32, u32)>,
 ) -> u64 {
+    checkpoint_with_completed_base(ctx, epoch, then_stop, finished_tasks, None).await
+}
+
+/// A fixture may acknowledge a base only after this helper has returned from
+/// authoritative publication of that base. Worker upload completion is earlier.
+async fn checkpoint_with_completed_base(
+    ctx: &mut SmokeTestContext<'_>,
+    epoch: u32,
+    then_stop: bool,
+    finished_tasks: &mut HashSet<(u32, u32)>,
+    completed_base_epoch: Option<u32>,
+) -> u64 {
+    checkpoint_with_optional_feed(
+        ctx,
+        epoch,
+        then_stop,
+        finished_tasks,
+        completed_base_epoch,
+        None,
+    )
+    .await
+    .1
+}
+
+async fn checkpoint_with_completed_base_and_feed(
+    ctx: &mut SmokeTestContext<'_>,
+    epoch: u32,
+    then_stop: bool,
+    finished_tasks: &mut HashSet<(u32, u32)>,
+    completed_base_epoch: Option<u32>,
+    feed: &Arc<tokio::sync::Mutex<()>>,
+    released: &Arc<std::sync::atomic::AtomicUsize>,
+) -> (usize, u64) {
+    let (frontier, bytes) = checkpoint_with_optional_feed(
+        ctx,
+        epoch,
+        then_stop,
+        finished_tasks,
+        completed_base_epoch,
+        Some((feed, released)),
+    )
+    .await;
+    (frontier.expect("feed frontier captured"), bytes)
+}
+
+async fn checkpoint_with_optional_feed(
+    ctx: &mut SmokeTestContext<'_>,
+    epoch: u32,
+    then_stop: bool,
+    finished_tasks: &mut HashSet<(u32, u32)>,
+    completed_base_epoch: Option<u32>,
+    feed: Option<(
+        &Arc<tokio::sync::Mutex<()>>,
+        &Arc<std::sync::atomic::AtomicUsize>,
+    )>,
+) -> (Option<usize>, u64) {
     let checkpoint_started = std::time::Instant::now();
     let checkpoint_id = epoch as i64;
     let leader = leader_mode();
@@ -181,17 +237,28 @@ async fn checkpoint_with_stop(
 
     let barrier = CheckpointBarrier {
         epoch,
+        completed_base_epoch,
         min_epoch: 0,
         timestamp: SystemTime::now(),
         then_stop,
     };
 
-    for source in ctx.engine.source_controls() {
-        source
-            .send(ControlMessage::Checkpoint(barrier))
-            .await
-            .unwrap();
-    }
+    let frontier = {
+        // Serialize only barrier enqueue with source release, allowing DATA to
+        // continue while asynchronous checkpoint upload is in progress.
+        let _gate = if let Some((gate, _)) = feed {
+            Some(gate.lock().await)
+        } else {
+            None
+        };
+        for source in ctx.engine.source_controls() {
+            source
+                .send(ControlMessage::Checkpoint(barrier))
+                .await
+                .unwrap();
+        }
+        feed.map(|(_, released)| released.load(std::sync::atomic::Ordering::Acquire))
+    };
 
     while !checkpoint_state.done() {
         let c: ControlResp = tokio::time::timeout(test_runtime_timeout(), ctx.control_rx.recv())
@@ -310,7 +377,7 @@ async fn checkpoint_with_stop(
         process_rss_bytes()
     );
     info!("Smoke test checkpoint completed");
-    checkpoint_bytes
+    (frontier, checkpoint_bytes)
 }
 
 async fn compact(
@@ -3174,6 +3241,9 @@ mod fault_tests;
 
 #[path = "smoke_state_table_lifecycle.rs"]
 mod smoke_state_table_lifecycle;
+
+#[path = "smoke_native_checkpoints.rs"]
+mod smoke_native_checkpoints;
 
 #[path = "smoke_sql_json.rs"]
 mod smoke_sql_json;

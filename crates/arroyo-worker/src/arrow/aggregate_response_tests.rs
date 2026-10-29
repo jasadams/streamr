@@ -94,7 +94,8 @@ async fn branch_response_aggregate_first_empty_unchanged_and_ticks_complete_once
     assert_eq!(operator.tick_interval(),None);
     let before=correction_inventory(operator.native_store.as_ref().unwrap()).await;
     operator.handle_tick(1,&mut ctx,&mut collector).await.unwrap();
-    operator.handle_checkpoint(CheckpointBarrier {epoch:1,min_epoch:0,timestamp:SystemTime::UNIX_EPOCH,then_stop:false},&mut ctx,&mut collector).await.unwrap();
+    operator.handle_checkpoint(CheckpointBarrier {
+        completed_base_epoch: None,epoch:1,min_epoch:0,timestamp:SystemTime::UNIX_EPOCH,then_stop:false},&mut ctx,&mut collector).await.unwrap();
     operator.on_close(&Some(SignalMessage::EndOfData),&mut ctx,&mut collector).await.unwrap();
     assert_eq!(collector.packets.len(),3);assert_eq!(correction_inventory(operator.native_store.as_ref().unwrap()).await,before);
     // No dirty emission survives the response; committed G persists its last
