@@ -170,6 +170,13 @@ sys.exit(int(os.environ.get('COMMAND_STATUS', '0')))
         run = self.records()[-1]['args']
         self.assertIn('streamr-test-cold-sccache:/var/cache/sccache', run)
         self.assertIn('streamr-build-pin-test', run)
+        self.assertNotIn('--rm', run, 'The explicit owner must observe and clean even a short-lived container')
+        result = self.run_wrapper('--exec', 'true',
+                                  STREAMR_BUILD_CONTAINER_NAME='streamr-build-pin-short-test')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        run = self.records()[-1]['args']
+        self.assertIn('streamr-build-pin-short-test', run)
+        self.assertNotIn('--rm', run)
         result = self.run_wrapper('build', STREAMR_CACHE_NAMESPACE='../unsafe')
         self.assertEqual(result.returncode, 2)
 

@@ -3577,6 +3577,18 @@ impl IncrementalAggregatingFunc {
         ctx: &mut OperatorContext,
         collector: &mut dyn Collector,
     ) -> Result<()> {
+        self.drain_native_dirty_selected(ctx, collector, None).await
+    }
+
+    /// Calendar dispatch can borrow its already admitted owner from the H
+    /// continuation after the initial full drain. All publication, admission
+    /// and commit ordering remain shared with ordinary dirty discovery.
+    async fn drain_native_dirty_selected(
+        &self,
+        ctx: &mut OperatorContext,
+        collector: &mut dyn Collector,
+        known_group: Option<&[u8]>,
+    ) -> Result<()> {
         let store = self
             .native_store
             .as_ref()
@@ -3644,7 +3656,22 @@ impl IncrementalAggregatingFunc {
             let mut scanned = 0usize;
             let mut exhausted = false;
             while scanned < max_dirty_groups {
-                let Some((dirty_key, _)) = scope.first_dirty_from(after.as_deref()).await? else {
+                let dirty_key = if let Some(group_key) = known_group {
+                    if after.is_some() {
+                        None
+                    } else {
+                        let key = native_group_key(b'D', group_key)?;
+                        // Release the marker value before decoding G. This
+                        // retains the existing sequential point-read peak.
+                        scope.get(&key).await?.is_some().then_some(key)
+                    }
+                } else {
+                    scope
+                        .first_dirty_from(after.as_deref())
+                        .await?
+                        .map(|(key, _)| key)
+                };
+                let Some(dirty_key) = dirty_key else {
                     exhausted = true;
                     break;
                 };
@@ -3699,7 +3726,7 @@ impl IncrementalAggregatingFunc {
             if let Some(final_batch) = final_batch {
                 collector.collect(final_batch).await?;
             }
-            if exhausted {
+            if exhausted || known_group.is_some() {
                 return Ok(());
             }
         }
@@ -4834,7 +4861,30 @@ impl ArrowOperator for IncrementalAggregatingFunc {
                 // the existing D-output peak. Tight configurations stay cold.
                 let mut continuation = store.try_expiry_progress(output_bytes);
                 while self.dispatch_calendar_due(continuation.as_mut()).await? {
-                    self.drain_native_dirty(ctx, collector).await?;
+                    let known_group = continuation
+                        .as_ref()
+                        .map(|progress| {
+                            let due = progress
+                                .after
+                                .as_deref()
+                                .context("committed calendar continuation missing")?;
+                            ensure!(
+                                due.first() == Some(&b'H') && due.len() >= 13,
+                                "invalid committed calendar due key"
+                            );
+                            let group_len =
+                                usize::try_from(u32::from_be_bytes(due[9..13].try_into()?))?;
+                            ensure!(
+                                group_len == due.len() - 13,
+                                "invalid committed calendar group key"
+                            );
+                            // Borrow the existing admitted H key through delivery;
+                            // no owner allocation or snapshot crosses the commit.
+                            Ok::<_, anyhow::Error>(&due[13..])
+                        })
+                        .transpose()?;
+                    self.drain_native_dirty_selected(ctx, collector, known_group)
+                        .await?;
                     tokio::task::yield_now().await;
                 }
             }
@@ -15831,5 +15881,11 @@ mod tests {
     }
     mod calendar_merge_tests {
         include!("calendar_merge_tests.rs");
+    }
+    mod calendar_drain_diagnostic_tests {
+        include!("calendar_drain_diagnostic_tests.rs");
+    }
+    mod calendar_known_owner_tests {
+        include!("calendar_known_owner_tests.rs");
     }
 }
