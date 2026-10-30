@@ -1,3 +1,19 @@
+## Active STR-163 — known-owner calendar delivery validated — 2026-10-30
+
+- Confirmed repeated per-owner D discovery after calendar dispatch. Private repair borrows the existing admitted H owner and uses shared normal G/D CDC through a point lookup; initial/full fallback drains, H/B scans, SQL/clocks/state/budgets/commit order stay unchanged. No new pool/cache/interface or production changes.
+- Combined scoped correctness01+02 independently PASS:38 selected tests, formatting/locked check/strict Clippy, both backends and same-process logical fresh-owner recovery. The historical Rocks CP fixture is SyncWal; native-format/process-loss qualification is not claimed. Explicit named cargo-dev ownership now retains containers for actual-CID cleanup; unnamed --rm unchanged,22 wrapper tests pass.
+- ONE optimized probe-OFF ABBA completed all four18433-input/1024-owner/2046-CDC exact arms. Mean rollover wall4.035200→0.833874s (4.839102x); CPU3.805→0.855s (4.450292x). Whole fixture1.355438x. Both candidates beat both baselines; controls/native proof/source/CAS restoration and all six cleanup receipts pass. KEEP scoped repair;10x/20x goal NOT met, no production/startup/application claim.
+- Base2b521; candidate product19cc1517. Release pins A bd227feb/B c1ad5ff8, matching opt3 native archivecd8300d8. Source is restored to the normal diagnostic helper. Advisory growth estimates no longer block execution; maintained100GiB/actual-stage guards remained. Prior incomplete/inconclusive receipts stay preserved.
+- [Validation](str-163-calendar-drain-validation.md) binds raw evidence and limitations. Evidence `/home/jason/qa-evidence/str163-calendar-optimized-abba-20261030-01/` plus `str163-frontier-20261030/`. Next: final delivery review, publish PR and verify enabled current-head CI; no further experiment, merge or deployment here. Coordinator owns rollout decision and remaining STR163 startup/recovery acceptance.
+
+## Active STR-163 — logical restore diagnosis — 2026-10-29
+
+- Dedicated worker fresh fetched/deployed base `2b521b0200ae0d7e433149da123c9043a3f1dad5`, worktree `str-163-diagnosis-20261029`; current AGENTS/build/team/ledger read. Invoking checkout preserved. No product edits/build or timeout/SQL/state/budget changes.
+- One ordinary checkpoint-preserving restart: CP2295 -> Running run27 in108.210s under unchanged120s. Completed native CP2296 metadata covers all seven live owners. Preserve running state; no second restart or speculative optimization.
+- CP2295 declares15,002,811 rows /4,492 Parquet files /888,790,034 stored bytes. Existing16-row groups imply >=938,490 write submissions. Captured20.285s/40.33 process CPU-s; profiler20.535 sampled CPU-s (~50.9% equivalent coverage). Captured disjoint groups: Parquet36.2%, background RocksDB22.5%, key codec15.1%; full/off-CPU distribution unknown.
+- Diagnostic discovery mistakenly HTTP-probed binary data listener and caused one connection-handler panic. Worker survived; identity-held restore samples remain useful, but this is NOT clean startup/recovery qualification. Executed script marked unsafe to reuse. No native network-regression claim.
+- Evidence `/home/jason/qa-evidence/str163-restore-diagnosis-20261029/result.md` binds receipts, profile, source and metadata. No native second-restore, reliable startup bound, full application parity or causal speedup claim. Independent result audit accepts logical restore/first native CP evidence with disclosed diagnostic side effect; no product experiment recommended. Findings handed to rollout coordinator; STR-163 remains open for reliable-startup/variability disposition. No product hypothesis awaiting user approval.
+
 ## Active STR-25 — native incremental checkpoints — 2026-10-29
 
 - User approved complete native capture, incremental SST transfer, shared-file

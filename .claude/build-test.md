@@ -98,6 +98,11 @@ pinned-executable paths. Paths containing colon/control characters, aliases and
 the build, executable preservation and dependent validation. This optional mount
 does not change profiles, native archive selection or default container mounts.
 
+`STREAMR_BUILD_CONTAINER_NAME=streamr-build-pin-...` declares an external owner.
+These named containers remain after exit so the owner can capture their actual
+container ID, including for short commands. The owner must remove its container
+before releasing the queue reservation. Ordinary unnamed commands use `--rm`.
+
 ## Build and preserve a CLI package
 
 Use a new evidence directory outside checkouts and Cargo caches, and supply

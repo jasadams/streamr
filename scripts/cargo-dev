@@ -53,9 +53,11 @@ if [[ -n "${STREAMR_BUILD_EVIDENCE_ROOT:-}" ]]; then
     fi
     evidence_options=(-v "$evidence_root:$evidence_root:z")
 fi
-container_options=()
+container_options=(--rm)
 if [[ -n "${STREAMR_BUILD_CONTAINER_NAME:-}" ]]; then
     [[ "$STREAMR_BUILD_CONTAINER_NAME" =~ ^streamr-build-pin-[a-z0-9-]+$ ]] || { echo "Invalid owned build container name" >&2; exit 2; }
+    # Explicit owners inspect the actual CID and remove it in their cleanup.
+    # Retain even short-lived commands until that owner can observe identity.
     container_options=(--name "$STREAMR_BUILD_CONTAINER_NAME")
 fi
 if [[ -n "${STREAMR_BUILD_DATABASE_CONTAINER:-}" ]]; then
@@ -113,7 +115,7 @@ if [[ -n "${STREAMR_SHARED_TARGET_DIR:-}" ]]; then
     [[ "$STREAMR_SHARED_TARGET_DIR" == /* ]] || { echo 'Shared target override must be absolute' >&2; exit 2; }
     shared_target="$STREAMR_SHARED_TARGET_DIR"
 fi
-exec "$repo_dir/scripts/rust-build" podman run --rm \
+exec "$repo_dir/scripts/rust-build" podman run \
     "${network_options[@]}" \
     "${container_options[@]}" \
     "${evidence_options[@]}" \
