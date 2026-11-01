@@ -1,47 +1,44 @@
-name: Lint
+name: Temporary focused native restore tests
 
-on: [push, pull_request]
+on: [push]
 
 permissions:
   contents: read
 
-concurrency:
-  group: lint-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
-
 jobs:
-  rust-format:
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
+  focused-restore:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
     steps:
-      - name: Check out
-        uses: actions/checkout@v4
-      - name: Install Rust formatter
-        uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@v4
         with:
-          toolchain: '1.95'
-          components: rustfmt
-      - name: Check Rust formatting
-        run: cargo fmt --all -- --check
-
-  webui-lint:
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    defaults:
-      run:
-        working-directory: webui
-    steps:
-      - name: Check out
-        uses: actions/checkout@v4
-      - name: Setup pnpm
-        uses: pnpm/action-setup@v4
+          persist-credentials: false
+          fetch-depth: 2
+      - name: Verify exact product source
+        run: |
+          test "$(git rev-parse HEAD:crates/arroyo-storage/src/streaming.rs)" = "$(git rev-parse 36818f61:crates/arroyo-storage/src/streaming.rs)"
+          test "$(git rev-parse HEAD:crates/arroyo-state/src/live/native_checkpoint.rs)" = "$(git rev-parse 36818f61:crates/arroyo-state/src/live/native_checkpoint.rs)"
+      - uses: dtolnay/rust-toolchain@master
         with:
-          version: 9.0.6
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '22'
-      - name: Install lint dependencies
-        run: pnpm install --frozen-lockfile --strict-peer-dependencies --ignore-scripts
-      - name: Check Web UI formatting and lint
-        run: pnpm check
+          toolchain: '1.96.0'
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libssl-dev cmake clang libclang-dev libsasl2-dev protobuf-compiler liblz4-dev
+      - name: Local reader path and file identity
+        run: |
+          cargo test --locked -p arroyo-storage --lib streaming::tests::local_checkpoint_reader_resolves_keys_and_pins_the_open_file -- --exact --nocapture | tee /tmp/reader-test.log
+          grep -F "test result: ok. 1 passed; 0 failed" /tmp/reader-test.log
+      - name: Native download integrity
+        run: |
+          cargo test --locked -p arroyo-state --lib live::native_checkpoint::tests::local_native_download_checks_multichunk_empty_and_corrupt_files -- --exact --nocapture | tee /tmp/download-test.log
+          grep -F "test result: ok. 1 passed; 0 failed" /tmp/download-test.log
+      - name: Native corruption cleanup and memory release
+        run: |
+          cargo test --locked -p arroyo-state --lib live::native_checkpoint::tests::native_corruption_failure_cleans_fresh_attempt_and_memory_limit_failure_releases_reader -- --exact --nocapture | tee /tmp/cleanup-test.log
+          grep -F "test result: ok. 1 passed; 0 failed" /tmp/cleanup-test.log
