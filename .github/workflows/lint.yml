@@ -14,6 +14,11 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Verify host Python supports maintained native selector
+        run: python3 -c 'import tomllib; print("host Python tomllib available")'
       - name: Install Podman
         run: |
           sudo apt-get update
