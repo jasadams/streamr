@@ -293,6 +293,39 @@ impl StorageProvider {
             .map_err(Into::into)
     }
 
+    /// Open a local checkpoint object once for sequential bounded reads. Use
+    /// the object store's path resolution so encoded keys and prefixes match
+    /// `checkpoint_range`. Other providers retain their existing range reads.
+    pub async fn local_checkpoint_reader(
+        &self,
+        path: &str,
+        expected_size: u64,
+    ) -> Result<Option<tokio::fs::File>, StorageError> {
+        if !self.config().is_local() {
+            return Ok(None);
+        }
+        let path = self.qualify_path(&Path::from(path)).into_owned();
+        let object = self
+            .object_store
+            .get(&path)
+            .await
+            .map_err(StorageError::from)?;
+        match object.payload {
+            object_store::GetResultPayload::File(file, _) => {
+                if object.meta.size != expected_size {
+                    return Err(invalid(
+                        "opened native checkpoint size differs from descriptor",
+                    ));
+                }
+                let mut reader = tokio::fs::File::from_std(file);
+                reader.set_max_buf_size(CHUNK_BYTES);
+                Ok(Some(reader))
+            }
+            // Keep using the object store if a local provider cannot expose a file.
+            object_store::GetResultPayload::Stream(_) => Ok(None),
+        }
+    }
+
     /// Called only after checkpoint GC has fenced the artifact's native owner.
     /// Known upload IDs remain visible until abort and temporary-payload cleanup
     /// succeed, so a process loss cannot strand an unlisted large upload.
@@ -619,6 +652,54 @@ async fn wait_for_block_blob_copy(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn local_checkpoint_reader_resolves_keys_and_pins_the_open_file() {
+        use tokio::io::AsyncReadExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "streamr-local-reader-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let storage = StorageProvider::for_url(root.to_str().unwrap())
+            .await
+            .unwrap();
+        let key = "prefix/a%20b.sst";
+        let payload = vec![17; CHUNK_BYTES + 3];
+        storage.put(key, payload.clone()).await.unwrap();
+        let expected = storage
+            .checkpoint_range(key, 0, CHUNK_BYTES as u64)
+            .await
+            .unwrap();
+        assert!(storage.local_checkpoint_reader(key, 1).await.is_err());
+        let mut reader = storage
+            .local_checkpoint_reader(key, payload.len() as u64)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut first = vec![0; CHUNK_BYTES];
+        reader.read_exact(&mut first).await.unwrap();
+        assert_eq!(first, expected.as_ref());
+
+        // An object replacement must not switch an in-flight restore to a
+        // different file. The descriptor checksum still validates the whole file.
+        storage.put(key, vec![33; CHUNK_BYTES + 3]).await.unwrap();
+        let mut tail = [0; 3];
+        reader.read_exact(&mut tail).await.unwrap();
+        assert_eq!(tail, [17; 3]);
+        assert!(reader.read_exact(&mut [0; 1]).await.is_err());
+        assert_eq!(
+            storage.get(key).await.unwrap().as_ref(),
+            vec![33; CHUNK_BYTES + 3]
+        );
+        drop(reader);
+        std::fs::remove_dir_all(root).unwrap();
+    }
     #[derive(Debug)]
     struct AzureFixtureStore {
         inner: object_store::memory::InMemory,
