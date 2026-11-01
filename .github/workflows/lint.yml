@@ -22,18 +22,17 @@ jobs:
       - name: Install Podman
         run: |
           sudo apt-get update
-          sudo apt-get install -y podman strace
+          sudo apt-get install -y podman
       - name: Preflight maintained wrapper and host mounts
         shell: bash
         run: |
           set -euo pipefail
           test -x scripts/cargo-dev && test -x scripts/rust-build
-          for tool in git flock sha256sum timeout python3 podman strace; do command -v "$tool" >/dev/null; done
+          for tool in git flock sha256sum timeout python3 podman; do command -v "$tool" >/dev/null; done
           shared_target="$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")/target"
           mkdir -p "$shared_target"
           test -d "$shared_target" && test -w "$shared_target"
           podman info >/dev/null
-          strace -f -c true >/dev/null 2>&1
           df -h "$shared_target" "$RUNNER_TEMP"
       - name: Capture controls and host capacity
         shell: bash
@@ -48,12 +47,12 @@ jobs:
           nproc >> "$results/host.txt"
           df -h "$RUNNER_TEMP" >> "$results/host.txt"
           cp .github/experiments/restore-sizes.json "$results/"
-      - name: Build maintained dev image with tracing tools
+      - name: Build maintained dev image with timing tool
         shell: bash
         run: |
           set -euo pipefail
           # Add observation tools after the committed image's pinned native stages.
-          printf '\nRUN apt-get update && apt-get install -y --no-install-recommends strace time && rm -rf /var/lib/apt/lists/*\n' >> Dockerfile.dev
+          printf '\nRUN apt-get update && apt-get install -y --no-install-recommends time && rm -rf /var/lib/apt/lists/*\n' >> Dockerfile.dev
           scripts/cargo-dev --build
           podman image inspect arroyo-dev > "$RUNNER_TEMP/str163-restore-run/results/dev-image.json"
       - name: Compile and measure baseline and candidate under one queue reservation

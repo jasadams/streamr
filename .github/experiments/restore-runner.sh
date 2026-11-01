@@ -5,7 +5,6 @@ export STREAMR_BUILD_EVIDENCE_ROOT="$STR163_RUN_ROOT"
 export CARGO_BUILD_JOBS=2
 fixture="$STR163_RUN_ROOT/fixture"
 results="$STR163_RUN_ROOT/results"
-scripts/cargo-dev --exec strace -f -c true > "$results/strace-preflight.stdout" 2> "$results/strace-preflight.stderr"
 python3 .github/experiments/restore-fixture.py create "$fixture"
 sha256sum "$fixture/manifest.json" >> "$results/controls.sha256"
 for role in baseline candidate; do
@@ -25,7 +24,7 @@ for role in baseline candidate; do
   test "$(wc -l < "$results/$role-executable.sha256")" -eq 1
   python3 .github/experiments/restore-fixture.py warm "$fixture" > "$results/$role-warm.txt"
   cat /proc/pressure/io > "$results/$role-pressure-before.txt"
-  scripts/cargo-dev --exec env "STR163_RESTORE_FIXTURE=$fixture" /usr/bin/time -v -o "$results/$role-time.txt" timeout --signal=TERM --kill-after=10s 600s strace -f -c -e trace=openat,read,pread64,write,fsync,fdatasync,statfs,fstatfs -o "$results/$role-strace.txt" "$executable" live::native_checkpoint::tests::local_native_download_measurement --ignored --exact --test-threads=1 --nocapture | tee "$results/$role-test.log"
+  scripts/cargo-dev --exec env "STR163_RESTORE_FIXTURE=$fixture" /usr/bin/time -v -o "$results/$role-time.txt" timeout --signal=TERM --kill-after=10s 600s "$executable" live::native_checkpoint::tests::local_native_download_measurement --ignored --exact --test-threads=1 --nocapture | tee "$results/$role-test.log"
   grep -F 'test result: ok. 1 passed; 0 failed' "$results/$role-test.log"
   grep -F 'STR163_OUTPUT_ORACLE=PASS' "$results/$role-test.log"
   cat /proc/pressure/io > "$results/$role-pressure-after.txt"
