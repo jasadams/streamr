@@ -484,6 +484,20 @@ pub(crate) async fn download(
         if head.size != file.size_bytes {
             return Err(error("native recovery object size mismatch"));
         }
+        let mut local_reader = if file.size_bytes == 0 {
+            None
+        } else {
+            request
+                .storage
+                .local_checkpoint_reader(&file.path, file.size_bytes)
+                .await
+                .map_err(error)?
+        };
+        let mut local_buffer = if local_reader.is_some() {
+            vec![0; range_bytes]
+        } else {
+            Vec::new()
+        };
         let mut output = tokio::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -497,11 +511,22 @@ pub(crate) async fn download(
             resources
                 .ensure_disk_space(directory, end - offset)
                 .map_err(error)?;
-            let bytes = request
-                .storage
-                .checkpoint_range(&file.path, offset, end)
-                .await
-                .map_err(error)?;
+            let remote_bytes;
+            let bytes: &[u8] = if let Some(reader) = &mut local_reader {
+                let length = (end - offset) as usize;
+                reader
+                    .read_exact(&mut local_buffer[..length])
+                    .await
+                    .map_err(error)?;
+                &local_buffer[..length]
+            } else {
+                remote_bytes = request
+                    .storage
+                    .checkpoint_range(&file.path, offset, end)
+                    .await
+                    .map_err(error)?;
+                remote_bytes.as_ref()
+            };
             if bytes.len() as u64 != end - offset {
                 return Err(error("native recovery object truncated"));
             }
@@ -627,6 +652,78 @@ mod tests {
             disk_reserve_bytes: 0,
         })
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn local_native_download_checks_multichunk_empty_and_corrupt_files() {
+        let remote = tempfile::tempdir().unwrap();
+        let storage = Arc::new(
+            arroyo_storage::StorageProvider::for_url(remote.path().to_str().unwrap())
+                .await
+                .unwrap(),
+        );
+        let payload = vec![42; CHUNK_BYTES * 2 + 3];
+        storage.put("native/data", payload.clone()).await.unwrap();
+        storage.put("native/empty", Vec::new()).await.unwrap();
+        let mut metadata = NativeDatabaseCheckpointMetadata {
+            format_version: protocol::FORMAT_VERSION,
+            compatibility_identity: compatibility_identity(),
+            ..Default::default()
+        };
+        metadata.files = vec![
+            NativeCheckpointFile {
+                local_name: "data.sst".into(),
+                path: "native/data".into(),
+                size_bytes: payload.len() as u64,
+                checksum: Sha256::digest(&payload).to_vec(),
+                ..Default::default()
+            },
+            NativeCheckpointFile {
+                local_name: "empty".into(),
+                path: "native/empty".into(),
+                size_bytes: 0,
+                checksum: Sha256::digest([]).to_vec(),
+                ..Default::default()
+            },
+        ];
+        let request = NativeRestoreRequest {
+            metadata,
+            storage: storage.clone(),
+        };
+        let target = tempfile::tempdir().unwrap();
+        download(&request, target.path(), &resources())
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read(target.path().join("data.sst")).unwrap(),
+            payload
+        );
+        assert!(
+            std::fs::read(target.path().join("empty"))
+                .unwrap()
+                .is_empty()
+        );
+
+        storage
+            .put("native/data", vec![1; payload.len()])
+            .await
+            .unwrap();
+        let corrupt_target = tempfile::tempdir().unwrap();
+        assert!(
+            download(&request, corrupt_target.path(), &resources())
+                .await
+                .is_err()
+        );
+        storage
+            .put("native/data", vec![1; payload.len() - 1])
+            .await
+            .unwrap();
+        let short_target = tempfile::tempdir().unwrap();
+        assert!(
+            download(&request, short_target.path(), &resources())
+                .await
+                .is_err()
+        );
     }
     fn config(root: &Path, attempt: u32) -> RocksStateConfig {
         RocksStateConfig {
