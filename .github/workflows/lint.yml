@@ -22,7 +22,19 @@ jobs:
       - name: Install Podman
         run: |
           sudo apt-get update
-          sudo apt-get install -y podman
+          sudo apt-get install -y podman strace
+      - name: Preflight maintained wrapper and host mounts
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -x scripts/cargo-dev && test -x scripts/rust-build
+          for tool in git flock sha256sum timeout python3 podman strace; do command -v "$tool" >/dev/null; done
+          shared_target="$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")/target"
+          mkdir -p "$shared_target"
+          test -d "$shared_target" && test -w "$shared_target"
+          podman info >/dev/null
+          strace -f -c true >/dev/null 2>&1
+          df -h "$shared_target" "$RUNNER_TEMP"
       - name: Capture controls and host capacity
         shell: bash
         run: |
