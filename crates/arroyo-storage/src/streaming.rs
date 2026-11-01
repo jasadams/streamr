@@ -47,6 +47,26 @@ struct CloudUpload {
 }
 
 impl StorageProvider {
+    /// Resolve a local checkpoint object using the object store's own path
+    /// encoding. Cloud objects cannot be linked into a working database.
+    pub async fn local_checkpoint_file(
+        &self,
+        path: &str,
+    ) -> Result<Option<(std::fs::File, std::path::PathBuf)>, StorageError> {
+        if !self.config().is_local() {
+            return Ok(None);
+        }
+        let path = self.qualify_path(&Path::from(path)).into_owned();
+        let result = self
+            .object_store
+            .get(&path)
+            .await
+            .map_err(StorageError::from)?;
+        match result.payload {
+            object_store::GetResultPayload::File(file, path) => Ok(Some((file, path))),
+            _ => Ok(None),
+        }
+    }
     fn native_upload_provider_kind(&self) -> &'static str {
         match self.config() {
             crate::BackendConfig::Local(_) => "local",
