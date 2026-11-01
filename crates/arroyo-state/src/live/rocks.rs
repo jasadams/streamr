@@ -207,7 +207,20 @@ impl RocksLiveState {
                 Ok::<_, LiveStateError>(StagingDirectory::restoring(path, cleanup))
             })
             .await??;
-        super::native_checkpoint::download(&request, &staging.path, &resources).await?;
+        let staging_path = staging.path.clone();
+        let staging_guard = Arc::new(Mutex::new(Some(staging)));
+        super::native_checkpoint::download(
+            &request,
+            &staging_path,
+            &resources,
+            Some(staging_guard.clone()),
+        )
+        .await?;
+        let staging = staging_guard
+            .lock()
+            .unwrap()
+            .take()
+            .expect("restore staging");
         let task_resources = resources.clone();
         resources
             .run_blocking(move || {

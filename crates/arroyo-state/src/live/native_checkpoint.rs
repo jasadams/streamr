@@ -444,6 +444,7 @@ pub(crate) async fn download(
     request: &NativeRestoreRequest,
     directory: &Path,
     resources: &WorkerStateResources,
+    staging_guard: Option<Arc<Mutex<Option<StagingDirectory>>>>,
 ) -> Result<()> {
     let metadata = &request.metadata;
     if metadata.compatibility_identity != compatibility_identity()
@@ -496,17 +497,25 @@ pub(crate) async fn download(
                 let destination = directory.join(&file.local_name);
                 let expected_size = file.size_bytes;
                 let expected_hash = file.checksum.clone();
+                let guard = staging_guard.clone();
                 let linked = resources
                     .run_blocking(move || -> std::io::Result<bool> {
                         use std::io::Read;
+                        // Keep staging and its cleanup permit alive until this
+                        // uncancellable blocking operation has really ended.
+                        let _guard = guard;
                         if std::fs::hard_link(&source_path, &destination).is_err() {
                             return Ok(false);
                         }
                         let checked = (|| {
                             let source_meta = source.metadata()?;
+                            let link_meta = std::fs::symlink_metadata(&destination)?;
                             let mut linked = std::fs::File::open(&destination)?;
                             let meta = linked.metadata()?;
-                            if !meta.is_file()
+                            if !link_meta.is_file()
+                                || link_meta.dev() != meta.dev()
+                                || link_meta.ino() != meta.ino()
+                                || !meta.is_file()
                                 || meta.len() != expected_size
                                 || source_meta.dev() != meta.dev()
                                 || source_meta.ino() != meta.ino()
@@ -835,6 +844,7 @@ mod tests {
                 },
                 staging.path(),
                 &resources,
+                None,
             )
             .await
             .unwrap();
@@ -871,6 +881,7 @@ mod tests {
                         },
                         other.path(),
                         &resources,
+                        None,
                     )
                     .await
                     .unwrap();
@@ -897,11 +908,37 @@ mod tests {
                     },
                     rejected.path(),
                     &resources,
+                    None,
                 )
                 .await
                 .is_err()
             );
             assert!(!rejected.path().join(bad_name).exists());
+            // A symlink to the real object must never become a symlink in the
+            // working database, even when following it yields the correct bytes.
+            let (_, source_path) = storage
+                .local_checkpoint_file(&ssts[0].path)
+                .await
+                .unwrap()
+                .unwrap();
+            let original = source_path.with_extension("original-test-object");
+            std::fs::rename(&source_path, &original).unwrap();
+            std::os::unix::fs::symlink(&original, &source_path).unwrap();
+            let rejected = tempfile::tempdir().unwrap();
+            let outcome = download(
+                &NativeRestoreRequest {
+                    metadata: first.clone(),
+                    storage: storage.clone(),
+                },
+                rejected.path(),
+                &resources,
+                None,
+            )
+            .await;
+            std::fs::remove_file(&source_path).unwrap();
+            std::fs::rename(&original, &source_path).unwrap();
+            assert!(outcome.is_err());
+            assert!(!rejected.path().join(&ssts[0].local_name).exists());
         }
         for file in &ssts {
             assert!(
