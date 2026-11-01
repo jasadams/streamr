@@ -1,71 +1,14 @@
-name: Temporary isolated native restore comparison
-
+name: Temporary Podman strace preflight
 on: [push]
-
 permissions:
   contents: read
-
 jobs:
-  restore-comparison:
+  probe:
     runs-on: ubuntu-22.04
-    timeout-minutes: 180
+    timeout-minutes: 8
     steps:
-      - uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-          fetch-depth: 0
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-      - name: Verify host Python supports maintained native selector
-        run: python3 -c 'import tomllib; print("host Python tomllib available")'
       - name: Install Podman
+        run: sudo apt-get update && sudo apt-get install -y podman
+      - name: Test trace of owned child inside default container
         run: |
-          sudo apt-get update
-          sudo apt-get install -y podman strace
-      - name: Preflight maintained wrapper and host mounts
-        shell: bash
-        run: |
-          set -euo pipefail
-          test -x scripts/cargo-dev && test -x scripts/rust-build
-          for tool in git flock sha256sum timeout python3 podman strace; do command -v "$tool" >/dev/null; done
-          shared_target="$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")/target"
-          mkdir -p "$shared_target"
-          test -d "$shared_target" && test -w "$shared_target"
-          podman info >/dev/null
-          strace -f -c true >/dev/null 2>&1
-          df -h "$shared_target" "$RUNNER_TEMP"
-      - name: Capture controls and host capacity
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p "$RUNNER_TEMP/str163-restore-run/results"
-          results="$RUNNER_TEMP/str163-restore-run/results"
-          git rev-parse HEAD > "$results/runner-commit.txt"
-          git diff --name-only 0af056f82f84d7c3ec273a5e6700f6a15e89bd97 36818f61a34487880096c54fe76bbcae0812df77 > "$results/product-diff-files.txt"
-          sha256sum .github/experiments/restore-* > "$results/controls.sha256"
-          uname -a > "$results/host.txt"
-          nproc >> "$results/host.txt"
-          df -h "$RUNNER_TEMP" >> "$results/host.txt"
-          cp .github/experiments/restore-sizes.json "$results/"
-      - name: Build maintained dev image with tracing tools
-        shell: bash
-        run: |
-          set -euo pipefail
-          # Add observation tools after the committed image's pinned native stages.
-          printf '\nRUN apt-get update && apt-get install -y --no-install-recommends strace time && rm -rf /var/lib/apt/lists/*\n' >> Dockerfile.dev
-          scripts/cargo-dev --build
-          podman image inspect arroyo-dev > "$RUNNER_TEMP/str163-restore-run/results/dev-image.json"
-      - name: Compile and measure baseline and candidate under one queue reservation
-        shell: bash
-        run: |
-          set -euo pipefail
-          export STR163_RUN_ROOT="$(realpath "$RUNNER_TEMP/str163-restore-run")"
-          scripts/rust-build bash .github/experiments/restore-runner.sh
-      - name: Preserve results even on failure
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: str163-restore-comparison
-          path: ${{ runner.temp }}/str163-restore-run/results/
-          if-no-files-found: error
+          podman run --rm docker.io/library/debian:bookworm-slim sh -c 'apt-get update && apt-get install -y --no-install-recommends strace && strace -f -c true'
