@@ -444,6 +444,7 @@ pub(crate) async fn download(
     request: &NativeRestoreRequest,
     directory: &Path,
     resources: &WorkerStateResources,
+    staging_guard: Option<Arc<Mutex<Option<StagingDirectory>>>>,
 ) -> Result<()> {
     let metadata = &request.metadata;
     if metadata.compatibility_identity != compatibility_identity()
@@ -456,9 +457,11 @@ pub(crate) async fn download(
         ));
     }
     let range_bytes = request.storage.streaming_read_range_bytes();
-    let _buffers = resources
-        .try_decoded_value(range_bytes * 2 + CHUNK_BYTES)
-        .map_err(error)?;
+    let buffers = Arc::new(
+        resources
+            .try_decoded_value(range_bytes * 2 + CHUNK_BYTES)
+            .map_err(error)?,
+    );
     let mut names = std::collections::HashSet::new();
     for file in &metadata.files {
         if file.local_name.is_empty()
@@ -473,9 +476,6 @@ pub(crate) async fn download(
         {
             return Err(error("unsafe or duplicate native recovery file"));
         }
-        resources
-            .ensure_disk_space(directory, file.size_bytes)
-            .map_err(error)?;
         let head = request
             .storage
             .head(file.path.clone())
@@ -484,6 +484,84 @@ pub(crate) async fn download(
         if head.size != file.size_bytes {
             return Err(error("native recovery object size mismatch"));
         }
+        // SSTs are immutable. Like Flink's local RocksDB restore, link them
+        // when the checkpoint and working directory share a filesystem; other
+        // files and providers retain the independent-copy path below.
+        #[cfg(unix)]
+        if file.shared && file.local_name.ends_with(".sst") {
+            if let Some((source, source_path)) = request
+                .storage
+                .local_checkpoint_file(&file.path)
+                .await
+                .map_err(error)?
+            {
+                use std::os::unix::fs::MetadataExt;
+                let destination = directory.join(&file.local_name);
+                let expected_size = file.size_bytes;
+                let expected_hash = file.checksum.clone();
+                let guard = staging_guard.clone();
+                let buffers = buffers.clone();
+                let linked = resources
+                    .run_blocking(move || -> std::io::Result<bool> {
+                        use std::io::Read;
+                        // Keep staging and its cleanup permit alive until this
+                        // uncancellable blocking operation has really ended.
+                        let _guard = guard;
+                        let _buffers = buffers;
+                        if std::fs::hard_link(&source_path, &destination).is_err() {
+                            return Ok(false);
+                        }
+                        let checked = (|| {
+                            let source_meta = source.metadata()?;
+                            let link_meta = std::fs::symlink_metadata(&destination)?;
+                            let mut linked = std::fs::File::open(&destination)?;
+                            let meta = linked.metadata()?;
+                            if !link_meta.is_file()
+                                || link_meta.dev() != meta.dev()
+                                || link_meta.ino() != meta.ino()
+                                || !meta.is_file()
+                                || meta.len() != expected_size
+                                || source_meta.dev() != meta.dev()
+                                || source_meta.ino() != meta.ino()
+                            {
+                                return Err(std::io::Error::other(
+                                    "native recovery link identity mismatch",
+                                ));
+                            }
+                            let mut hash = Sha256::new();
+                            let mut buffer = [0u8; CHUNK_BYTES];
+                            let mut total = 0u64;
+                            loop {
+                                let n = linked.read(&mut buffer)?;
+                                if n == 0 {
+                                    break;
+                                }
+                                total += n as u64;
+                                hash.update(&buffer[..n]);
+                            }
+                            if total != expected_size || hash.finalize()[..] != expected_hash {
+                                return Err(std::io::Error::other(
+                                    "native recovery object checksum mismatch",
+                                ));
+                            }
+                            linked.sync_all()
+                        })();
+                        if checked.is_err() {
+                            let _ = std::fs::remove_file(&destination);
+                        }
+                        checked.map(|()| true)
+                    })
+                    .await
+                    .map_err(error)?
+                    .map_err(error)?;
+                if linked {
+                    continue;
+                }
+            }
+        }
+        resources
+            .ensure_disk_space(directory, file.size_bytes)
+            .map_err(error)?;
         let mut output = tokio::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -759,6 +837,113 @@ mod tests {
             !ssts.is_empty(),
             "WAL-disabled memtable must become native SST state"
         );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let staging = tempfile::tempdir().unwrap();
+            download(
+                &NativeRestoreRequest {
+                    metadata: first.clone(),
+                    storage: storage.clone(),
+                },
+                staging.path(),
+                &resources,
+                None,
+            )
+            .await
+            .unwrap();
+            for file in &first.files {
+                let (source, _) = storage
+                    .local_checkpoint_file(&file.path)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let source = source.metadata().unwrap();
+                let restored = std::fs::metadata(staging.path().join(&file.local_name)).unwrap();
+                if file.shared && file.local_name.ends_with(".sst") {
+                    assert_eq!(
+                        (source.dev(), source.ino()),
+                        (restored.dev(), restored.ino())
+                    );
+                } else {
+                    assert_ne!(
+                        (source.dev(), source.ino()),
+                        (restored.dev(), restored.ino())
+                    );
+                }
+            }
+            // /dev/shm is a separate filesystem on normal Linux runners. When
+            // available, exercise the real EXDEV path, not a mocked failure.
+            if let Ok(other) = tempfile::Builder::new().tempdir_in("/dev/shm") {
+                if std::fs::metadata(other.path()).unwrap().dev()
+                    != std::fs::metadata(staging.path()).unwrap().dev()
+                {
+                    download(
+                        &NativeRestoreRequest {
+                            metadata: first.clone(),
+                            storage: storage.clone(),
+                        },
+                        other.path(),
+                        &resources,
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                    let (source, _) = storage
+                        .local_checkpoint_file(&ssts[0].path)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    let source = source.metadata().unwrap();
+                    let copy = std::fs::metadata(other.path().join(&ssts[0].local_name)).unwrap();
+                    assert_ne!((source.dev(), source.ino()), (copy.dev(), copy.ino()));
+                }
+            }
+            let mut invalid = first.clone();
+            let bad = invalid.files.iter_mut().find(|file| file.shared).unwrap();
+            let bad_name = bad.local_name.clone();
+            bad.checksum[0] ^= 1;
+            let rejected = tempfile::tempdir().unwrap();
+            assert!(
+                download(
+                    &NativeRestoreRequest {
+                        metadata: invalid,
+                        storage: storage.clone()
+                    },
+                    rejected.path(),
+                    &resources,
+                    None,
+                )
+                .await
+                .is_err()
+            );
+            assert!(!rejected.path().join(bad_name).exists());
+            // A symlink to the real object must never become a symlink in the
+            // working database, even when following it yields the correct bytes.
+            let (_, source_path) = storage
+                .local_checkpoint_file(&ssts[0].path)
+                .await
+                .unwrap()
+                .unwrap();
+            let original = source_path.with_extension("original-test-object");
+            std::fs::rename(&source_path, &original).unwrap();
+            std::os::unix::fs::symlink(&original, &source_path).unwrap();
+            let rejected = tempfile::tempdir().unwrap();
+            let outcome = download(
+                &NativeRestoreRequest {
+                    metadata: first.clone(),
+                    storage: storage.clone(),
+                },
+                rejected.path(),
+                &resources,
+                None,
+            )
+            .await;
+            std::fs::remove_file(&source_path).unwrap();
+            std::fs::rename(&original, &source_path).unwrap();
+            assert!(outcome.is_err());
+            assert!(!rejected.path().join(&ssts[0].local_name).exists());
+        }
         for file in &ssts {
             assert!(
                 second.files.contains(file),
