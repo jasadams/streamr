@@ -457,9 +457,11 @@ pub(crate) async fn download(
         ));
     }
     let range_bytes = request.storage.streaming_read_range_bytes();
-    let _buffers = resources
-        .try_decoded_value(range_bytes * 2 + CHUNK_BYTES)
-        .map_err(error)?;
+    let buffers = Arc::new(
+        resources
+            .try_decoded_value(range_bytes * 2 + CHUNK_BYTES)
+            .map_err(error)?,
+    );
     let mut names = std::collections::HashSet::new();
     for file in &metadata.files {
         if file.local_name.is_empty()
@@ -498,12 +500,14 @@ pub(crate) async fn download(
                 let expected_size = file.size_bytes;
                 let expected_hash = file.checksum.clone();
                 let guard = staging_guard.clone();
+                let buffers = buffers.clone();
                 let linked = resources
                     .run_blocking(move || -> std::io::Result<bool> {
                         use std::io::Read;
                         // Keep staging and its cleanup permit alive until this
                         // uncancellable blocking operation has really ended.
                         let _guard = guard;
+                        let _buffers = buffers;
                         if std::fs::hard_link(&source_path, &destination).is_err() {
                             return Ok(false);
                         }
